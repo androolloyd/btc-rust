@@ -81,7 +81,7 @@ fn decode_version<R: Read>(r: &mut R) -> Result<VersionMessage, EncodeError> {
     let nonce = r.read_u64_le()?;
     // user_agent as var_str
     let ua_len = VarInt::decode(r)?.0 as usize;
-    if ua_len > 256 {
+    if ua_len > 4096 {
         return Err(EncodeError::InvalidData("user agent too long".into()));
     }
     let ua_bytes = r.read_bytes(ua_len)?;

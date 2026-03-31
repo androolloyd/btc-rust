@@ -56,7 +56,10 @@ impl Connection {
     pub async fn recv_message(&mut self) -> Result<NetworkMessage, ConnectionError> {
         match self.framed.next().await {
             Some(Ok(msg)) => Ok(msg),
-            Some(Err(e)) => Err(ConnectionError::Io(e)),
+            Some(Err(e)) => {
+                tracing::debug!(error = %e, "message decode/io error");
+                Err(ConnectionError::Io(e))
+            }
             None => Err(ConnectionError::ConnectionClosed),
         }
     }

@@ -102,6 +102,7 @@ impl Encodable for TxOut {
 impl Decodable for TxOut {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, EncodeError> {
         let value = Amount::from_sat(reader.read_i64_le()?);
+        // Validate non-negative and within MAX_MONEY
         if value.as_sat() < 0 || !value.is_valid() {
             return Err(EncodeError::InvalidData("invalid output value".into()));
         }

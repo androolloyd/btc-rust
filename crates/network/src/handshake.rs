@@ -75,7 +75,7 @@ impl Handshake {
 
         let version = VersionMessage {
             version: ProtocolVersion::CURRENT.0,
-            services: ServiceFlags::NETWORK.0,
+            services: ServiceFlags::NETWORK.0 | ServiceFlags::WITNESS.0,
             timestamp,
             receiver: NetAddress::default(),
             sender: NetAddress::default(),
@@ -108,18 +108,14 @@ impl Handshake {
                 // After receiving version, send verack
                 responses.push(NetworkMessage::Verack);
 
-                // Send wtxidrelay if peer supports it (BIP339, protocol >= 70016)
+                // BIP339: wtxidrelay MUST be sent before verack
                 if peer_version >= ProtocolVersion::WTXID_RELAY.0 {
-                    responses.push(NetworkMessage::WtxidRelay);
+                    // Insert wtxidrelay BEFORE verack in the response list
+                    responses.insert(0, NetworkMessage::WtxidRelay);
                 }
 
-                // Send sendcmpct if peer supports compact blocks (BIP152, protocol >= 70014)
-                if peer_version >= ProtocolVersion::COMPACT_BLOCKS.0 {
-                    responses.push(NetworkMessage::SendCmpct {
-                        announce: false,
-                        version: SENDCMPCT_VERSION,
-                    });
-                }
+                // NOTE: sendcmpct is sent AFTER handshake completes (after verack exchange),
+                // not during version processing. The sync manager handles this.
 
                 match self.state {
                     HandshakeState::VersionSent => {
