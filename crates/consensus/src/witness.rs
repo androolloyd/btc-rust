@@ -432,14 +432,14 @@ pub fn verify_input(
             return Err(WitnessError::ScriptSigNotEmpty);
         }
 
-        // Get the witness for this input — check bounds properly rather than
-        // silently creating an empty witness with unwrap_or_default()
+        // Get the witness for this input.
         let witness = if input_index < tx.witness.len() {
             tx.witness[input_index].clone()
         } else {
-            // Transaction has no witness data for this input — it's a legacy tx
-            // spending a witness program, which is invalid
-            return Err(WitnessError::EmptyWitness);
+            // No witness data — use empty witness.
+            // For unknown future versions (v1 non-32-byte, v2-v16), empty
+            // witness is valid (soft-fork safe per BIP141).
+            btc_primitives::transaction::Witness::new()
         };
 
         return verify_witness_program(
