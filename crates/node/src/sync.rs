@@ -21,7 +21,7 @@ use btc_network::message::{
 use btc_network::protocol::ProtocolVersion;
 use btc_primitives::hash::BlockHash;
 use btc_primitives::network::Network;
-use btc_storage::redb_backend::RedbDatabase;
+use btc_storage::qmdb_backend::QmdbDatabase;
 use btc_storage::PersistentUtxoSet;
 
 use crate::state::NodeState;
@@ -82,9 +82,8 @@ pub fn load_checkpoint(datadir: &Path) -> Option<Checkpoint> {
 /// given path. Returns `None` if the database cannot be opened.
 pub fn open_persistent_utxo_set(
     db_path: &Path,
-) -> Option<PersistentUtxoSet<RedbDatabase>> {
-    let db = RedbDatabase::new(db_path).ok()?;
-    db.init_tables().ok()?;
+) -> Option<PersistentUtxoSet<QmdbDatabase>> {
+    let db = QmdbDatabase::new(db_path).ok()?;
     Some(PersistentUtxoSet::new(Arc::new(db)))
 }
 
@@ -212,7 +211,7 @@ pub struct SyncManager {
     /// Optional persistent UTXO set backed by redb.  When set, UTXO updates
     /// are also applied to this database so that the node can resume sync
     /// without reprocessing all blocks.
-    persistent_utxo: Option<PersistentUtxoSet<RedbDatabase>>,
+    persistent_utxo: Option<PersistentUtxoSet<QmdbDatabase>>,
 }
 
 impl SyncManager {
