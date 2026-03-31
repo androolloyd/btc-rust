@@ -3,9 +3,8 @@
 use btc_consensus::script_engine::{ScriptEngine, ScriptFlags};
 use btc_consensus::sig_verify::Secp256k1Verifier;
 use btc_primitives::amount::Amount;
-use btc_primitives::hash::{sha256d, TxHash};
 use btc_primitives::script::{Script, ScriptBuf};
-use btc_primitives::transaction::{OutPoint, TxIn, TxOut, Transaction};
+use btc_primitives::transaction::{OutPoint, TxOut};
 use btc_test::{TestKeyPair, TestNode};
 use thiserror::Error;
 

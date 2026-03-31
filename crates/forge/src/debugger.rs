@@ -90,7 +90,7 @@ impl ScriptDebugger {
 
         // Execute the full script in one go and capture the stack at each
         // instruction boundary by replaying prefixes.
-        for (i, &(pc, opcode, end)) in instructions.iter().enumerate() {
+        for &(pc, opcode, end) in instructions.iter() {
             // Execute the script prefix [0..end] in a fresh engine.
             let prefix_bytes = &self.script.as_bytes()[..end];
             let prefix_script = Script::from_bytes(prefix_bytes);

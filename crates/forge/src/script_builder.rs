@@ -145,7 +145,7 @@ impl ForgeScript {
 
     /// Timelock wrapper: `<locktime> OP_CHECKLOCKTIMEVERIFY OP_DROP <inner>`
     pub fn timelock(locktime: i64, inner: &ScriptBuf) -> Self {
-        let mut s = ForgeScript::new()
+        let s = ForgeScript::new()
             .push_num(locktime)
             .op(Opcode::OP_CHECKLOCKTIMEVERIFY)
             .op(Opcode::OP_DROP);
@@ -159,7 +159,7 @@ impl ForgeScript {
 
     /// Hashlock wrapper: `OP_SHA256 <hash> OP_EQUALVERIFY <inner>`
     pub fn hashlock(hash: &[u8; 32], inner: &ScriptBuf) -> Self {
-        let mut s = ForgeScript::new()
+        let s = ForgeScript::new()
             .op(Opcode::OP_SHA256)
             .push_bytes(hash)
             .op(Opcode::OP_EQUALVERIFY);
