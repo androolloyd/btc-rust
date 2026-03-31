@@ -377,15 +377,8 @@ impl SyncManager {
         // Phase 4 -- header sync.
         let peer_tip = self.sync_headers(&mut conn).await?;
 
-        // Save checkpoint after header sync completes.
-        if let Some(ref datadir) = self.datadir {
-            let cs = self.chain_state.read().await;
-            let best = cs.best_header();
-            let cp = Checkpoint::new(cs.best_height(), best.header.block_hash());
-            if let Err(e) = save_checkpoint(datadir, &cp) {
-                warn!(error = %e, "failed to save checkpoint after header sync");
-            }
-        }
+        // NOTE: checkpoint is only saved after BLOCK validation (not headers)
+        // to prevent skipping block download on restart.
 
         // Phase 5 -- block sync.
         // Use checkpoint height if available — skip blocks we already validated.
