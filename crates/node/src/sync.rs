@@ -21,7 +21,7 @@ use btc_network::message::{
 use btc_network::protocol::ProtocolVersion;
 use btc_primitives::hash::BlockHash;
 use btc_primitives::network::Network;
-use btc_storage::qmdb_backend::QmdbDatabase;
+use btc_storage::redb_backend::RedbDatabase;
 use btc_storage::PersistentUtxoSet;
 
 use crate::state::NodeState;
@@ -82,8 +82,8 @@ pub fn load_checkpoint(datadir: &Path) -> Option<Checkpoint> {
 /// given path. Returns `None` if the database cannot be opened.
 pub fn open_persistent_utxo_set(
     db_path: &Path,
-) -> Option<PersistentUtxoSet<QmdbDatabase>> {
-    let db = QmdbDatabase::new(db_path).ok()?;
+) -> Option<PersistentUtxoSet<RedbDatabase>> {
+    let db = RedbDatabase::new(db_path).ok()?; db.init_tables().ok()?;
     Some(PersistentUtxoSet::new(Arc::new(db)))
 }
 
@@ -211,7 +211,7 @@ pub struct SyncManager {
     /// Optional persistent UTXO set backed by redb.  When set, UTXO updates
     /// are also applied to this database so that the node can resume sync
     /// without reprocessing all blocks.
-    persistent_utxo: Option<PersistentUtxoSet<QmdbDatabase>>,
+    persistent_utxo: Option<PersistentUtxoSet<RedbDatabase>>,
 }
 
 impl SyncManager {
@@ -242,7 +242,7 @@ impl SyncManager {
     }
 
     /// Create a `SyncManager` with a data directory for checkpoint and UTXO
-    /// persistence.  If the redb database at `{datadir}/utxo.qmdb` can be
+    /// persistence.  If the redb database at `{datadir}/utxo.redb` can be
     /// opened, a `PersistentUtxoSet` is initialised and UTXO updates are
     /// persisted to disk during IBD.
     pub fn with_datadir(
@@ -258,7 +258,7 @@ impl SyncManager {
         }
 
         // Open persistent UTXO database
-        let db_path = datadir.join("utxo.qmdb");
+        let db_path = datadir.join("utxo.redb");
         let persistent_utxo = open_persistent_utxo_set(&db_path);
         if persistent_utxo.is_some() {
             info!(path = %db_path.display(), "persistent UTXO set opened");
@@ -914,12 +914,14 @@ impl SyncManager {
                         ) {
                             let utxo_set = self.utxo_set.read().await;
                             let validator = ParallelValidator::new(ParallelConfig::default());
-                            if let Err(errors) = validator.validate_block_scripts(
-                                &block,
-                                &*utxo_set,
-                                block_height,
-                                &self.chain_params,
-                            ) {
+                            // Use persistent UTXO set if available (for resume scenarios
+                            // where in-memory set is empty), otherwise use in-memory.
+                            let validate_result = if let Some(ref persistent) = self.persistent_utxo {
+                                validator.validate_block_scripts(&block, persistent, block_height, &self.chain_params)
+                            } else {
+                                validator.validate_block_scripts(&block, &*utxo_set, block_height, &self.chain_params)
+                            };
+                            if let Err(errors) = validate_result {
                                 // During IBD, log script failures as warnings but continue.
                                 // UTXO validation (Step 2) already passed, so chain state is safe.
                                 // Script verification issues will be fixed and re-validated.
@@ -1619,7 +1621,7 @@ mod tests {
     #[test]
     fn test_persistent_utxo_set_construction() {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
-        let db_path = dir.path().join("utxo.qmdb");
+        let db_path = dir.path().join("utxo.redb");
 
         let persistent = open_persistent_utxo_set(&db_path);
         assert!(persistent.is_some(), "should be able to open persistent UTXO set");

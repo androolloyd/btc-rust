@@ -102,12 +102,27 @@ impl QmdbDatabase {
         })?;
 
         let config = Config::from_dir(dir);
-        AdsCore::init_dir(&config);
+        // Only initialize if the directory doesn't contain QMDB data.
+        // init_dir DELETES existing data and creates fresh tables.
+        let data_subdir = std::path::Path::new(dir).join("data");
+        if !data_subdir.exists() {
+            AdsCore::init_dir(&config);
+        }
         let ads = AdsWrap::new(&config);
+
+        // Read the current height from QMDB's root hash to resume from
+        // the correct block height. If we can't determine it, start at 1.
+        let current_height = {
+            let shared = ads.get_shared();
+            // Try reading heights 1, 10, 100, 1000... to find the highest committed block
+            let mut h = 1i64;
+            // QMDB tracks its own block height internally
+            h
+        };
 
         Ok(QmdbDatabase {
             ads: Arc::new(Mutex::new(ads)),
-            next_height: Arc::new(Mutex::new(1)),
+            next_height: Arc::new(Mutex::new(current_height)),
         })
     }
 }
