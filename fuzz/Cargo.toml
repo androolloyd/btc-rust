@@ -1,0 +1,57 @@
+[package]
+name = "btc-rust-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone workspace -- cargo-fuzz crates must not be members of the
+# parent workspace because they require special compiler flags (-Zsanitizer).
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+btc-primitives = { path = "../crates/primitives" }
+btc-consensus = { path = "../crates/consensus" }
+btc-network = { path = "../crates/network" }
+arbitrary = { version = "1", features = ["derive"] }
+bytes = "1"
+tokio-util = { version = "0.7", features = ["codec"] }
+
+[[bin]]
+name = "fuzz_transaction_decode"
+path = "fuzz_targets/fuzz_transaction_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_block_decode"
+path = "fuzz_targets/fuzz_block_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_script_execute"
+path = "fuzz_targets/fuzz_script_execute.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_p2p_message"
+path = "fuzz_targets/fuzz_p2p_message.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_bech32_decode"
+path = "fuzz_targets/fuzz_bech32_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_varint_decode"
+path = "fuzz_targets/fuzz_varint_decode.rs"
+test = false
+doc = false

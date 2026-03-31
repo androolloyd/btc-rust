@@ -95,21 +95,20 @@ impl AddressIndexStage {
             None => return Vec::new(),
         };
 
-        // Collect spent outputs by (output_index, absolute_value).
-        // Spend entries have value < 0 and output_index matching the vout consumed.
-        // The spend entry's txid is the *spending* tx, not the original output's tx,
-        // so we match by (output_index, abs_value) instead.
-        let mut spent: std::collections::HashSet<(u32, i64)> =
+        // Collect spent (txid, output_index) pairs. The spend entry stores
+        // the *original* output's txid (the outpoint being consumed), so we
+        // can match receives to spends directly.
+        let mut spent: std::collections::HashSet<(TxHash, u32)> =
             std::collections::HashSet::new();
         for entry in entries {
             if entry.value < 0 {
-                spent.insert((entry.output_index, -entry.value));
+                spent.insert((entry.txid, entry.output_index));
             }
         }
 
         entries
             .iter()
-            .filter(|e| e.value > 0 && !spent.contains(&(e.output_index, e.value)))
+            .filter(|e| e.value > 0 && !spent.contains(&(e.txid, e.output_index)))
             .cloned()
             .collect()
     }

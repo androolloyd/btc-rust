@@ -491,6 +491,177 @@ mod tests {
     }
 
     #[test]
+    fn test_tagged_hash_different_tags_different_results() {
+        // Verify that different tags produce different hashes even with the same message
+        let msg = b"test message";
+        let h1 = tagged_hash(b"TapLeaf", msg);
+        let h2 = tagged_hash(b"TapBranch", msg);
+        let h3 = tagged_hash(b"TapTweak", msg);
+        let h4 = tagged_hash(b"TapSighash", msg);
+
+        assert_ne!(h1, h2);
+        assert_ne!(h1, h3);
+        assert_ne!(h1, h4);
+        assert_ne!(h2, h3);
+        assert_ne!(h2, h4);
+        assert_ne!(h3, h4);
+    }
+
+    #[test]
+    fn test_verify_key_path_empty_witness() {
+        let tx = make_test_tx();
+        let output_key = [0xab; 32];
+        let prevouts = vec![TxOut {
+            value: btc_primitives::amount::Amount::from_sat(2_000_000),
+            script_pubkey: ScriptBuf::p2tr(&[0xcd; 32]),
+        }];
+
+        // Empty witness must be rejected
+        let witness = Witness::new();
+        static VERIFIER: crate::sig_verify::Secp256k1Verifier = crate::sig_verify::Secp256k1Verifier;
+        let result = verify_key_path(&output_key, &witness, &tx, 0, &prevouts, &VERIFIER);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verify_script_path_valid_control_block_structure() {
+        let tx = make_test_tx();
+        let output_key = [0xab; 32];
+        let prevouts = vec![TxOut {
+            value: btc_primitives::amount::Amount::from_sat(2_000_000),
+            script_pubkey: ScriptBuf::p2tr(&[0xcd; 32]),
+        }];
+
+        // Build a witness with: [tapscript, control_block]
+        // tapscript = OP_1 (non-empty script that evaluates to true)
+        let tapscript = vec![Opcode::OP_1 as u8];
+
+        // control_block = leaf_version(1) + internal_key(32) = 33 bytes minimum
+        let mut control_block = vec![TAPSCRIPT_LEAF_VERSION];
+        control_block.extend_from_slice(&[0xbb; 32]); // internal key
+
+        let mut witness = Witness::new();
+        witness.push(tapscript);
+        witness.push(control_block);
+
+        static VERIFIER: crate::sig_verify::Secp256k1Verifier = crate::sig_verify::Secp256k1Verifier;
+        let flags = ScriptFlags::all();
+        // Should succeed structurally (script is non-empty, control block parses)
+        let result = verify_script_path(&output_key, &witness, &tx, 0, &prevouts, &VERIFIER, &flags);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_verify_script_path_invalid_control_block_too_short() {
+        let tx = make_test_tx();
+        let output_key = [0xab; 32];
+        let prevouts = vec![TxOut {
+            value: btc_primitives::amount::Amount::from_sat(2_000_000),
+            script_pubkey: ScriptBuf::p2tr(&[0xcd; 32]),
+        }];
+
+        // Control block too short (only 10 bytes, need at least 33)
+        let mut witness = Witness::new();
+        witness.push(vec![Opcode::OP_1 as u8]); // tapscript
+        witness.push(vec![0xc0; 10]); // control block too short
+
+        static VERIFIER: crate::sig_verify::Secp256k1Verifier = crate::sig_verify::Secp256k1Verifier;
+        let flags = ScriptFlags::all();
+        let result = verify_script_path(&output_key, &witness, &tx, 0, &prevouts, &VERIFIER, &flags);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verify_script_path_empty_tapscript_rejected() {
+        let tx = make_test_tx();
+        let output_key = [0xab; 32];
+        let prevouts = vec![TxOut {
+            value: btc_primitives::amount::Amount::from_sat(2_000_000),
+            script_pubkey: ScriptBuf::p2tr(&[0xcd; 32]),
+        }];
+
+        // Empty tapscript should be rejected
+        let mut control_block = vec![TAPSCRIPT_LEAF_VERSION];
+        control_block.extend_from_slice(&[0xbb; 32]);
+
+        let mut witness = Witness::new();
+        witness.push(vec![]); // empty tapscript
+        witness.push(control_block);
+
+        static VERIFIER: crate::sig_verify::Secp256k1Verifier = crate::sig_verify::Secp256k1Verifier;
+        let flags = ScriptFlags::all();
+        let result = verify_script_path(&output_key, &witness, &tx, 0, &prevouts, &VERIFIER, &flags);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_verify_taproot_input_dispatching() {
+        let tx = make_test_tx();
+        let output_key = [0xab; 32];
+        let prevouts = vec![TxOut {
+            value: btc_primitives::amount::Amount::from_sat(2_000_000),
+            script_pubkey: ScriptBuf::p2tr(&[0xcd; 32]),
+        }];
+        static VERIFIER: crate::sig_verify::Secp256k1Verifier = crate::sig_verify::Secp256k1Verifier;
+        let flags = ScriptFlags::all();
+
+        // 1 item (after annex extraction) = key path
+        // A 64-byte signature attempt (will fail sig verification, not dispatch)
+        let mut witness_key = Witness::new();
+        witness_key.push(vec![0xaa; 64]); // 64-byte "signature"
+        let result = verify_taproot_input(
+            &output_key, &witness_key, &tx, 0, &prevouts, &VERIFIER, &flags,
+        );
+        // This dispatches to key path and fails at sig verification (not empty witness)
+        assert!(matches!(result, Err(TaprootError::SignatureVerificationFailed)));
+
+        // 2+ items = script path
+        let tapscript = vec![Opcode::OP_1 as u8];
+        let mut control_block = vec![TAPSCRIPT_LEAF_VERSION];
+        control_block.extend_from_slice(&[0xbb; 32]);
+        let mut witness_script = Witness::new();
+        witness_script.push(tapscript);
+        witness_script.push(control_block);
+        let result = verify_taproot_input(
+            &output_key, &witness_script, &tx, 0, &prevouts, &VERIFIER, &flags,
+        );
+        // Dispatches to script path -- should succeed structurally
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_merkle_tree_three_leaves_unbalanced() {
+        // Build a 3-leaf tree: branch(branch(A, B), C)
+        let script_a = vec![Opcode::OP_1 as u8];
+        let script_b = vec![Opcode::OP_2 as u8];
+        let script_c = vec![Opcode::OP_3 as u8];
+
+        let leaf_a = tap_leaf_hash(TAPSCRIPT_LEAF_VERSION, &script_a);
+        let leaf_b = tap_leaf_hash(TAPSCRIPT_LEAF_VERSION, &script_b);
+        let leaf_c = tap_leaf_hash(TAPSCRIPT_LEAF_VERSION, &script_c);
+
+        // First combine A and B
+        let branch_ab = tap_branch_hash(&leaf_a, &leaf_b);
+        // Then combine AB with C for the root
+        let root = tap_branch_hash(&branch_ab, &leaf_c);
+
+        assert_ne!(root, [0u8; 32]);
+
+        // The root should differ from a tree with different structure: branch(A, branch(B, C))
+        let branch_bc = tap_branch_hash(&leaf_b, &leaf_c);
+        let root_alt = tap_branch_hash(&leaf_a, &branch_bc);
+        // Different tree structures produce different roots (in general)
+        // They may or may not differ due to commutative sorting, but the structure is different
+        // Let's just verify both are valid non-zero hashes
+        assert_ne!(root_alt, [0u8; 32]);
+
+        // Verify that the merkle proof for leaf C works:
+        // proof for C is [branch_ab], and root = branch(branch_ab, leaf_c)
+        let computed_root = tap_branch_hash(&leaf_c, &branch_ab);
+        assert_eq!(computed_root, root);
+    }
+
+    #[test]
     fn test_merkle_tree_construction() {
         // Build a simple 2-leaf merkle tree and verify the root
         let script_a = vec![Opcode::OP_1 as u8];

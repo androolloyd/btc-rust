@@ -541,6 +541,271 @@ mod tests {
         assert_eq!(hash, expected);
     }
 
+    /// Helper to create a test transaction for segwit/taproot tests
+    fn make_segwit_test_tx() -> Transaction {
+        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
+        use btc_primitives::hash::TxHash;
+        use btc_primitives::amount::Amount;
+
+        Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0xab; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76, 0xa9]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        }
+    }
+
+    #[test]
+    fn test_sighash_segwit_v0_basic() {
+        let tx = make_segwit_test_tx();
+        let script_code = p2wpkh_script_code(&[0xab; 20]);
+        let value = 10_000_000i64;
+
+        let hash = sighash_segwit_v0(&tx, 0, &script_code, value, SighashType::ALL).unwrap();
+        // Must produce a non-zero 32-byte hash
+        assert_ne!(hash, [0u8; 32]);
+        assert_eq!(hash.len(), 32);
+
+        // Must be deterministic
+        let hash2 = sighash_segwit_v0(&tx, 0, &script_code, value, SighashType::ALL).unwrap();
+        assert_eq!(hash, hash2);
+    }
+
+    #[test]
+    fn test_sighash_segwit_v0_none() {
+        let tx = make_segwit_test_tx();
+        let script_code = p2wpkh_script_code(&[0xab; 20]);
+        let value = 10_000_000i64;
+
+        let hash_all = sighash_segwit_v0(&tx, 0, &script_code, value, SighashType::ALL).unwrap();
+        let hash_none = sighash_segwit_v0(&tx, 0, &script_code, value, SighashType::NONE).unwrap();
+
+        assert_ne!(hash_none, [0u8; 32]);
+        // SIGHASH_NONE must differ from SIGHASH_ALL
+        assert_ne!(hash_all, hash_none);
+    }
+
+    #[test]
+    fn test_sighash_segwit_v0_single() {
+        let tx = make_segwit_test_tx();
+        let script_code = p2wpkh_script_code(&[0xab; 20]);
+        let value = 10_000_000i64;
+
+        let hash_all = sighash_segwit_v0(&tx, 0, &script_code, value, SighashType::ALL).unwrap();
+        let hash_single = sighash_segwit_v0(&tx, 0, &script_code, value, SighashType::SINGLE).unwrap();
+
+        assert_ne!(hash_single, [0u8; 32]);
+        assert_ne!(hash_all, hash_single);
+    }
+
+    #[test]
+    fn test_sighash_segwit_v0_anyonecanpay() {
+        let tx = make_segwit_test_tx();
+        let script_code = p2wpkh_script_code(&[0xab; 20]);
+        let value = 10_000_000i64;
+
+        // SIGHASH_ALL | ANYONECANPAY
+        let hash_acp = sighash_segwit_v0(
+            &tx, 0, &script_code, value,
+            SighashType(SighashType::ALL.0 | SighashType::ANYONECANPAY.0),
+        ).unwrap();
+
+        let hash_all = sighash_segwit_v0(&tx, 0, &script_code, value, SighashType::ALL).unwrap();
+
+        assert_ne!(hash_acp, [0u8; 32]);
+        // ANYONECANPAY changes the hash (zeros out hashPrevouts and hashSequence)
+        assert_ne!(hash_all, hash_acp);
+    }
+
+    #[test]
+    fn test_sighash_segwit_v0_input_out_of_range() {
+        let tx = make_segwit_test_tx();
+        let script_code = p2wpkh_script_code(&[0xab; 20]);
+        let result = sighash_segwit_v0(&tx, 5, &script_code, 10_000_000, SighashType::ALL);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sighash_taproot_basic() {
+        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
+        use btc_primitives::hash::TxHash;
+        use btc_primitives::amount::Amount;
+
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0xaa; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(1_000_000),
+                script_pubkey: ScriptBuf::p2tr(&[0xab; 32]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let prevouts = vec![TxOut {
+            value: Amount::from_sat(2_000_000),
+            script_pubkey: ScriptBuf::p2tr(&[0xcd; 32]),
+        }];
+
+        // Default taproot sighash type is 0x00
+        let hash = sighash_taproot(&tx, 0, &prevouts, SighashType(0x00), None, None).unwrap();
+        assert_ne!(hash, [0u8; 32]);
+        assert_eq!(hash.len(), 32);
+
+        // Deterministic
+        let hash2 = sighash_taproot(&tx, 0, &prevouts, SighashType(0x00), None, None).unwrap();
+        assert_eq!(hash, hash2);
+    }
+
+    #[test]
+    fn test_sighash_taproot_with_leaf_hash() {
+        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
+        use btc_primitives::hash::TxHash;
+        use btc_primitives::amount::Amount;
+
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0xaa; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(1_000_000),
+                script_pubkey: ScriptBuf::p2tr(&[0xab; 32]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let prevouts = vec![TxOut {
+            value: Amount::from_sat(2_000_000),
+            script_pubkey: ScriptBuf::p2tr(&[0xcd; 32]),
+        }];
+
+        let leaf_hash = [0xef; 32];
+        let hash_with_leaf = sighash_taproot(
+            &tx, 0, &prevouts, SighashType(0x00), None, Some(&leaf_hash),
+        ).unwrap();
+
+        let hash_without_leaf = sighash_taproot(
+            &tx, 0, &prevouts, SighashType(0x00), None, None,
+        ).unwrap();
+
+        assert_ne!(hash_with_leaf, [0u8; 32]);
+        // Script path (with leaf hash) must differ from key path (without)
+        assert_ne!(hash_with_leaf, hash_without_leaf);
+    }
+
+    #[test]
+    fn test_sighash_taproot_with_annex() {
+        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
+        use btc_primitives::hash::TxHash;
+        use btc_primitives::amount::Amount;
+
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0xaa; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(1_000_000),
+                script_pubkey: ScriptBuf::p2tr(&[0xab; 32]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let prevouts = vec![TxOut {
+            value: Amount::from_sat(2_000_000),
+            script_pubkey: ScriptBuf::p2tr(&[0xcd; 32]),
+        }];
+
+        let annex = vec![0x50, 0x01, 0x02, 0x03];
+        let hash_with_annex = sighash_taproot(
+            &tx, 0, &prevouts, SighashType(0x00), Some(&annex), None,
+        ).unwrap();
+
+        let hash_without_annex = sighash_taproot(
+            &tx, 0, &prevouts, SighashType(0x00), None, None,
+        ).unwrap();
+
+        assert_ne!(hash_with_annex, [0u8; 32]);
+        // Annex changes the spend_type byte and adds an annex hash
+        assert_ne!(hash_with_annex, hash_without_annex);
+    }
+
+    #[test]
+    fn test_sighash_taproot_input_out_of_range() {
+        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
+        use btc_primitives::hash::TxHash;
+        use btc_primitives::amount::Amount;
+
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0xaa; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(1_000_000),
+                script_pubkey: ScriptBuf::p2tr(&[0xab; 32]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let prevouts = vec![TxOut {
+            value: Amount::from_sat(2_000_000),
+            script_pubkey: ScriptBuf::p2tr(&[0xcd; 32]),
+        }];
+
+        // Input index out of range
+        let result = sighash_taproot(&tx, 5, &prevouts, SighashType(0x00), None, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sighash_taproot_prevouts_mismatch() {
+        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
+        use btc_primitives::hash::TxHash;
+        use btc_primitives::amount::Amount;
+
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0xaa; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(1_000_000),
+                script_pubkey: ScriptBuf::p2tr(&[0xab; 32]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        // prevouts count does not match inputs count
+        let result = sighash_taproot(&tx, 0, &[], SighashType(0x00), None, None);
+        assert!(result.is_err());
+    }
+
     #[test]
     fn test_p2wpkh_script_code() {
         let hash = [0xab; 20];
