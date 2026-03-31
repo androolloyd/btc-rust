@@ -6,6 +6,7 @@
 //! managed by the [`ExExManager`].
 
 pub mod ordinals;
+pub mod runes;
 
 use btc_consensus::utxo::UtxoSetUpdate;
 use btc_primitives::block::Block;
