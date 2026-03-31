@@ -16,6 +16,7 @@ pub const BODIES: StageId = StageId("Bodies");
 pub const VALIDATION: StageId = StageId("Validation");
 pub const UTXO_INDEX: StageId = StageId("UtxoIndex");
 pub const TX_INDEX: StageId = StageId("TxIndex");
+pub const ADDRESS_INDEX: StageId = StageId("AddressIndex");
 
 #[derive(Debug, Error)]
 pub enum StageError {

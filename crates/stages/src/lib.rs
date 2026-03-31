@@ -4,6 +4,7 @@ pub mod headers;
 pub mod bodies;
 pub mod execution;
 pub mod indexing;
+pub mod address_index;
 
 pub use pipeline::Pipeline;
 pub use stage::{Stage, StageId, StageError, ExecOutput, UnwindOutput};
@@ -11,6 +12,7 @@ pub use headers::{HeadersStage, HeadersSyncState};
 pub use bodies::{BodiesStage, BodiesSyncState};
 pub use execution::{ExecutionStage, UtxoChange};
 pub use indexing::{IndexingStage, TxIndexEntry};
+pub use address_index::{AddressIndexStage, AddressIndexEntry};
 
 /// Build the default sync pipeline with all standard stages.
 ///
@@ -19,19 +21,21 @@ pub use indexing::{IndexingStage, TxIndexEntry};
 /// 2. **Bodies** -- download block bodies (transactions) for stored headers
 /// 3. **Execution** -- validate transactions and update the UTXO set
 /// 4. **Indexing** -- build the transaction index for RPC lookups
+/// 5. **AddressIndex** -- build the address/script index for balance and history lookups
 pub fn build_default_pipeline() -> Pipeline {
     let mut pipeline = Pipeline::new();
     pipeline.add_stage(Box::new(HeadersStage::new()));
     pipeline.add_stage(Box::new(BodiesStage::new()));
     pipeline.add_stage(Box::new(ExecutionStage::new()));
     pipeline.add_stage(Box::new(IndexingStage::new()));
+    pipeline.add_stage(Box::new(AddressIndexStage::new()));
     pipeline
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stage::{HEADERS, BODIES, VALIDATION, TX_INDEX};
+    use crate::stage::{HEADERS, BODIES, VALIDATION, TX_INDEX, ADDRESS_INDEX};
 
     #[test]
     fn test_build_default_pipeline() {
@@ -42,6 +46,7 @@ mod tests {
         assert_eq!(pipeline.checkpoint(BODIES), None);
         assert_eq!(pipeline.checkpoint(VALIDATION), None);
         assert_eq!(pipeline.checkpoint(TX_INDEX), None);
+        assert_eq!(pipeline.checkpoint(ADDRESS_INDEX), None);
     }
 
     #[test]
@@ -54,6 +59,7 @@ mod tests {
         assert_eq!(pipeline.checkpoint(BODIES), Some(100));
         assert_eq!(pipeline.checkpoint(VALIDATION), Some(100));
         assert_eq!(pipeline.checkpoint(TX_INDEX), Some(100));
+        assert_eq!(pipeline.checkpoint(ADDRESS_INDEX), Some(100));
     }
 
     #[test]
@@ -67,6 +73,7 @@ mod tests {
         assert_eq!(pipeline.checkpoint(BODIES), Some(0));
         assert_eq!(pipeline.checkpoint(VALIDATION), Some(0));
         assert_eq!(pipeline.checkpoint(TX_INDEX), Some(0));
+        assert_eq!(pipeline.checkpoint(ADDRESS_INDEX), Some(0));
     }
 
     #[test]
@@ -101,8 +108,9 @@ mod tests {
         assert_eq!(pipeline.checkpoint(BODIES), Some(0));
 
         // The failing stage itself gets unwound too (index 2 is included).
-        // Indexing stage was never executed, so no checkpoint for it.
+        // Indexing and AddressIndex stages were never executed, so no checkpoint for them.
         assert_eq!(pipeline.checkpoint(TX_INDEX), None);
+        assert_eq!(pipeline.checkpoint(ADDRESS_INDEX), None);
     }
 
     #[test]
@@ -142,6 +150,15 @@ mod tests {
         assert!(out.done);
         let uw = idx.unwind(25).unwrap();
         assert_eq!(uw.checkpoint, 25);
+
+        // Address Index
+        let mut addr_idx = AddressIndexStage::new();
+        assert_eq!(addr_idx.id(), ADDRESS_INDEX);
+        let out = addr_idx.execute(50).unwrap();
+        assert_eq!(out.checkpoint, 50);
+        assert!(out.done);
+        let uw = addr_idx.unwind(25).unwrap();
+        assert_eq!(uw.checkpoint, 25);
     }
 
     #[test]
@@ -158,5 +175,6 @@ mod tests {
         assert_eq!(pipeline.checkpoint(BODIES), Some(100));
         assert_eq!(pipeline.checkpoint(VALIDATION), Some(100));
         assert_eq!(pipeline.checkpoint(TX_INDEX), Some(100));
+        assert_eq!(pipeline.checkpoint(ADDRESS_INDEX), Some(100));
     }
 }
