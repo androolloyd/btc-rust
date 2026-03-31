@@ -23,6 +23,199 @@ cargo build --release
 ./target/release/btc-node run --interactive
 ```
 
+## Script Development Quickstart
+
+btc-rust includes `btc-forge`, a Foundry-equivalent toolkit for Bitcoin Script development. No external tools needed — write, test, debug, and analyze scripts entirely in Rust.
+
+### 1. Add dependencies
+
+```toml
+# Cargo.toml
+[dev-dependencies]
+btc-forge = { path = "crates/forge" }  # or from registry when published
+btc-test = { path = "crates/test-harness" }
+```
+
+### 2. Write and test a script
+
+```rust
+use btc_forge::{ScriptEnv, ForgeScript, ScriptDebugger, TxBuilder, Amount, Opcode};
+use btc_forge::analyze_script;
+
+#[test]
+fn test_hash_timelock_contract() {
+    let mut env = ScriptEnv::new();
+    let alice = env.new_named_account("alice");
+    let bob = env.new_named_account("bob");
+
+    // Build an HTLC: Bob can claim with preimage, Alice can reclaim after timeout
+    let preimage = b"my_secret_preimage_here!";
+    let hash = sha256(preimage);
+
+    let htlc = ForgeScript::htlc(
+        &env.accounts[1].keypair.public_key.serialize(),  // bob
+        &env.accounts[0].keypair.public_key.serialize(),  // alice
+        &hash,
+        100,  // timeout at block 100
+    ).build();
+
+    // Analyze the script
+    let analysis = analyze_script(htlc.as_script());
+    println!("Size: {} bytes", analysis.size_bytes);
+    println!("Opcodes: {}", analysis.op_count);
+    println!("Sigops: {}", analysis.sigop_count);
+    println!("Branches: {}", analysis.branches.len());
+}
+```
+
+### 3. Debug script execution step-by-step
+
+```rust
+#[test]
+fn test_debug_arithmetic() {
+    // Build: 2 + 3 == 5 ?
+    let script = ForgeScript::new()
+        .push_num(2)
+        .push_num(3)
+        .op(Opcode::OP_ADD)
+        .push_num(5)
+        .op(Opcode::OP_EQUAL)
+        .build();
+
+    let mut debugger = ScriptDebugger::new(script.as_script());
+    let trace = debugger.run();
+
+    // Inspect stack at each step
+    for step in &trace {
+        println!("PC:{} {:?} → stack: {:?}", step.pc, step.opcode, step.stack);
+    }
+    // PC:0 PushBytes([2]) → stack: [[2]]
+    // PC:2 PushBytes([3]) → stack: [[2], [3]]
+    // PC:4 OP_ADD         → stack: [[5]]
+    // PC:5 PushBytes([5]) → stack: [[5], [5]]
+    // PC:7 OP_EQUAL       → stack: [[1]]
+}
+```
+
+### 4. Build and verify transactions
+
+```rust
+#[test]
+fn test_spend_p2pkh() {
+    let mut env = ScriptEnv::new();
+    let alice = env.new_named_account("alice");
+
+    // Fund alice with 1 BTC
+    let utxo = env.fund_p2pkh(0, Amount::from_sat(100_000_000));
+
+    // Build a spending transaction
+    let tx = TxBuilder::new()
+        .add_input(&utxo)
+        .add_output(
+            ForgeScript::p2pkh(&[0u8; 20]).build(),
+            Amount::from_sat(99_990_000),  // 10K sat fee
+        )
+        .sign_input(0, &env.accounts[0].keypair, &utxo.txout)
+        .build();
+
+    assert_eq!(tx.inputs.len(), 1);
+    assert_eq!(tx.outputs.len(), 1);
+}
+```
+
+### 5. Test timelocks (CLTV/CSV)
+
+```rust
+#[test]
+fn test_timelock_enforced() {
+    let mut env = ScriptEnv::new();
+
+    // Script: require block height >= 500
+    let script = ForgeScript::new()
+        .push_num(500)
+        .op(Opcode::OP_CHECKLOCKTIMEVERIFY)
+        .op(Opcode::OP_DROP)
+        .op(Opcode::OP_1)
+        .build();
+
+    // At height 100: should fail
+    let result = env.verify_script_at_height(&script, 100);
+    assert!(result.is_err());
+
+    // At height 600: should succeed
+    let result = env.verify_script_at_height(&script, 600);
+    assert!(result.is_ok());
+}
+```
+
+### 6. Test proposed opcodes (CTV, CAT)
+
+```rust
+use btc_consensus::opcode_plugin::{OpCat, OpCheckTemplateVerify, OpcodeRegistry};
+
+#[test]
+fn test_op_cat() {
+    let mut registry = OpcodeRegistry::new();
+    registry.register(Box::new(OpCat));
+
+    let script = ForgeScript::new()
+        .push_bytes(b"hello")
+        .push_bytes(b"world")
+        .op(Opcode::OP_CAT)  // concatenate
+        .build();
+
+    // Execute with the custom opcode registry
+    let result = env.execute_with_registry(&script, &registry);
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap().final_stack[0], b"helloworld");
+}
+```
+
+### 7. Common script patterns
+
+```rust
+// P2PKH
+let script = ForgeScript::p2pkh(&pubkey_hash).build();
+
+// P2WPKH
+let script = ForgeScript::p2wpkh(&pubkey_hash).build();
+
+// Multisig (2-of-3)
+let script = ForgeScript::multisig(2, &[&pk1, &pk2, &pk3]).build();
+
+// Hash timelock (HTLC)
+let script = ForgeScript::htlc(&receiver_pk, &sender_pk, &hash, timeout).build();
+
+// Timelock wrapper
+let script = ForgeScript::timelock(1000, &inner_script).build();
+
+// Hash lock wrapper
+let script = ForgeScript::hashlock(&sha256_hash, &inner_script).build();
+
+// OP_RETURN data
+let script = ForgeScript::op_return(b"hello from btc-rust").build();
+```
+
+### 8. Run the regtest test harness
+
+```rust
+use btc_test::{TestNode, TestKeyPair};
+
+#[test]
+fn test_full_flow() {
+    let mut node = TestNode::new();  // in-process regtest node
+
+    // Mine 101 blocks (coinbase maturity)
+    node.mine_blocks(101);
+    assert_eq!(node.height(), 101);
+
+    // Check balance
+    let key = TestKeyPair::generate();
+    let balance = node.get_balance(&key.p2pkh_script_hash());
+    assert_eq!(balance, 0);
+}
+```
+
 ## Architecture
 
 11 crates in a Cargo workspace, each independently importable:
