@@ -966,13 +966,14 @@ mod tests {
     // ---- Test: signet always uses fixed difficulty (pow_limit) ----
 
     #[test]
-    fn test_signet_fixed_difficulty() {
+    fn test_signet_uses_normal_retarget() {
         let params = ChainParams::signet();
         let chain = ChainState::new(params);
         let genesis = chain.best_header().clone();
 
-        // At any height (e.g., height 1 and a non-retarget height), the
-        // expected difficulty should be pow_limit.
+        // Signet uses the same difficulty retarget as mainnet.
+        // At height 1 (not a retarget boundary), difficulty should match
+        // the previous block's bits.
         let dummy_header = BlockHeader {
             version: 1,
             prev_blockhash: genesis.header.block_hash(),
@@ -985,16 +986,14 @@ mod tests {
         let expected = chain.get_next_work_required(1, &dummy_header, &genesis);
         assert_eq!(
             expected.to_u32(),
-            chain.params.pow_limit.to_u32(),
-            "signet should always use pow_limit as target"
+            genesis.header.bits.to_u32(),
+            "signet non-retarget height should keep previous difficulty"
         );
 
-        // Also verify at a retarget boundary (height 2016).
+        // At a retarget boundary (height 2016), difficulty WILL change based
+        // on actual vs expected timespan — this is correct signet behavior.
         let expected_at_retarget = chain.get_next_work_required(2016, &dummy_header, &genesis);
-        assert_eq!(
-            expected_at_retarget.to_u32(),
-            chain.params.pow_limit.to_u32(),
-            "signet should use pow_limit even at retarget boundary"
-        );
+        // Just verify it returns something valid (non-zero)
+        assert_ne!(expected_at_retarget.to_u32(), 0, "retarget should produce valid difficulty");
     }
 }

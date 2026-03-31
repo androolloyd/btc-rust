@@ -38,6 +38,134 @@ impl SighashType {
     }
 }
 
+/// BIP118 SIGHASH_ANYPREVOUT — allows rebinding to any UTXO (skips outpoint)
+pub const SIGHASH_ANYPREVOUT: u32 = 0x41;
+
+/// BIP118 SIGHASH_ANYPREVOUTANYSCRIPT — also skips scriptPubKey and amount
+pub const SIGHASH_ANYPREVOUTANYSCRIPT: u32 = 0x42;
+
+/// Compute BIP118 ANYPREVOUT sighash (taproot-style but skipping input identity).
+///
+/// - SIGHASH_ANYPREVOUT (0x41): like taproot sighash but skip the outpoint,
+///   allowing the signature to be valid for spending any UTXO with the same script.
+/// - SIGHASH_ANYPREVOUTANYSCRIPT (0x42): additionally skip the scriptPubKey and
+///   input amount, allowing rebinding to any UTXO regardless of script or value.
+///
+/// This function follows the BIP341 taproot sighash structure with targeted
+/// omissions as specified by BIP118.
+pub fn sighash_anyprevout(
+    tx: &Transaction,
+    input_index: usize,
+    prevouts: &[btc_primitives::transaction::TxOut],
+    hash_type: u32,
+    annex: Option<&[u8]>,
+    leaf_hash: Option<&[u8; 32]>,
+) -> Result<[u8; 32], SighashError> {
+    if input_index >= tx.inputs.len() {
+        return Err(SighashError::InputOutOfRange(input_index, tx.inputs.len()));
+    }
+    if prevouts.len() != tx.inputs.len() {
+        return Err(SighashError::InputOutOfRange(prevouts.len(), tx.inputs.len()));
+    }
+
+    let is_anyprevout = hash_type == SIGHASH_ANYPREVOUT;
+    let is_anyprevoutanyscript = hash_type == SIGHASH_ANYPREVOUTANYSCRIPT;
+
+    if !is_anyprevout && !is_anyprevoutanyscript {
+        return Err(SighashError::InvalidSighashType(hash_type));
+    }
+
+    let mut msg = Vec::with_capacity(256);
+
+    // Epoch (0x00) — same as BIP341
+    msg.push(0x00);
+
+    // Hash type byte
+    msg.push(hash_type as u8);
+
+    // nVersion
+    msg.write_i32_le(tx.version)?;
+
+    // nLocktime
+    msg.write_u32_le(tx.lock_time)?;
+
+    // For ANYPREVOUT, we do NOT commit to prevouts (outpoints) — that is the
+    // whole point. But we still commit to amounts, scriptPubKeys, and sequences.
+    // For ANYPREVOUTANYSCRIPT, we also skip amounts and scriptPubKeys.
+
+    // sha_amounts: only for ANYPREVOUT (not ANYPREVOUTANYSCRIPT)
+    if is_anyprevout {
+        let mut amounts_buf = Vec::new();
+        for prevout in prevouts {
+            amounts_buf.write_i64_le(prevout.value.as_sat())?;
+        }
+        msg.extend_from_slice(&sha256(&amounts_buf));
+
+        // sha_scriptpubkeys
+        let mut scripts_buf = Vec::new();
+        for prevout in prevouts {
+            prevout.script_pubkey.encode(&mut scripts_buf)?;
+        }
+        msg.extend_from_slice(&sha256(&scripts_buf));
+    }
+    // ANYPREVOUTANYSCRIPT skips both amounts and scriptPubKeys entirely.
+
+    // sha_sequences: commit to all sequences (not input-specific)
+    {
+        let mut seq_buf = Vec::new();
+        for input in &tx.inputs {
+            seq_buf.write_u32_le(input.sequence)?;
+        }
+        msg.extend_from_slice(&sha256(&seq_buf));
+    }
+
+    // sha_outputs (SIGHASH_ALL behaviour — BIP118 doesn't modify output handling)
+    {
+        let mut outputs_buf = Vec::new();
+        for output in &tx.outputs {
+            output.encode(&mut outputs_buf)?;
+        }
+        msg.extend_from_slice(&sha256(&outputs_buf));
+    }
+
+    // Spend type
+    let mut spend_type: u8 = 0;
+    if annex.is_some() {
+        spend_type |= 1;
+    }
+    if leaf_hash.is_some() {
+        spend_type |= 2;
+    }
+    msg.push(spend_type);
+
+    // Input-specific data — ANYPREVOUT skips the outpoint but includes the rest.
+    // We do NOT write the outpoint (that is what makes it "any prev out").
+    // For ANYPREVOUT, we still commit to amount and scriptPubKey of THIS input.
+    if is_anyprevout {
+        msg.write_i64_le(prevouts[input_index].value.as_sat())?;
+        prevouts[input_index].script_pubkey.encode(&mut msg)?;
+    }
+    // For ANYPREVOUTANYSCRIPT, we skip outpoint, amount, and scriptPubKey.
+
+    // Sequence of the input being signed
+    msg.write_u32_le(tx.inputs[input_index].sequence)?;
+
+    // Annex hash
+    if let Some(annex_data) = annex {
+        let annex_hash = sha256(annex_data);
+        msg.extend_from_slice(&annex_hash);
+    }
+
+    // Leaf hash (for script path spending)
+    if let Some(lh) = leaf_hash {
+        msg.extend_from_slice(lh);
+        msg.push(0x00); // key_version
+        msg.write_u32_le(0xffffffff)?; // code_separator_pos (none)
+    }
+
+    Ok(crate::taproot::tagged_hash(b"TapSighash", &msg))
+}
+
 /// Compute legacy sighash (pre-segwit)
 ///
 /// This follows the original Bitcoin sighash algorithm:

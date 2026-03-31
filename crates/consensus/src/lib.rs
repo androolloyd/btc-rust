@@ -19,12 +19,12 @@ pub mod parallel;
 pub mod ffi;
 
 pub use block_template::{build_block_template, BlockTemplate};
-pub use opcode_plugin::{OpcodePlugin, OpcodeRegistry, OpcodeContext, OpcodeExecContext, OpCheckTemplateVerify, OpCat, OpCheckSigFromStack, OpInternalKey};
+pub use opcode_plugin::{OpcodePlugin, OpcodeRegistry, OpcodeContext, OpcodeExecContext, OpCheckTemplateVerify, OpCat, OpCheckSigFromStack, OpInternalKey, OpCheckSigAnyprevout, OpTxHash, OpCheckContractVerify, default_check_template_verify_hash, covenant_registry};
 pub use chain::ChainState;
 pub use checkpoints::Checkpoints;
 pub use reorg::ReorgManager;
 pub use script_engine::ScriptEngine;
-pub use sighash::{sighash_legacy, sighash_segwit_v0, sighash_segwit_v0_cached, sighash_taproot, SighashCache, SighashType};
+pub use sighash::{sighash_legacy, sighash_segwit_v0, sighash_segwit_v0_cached, sighash_taproot, sighash_anyprevout, SighashCache, SighashType, SIGHASH_ANYPREVOUT, SIGHASH_ANYPREVOUTANYSCRIPT};
 pub use taproot::verify_taproot_input;
 pub use validation::BlockValidator;
 pub use witness::{verify_witness_program, verify_input, WitnessError};

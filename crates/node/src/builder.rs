@@ -247,6 +247,17 @@ impl Node {
         });
 
         // -----------------------------------------------------------------
+        // 4b. Spawn Explorer server (block explorer UI on port rpc+2)
+        // -----------------------------------------------------------------
+        let explorer_metrics = node_state.metrics_collector();
+        let explorer_server = crate::explorer::ExplorerServer::new(self.config.rpc_port + 2);
+        let explorer_handle = tokio::spawn(async move {
+            if let Err(e) = explorer_server.run(explorer_metrics).await {
+                tracing::error!(error = %e, "Explorer server error");
+            }
+        });
+
+        // -----------------------------------------------------------------
         // 5. Spawn ZMQ publisher connected to ExExManager
         // -----------------------------------------------------------------
         let zmq_publisher = ZmqPublisher::new(28332);
@@ -325,6 +336,7 @@ impl Node {
 
         rpc_handle.abort();
         http_handle.abort();
+        explorer_handle.abort();
         zmq_handle.abort();
         Ok(())
     }

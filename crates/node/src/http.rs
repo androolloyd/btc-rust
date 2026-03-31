@@ -65,6 +65,18 @@ impl HttpResponse {
         }
     }
 
+    /// 200 OK with HTML body.
+    pub fn html(body: &str) -> Self {
+        Self {
+            status: 200,
+            status_text: "OK".into(),
+            headers: vec![
+                ("Content-Type".into(), "text/html; charset=utf-8".into()),
+            ],
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
     /// 404 Not Found.
     pub fn not_found() -> Self {
         Self {
@@ -334,7 +346,7 @@ impl Clone for MetricsCollector {
 // ---------------------------------------------------------------------------
 
 /// Handle all incoming HTTP requests and route them.
-fn handle_request(req: &HttpRequest, metrics: &MetricsCollector) -> HttpResponse {
+pub fn handle_request(req: &HttpRequest, metrics: &MetricsCollector) -> HttpResponse {
     if req.method != "GET" {
         return HttpResponse::bad_request("only GET is supported");
     }
