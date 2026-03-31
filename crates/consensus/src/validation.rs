@@ -203,7 +203,11 @@ impl ChainParams {
             bip66_height: 1,
             segwit_height: 1,
             taproot_height: 1,
-            assume_valid: None,
+            // Use a recent signet block as assume-valid to speed up IBD
+            // Block 250000 on signet
+            assume_valid: Some(BlockHash::from_hex(
+                "0000003a3b62a0d42a58b3898e7e4e27fce68a0e5ab5c11a45fc56e8388554a4"
+            ).unwrap()),
             signet_challenge: Some(ScriptBuf::from_bytes(challenge_bytes)),
         }
     }
