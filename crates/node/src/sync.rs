@@ -252,18 +252,18 @@ impl SyncManager {
         chain_params: ChainParams,
         datadir: PathBuf,
     ) -> Self {
-        // Attempt to load the checkpoint.
-        if let Some(cp) = load_checkpoint(&datadir) {
-            info!(height = cp.height, hash = %cp.hash, "loaded checkpoint from disk");
-        }
+        // Load checkpoint — tells us where we left off
+        let checkpoint = load_checkpoint(&datadir);
+        let resume_height = checkpoint.as_ref().map(|cp| {
+            info!(height = cp.height, hash = %cp.hash, "resuming from checkpoint");
+            cp.height
+        }).unwrap_or(0);
 
-        // Attempt to open the persistent UTXO database.
+        // Open persistent UTXO database
         let db_path = datadir.join("utxo.qmdb");
         let persistent_utxo = open_persistent_utxo_set(&db_path);
         if persistent_utxo.is_some() {
             info!(path = %db_path.display(), "persistent UTXO set opened");
-        } else {
-            warn!(path = %db_path.display(), "failed to open persistent UTXO set, using in-memory only");
         }
 
         SyncManager {
@@ -390,8 +390,18 @@ impl SyncManager {
         }
 
         // Phase 5 -- block sync.
-        if peer_tip > best_height {
-            self.sync_blocks(&mut conn, best_height + 1, peer_tip).await?;
+        // Use checkpoint height if available — skip blocks we already validated.
+        let block_start = {
+            let cp_height = self.datadir.as_ref()
+                .and_then(|d| load_checkpoint(d))
+                .map(|cp| cp.height)
+                .unwrap_or(0);
+            // Start from whichever is higher: chain_state height or checkpoint
+            std::cmp::max(best_height, cp_height) + 1
+        };
+        if peer_tip >= block_start {
+            info!(from = block_start, to = peer_tip, "starting block download (skipping already-validated blocks)");
+            self.sync_blocks(&mut conn, block_start, peer_tip).await?;
         }
 
         // Phase 6 -- synced.
@@ -956,10 +966,15 @@ impl SyncManager {
                         if let Some(ref mut persistent) = self.persistent_utxo {
                             // Always apply (updates the in-memory cache inside PersistentUtxoSet)
                             persistent.apply_update_cached(&utxo_update);
-                            // Flush to disk every 500 blocks
+                            // Flush to disk every 500 blocks + save checkpoint
                             if block_height % 500 == 0 {
                                 if let Err(e) = persistent.flush_cache() {
                                     warn!(height = block_height, error = %e, "failed to flush UTXO cache");
+                                }
+                                // Save checkpoint so restarts skip these blocks
+                                if let Some(ref datadir) = self.datadir {
+                                    let cp = Checkpoint::new(block_height, block_hash);
+                                    let _ = save_checkpoint(datadir, &cp);
                                 }
                             }
                         }
