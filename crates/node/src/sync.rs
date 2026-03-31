@@ -857,8 +857,17 @@ impl SyncManager {
                         // value conservation, reward limit).
                         // -------------------------------------------------
                         let utxo_update = {
+                            // Use persistent UTXO set if available (for resume),
+                            // otherwise fall back to in-memory set.
                             let utxo_set = self.utxo_set.read().await;
-                            match connect_block(&block, block_height, &*utxo_set) {
+                            let connect_result = if let Some(ref persistent) = self.persistent_utxo {
+                                // Try persistent first (has data from previous runs)
+                                connect_block(&block, block_height, persistent)
+                                    .or_else(|_| connect_block(&block, block_height, &*utxo_set))
+                            } else {
+                                connect_block(&block, block_height, &*utxo_set)
+                            };
+                            match connect_result {
                                 Ok(update) => update,
                                 Err(e) => {
                                     warn!(
