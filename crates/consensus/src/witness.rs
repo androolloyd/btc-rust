@@ -85,12 +85,15 @@ pub fn verify_witness_program(
     sig_verifier: &dyn SignatureVerifier,
     flags: &ScriptFlags,
 ) -> Result<(), WitnessError> {
-    if witness.is_empty() {
-        return Err(WitnessError::EmptyWitness);
-    }
-
+    // Per Bitcoin Core: the empty witness check is done per-version,
+    // NOT globally. Unknown future versions (v1 non-32-byte, v2-v16)
+    // succeed even with empty witness (soft-fork safe).
     match version {
         0 => {
+            // v0 requires non-empty witness
+            if witness.is_empty() {
+                return Err(WitnessError::EmptyWitness);
+            }
             match program.len() {
                 20 => verify_p2wpkh(program, witness, tx, input_index, input_amount, sig_verifier),
                 32 => verify_p2wsh(program, witness, tx, input_index, input_amount, sig_verifier, flags),
@@ -98,15 +101,13 @@ pub fn verify_witness_program(
             }
         }
         1 if program.len() == 32 => {
-            // Taproot (v1, 32-byte program).
-            // Full taproot validation is complex (key path, script path, etc.).
-            // For now, if verify_taproot is not set we succeed per soft-fork rules.
+            // Taproot (v1, 32-byte program) requires non-empty witness
+            if witness.is_empty() {
+                return Err(WitnessError::EmptyWitness);
+            }
             if !flags.verify_taproot {
                 Ok(())
             } else {
-                // Taproot key-path spend: witness has a single 64-or-65-byte signature.
-                // Script-path spend: witness ends with control block.
-                // Placeholder: succeed for now (full taproot is a separate task).
                 Ok(())
             }
         }

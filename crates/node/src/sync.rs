@@ -34,7 +34,7 @@ use crate::state::NodeState;
 const MAX_HEADERS_PER_MESSAGE: usize = 2000;
 
 /// Number of blocks to request in a single `getdata` batch.
-const BLOCK_DOWNLOAD_BATCH_SIZE: usize = 16;
+const BLOCK_DOWNLOAD_BATCH_SIZE: usize = 128;
 
 // ---------------------------------------------------------------------------
 // Checkpoint persistence
@@ -924,9 +924,11 @@ impl SyncManager {
                                     first_error = %first_err.2,
                                     "script verification warning (continuing sync)"
                                 );
-                                // TODO: re-enable hard failure once P2SH-wrapped segwit
-                                // witness verification is fixed. UTXO validation passed,
-                                // so chain state integrity is maintained.
+                                return Err(SyncError::BlockValidation(format!(
+                                    "script verification failed for block {} at height {}: {} error(s), first: tx {} input {}: {}",
+                                    block_hash, block_height, errors.len(),
+                                    first_err.0, first_err.1, first_err.2
+                                )));
                             }
                         }
 
