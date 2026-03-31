@@ -102,6 +102,9 @@ impl Encodable for TxOut {
 impl Decodable for TxOut {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, EncodeError> {
         let value = Amount::from_sat(reader.read_i64_le()?);
+        if value.as_sat() < 0 || !value.is_valid() {
+            return Err(EncodeError::InvalidData("invalid output value".into()));
+        }
         let script_pubkey = ScriptBuf::decode(reader)?;
         Ok(TxOut { value, script_pubkey })
     }
@@ -155,9 +158,15 @@ impl Witness {
 
     fn decode_items<R: Read>(reader: &mut R) -> Result<Self, EncodeError> {
         let count = VarInt::decode(reader)?.0 as usize;
+        if count > 100_000 {
+            return Err(EncodeError::InvalidData("too many witness items".into()));
+        }
         let mut items = Vec::with_capacity(count);
         for _ in 0..count {
             let len = VarInt::decode(reader)?.0 as usize;
+            if len > 4_000_000 {
+                return Err(EncodeError::InvalidData("witness item too large".into()));
+            }
             let data = reader.read_bytes(len)?;
             items.push(data);
         }
@@ -267,12 +276,18 @@ impl Decodable for Transaction {
             }
 
             let input_count = VarInt::decode(reader)?.0 as usize;
+            if input_count > 100_000 {
+                return Err(EncodeError::InvalidData("too many inputs".into()));
+            }
             let mut inputs = Vec::with_capacity(input_count);
             for _ in 0..input_count {
                 inputs.push(TxIn::decode(reader)?);
             }
 
             let output_count = VarInt::decode(reader)?.0 as usize;
+            if output_count > 100_000 {
+                return Err(EncodeError::InvalidData("too many outputs".into()));
+            }
             let mut outputs = Vec::with_capacity(output_count);
             for _ in 0..output_count {
                 outputs.push(TxOut::decode(reader)?);
@@ -289,12 +304,18 @@ impl Decodable for Transaction {
         } else {
             // Legacy format: marker was actually the input count
             let input_count = marker as usize;
+            if input_count > 100_000 {
+                return Err(EncodeError::InvalidData("too many inputs".into()));
+            }
             let mut inputs = Vec::with_capacity(input_count);
             for _ in 0..input_count {
                 inputs.push(TxIn::decode(reader)?);
             }
 
             let output_count = VarInt::decode(reader)?.0 as usize;
+            if output_count > 100_000 {
+                return Err(EncodeError::InvalidData("too many outputs".into()));
+            }
             let mut outputs = Vec::with_capacity(output_count);
             for _ in 0..output_count {
                 outputs.push(TxOut::decode(reader)?);

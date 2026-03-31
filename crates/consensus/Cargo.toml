@@ -5,6 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+ffi = []
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 btc-primitives = { workspace = true }
 sha1 = { workspace = true }

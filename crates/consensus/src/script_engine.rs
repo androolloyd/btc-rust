@@ -623,16 +623,61 @@ impl<'a> ScriptEngine<'a> {
                 if !self.flags.verify_checklocktimeverify {
                     // Treat as NOP
                 } else {
-                    let _locktime = decode_num(self.top()?)?;
-                    // Full implementation needs tx context
+                    let locktime = decode_num(self.top()?)?;
+                    if locktime < 0 {
+                        return Err(ScriptError::NegativeLocktime);
+                    }
+                    if let Some(tx) = self.tx {
+                        let tx_locktime = tx.lock_time as i64;
+                        // Both must be same type (block height < 500M, or timestamp >= 500M)
+                        if (locktime < 500_000_000 && tx_locktime >= 500_000_000)
+                            || (locktime >= 500_000_000 && tx_locktime < 500_000_000)
+                        {
+                            return Err(ScriptError::UnsatisfiedLocktime);
+                        }
+                        if locktime > tx_locktime {
+                            return Err(ScriptError::UnsatisfiedLocktime);
+                        }
+                        // Check sequence is not SEQUENCE_FINAL (disabled)
+                        if self.input_index < tx.inputs.len()
+                            && tx.inputs[self.input_index].sequence == 0xffffffff
+                        {
+                            return Err(ScriptError::UnsatisfiedLocktime);
+                        }
+                    }
                 }
             }
             Opcode::OP_CHECKSEQUENCEVERIFY => {
                 if !self.flags.verify_checksequenceverify {
                     // Treat as NOP
                 } else {
-                    let _sequence = decode_num(self.top()?)?;
-                    // Full implementation needs tx context
+                    let sequence = decode_num(self.top()?)?;
+                    if sequence < 0 {
+                        // negative = NOP behavior
+                    } else {
+                        let sequence = sequence as u32;
+                        if sequence & (1 << 31) != 0 {
+                            // disabled flag = NOP behavior
+                        } else if let Some(tx) = self.tx {
+                            if tx.version < 2 {
+                                return Err(ScriptError::UnsatisfiedLocktime);
+                            }
+                            if self.input_index < tx.inputs.len() {
+                                let tx_seq = tx.inputs[self.input_index].sequence;
+                                if tx_seq & (1 << 31) != 0 {
+                                    return Err(ScriptError::UnsatisfiedLocktime);
+                                }
+                                // Compare type flags (bit 22)
+                                if (sequence & (1 << 22)) != (tx_seq & (1 << 22)) {
+                                    return Err(ScriptError::UnsatisfiedLocktime);
+                                }
+                                // Compare masked 16-bit values
+                                if (sequence & 0xffff) > (tx_seq & 0xffff) {
+                                    return Err(ScriptError::UnsatisfiedLocktime);
+                                }
+                            }
+                        }
+                    }
                 }
             }
 

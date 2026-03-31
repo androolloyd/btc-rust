@@ -11,7 +11,7 @@ use btc_primitives::script::{Script, ScriptBuf, Opcode};
 use btc_primitives::transaction::{Transaction, TxOut, Witness};
 use crate::script_engine::{ScriptEngine, ScriptFlags};
 use crate::sig_verify::SignatureVerifier;
-use crate::sighash::{sighash_segwit_v0, SighashType, p2wpkh_script_code};
+use crate::sighash::{sighash_legacy, sighash_segwit_v0, SighashType, p2wpkh_script_code};
 use thiserror::Error;
 
 /// Errors that can occur during witness verification.
@@ -315,17 +315,12 @@ struct SegwitSignatureVerifier<'a> {
     script_code: Vec<u8>,
 }
 
-impl<'a> SignatureVerifier for SegwitSignatureVerifier<'a> {
-    fn verify_ecdsa(
-        &self,
-        _msg_hash: &[u8; 32],
-        sig: &[u8],
-        pubkey: &[u8],
-    ) -> Result<bool, crate::sig_verify::SigError> {
-        // The engine has already stripped the hashtype byte and computed a legacy sighash
-        // in _msg_hash. We ignore that and try all sighash types with BIP143.
-        //
-        // We try the common sighash types. The correct one will verify successfully.
+impl<'a> SegwitSignatureVerifier<'a> {
+    /// Recover the sighash type by matching the legacy sighash (`msg_hash`)
+    /// against trial legacy sighash computations for each possible type.
+    /// This is cheap (hash comparisons only) and avoids brute-forcing the
+    /// expensive ECDSA verification.
+    fn recover_sighash_type(&self, msg_hash: &[u8; 32]) -> Option<SighashType> {
         let sighash_types: &[SighashType] = &[
             SighashType::ALL,
             SighashType::NONE,
@@ -336,20 +331,49 @@ impl<'a> SignatureVerifier for SegwitSignatureVerifier<'a> {
         ];
 
         for &hash_type in sighash_types {
-            if let Ok(sighash) = sighash_segwit_v0(
+            if let Ok(legacy_hash) = sighash_legacy(
                 self.tx,
                 self.input_index,
                 &self.script_code,
-                self.input_amount,
                 hash_type,
             ) {
-                if let Ok(true) = self.inner.verify_ecdsa(&sighash, sig, pubkey) {
-                    return Ok(true);
+                if &legacy_hash == msg_hash {
+                    return Some(hash_type);
                 }
             }
         }
+        None
+    }
+}
 
-        Ok(false)
+impl<'a> SignatureVerifier for SegwitSignatureVerifier<'a> {
+    fn verify_ecdsa(
+        &self,
+        msg_hash: &[u8; 32],
+        sig: &[u8],
+        pubkey: &[u8],
+    ) -> Result<bool, crate::sig_verify::SigError> {
+        // The engine has already stripped the hashtype byte and computed a legacy
+        // sighash in msg_hash. We recover the actual sighash type by matching
+        // the legacy sighash against trial computations, then use that type to
+        // compute the correct BIP143 segwit sighash.
+        let hash_type = match self.recover_sighash_type(msg_hash) {
+            Some(ht) => ht,
+            None => return Ok(false),
+        };
+
+        let sighash = match sighash_segwit_v0(
+            self.tx,
+            self.input_index,
+            &self.script_code,
+            self.input_amount,
+            hash_type,
+        ) {
+            Ok(h) => h,
+            Err(_) => return Ok(false),
+        };
+
+        self.inner.verify_ecdsa(&sighash, sig, pubkey)
     }
 
     fn verify_schnorr(

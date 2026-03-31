@@ -3,6 +3,7 @@ pub mod codec;
 pub mod compact_blocks;
 pub mod connection;
 pub mod discovery;
+pub mod erlay;
 pub mod handshake;
 pub mod message;
 pub mod package_relay;

@@ -685,6 +685,19 @@ impl SyncManager {
                     // Ignore protocol bookkeeping messages.
                     continue;
                 }
+                NetworkMessage::GetHeaders(_) => {
+                    // Peer asks us for headers — respond with empty headers
+                    // (we're still syncing, we don't have anything useful to send)
+                    if let Err(e) = peer.send_message(NetworkMessage::Headers(vec![])).await {
+                        warn!(error = %e, "failed to respond to getheaders");
+                    }
+                }
+                NetworkMessage::GetData(items) => {
+                    // Peer asks for data — respond with notfound
+                    if let Err(e) = peer.send_message(NetworkMessage::NotFound(items)).await {
+                        warn!(error = %e, "failed to respond to getdata");
+                    }
+                }
                 other => {
                     debug!(command = other.command(), "ignoring message during header sync");
                 }

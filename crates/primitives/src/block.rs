@@ -106,6 +106,9 @@ impl Decodable for Block {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, EncodeError> {
         let header = BlockHeader::decode(reader)?;
         let tx_count = VarInt::decode(reader)?.0 as usize;
+        if tx_count > 100_000 {
+            return Err(EncodeError::InvalidData("too many transactions".into()));
+        }
         let mut transactions = Vec::with_capacity(tx_count);
         for _ in 0..tx_count {
             transactions.push(Transaction::decode(reader)?);

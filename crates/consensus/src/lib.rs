@@ -15,6 +15,9 @@ pub mod utxo;
 pub mod witness;
 pub mod parallel;
 
+#[cfg(feature = "ffi")]
+pub mod ffi;
+
 pub use block_template::{build_block_template, BlockTemplate};
 pub use opcode_plugin::{OpcodePlugin, OpcodeRegistry, OpcodeContext, OpcodeExecContext, OpCheckTemplateVerify, OpCat, OpCheckSigFromStack, OpInternalKey};
 pub use chain::ChainState;

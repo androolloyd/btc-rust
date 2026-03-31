@@ -82,6 +82,23 @@ impl BlockValidator {
             return Err(ValidationError::InvalidMerkleRoot);
         }
 
+        // Check block size (CVE prevention: blocks must not exceed MAX_BLOCK_SIZE)
+        let encoded = btc_primitives::encode::encode(block);
+        if encoded.len() > MAX_BLOCK_SIZE {
+            return Err(ValidationError::BlockTooLarge {
+                size: encoded.len(),
+                max: MAX_BLOCK_SIZE,
+            });
+        }
+
+        // CVE-2012-2459: check for duplicate transactions
+        let mut seen_txids = std::collections::HashSet::new();
+        for tx in &block.transactions {
+            if !seen_txids.insert(tx.txid()) {
+                return Err(ValidationError::DuplicateTransaction);
+            }
+        }
+
         Ok(())
     }
 }
