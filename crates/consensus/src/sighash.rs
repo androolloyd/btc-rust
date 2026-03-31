@@ -1018,4 +1018,72 @@ mod tests {
         assert_eq!(code[23], 0x88); // OP_EQUALVERIFY
         assert_eq!(code[24], 0xac); // OP_CHECKSIG
     }
+
+    #[test]
+    fn test_find_and_delete_preserves_push_data_containing_0xab() {
+        // Fix 1: find_and_delete must parse instructions, not filter bytes.
+        // OP_CODESEPARATOR = 0xab. A push data containing 0xab must NOT be deleted.
+        use btc_primitives::script::Opcode;
+
+        // Build a script: PUSH(3 bytes including 0xab) OP_CODESEPARATOR OP_1
+        // Bytes: [0x03, 0xaa, 0xab, 0xac, 0xab, 0x51]
+        //   0x03 = push 3 bytes
+        //   0xaa, 0xab, 0xac = the push data (contains 0xab!)
+        //   0xab = OP_CODESEPARATOR (bare opcode)
+        //   0x51 = OP_1
+        let script = vec![0x03, 0xaa, 0xab, 0xac, 0xab, 0x51];
+        let result = find_and_delete(&script, Opcode::OP_CODESEPARATOR);
+
+        // Only the bare OP_CODESEPARATOR at position 4 should be removed.
+        // The 0xab inside the push data (position 2) must remain.
+        let expected = vec![0x03, 0xaa, 0xab, 0xac, 0x51];
+        assert_eq!(
+            result.as_ref(), &expected[..],
+            "find_and_delete must not strip 0xab bytes inside push data"
+        );
+    }
+
+    #[test]
+    fn test_find_and_delete_removes_multiple_codeseparators() {
+        use btc_primitives::script::Opcode;
+
+        // Script: OP_CODESEPARATOR OP_1 OP_CODESEPARATOR OP_2
+        // Bytes: [0xab, 0x51, 0xab, 0x52]
+        let script = vec![0xab, 0x51, 0xab, 0x52];
+        let result = find_and_delete(&script, Opcode::OP_CODESEPARATOR);
+
+        // Both OP_CODESEPARATOR instances should be removed.
+        let expected = vec![0x51, 0x52];
+        assert_eq!(result.as_ref(), &expected[..]);
+    }
+
+    #[test]
+    fn test_find_and_delete_no_change_returns_borrowed() {
+        use btc_primitives::script::Opcode;
+
+        // Script with no OP_CODESEPARATOR: OP_1 OP_2
+        let script = vec![0x51, 0x52];
+        let result = find_and_delete(&script, Opcode::OP_CODESEPARATOR);
+        // Should return Borrowed (no allocation)
+        assert!(matches!(result, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(result.as_ref(), &script[..]);
+    }
+
+    #[test]
+    fn test_find_and_delete_pushdata1_containing_0xab() {
+        use btc_primitives::script::Opcode;
+
+        // Build script with OP_PUSHDATA1 containing 0xab bytes
+        // OP_PUSHDATA1 = 0x4c, length = 2, data = [0xab, 0xab]
+        // followed by OP_CODESEPARATOR (bare) and OP_1
+        let script = vec![0x4c, 0x02, 0xab, 0xab, 0xab, 0x51];
+        let result = find_and_delete(&script, Opcode::OP_CODESEPARATOR);
+
+        // Only the bare OP_CODESEPARATOR at position 4 should be removed.
+        let expected = vec![0x4c, 0x02, 0xab, 0xab, 0x51];
+        assert_eq!(
+            result.as_ref(), &expected[..],
+            "find_and_delete must not strip 0xab inside OP_PUSHDATA1 data"
+        );
+    }
 }

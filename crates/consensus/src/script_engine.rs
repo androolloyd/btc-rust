@@ -2310,4 +2310,163 @@ mod tests {
         engine.execute(script_pubkey.as_script()).unwrap();
         assert!(engine.success(), "OP_CHECKMULTISIGVERIFY should succeed and leave OP_1 on stack");
     }
+
+    // ========== Security audit fix tests ==========
+
+    #[test]
+    fn test_op_sha1_correct_hash() {
+        // Fix 2: OP_SHA1 must produce real SHA1, not zeros.
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_slice(b"abc");
+        script.push_opcode(Opcode::OP_SHA1);
+        engine.execute(script.as_script()).unwrap();
+        let result = engine.stack().last().unwrap();
+        // SHA1("abc") = a9993e364706816aba3e25717850c26c9cd0d89d
+        let expected = hex::decode("a9993e364706816aba3e25717850c26c9cd0d89d").unwrap();
+        assert_eq!(result, &expected, "OP_SHA1 must produce the real SHA1 hash, not zeros");
+    }
+
+    #[test]
+    fn test_op_sha1_empty_input() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_0); // push empty
+        script.push_opcode(Opcode::OP_SHA1);
+        engine.execute(script.as_script()).unwrap();
+        let result = engine.stack().last().unwrap();
+        // SHA1("") = da39a3ee5e6b4b0d3255bfef95601890afd80709
+        let expected = hex::decode("da39a3ee5e6b4b0d3255bfef95601890afd80709").unwrap();
+        assert_eq!(result, &expected);
+    }
+
+    #[test]
+    fn test_op_pick_negative_rejected() {
+        // Fix 4: OP_PICK must reject negative values.
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_1);
+        script.push_opcode(Opcode::OP_2);
+        script.push_opcode(Opcode::OP_1NEGATE); // push -1
+        script.push_opcode(Opcode::OP_PICK);
+        let result = engine.execute(script.as_script());
+        assert!(
+            matches!(result, Err(ScriptError::InvalidStackOperation)),
+            "OP_PICK with negative index must fail with InvalidStackOperation, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_op_roll_negative_rejected() {
+        // Fix 4: OP_ROLL must reject negative values.
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_1);
+        script.push_opcode(Opcode::OP_2);
+        script.push_opcode(Opcode::OP_1NEGATE); // push -1
+        script.push_opcode(Opcode::OP_ROLL);
+        let result = engine.execute(script.as_script());
+        assert!(
+            matches!(result, Err(ScriptError::InvalidStackOperation)),
+            "OP_ROLL with negative index must fail with InvalidStackOperation, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_op_tuck_stack_overflow() {
+        // Fix 5: OP_TUCK must check stack size before inserting.
+        static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
+        let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
+        // Fill the stack to MAX_STACK_SIZE - 1 (999 elements).
+        // We push manually because the script op_count limit (201) would trigger
+        // before we could push 999 items via opcodes.
+        for _ in 0..999 {
+            engine.stack.push(vec![0x01]);
+        }
+        assert_eq!(engine.stack.len(), 999);
+        // Now the stack has 999 elements. OP_TUCK would add 1 element (the insert),
+        // making it 1000. That should be allowed since MAX_STACK_SIZE is 1000.
+        // Actually, the check is >= MAX_STACK_SIZE, so len 999 + altstack 0 = 999,
+        // which is < 1000, so it should succeed.
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_TUCK);
+        engine.execute(script.as_script()).unwrap();
+        assert_eq!(engine.stack.len(), 1000);
+
+        // Now stack is at 1000. Another OP_TUCK should fail.
+        let mut engine2 = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
+        for _ in 0..1000 {
+            engine2.stack.push(vec![0x01]);
+        }
+        let mut script2 = ScriptBuf::new();
+        script2.push_opcode(Opcode::OP_TUCK);
+        let result = engine2.execute(script2.as_script());
+        assert!(
+            matches!(result, Err(ScriptError::StackOverflow)),
+            "OP_TUCK at MAX_STACK_SIZE must fail with StackOverflow, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_checkmultisig_nkeys_counts_toward_op_limit() {
+        // Fix 3: n_keys in OP_CHECKMULTISIG must be added to op_count.
+        // If we execute a script with enough ops that n_keys pushes it over 201,
+        // it should fail with OpCountLimit.
+        let mut engine = make_engine();
+        // Build a script with 200 NOPs (each counted), then OP_CHECKMULTISIG with n_keys=2.
+        // 200 NOPs + 1 CHECKMULTISIG = 201 op_count, then +2 from n_keys = 203 -> exceeds limit.
+        let mut script = ScriptBuf::new();
+        for _ in 0..200 {
+            script.push_opcode(Opcode::OP_NOP);
+        }
+        // Push dummy, n_sigs=0, n_keys=2, two dummy pubkeys
+        script.push_opcode(Opcode::OP_0); // dummy element
+        script.push_opcode(Opcode::OP_0); // n_sigs = 0
+        script.push_slice(&[0x02; 33]); // dummy pubkey 1
+        script.push_slice(&[0x02; 33]); // dummy pubkey 2
+        script.push_opcode(Opcode::OP_2); // n_keys = 2
+        script.push_opcode(Opcode::OP_CHECKMULTISIG);
+        let result = engine.execute(script.as_script());
+        assert!(
+            matches!(result, Err(ScriptError::OpCountLimit)),
+            "OP_CHECKMULTISIG with n_keys pushing op_count over 201 must fail, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_checkmultisig_negative_nkeys_rejected() {
+        // Fix 3/4: negative n_keys must be rejected.
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_0); // dummy
+        script.push_opcode(Opcode::OP_1NEGATE); // n_keys = -1
+        script.push_opcode(Opcode::OP_CHECKMULTISIG);
+        let result = engine.execute(script.as_script());
+        assert!(
+            matches!(result, Err(ScriptError::InvalidStackOperation)),
+            "OP_CHECKMULTISIG with negative n_keys must fail, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_checkmultisig_negative_nsigs_rejected() {
+        // Fix 3/4: negative n_sigs must be rejected.
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_0); // dummy
+        script.push_opcode(Opcode::OP_1NEGATE); // n_sigs = -1
+        script.push_opcode(Opcode::OP_0); // n_keys = 0
+        script.push_opcode(Opcode::OP_CHECKMULTISIG);
+        let result = engine.execute(script.as_script());
+        assert!(
+            matches!(result, Err(ScriptError::InvalidStackOperation)),
+            "OP_CHECKMULTISIG with negative n_sigs must fail, got {:?}",
+            result
+        );
+    }
 }
