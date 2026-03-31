@@ -206,8 +206,9 @@ impl ChainState {
         {
             self.best_header = hash;
             self.best_height = new_height;
-            // Rebuild height index along the best chain.
-            self.rebuild_height_index();
+            // Incrementally update the height index instead of rebuilding from scratch.
+            // This avoids O(chain_height) HashMap insertions per new header.
+            self.height_index.insert(new_height, hash);
         }
 
         Ok(hash)

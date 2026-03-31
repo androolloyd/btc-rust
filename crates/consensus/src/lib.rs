@@ -18,7 +18,7 @@ pub use chain::ChainState;
 pub use checkpoints::Checkpoints;
 pub use reorg::ReorgManager;
 pub use script_engine::ScriptEngine;
-pub use sighash::{sighash_legacy, sighash_segwit_v0, sighash_taproot, SighashType};
+pub use sighash::{sighash_legacy, sighash_segwit_v0, sighash_segwit_v0_cached, sighash_taproot, SighashCache, SighashType};
 pub use taproot::verify_taproot_input;
 pub use validation::BlockValidator;
 pub use witness::{verify_witness_program, verify_input, WitnessError};

@@ -245,7 +245,7 @@ impl<'a> ScriptEngine<'a> {
                         self.last_codeseparator_pos = Some(byte_pos);
                     }
 
-                    self.execute_opcode(op)?;
+                    self.execute_opcode(op, &mut op_count)?;
                 }
             }
         }
@@ -336,7 +336,7 @@ impl<'a> ScriptEngine<'a> {
         self.stack.last().ok_or(ScriptError::StackUnderflow)
     }
 
-    fn execute_opcode(&mut self, op: Opcode) -> Result<(), ScriptError> {
+    fn execute_opcode(&mut self, op: Opcode, op_count: &mut usize) -> Result<(), ScriptError> {
         match op {
             // Constants
             Opcode::OP_0 => self.push(Vec::new())?,
@@ -405,6 +405,9 @@ impl<'a> ScriptEngine<'a> {
             }
             Opcode::OP_TUCK => {
                 if self.stack.len() < 2 { return Err(ScriptError::StackUnderflow); }
+                if self.stack.len() + self.altstack.len() >= MAX_STACK_SIZE {
+                    return Err(ScriptError::StackOverflow);
+                }
                 let top = self.stack.last().unwrap().clone();
                 let len = self.stack.len();
                 self.stack.insert(len - 2, top);
@@ -615,13 +618,17 @@ impl<'a> ScriptEngine<'a> {
 
             // Pick/Roll
             Opcode::OP_PICK => {
-                let n = decode_num(&self.pop()?)? as usize;
+                let n_val = decode_num(&self.pop()?)?;
+                if n_val < 0 { return Err(ScriptError::InvalidStackOperation); }
+                let n = n_val as usize;
                 if n >= self.stack.len() { return Err(ScriptError::StackUnderflow); }
                 let val = self.stack[self.stack.len() - 1 - n].clone();
                 self.push(val)?;
             }
             Opcode::OP_ROLL => {
-                let n = decode_num(&self.pop()?)? as usize;
+                let n_val = decode_num(&self.pop()?)?;
+                if n_val < 0 { return Err(ScriptError::InvalidStackOperation); }
+                let n = n_val as usize;
                 if n >= self.stack.len() { return Err(ScriptError::StackUnderflow); }
                 let idx = self.stack.len() - 1 - n;
                 let val = self.stack.remove(idx);
@@ -652,9 +659,12 @@ impl<'a> ScriptEngine<'a> {
 
             Opcode::OP_SHA1 => {
                 // SHA1 is deprecated/weak but required for consensus
-                let _data = self.pop()?;
-                // TODO: implement SHA1 (needed for old scripts)
-                self.push(vec![0u8; 20])?;
+                let data = self.pop()?;
+                use sha1::Digest;
+                let mut hasher = sha1::Sha1::new();
+                hasher.update(&data);
+                let result: [u8; 20] = hasher.finalize().into();
+                self.push(result.to_vec())?;
             }
 
             Opcode::OP_CODESEPARATOR => {
@@ -663,9 +673,19 @@ impl<'a> ScriptEngine<'a> {
 
             Opcode::OP_CHECKMULTISIG | Opcode::OP_CHECKMULTISIGVERIFY => {
                 // Pop number of keys
-                let n_keys = decode_num(&self.pop()?)? as usize;
+                let n_keys_val = decode_num(&self.pop()?)?;
+                if n_keys_val < 0 {
+                    return Err(ScriptError::InvalidStackOperation);
+                }
+                let n_keys = n_keys_val as usize;
                 if n_keys > 20 {
                     return Err(ScriptError::InvalidStackOperation);
+                }
+
+                // BIP consensus: n_keys counts toward the 201-op limit
+                *op_count += n_keys;
+                if *op_count > MAX_OPS_PER_SCRIPT {
+                    return Err(ScriptError::OpCountLimit);
                 }
 
                 // Pop public keys
@@ -675,7 +695,11 @@ impl<'a> ScriptEngine<'a> {
                 }
 
                 // Pop number of sigs
-                let n_sigs = decode_num(&self.pop()?)? as usize;
+                let n_sigs_val = decode_num(&self.pop()?)?;
+                if n_sigs_val < 0 {
+                    return Err(ScriptError::InvalidStackOperation);
+                }
+                let n_sigs = n_sigs_val as usize;
                 if n_sigs > n_keys {
                     return Err(ScriptError::InvalidStackOperation);
                 }

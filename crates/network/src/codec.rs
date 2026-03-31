@@ -141,7 +141,12 @@ fn encode_inv_vec<W: Write>(items: &[InvItem], w: &mut W) -> Result<usize, Encod
 
 fn decode_inv_vec<R: Read>(r: &mut R) -> Result<Vec<InvItem>, EncodeError> {
     let count = VarInt::decode(r)?.0 as usize;
-    let mut items = Vec::with_capacity(count.min(50_000));
+    if count > 50_000 {
+        return Err(EncodeError::InvalidData(format!(
+            "inv vector too large: {count} items (max 50000)"
+        )));
+    }
+    let mut items = Vec::with_capacity(count);
     for _ in 0..count {
         items.push(decode_inv_item(r)?);
     }

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use btc_primitives::encode::{Encodable, WriteExt, VarInt};
 use btc_primitives::hash::{sha256d, sha256};
 use btc_primitives::script::ScriptBuf;
@@ -60,7 +61,7 @@ pub fn sighash_legacy(
     // OP_CODESEPARATOR opcodes from the script before computing the sighash.
     use btc_primitives::script::Opcode;
     let script_code = find_and_delete(script_code, Opcode::OP_CODESEPARATOR);
-    let script_code = script_code.as_slice();
+    let script_code: &[u8] = &script_code;
 
     let base = hash_type.base_type();
 
@@ -71,7 +72,7 @@ pub fn sighash_legacy(
         return Ok(result);
     }
 
-    let mut buf = Vec::new();
+    let mut buf = Vec::with_capacity(4 + 4 + tx.inputs.len() * 180 + tx.outputs.len() * 34 + 4 + 4);
 
     // Version
     buf.write_i32_le(tx.version)?;
@@ -180,7 +181,7 @@ pub fn sighash_segwit_v0(
 
     // 2. hashPrevouts
     if !anyone_can_pay {
-        let mut prevouts_buf = Vec::new();
+        let mut prevouts_buf = Vec::with_capacity(tx.inputs.len() * 36);
         for input in &tx.inputs {
             input.previous_output.encode(&mut prevouts_buf)?;
         }
@@ -191,7 +192,7 @@ pub fn sighash_segwit_v0(
 
     // 3. hashSequence
     if !anyone_can_pay && base != 2 && base != 3 {
-        let mut seq_buf = Vec::new();
+        let mut seq_buf = Vec::with_capacity(tx.inputs.len() * 4);
         for input in &tx.inputs {
             seq_buf.write_u32_le(input.sequence)?;
         }
@@ -216,11 +217,143 @@ pub fn sighash_segwit_v0(
     // 8. hashOutputs
     if base != 2 && base != 3 {
         // SIGHASH_ALL
-        let mut outputs_buf = Vec::new();
+        let mut outputs_buf = Vec::with_capacity(tx.outputs.len() * 34);
         for output in &tx.outputs {
             output.encode(&mut outputs_buf)?;
         }
         buf.extend_from_slice(&sha256d(&outputs_buf));
+    } else if base == 3 && input_index < tx.outputs.len() {
+        // SIGHASH_SINGLE
+        let mut output_buf = Vec::new();
+        tx.outputs[input_index].encode(&mut output_buf)?;
+        buf.extend_from_slice(&sha256d(&output_buf));
+    } else {
+        buf.extend_from_slice(&[0u8; 32]);
+    }
+
+    // 9. nLocktime
+    buf.write_u32_le(tx.lock_time)?;
+
+    // 10. nHashType
+    buf.write_u32_le(hash_type.0)?;
+
+    Ok(sha256d(&buf))
+}
+
+/// Cache for BIP143 intermediate hashes (hashPrevouts, hashSequence, hashOutputs).
+///
+/// When verifying multiple inputs of the same transaction, these intermediate
+/// hashes are identical across inputs (for non-ANYONECANPAY/NONE/SINGLE sighash
+/// types). Caching them avoids O(inputs^2) hashing.
+pub struct SighashCache {
+    pub hash_prevouts: Option<[u8; 32]>,
+    pub hash_sequence: Option<[u8; 32]>,
+    pub hash_outputs: Option<[u8; 32]>,
+}
+
+impl SighashCache {
+    /// Create a new empty cache.
+    pub fn new() -> Self {
+        SighashCache {
+            hash_prevouts: None,
+            hash_sequence: None,
+            hash_outputs: None,
+        }
+    }
+}
+
+/// Compute BIP143 segwit sighash (v0 witness programs), with caching of
+/// hashPrevouts, hashSequence, and hashOutputs across inputs.
+///
+/// This is the same algorithm as [`sighash_segwit_v0`] but avoids recomputing
+/// intermediate hashes when verifying multiple inputs of the same transaction.
+pub fn sighash_segwit_v0_cached(
+    tx: &Transaction,
+    input_index: usize,
+    script_code: &[u8],
+    value: i64,
+    hash_type: SighashType,
+    cache: &mut SighashCache,
+) -> Result<[u8; 32], SighashError> {
+    if input_index >= tx.inputs.len() {
+        return Err(SighashError::InputOutOfRange(input_index, tx.inputs.len()));
+    }
+
+    let base = hash_type.base_type();
+    let anyone_can_pay = hash_type.anyone_can_pay();
+
+    let mut buf = Vec::with_capacity(256);
+
+    // 1. nVersion
+    buf.write_i32_le(tx.version)?;
+
+    // 2. hashPrevouts
+    if !anyone_can_pay {
+        let hash_prevouts = match cache.hash_prevouts {
+            Some(h) => h,
+            None => {
+                let mut prevouts_buf = Vec::with_capacity(tx.inputs.len() * 36);
+                for input in &tx.inputs {
+                    input.previous_output.encode(&mut prevouts_buf)?;
+                }
+                let h = sha256d(&prevouts_buf);
+                cache.hash_prevouts = Some(h);
+                h
+            }
+        };
+        buf.extend_from_slice(&hash_prevouts);
+    } else {
+        buf.extend_from_slice(&[0u8; 32]);
+    }
+
+    // 3. hashSequence
+    if !anyone_can_pay && base != 2 && base != 3 {
+        let hash_sequence = match cache.hash_sequence {
+            Some(h) => h,
+            None => {
+                let mut seq_buf = Vec::with_capacity(tx.inputs.len() * 4);
+                for input in &tx.inputs {
+                    seq_buf.write_u32_le(input.sequence)?;
+                }
+                let h = sha256d(&seq_buf);
+                cache.hash_sequence = Some(h);
+                h
+            }
+        };
+        buf.extend_from_slice(&hash_sequence);
+    } else {
+        buf.extend_from_slice(&[0u8; 32]);
+    }
+
+    // 4. outpoint
+    tx.inputs[input_index].previous_output.encode(&mut buf)?;
+
+    // 5. scriptCode
+    VarInt(script_code.len() as u64).encode(&mut buf)?;
+    buf.extend_from_slice(script_code);
+
+    // 6. value
+    buf.write_i64_le(value)?;
+
+    // 7. nSequence
+    buf.write_u32_le(tx.inputs[input_index].sequence)?;
+
+    // 8. hashOutputs
+    if base != 2 && base != 3 {
+        // SIGHASH_ALL
+        let hash_outputs = match cache.hash_outputs {
+            Some(h) => h,
+            None => {
+                let mut outputs_buf = Vec::with_capacity(tx.outputs.len() * 34);
+                for output in &tx.outputs {
+                    output.encode(&mut outputs_buf)?;
+                }
+                let h = sha256d(&outputs_buf);
+                cache.hash_outputs = Some(h);
+                h
+            }
+        };
+        buf.extend_from_slice(&hash_outputs);
     } else if base == 3 && input_index < tx.outputs.len() {
         // SIGHASH_SINGLE
         let mut output_buf = Vec::new();
@@ -262,10 +395,11 @@ pub fn sighash_taproot(
     let anyone_can_pay = hash_type.anyone_can_pay();
 
     // BIP340 tagged hash: SHA256(SHA256("TapSighash") || SHA256("TapSighash") || msg)
-    let tag_hash = sha256(b"TapSighash");
+    static TAP_SIGHASH_TAG: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    let tag_hash = TAP_SIGHASH_TAG.get_or_init(|| sha256(b"TapSighash"));
     let mut hasher_input = Vec::new();
-    hasher_input.extend_from_slice(&tag_hash);
-    hasher_input.extend_from_slice(&tag_hash);
+    hasher_input.extend_from_slice(tag_hash);
+    hasher_input.extend_from_slice(tag_hash);
 
     let mut msg = Vec::with_capacity(256);
 
@@ -373,8 +507,73 @@ pub fn sighash_taproot(
 /// Remove all occurrences of an opcode from a script.
 /// This is Bitcoin's `FindAndDelete` operation, used to strip OP_CODESEPARATOR
 /// from the script before sighash computation.
-fn find_and_delete(script: &[u8], opcode: btc_primitives::script::Opcode) -> Vec<u8> {
-    script.iter().copied().filter(|&b| b != opcode.to_u8()).collect()
+///
+/// This must parse the script as instructions rather than filtering raw bytes,
+/// because data pushes may contain bytes that happen to equal the opcode value
+/// (e.g., 0xab inside push data is NOT an OP_CODESEPARATOR).
+///
+/// Returns `Cow::Borrowed` when no matching opcodes are found (avoiding allocation).
+fn find_and_delete<'a>(script: &'a [u8], opcode: btc_primitives::script::Opcode) -> Cow<'a, [u8]> {
+    let target = opcode.to_u8();
+    // Quick scan: if the byte doesn't appear at all, nothing to delete.
+    if !script.contains(&target) {
+        return Cow::Borrowed(script);
+    }
+
+    let mut out = Vec::with_capacity(script.len());
+    let mut found = false;
+    let mut pos: usize = 0;
+
+    while pos < script.len() {
+        let byte = script[pos];
+        let instr_start = pos;
+        pos += 1;
+
+        // Determine instruction length (mirrors ScriptInstructions::next in script.rs)
+        if byte == 0 {
+            // OP_0: single-byte opcode, pos already advanced
+        } else if (1..=75).contains(&byte) {
+            // Direct push: next `byte` bytes are data
+            pos += byte as usize;
+        } else if byte == btc_primitives::script::Opcode::OP_PUSHDATA1.to_u8() {
+            if pos < script.len() {
+                let len = script[pos] as usize;
+                pos += 1 + len;
+            }
+        } else if byte == btc_primitives::script::Opcode::OP_PUSHDATA2.to_u8() {
+            if pos + 2 <= script.len() {
+                let len = u16::from_le_bytes([script[pos], script[pos + 1]]) as usize;
+                pos += 2 + len;
+            }
+        } else if byte == btc_primitives::script::Opcode::OP_PUSHDATA4.to_u8() {
+            if pos + 4 <= script.len() {
+                let len = u32::from_le_bytes([
+                    script[pos], script[pos + 1], script[pos + 2], script[pos + 3],
+                ]) as usize;
+                pos += 4 + len;
+            }
+        }
+        // else: regular single-byte opcode, pos already advanced by 1.
+
+        // Clamp to script length to avoid out-of-bounds on malformed scripts
+        let end = pos.min(script.len());
+
+        // A single-byte non-push instruction matching the target should be skipped.
+        let is_single_byte_opcode = (end - instr_start) == 1 && !(1..=75).contains(&byte);
+        let skip = is_single_byte_opcode && byte == target;
+
+        if skip {
+            found = true;
+        } else {
+            out.extend_from_slice(&script[instr_start..end]);
+        }
+    }
+
+    if found {
+        Cow::Owned(out)
+    } else {
+        Cow::Borrowed(script)
+    }
 }
 
 /// Helper: compute the script code for P2WPKH spending
