@@ -9,6 +9,7 @@ license.workspace = true
 btc-primitives = { workspace = true }
 btc-consensus = { workspace = true }
 btc-storage = { workspace = true }
+btc-mempool = { workspace = true }
 btc-network = { workspace = true }
 btc-stages = { workspace = true }
 btc-rpc = { workspace = true }
@@ -21,6 +22,11 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 eyre = { workspace = true }
+
+redb = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lib]
 name = "btc_node"

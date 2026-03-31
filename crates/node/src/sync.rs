@@ -1,13 +1,15 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, info, warn};
 
 use btc_consensus::chain::ChainState;
+use btc_consensus::reorg::{self, ReorgManager, ReorgResult};
 use btc_consensus::utxo::{connect_block, InMemoryUtxoSet};
 use btc_consensus::validation::{BlockValidator, ChainParams};
 use btc_consensus::{ParallelValidator, ParallelConfig};
+use btc_exex::ExExNotification;
 use btc_network::connection::{Connection, ConnectionError};
 use btc_network::discovery::PeerManager;
 use btc_network::message::{
@@ -16,6 +18,8 @@ use btc_network::message::{
 use btc_network::protocol::ProtocolVersion;
 use btc_primitives::hash::BlockHash;
 use btc_primitives::network::Network;
+
+use crate::state::NodeState;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -107,6 +111,8 @@ pub enum SyncError {
     BlockValidation(String),
     #[error("sync aborted: {0}")]
     Aborted(String),
+    #[error("reorg error: {0}")]
+    Reorg(#[from] btc_consensus::reorg::ReorgError),
 }
 
 // ---------------------------------------------------------------------------
@@ -132,9 +138,20 @@ pub struct SyncManager {
     utxo_set: Arc<RwLock<InMemoryUtxoSet>>,
     /// Network-specific consensus parameters (assume-valid, activation heights, etc.).
     chain_params: ChainParams,
+    /// Manages undo data for chain reorganisations.
+    reorg_manager: ReorgManager,
+    /// Optional broadcast sender for ExEx notifications.  When set, the sync
+    /// manager emits `BlockCommitted` events after each block is validated.
+    exex_sender: Option<broadcast::Sender<ExExNotification>>,
+    /// Optional shared node state.  When set, the sync manager updates the
+    /// chain tip after each block is validated.
+    node_state: Option<NodeState>,
 }
 
 impl SyncManager {
+    /// Default number of blocks of undo data to retain for reorg protection.
+    const DEFAULT_MAX_UNDO_DEPTH: u64 = 100;
+
     /// Create a new `SyncManager`.
     pub fn new(
         network: Network,
@@ -149,7 +166,26 @@ impl SyncManager {
             sync_state: SyncState::Idle,
             utxo_set: Arc::new(RwLock::new(InMemoryUtxoSet::new())),
             chain_params,
+            reorg_manager: ReorgManager::new(Self::DEFAULT_MAX_UNDO_DEPTH),
+            exex_sender: None,
+            node_state: None,
         }
+    }
+
+    /// Set the ExEx broadcast sender so that block commit events are emitted.
+    pub fn set_exex_sender(&mut self, sender: broadcast::Sender<ExExNotification>) {
+        self.exex_sender = Some(sender);
+    }
+
+    /// Set the shared NodeState so that chain tip updates propagate to all
+    /// sub-systems (RPC, HTTP, metrics, etc.).
+    pub fn set_node_state(&mut self, state: NodeState) {
+        self.node_state = Some(state);
+    }
+
+    /// Return a reference to the reorg manager (for testing / inspection).
+    pub fn reorg_manager(&self) -> &ReorgManager {
+        &self.reorg_manager
     }
 
     // ------------------------------------------------------------------
@@ -343,9 +379,13 @@ impl SyncManager {
     ) -> Result<u64, SyncError> {
         loop {
             // Build locator from our current best chain.
-            let (locators, our_height) = {
+            let (locators, our_height, old_best_hash) = {
                 let cs = self.chain_state.read().await;
-                (cs.get_locator_hashes(), cs.best_height())
+                (
+                    cs.get_locator_hashes(),
+                    cs.best_height(),
+                    cs.best_header().header.block_hash(),
+                )
             };
 
             self.sync_state = SyncState::DownloadingHeaders {
@@ -381,9 +421,9 @@ impl SyncManager {
                 }
             }
 
-            let new_height = {
+            let (new_height, new_best_hash) = {
                 let cs = self.chain_state.read().await;
-                cs.best_height()
+                (cs.best_height(), cs.best_header().header.block_hash())
             };
 
             info!(
@@ -391,6 +431,34 @@ impl SyncManager {
                 height = new_height,
                 "headers batch accepted"
             );
+
+            // Detect potential chain reorganisation: if the best tip changed
+            // to a block that is NOT a descendant of the old best, the chain
+            // state has switched to a competing branch.
+            if new_best_hash != old_best_hash {
+                let cs = self.chain_state.read().await;
+                let new_entry = cs.get_header(&new_best_hash);
+                let is_descendant = new_entry.map_or(false, |e| {
+                    // Walk back from new tip to see if old_best_hash is an
+                    // ancestor.  Quick check: if the new best is simply one
+                    // batch ahead (prev of first new header == old best) this
+                    // is normal linear extension.  Otherwise it may be a
+                    // reorg.
+                    let first_new = &headers[0];
+                    first_new.prev_blockhash == old_best_hash
+                        || e.header.prev_blockhash == old_best_hash
+                });
+                if !is_descendant {
+                    info!(
+                        old_tip = %old_best_hash,
+                        new_tip = %new_best_hash,
+                        "potential chain reorganization detected during header sync"
+                    );
+                    // The reorg will be handled during block download: we
+                    // will download blocks on the new best chain and the old
+                    // chain blocks become stale.
+                }
+            }
 
             self.sync_state = SyncState::DownloadingHeaders {
                 progress: new_height,
@@ -627,6 +695,31 @@ impl SyncManager {
                             utxo_set.apply_update(&utxo_update);
                         }
 
+                        // -------------------------------------------------
+                        // Step 5: Store undo data for reorg protection and
+                        // prune old entries beyond the configured depth.
+                        // -------------------------------------------------
+                        self.reorg_manager.store_undo(block_height, utxo_update.clone());
+                        let max_undo = self.reorg_manager.max_undo_depth();
+                        if block_height > max_undo {
+                            self.reorg_manager.prune_undo(block_height - max_undo);
+                        }
+
+                        // -------------------------------------------------
+                        // Step 6: Emit ExEx notification and update NodeState
+                        // -------------------------------------------------
+                        if let Some(ref sender) = self.exex_sender {
+                            sender.send(ExExNotification::BlockCommitted {
+                                height: block_height,
+                                hash: block_hash,
+                                block: block.clone(),
+                                utxo_changes: utxo_update,
+                            }).ok();
+                        }
+                        if let Some(ref ns) = self.node_state {
+                            ns.update_chain_tip(block_height, &block_hash.to_string());
+                        }
+
                         debug!(
                             height = block_height,
                             hash = %block_hash,
@@ -666,6 +759,48 @@ impl SyncManager {
 
         info!(blocks = downloaded, "block download complete");
         Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Reorg handling
+    // ------------------------------------------------------------------
+
+    /// Handle a chain reorganisation between `old_tip` and `new_tip`.
+    ///
+    /// This method uses the `ReorgManager`'s stored undo data to disconnect
+    /// blocks from the old chain back to the fork point, then connects blocks
+    /// on the new chain.  The `new_blocks` slice must contain the full blocks
+    /// from the fork point (exclusive) to `new_tip` (inclusive), in order.
+    pub async fn handle_reorg(
+        &mut self,
+        old_tip: BlockHash,
+        new_tip: BlockHash,
+        new_blocks: &[btc_primitives::block::Block],
+    ) -> Result<ReorgResult, SyncError> {
+        info!(%old_tip, %new_tip, "handling chain reorganization");
+
+        let mut cs = self.chain_state.write().await;
+        let mut utxo_set = self.utxo_set.write().await;
+
+        let result = reorg::execute_reorg(
+            &mut cs,
+            &self.reorg_manager,
+            &mut utxo_set,
+            &old_tip,
+            &new_tip,
+            new_blocks,
+        )?;
+
+        info!(
+            fork_point = %result.fork_point,
+            fork_height = result.fork_height,
+            disconnected = result.disconnected.len(),
+            connected = result.connected.len(),
+            depth = result.depth,
+            "chain reorganization complete"
+        );
+
+        Ok(result)
     }
 }
 
@@ -1034,5 +1169,103 @@ mod tests {
         let mut sm = make_sync_manager();
         sm.sync_state = state;
         sm
+    }
+
+    // -----------------------------------------------------------------------
+    // ReorgManager integration tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sync_manager_has_reorg_manager() {
+        let sm = make_sync_manager();
+        assert_eq!(
+            sm.reorg_manager().max_undo_depth(),
+            SyncManager::DEFAULT_MAX_UNDO_DEPTH,
+            "reorg manager should be initialized with default undo depth"
+        );
+    }
+
+    #[test]
+    fn test_sync_manager_reorg_manager_stores_undo() {
+        let mut sm = make_sync_manager();
+        let update = btc_consensus::utxo::UtxoSetUpdate {
+            spent: vec![],
+            created: vec![],
+        };
+        sm.reorg_manager.store_undo(42, update);
+        assert!(
+            sm.reorg_manager().get_undo(42).is_some(),
+            "should be able to store and retrieve undo data"
+        );
+        assert!(
+            sm.reorg_manager().get_undo(43).is_none(),
+            "should not find undo data at a different height"
+        );
+    }
+
+    #[test]
+    fn test_sync_manager_reorg_manager_prunes_undo() {
+        let mut sm = make_sync_manager();
+        for h in 1..=10u64 {
+            sm.reorg_manager.store_undo(
+                h,
+                btc_consensus::utxo::UtxoSetUpdate {
+                    spent: vec![],
+                    created: vec![],
+                },
+            );
+        }
+
+        sm.reorg_manager.prune_undo(6);
+        for h in 1..=5u64 {
+            assert!(
+                sm.reorg_manager().get_undo(h).is_none(),
+                "height {} should be pruned",
+                h
+            );
+        }
+        for h in 6..=10u64 {
+            assert!(
+                sm.reorg_manager().get_undo(h).is_some(),
+                "height {} should remain",
+                h
+            );
+        }
+    }
+
+    #[test]
+    fn test_sync_error_reorg_variant() {
+        let reorg_err = btc_consensus::reorg::ReorgError::TooDeep {
+            depth: 200,
+            max: 100,
+        };
+        let sync_err: SyncError = reorg_err.into();
+        let msg = sync_err.to_string();
+        assert!(
+            msg.contains("reorg") || msg.contains("200") || msg.contains("100"),
+            "reorg error should be wrapped in SyncError: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_sync_manager_default_undo_depth() {
+        assert_eq!(
+            SyncManager::DEFAULT_MAX_UNDO_DEPTH,
+            100,
+            "default undo depth should be 100 blocks"
+        );
+    }
+
+    #[test]
+    fn test_sync_manager_reorg_manager_accessor() {
+        let sm = make_sync_manager();
+        // Verify the accessor returns a reference to the internal reorg manager.
+        let mgr = sm.reorg_manager();
+        assert_eq!(mgr.max_undo_depth(), 100);
+        assert!(
+            mgr.get_undo(0).is_none(),
+            "fresh reorg manager should have no undo data"
+        );
     }
 }

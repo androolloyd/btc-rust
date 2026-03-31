@@ -1,10 +1,15 @@
 use std::marker::PhantomData;
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use btc_exex::ExExManager;
 use btc_primitives::Network;
 use btc_rpc::server::RpcServer;
 use btc_stages::Pipeline;
 use tracing::info;
+
+use crate::state::NodeState;
+use crate::zmq::ZmqPublisher;
 
 // ---------------------------------------------------------------------------
 // Type-state markers
@@ -215,19 +220,54 @@ impl Node {
         info!(path = %self.database.path.display(), "database opened");
         info!(port = self.network.port, "p2p network ready");
 
-        // Initialize consensus chain state
-        let params = btc_consensus::validation::ChainParams::from_network(self.config.network);
-        let chain_state = std::sync::Arc::new(tokio::sync::RwLock::new(
-            btc_consensus::ChainState::new(params),
-        ));
+        // -----------------------------------------------------------------
+        // 1. Create shared NodeState (single source of truth)
+        // -----------------------------------------------------------------
+        let node_state = NodeState::new(self.config.network);
+        node_state.syncing.store(true, std::sync::atomic::Ordering::SeqCst);
 
-        // Initialize peer manager
-        let peer_manager = std::sync::Arc::new(tokio::sync::RwLock::new(
-            btc_network::discovery::PeerManager::new(self.config.network),
-        ));
+        // -----------------------------------------------------------------
+        // 2. Create ExExManager for chain event notifications
+        // -----------------------------------------------------------------
+        let exex_manager = ExExManager::new(self.config.network);
 
-        // Initialize RPC server with shared state
-        let rpc_handler = std::sync::Arc::new(btc_rpc::handler::RpcHandler::new());
+        // -----------------------------------------------------------------
+        // 3. Build MetricsCollector from NodeState (shares atomics)
+        // -----------------------------------------------------------------
+        let metrics = node_state.metrics_collector();
+
+        // -----------------------------------------------------------------
+        // 4. Spawn HTTP server (Esplora REST + Prometheus metrics)
+        // -----------------------------------------------------------------
+        let http_server = crate::http::HttpServer::new(self.config.rpc_port + 1, metrics);
+        let http_handle = tokio::spawn(async move {
+            if let Err(e) = http_server.run().await {
+                tracing::error!(error = %e, "HTTP server error");
+            }
+        });
+
+        // -----------------------------------------------------------------
+        // 5. Spawn ZMQ publisher connected to ExExManager
+        // -----------------------------------------------------------------
+        let zmq_publisher = ZmqPublisher::new(28332);
+        let zmq_ctx = exex_manager.subscribe();
+        let zmq_handle = tokio::spawn(async move {
+            if let Err(e) = zmq_publisher.run(zmq_ctx).await {
+                tracing::error!(error = %e, "ZMQ publisher error");
+            }
+        });
+
+        // -----------------------------------------------------------------
+        // 6. Initialize RPC server with shared state from NodeState
+        // -----------------------------------------------------------------
+        let rpc_handler = Arc::new(btc_rpc::handler::RpcHandler::new_with_state(
+            Arc::clone(&node_state.chain_height),
+            Arc::clone(&node_state.best_hash),
+            node_state.rpc_network_name(),
+            Arc::clone(&node_state.peer_count),
+            Arc::clone(&node_state.mempool_size),
+            Arc::clone(&node_state.mempool_bytes),
+        ));
         let rpc = RpcServer::new(self.config.rpc_port);
         let rpc_handler_clone = rpc_handler.clone();
 
@@ -238,8 +278,22 @@ impl Node {
             }
         });
 
-        // Start sync manager — create a second ChainParams for the sync
-        // manager since the first was consumed by ChainState::new().
+        // -----------------------------------------------------------------
+        // 7. Initialize consensus chain state
+        // -----------------------------------------------------------------
+        let params = btc_consensus::validation::ChainParams::from_network(self.config.network);
+        let chain_state = std::sync::Arc::new(tokio::sync::RwLock::new(
+            btc_consensus::ChainState::new(params),
+        ));
+
+        // Initialize peer manager
+        let peer_manager = std::sync::Arc::new(tokio::sync::RwLock::new(
+            btc_network::discovery::PeerManager::new(self.config.network),
+        ));
+
+        // -----------------------------------------------------------------
+        // 8. Start sync manager with ExEx sender for notifications
+        // -----------------------------------------------------------------
         let sync_params = btc_consensus::validation::ChainParams::from_network(self.config.network);
         let mut sync_mgr = crate::sync::SyncManager::new(
             self.config.network,
@@ -247,6 +301,8 @@ impl Node {
             peer_manager.clone(),
             sync_params,
         );
+        sync_mgr.set_exex_sender(exex_manager.sender().clone());
+        sync_mgr.set_node_state(node_state.clone());
 
         info!("starting initial block download");
 
@@ -260,12 +316,16 @@ impl Node {
             }
         }
 
+        node_state.syncing.store(false, std::sync::atomic::Ordering::SeqCst);
+
         // Keep running (serve RPC, listen for new blocks)
         info!("btc-node running — press Ctrl+C to stop");
         tokio::signal::ctrl_c().await?;
         info!("shutting down");
 
         rpc_handle.abort();
+        http_handle.abort();
+        zmq_handle.abort();
         Ok(())
     }
 }
