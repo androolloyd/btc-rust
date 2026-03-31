@@ -1020,4 +1020,98 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_filter_matching_with_real_scripts() {
+        // Build a block with real P2PKH and P2WPKH scripts, construct a filter,
+        // and verify match_any returns true for scripts in the block and false for
+        // scripts not in the block.
+        let pkh_a = [0xaa; 20];
+        let pkh_b = [0xbb; 20];
+        let pkh_c = [0xcc; 20]; // not in block
+
+        let spk_a = ScriptBuf::p2pkh(&pkh_a);
+        let spk_b = ScriptBuf::p2wpkh(&pkh_b);
+        let spk_c = ScriptBuf::p2pkh(&pkh_c);
+
+        // Build a simple block with a coinbase and one user tx.
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::COINBASE,
+                script_sig: ScriptBuf::from_bytes(vec![0x04, 0x01]),
+                sequence: TxIn::SEQUENCE_FINAL,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(50 * 100_000_000),
+                script_pubkey: spk_a.clone(),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let user_tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0x11; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![0x01]),
+                sequence: TxIn::SEQUENCE_FINAL,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: spk_b.clone(),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let txids: Vec<[u8; 32]> = [&coinbase, &user_tx]
+            .iter()
+            .map(|tx| tx.txid().to_bytes())
+            .collect();
+        let merkle_root = TxHash::from_bytes(btc_primitives::block::merkle_root(&txids));
+
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_blockhash: BlockHash::ZERO,
+                merkle_root,
+                time: 1700000000,
+                bits: CompactTarget::MAX_TARGET,
+                nonce: 0,
+            },
+            transactions: vec![coinbase, user_tx],
+        };
+
+        // For the non-coinbase tx, provide its input's prev scriptPubKey.
+        let prev_spks = vec![vec![vec![0x76; 25]]]; // dummy prev script
+
+        let prev_filter_header = [0u8; 32];
+        let filter = build_basic_filter(&block, &prev_spks, &prev_filter_header);
+        assert!(filter.n > 0, "filter should have elements");
+
+        // match_any should return true for scripts that are in the block.
+        assert!(
+            filter.match_any(&[spk_a.as_bytes()]),
+            "filter should match P2PKH script A (in block)"
+        );
+        assert!(
+            filter.match_any(&[spk_b.as_bytes()]),
+            "filter should match P2WPKH script B (in block)"
+        );
+
+        // match_any should return false for scripts not in the block
+        // (subject to false-positive rate, but with only a few items the
+        // probability is negligible).
+        assert!(
+            !filter.match_any(&[spk_c.as_bytes()]),
+            "filter should not match script C (not in block)"
+        );
+
+        // Verify match_any with multiple query items.
+        assert!(
+            filter.match_any(&[spk_a.as_bytes(), spk_c.as_bytes()]),
+            "should match when at least one script is in the block"
+        );
+    }
 }

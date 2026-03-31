@@ -446,4 +446,73 @@ mod tests {
         let missing = result.unwrap_err();
         assert_eq!(missing.len(), 1);
     }
+
+    #[test]
+    fn test_compact_block_reconstruct_partial_mempool() {
+        // Block has 3 non-coinbase transactions. Mempool only has 2 of them.
+        // Reconstruction should fail and report exactly 1 missing short ID.
+        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
+        use btc_primitives::script::ScriptBuf;
+        use btc_primitives::amount::Amount;
+
+        let header = BlockHeader {
+            version: 1,
+            prev_blockhash: BlockHash::ZERO,
+            merkle_root: TxHash::from_bytes([0xab; 32]),
+            time: 1231006505,
+            bits: CompactTarget::MAX_TARGET,
+            nonce: 2083236893,
+        };
+
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::COINBASE,
+                script_sig: ScriptBuf::from_bytes(vec![0x04, 0xff]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76, 0xa9]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let make_tx = |id: u8| Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([id; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![id]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(1_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let tx1 = make_tx(0x11);
+        let tx2 = make_tx(0x22);
+        let tx3 = make_tx(0x33);
+
+        let compact = CompactBlock::from_block(
+            header,
+            &[coinbase.clone(), tx1.clone(), tx2.clone(), tx3.clone()],
+            99,
+        );
+        assert_eq!(compact.short_ids.len(), 3, "3 non-coinbase txs");
+
+        // Mempool has tx1 and tx3 but NOT tx2.
+        let mut mempool = std::collections::HashMap::new();
+        mempool.insert(tx1.txid(), tx1);
+        mempool.insert(tx3.txid(), tx3);
+
+        let result = compact.reconstruct(&mempool);
+        assert!(result.is_err(), "should fail with partial mempool");
+        let missing = result.unwrap_err();
+        assert_eq!(missing.len(), 1, "exactly 1 tx should be missing");
+    }
 }

@@ -10,6 +10,7 @@ btc-consensus = { workspace = true }
 btc-storage = { workspace = true }
 btc-mempool = { workspace = true }
 btc-network = { workspace = true }
+btc-exex = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

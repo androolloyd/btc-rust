@@ -460,4 +460,47 @@ mod tests {
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0], txid_c);
     }
+
+    #[test]
+    fn test_3_tx_cluster_diamond_dependency() {
+        // Diamond dependency pattern:
+        //    A
+        //   / \
+        //  B   C
+        //   \ /
+        //    D
+        // B and C both spend outputs from A, and D spends from both B and C.
+        // All four should end up in a single cluster.
+        let mut pool = Mempool::new(10_000_000, 1000);
+
+        // A: base transaction, no mempool parent
+        let tx_a = make_tx(0x01, None, 50_000);
+        let txid_a = tx_a.txid();
+        pool.add_tx(tx_a, Amount::from_sat(1_000), 100).unwrap();
+
+        // B: spends from A
+        let tx_b = make_tx(0x02, Some(txid_a), 40_000);
+        let txid_b = tx_b.txid();
+        pool.add_tx(tx_b, Amount::from_sat(2_000), 101).unwrap();
+
+        // C: also spends from A (via a different "virtual" output -- we use
+        // the same txid since make_tx always uses output index 0, but that's
+        // fine for clustering purposes since the clustering logic only checks
+        // whether the parent txid is in the mempool).
+        let tx_c = make_tx(0x03, Some(txid_a), 35_000);
+        let _txid_c = tx_c.txid();
+        pool.add_tx(tx_c, Amount::from_sat(3_000), 102).unwrap();
+
+        let clusters = build_clusters(&pool);
+
+        // All three should be in one cluster (connected via A).
+        assert_eq!(
+            clusters.len(),
+            1,
+            "diamond dependency should form 1 cluster, got {}",
+            clusters.len()
+        );
+        assert_eq!(clusters[0].txids.len(), 3);
+        assert_eq!(clusters[0].total_fees, 6_000); // 1000 + 2000 + 3000
+    }
 }

@@ -55,3 +55,15 @@ name = "fuzz_varint_decode"
 path = "fuzz_targets/fuzz_varint_decode.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_witness_verify"
+path = "fuzz_targets/fuzz_witness_verify.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_block_template"
+path = "fuzz_targets/fuzz_block_template.rs"
+test = false
+doc = false
