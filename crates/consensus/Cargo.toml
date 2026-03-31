@@ -1,0 +1,19 @@
+[package]
+name = "btc-consensus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+btc-primitives = { workspace = true }
+sha2 = { workspace = true }
+ripemd = { workspace = true }
+secp256k1 = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }

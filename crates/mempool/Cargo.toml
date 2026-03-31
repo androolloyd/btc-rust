@@ -1,0 +1,10 @@
+[package]
+name = "btc-mempool"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+btc-primitives = { workspace = true }
+btc-consensus = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

@@ -1,0 +1,30 @@
+[package]
+name = "btc-node"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+btc-primitives = { workspace = true }
+btc-consensus = { workspace = true }
+btc-storage = { workspace = true }
+btc-network = { workspace = true }
+btc-stages = { workspace = true }
+btc-rpc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+eyre = { workspace = true }
+
+[lib]
+name = "btc_node"
+path = "src/lib.rs"
+
+[[bin]]
+name = "btc-node"
+path = "src/main.rs"

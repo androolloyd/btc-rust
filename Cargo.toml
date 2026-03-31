@@ -1,0 +1,72 @@
+[workspace]
+members = [
+    "crates/primitives",
+    "crates/consensus",
+    "crates/storage",
+    "crates/network",
+    "crates/stages",
+    "crates/rpc",
+    "crates/node",
+    "crates/mempool",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/example/btc-rust"
+
+[workspace.dependencies]
+# Internal crates
+btc-primitives = { path = "crates/primitives" }
+btc-consensus = { path = "crates/consensus" }
+btc-storage = { path = "crates/storage" }
+btc-network = { path = "crates/network" }
+btc-stages = { path = "crates/stages" }
+btc-rpc = { path = "crates/rpc" }
+btc-node = { path = "crates/node" }
+btc-mempool = { path = "crates/mempool" }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Crypto
+sha2 = "0.10"
+ripemd = "0.1"
+secp256k1 = { version = "0.29", features = ["global-context", "rand-std"] }
+k256 = "0.13"
+
+# Hashing
+bitcoin_hashes = "0.14"
+
+# Database
+redb = "2"
+qmdb = { git = "https://github.com/androolloyd/qmdb.git", default-features = false }
+parking_lot = "0.12"
+
+# Networking
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+tokio-util = { version = "0.7", features = ["codec"] }
+futures-util = { version = "0.3", features = ["sink"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilities
+thiserror = "2"
+hex = "0.4"
+rand = "0.8"
+smallvec = "1"
+derive_more = { version = "1", features = ["display", "from", "into", "deref"] }
+clap = { version = "4", features = ["derive"] }
+eyre = "0.6"
+
+# Testing
+proptest = "1"
+criterion = "0.5"
+tempfile = "3"

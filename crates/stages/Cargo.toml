@@ -1,0 +1,16 @@
+[package]
+name = "btc-stages"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+btc-primitives = { workspace = true }
+btc-consensus = { workspace = true }
+btc-storage = { workspace = true }
+btc-network = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+eyre = { workspace = true }

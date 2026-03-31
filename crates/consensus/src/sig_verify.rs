@@ -1,0 +1,59 @@
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum SigError {
+    #[error("invalid signature encoding")]
+    InvalidEncoding,
+    #[error("invalid public key")]
+    InvalidPubKey,
+    #[error("signature verification failed")]
+    VerifyFailed,
+    #[error("secp256k1 error: {0}")]
+    Secp256k1(#[from] secp256k1::Error),
+}
+
+/// Signature verification trait — designed to be swappable for post-quantum algorithms
+pub trait SignatureVerifier: Send + Sync {
+    fn verify_ecdsa(&self, msg_hash: &[u8; 32], sig: &[u8], pubkey: &[u8]) -> Result<bool, SigError>;
+    fn verify_schnorr(&self, msg_hash: &[u8; 32], sig: &[u8], pubkey: &[u8]) -> Result<bool, SigError>;
+}
+
+/// Default secp256k1-based verifier (current Bitcoin consensus)
+pub struct Secp256k1Verifier;
+
+impl SignatureVerifier for Secp256k1Verifier {
+    fn verify_ecdsa(&self, msg_hash: &[u8; 32], sig: &[u8], pubkey: &[u8]) -> Result<bool, SigError> {
+        let secp = secp256k1::Secp256k1::verification_only();
+        let message = secp256k1::Message::from_digest(*msg_hash);
+        let signature = secp256k1::ecdsa::Signature::from_der(sig)?;
+        let public_key = secp256k1::PublicKey::from_slice(pubkey)?;
+        Ok(secp.verify_ecdsa(&message, &signature, &public_key).is_ok())
+    }
+
+    fn verify_schnorr(&self, msg_hash: &[u8; 32], sig: &[u8], pubkey: &[u8]) -> Result<bool, SigError> {
+        let secp = secp256k1::Secp256k1::verification_only();
+        let message = secp256k1::Message::from_digest(*msg_hash);
+
+        if sig.len() != 64 {
+            return Err(SigError::InvalidEncoding);
+        }
+        let signature = secp256k1::schnorr::Signature::from_slice(sig)?;
+
+        if pubkey.len() != 32 {
+            return Err(SigError::InvalidPubKey);
+        }
+        let xonly = secp256k1::XOnlyPublicKey::from_slice(pubkey)?;
+        Ok(secp.verify_schnorr(&signature, &message, &xonly).is_ok())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_verifier_trait_object() {
+        // Verify the trait is object-safe
+        let _verifier: Box<dyn SignatureVerifier> = Box::new(Secp256k1Verifier);
+    }
+}
