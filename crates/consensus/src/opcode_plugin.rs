@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use btc_primitives::network::Network;
+use btc_primitives::hash::sha256;
 use btc_primitives::transaction::Transaction;
 use crate::script_engine::{ScriptError, ScriptFlags};
 
@@ -30,6 +31,9 @@ pub struct OpcodeExecContext<'a> {
     pub input_index: usize,
     pub input_amount: i64,
     pub flags: &'a ScriptFlags,
+    /// The taproot internal key, if executing in a tapscript context.
+    /// This is the 32-byte x-only public key used before tweaking.
+    pub taproot_internal_key: Option<[u8; 32]>,
 }
 
 /// Trait that BIP authors implement to add a new opcode without forking the node.
@@ -173,6 +177,120 @@ impl OpcodePlugin for OpCat {
             return Err(ScriptError::PushSizeLimit);
         }
         ctx.stack.push(result);
+        Ok(())
+    }
+}
+
+/// BIP348 OP_CHECKSIGFROMSTACK — verify a signature against an arbitrary
+/// message (not the transaction sighash).
+///
+/// Stack before: `<sig> <msg> <pubkey>`
+/// Stack after:  `<result>` (OP_TRUE or OP_FALSE)
+///
+/// Pops the pubkey, message, and signature from the stack. Hashes the message
+/// with SHA-256, then verifies the signature against the pubkey using Schnorr
+/// (in tapscript) or ECDSA (in legacy). Pushes OP_TRUE (1) on success or
+/// OP_FALSE (empty) on failure.
+pub struct OpCheckSigFromStack;
+
+impl OpcodePlugin for OpCheckSigFromStack {
+    fn opcode(&self) -> u8 {
+        0xb4 // OP_NOP5
+    }
+
+    fn name(&self) -> &str {
+        "OP_CHECKSIGFROMSTACK"
+    }
+
+    fn context(&self) -> OpcodeContext {
+        OpcodeContext::TapscriptOnly
+    }
+
+    fn execute(&self, ctx: &mut OpcodeExecContext) -> Result<(), ScriptError> {
+        // Pop pubkey (top of stack)
+        let pubkey = ctx.stack.pop().ok_or(ScriptError::StackUnderflow)?;
+        // Pop message
+        let msg = ctx.stack.pop().ok_or(ScriptError::StackUnderflow)?;
+        // Pop signature
+        let sig = ctx.stack.pop().ok_or(ScriptError::StackUnderflow)?;
+
+        // Validate pubkey length: 32 bytes for x-only (Schnorr/tapscript)
+        if pubkey.len() != 32 {
+            // Invalid pubkey size — push false
+            ctx.stack.push(vec![]);
+            return Ok(());
+        }
+
+        // Hash the message with SHA-256 to produce a 32-byte digest
+        let msg_hash = sha256(&msg);
+
+        // Validate signature length: 64 bytes for Schnorr
+        if sig.len() != 64 {
+            // Invalid signature — push false
+            ctx.stack.push(vec![]);
+            return Ok(());
+        }
+
+        // Verify signature using secp256k1 Schnorr
+        let secp = secp256k1::Secp256k1::verification_only();
+        let message = secp256k1::Message::from_digest(msg_hash);
+
+        let schnorr_sig = match secp256k1::schnorr::Signature::from_slice(&sig) {
+            Ok(s) => s,
+            Err(_) => {
+                ctx.stack.push(vec![]);
+                return Ok(());
+            }
+        };
+
+        let xonly_key = match secp256k1::XOnlyPublicKey::from_slice(&pubkey) {
+            Ok(k) => k,
+            Err(_) => {
+                ctx.stack.push(vec![]);
+                return Ok(());
+            }
+        };
+
+        if secp.verify_schnorr(&schnorr_sig, &message, &xonly_key).is_ok() {
+            ctx.stack.push(vec![0x01]); // OP_TRUE
+        } else {
+            ctx.stack.push(vec![]); // OP_FALSE
+        }
+
+        Ok(())
+    }
+}
+
+/// BIP349 OP_INTERNALKEY — push the taproot internal key onto the stack.
+///
+/// In a tapscript execution context, pushes the 32-byte x-only internal key
+/// (the key before tweaking) onto the stack. This allows tapscripts to
+/// introspect on the internal key without needing to embed it in the script.
+///
+/// Fails with `VerifyFailed` if no internal key is available (i.e., the
+/// script is not executing in a tapscript context).
+pub struct OpInternalKey;
+
+impl OpcodePlugin for OpInternalKey {
+    fn opcode(&self) -> u8 {
+        0xb5 // OP_NOP6
+    }
+
+    fn name(&self) -> &str {
+        "OP_INTERNALKEY"
+    }
+
+    fn context(&self) -> OpcodeContext {
+        OpcodeContext::TapscriptOnly
+    }
+
+    fn execute(&self, ctx: &mut OpcodeExecContext) -> Result<(), ScriptError> {
+        // Retrieve the internal key from the execution context.
+        let internal_key = ctx
+            .taproot_internal_key
+            .ok_or(ScriptError::VerifyFailed)?;
+
+        ctx.stack.push(internal_key.to_vec());
         Ok(())
     }
 }
@@ -369,5 +487,232 @@ mod tests {
         assert_eq!(cat.context(), OpcodeContext::TapscriptOnly);
         assert_eq!(cat.opcode(), 0x7e);
         assert_eq!(cat.name(), "OP_CAT");
+    }
+
+    // -----------------------------------------------------------------------
+    // OP_CHECKSIGFROMSTACK (BIP348) tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_checksigfromstack_registration() {
+        let csfs = OpCheckSigFromStack;
+        assert_eq!(csfs.opcode(), 0xb4);
+        assert_eq!(csfs.name(), "OP_CHECKSIGFROMSTACK");
+        assert_eq!(csfs.context(), OpcodeContext::TapscriptOnly);
+    }
+
+    #[test]
+    fn test_checksigfromstack_valid_signature() {
+        // Generate a keypair, sign a message, verify via OP_CHECKSIGFROMSTACK
+        let secp = secp256k1::Secp256k1::new();
+        let (secret_key, public_key) = secp.generate_keypair(&mut secp256k1::rand::thread_rng());
+        let (xonly_pubkey, _parity) = public_key.x_only_public_key();
+
+        let message = b"Hello, BIP348!";
+        let msg_hash = btc_primitives::hash::sha256(message);
+        let secp_msg = secp256k1::Message::from_digest(msg_hash);
+
+        let keypair = secp256k1::Keypair::from_secret_key(&secp, &secret_key);
+        let signature = secp.sign_schnorr(&secp_msg, &keypair);
+
+        // Build the execution context manually
+        let flags = ScriptFlags::none();
+        let mut stack: Vec<Vec<u8>> = Vec::new();
+        let mut altstack: Vec<Vec<u8>> = Vec::new();
+
+        // Push in order: sig, msg, pubkey (sig deepest, pubkey on top)
+        stack.push(signature.as_ref().to_vec()); // 64-byte Schnorr sig
+        stack.push(message.to_vec());
+        stack.push(xonly_pubkey.serialize().to_vec()); // 32-byte x-only key
+
+        let csfs = OpCheckSigFromStack;
+        let mut ctx = OpcodeExecContext {
+            stack: &mut stack,
+            altstack: &mut altstack,
+            tx: None,
+            input_index: 0,
+            input_amount: 0,
+            flags: &flags,
+            taproot_internal_key: None,
+        };
+
+        csfs.execute(&mut ctx).unwrap();
+
+        // Top of stack should be OP_TRUE (0x01)
+        assert_eq!(ctx.stack.len(), 1);
+        assert_eq!(ctx.stack[0], vec![0x01]);
+    }
+
+    #[test]
+    fn test_checksigfromstack_invalid_signature() {
+        let flags = ScriptFlags::none();
+        let mut stack: Vec<Vec<u8>> = Vec::new();
+        let mut altstack: Vec<Vec<u8>> = Vec::new();
+
+        // Push invalid data: generate a real pubkey so parsing succeeds
+        let secp = secp256k1::Secp256k1::new();
+        let (_secret_key, public_key) = secp.generate_keypair(&mut secp256k1::rand::thread_rng());
+        let (xonly_pubkey, _parity) = public_key.x_only_public_key();
+
+        stack.push(vec![0x00; 64]); // invalid 64-byte sig (will parse but fail verify)
+        stack.push(b"test message".to_vec());
+        stack.push(xonly_pubkey.serialize().to_vec());
+
+        let csfs = OpCheckSigFromStack;
+        let mut ctx = OpcodeExecContext {
+            stack: &mut stack,
+            altstack: &mut altstack,
+            tx: None,
+            input_index: 0,
+            input_amount: 0,
+            flags: &flags,
+            taproot_internal_key: None,
+        };
+
+        csfs.execute(&mut ctx).unwrap();
+
+        // Should push false (empty vec)
+        assert_eq!(ctx.stack.len(), 1);
+        assert!(ctx.stack[0].is_empty());
+    }
+
+    #[test]
+    fn test_checksigfromstack_wrong_sig_length() {
+        let flags = ScriptFlags::none();
+        let mut stack: Vec<Vec<u8>> = Vec::new();
+        let mut altstack: Vec<Vec<u8>> = Vec::new();
+
+        // Push a signature that is not 64 bytes
+        stack.push(vec![0x30; 32]); // wrong length sig
+        stack.push(b"test".to_vec());
+        stack.push(vec![0x02; 32]);
+
+        let csfs = OpCheckSigFromStack;
+        let mut ctx = OpcodeExecContext {
+            stack: &mut stack,
+            altstack: &mut altstack,
+            tx: None,
+            input_index: 0,
+            input_amount: 0,
+            flags: &flags,
+            taproot_internal_key: None,
+        };
+
+        csfs.execute(&mut ctx).unwrap();
+
+        // Should push false due to invalid sig length
+        assert_eq!(ctx.stack.len(), 1);
+        assert!(ctx.stack[0].is_empty());
+    }
+
+    #[test]
+    fn test_checksigfromstack_stack_underflow() {
+        let flags = ScriptFlags::none();
+        let mut stack: Vec<Vec<u8>> = Vec::new();
+        let mut altstack: Vec<Vec<u8>> = Vec::new();
+
+        // Only push one element -- need three
+        stack.push(vec![0x02; 32]);
+
+        let csfs = OpCheckSigFromStack;
+        let mut ctx = OpcodeExecContext {
+            stack: &mut stack,
+            altstack: &mut altstack,
+            tx: None,
+            input_index: 0,
+            input_amount: 0,
+            flags: &flags,
+            taproot_internal_key: None,
+        };
+
+        let result = csfs.execute(&mut ctx);
+        assert!(matches!(result, Err(ScriptError::StackUnderflow)));
+    }
+
+    // -----------------------------------------------------------------------
+    // OP_INTERNALKEY (BIP349) tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_internalkey_registration() {
+        let opik = OpInternalKey;
+        assert_eq!(opik.opcode(), 0xb5);
+        assert_eq!(opik.name(), "OP_INTERNALKEY");
+        assert_eq!(opik.context(), OpcodeContext::TapscriptOnly);
+    }
+
+    #[test]
+    fn test_internalkey_pushes_key() {
+        let flags = ScriptFlags::none();
+        let mut stack: Vec<Vec<u8>> = Vec::new();
+        let mut altstack: Vec<Vec<u8>> = Vec::new();
+
+        let internal_key = [0xab; 32];
+
+        let opik = OpInternalKey;
+        let mut ctx = OpcodeExecContext {
+            stack: &mut stack,
+            altstack: &mut altstack,
+            tx: None,
+            input_index: 0,
+            input_amount: 0,
+            flags: &flags,
+            taproot_internal_key: Some(internal_key),
+        };
+
+        opik.execute(&mut ctx).unwrap();
+
+        assert_eq!(ctx.stack.len(), 1);
+        assert_eq!(ctx.stack[0], internal_key.to_vec());
+        assert_eq!(ctx.stack[0].len(), 32);
+    }
+
+    #[test]
+    fn test_internalkey_fails_without_key() {
+        let flags = ScriptFlags::none();
+        let mut stack: Vec<Vec<u8>> = Vec::new();
+        let mut altstack: Vec<Vec<u8>> = Vec::new();
+
+        let opik = OpInternalKey;
+        let mut ctx = OpcodeExecContext {
+            stack: &mut stack,
+            altstack: &mut altstack,
+            tx: None,
+            input_index: 0,
+            input_amount: 0,
+            flags: &flags,
+            taproot_internal_key: None, // no internal key
+        };
+
+        let result = opik.execute(&mut ctx);
+        assert!(matches!(result, Err(ScriptError::VerifyFailed)));
+    }
+
+    #[test]
+    fn test_internalkey_multiple_pushes() {
+        let flags = ScriptFlags::none();
+        let mut stack: Vec<Vec<u8>> = Vec::new();
+        let mut altstack: Vec<Vec<u8>> = Vec::new();
+
+        let internal_key = [0xcd; 32];
+
+        let opik = OpInternalKey;
+
+        // Execute twice -- should push the same key twice
+        let mut ctx = OpcodeExecContext {
+            stack: &mut stack,
+            altstack: &mut altstack,
+            tx: None,
+            input_index: 0,
+            input_amount: 0,
+            flags: &flags,
+            taproot_internal_key: Some(internal_key),
+        };
+        opik.execute(&mut ctx).unwrap();
+        opik.execute(&mut ctx).unwrap();
+
+        assert_eq!(ctx.stack.len(), 2);
+        assert_eq!(ctx.stack[0], ctx.stack[1]);
+        assert_eq!(ctx.stack[0], internal_key.to_vec());
     }
 }

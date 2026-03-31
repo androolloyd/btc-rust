@@ -1,0 +1,16 @@
+name: btc-rust-devnet
+description: Multi-node btc-rust test network
+
+participants:
+  - name: miner
+    image: btc-rust:latest
+    cmd: ["btc-node", "run", "--network", "regtest", "--output", "json"]
+    ports:
+      p2p: 18444
+      rpc: 18443
+  - name: node1
+    image: btc-rust:latest
+    cmd: ["btc-node", "run", "--network", "regtest", "--output", "json"]
+  - name: node2
+    image: btc-rust:latest
+    cmd: ["btc-node", "run", "--network", "regtest", "--output", "json"]

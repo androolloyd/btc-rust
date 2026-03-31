@@ -13,6 +13,7 @@ ripemd = { workspace = true }
 secp256k1 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 serde = { workspace = true }

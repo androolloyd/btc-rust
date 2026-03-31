@@ -650,6 +650,7 @@ impl<'a> ScriptEngine<'a> {
                             input_index: self.input_index,
                             input_amount: self.input_amount,
                             flags: &self.flags,
+                            taproot_internal_key: None,
                         };
                         plugin.execute(&mut ctx)?;
                     }
@@ -672,6 +673,7 @@ impl<'a> ScriptEngine<'a> {
                             input_index: self.input_index,
                             input_amount: self.input_amount,
                             flags: &self.flags,
+                            taproot_internal_key: None,
                         };
                         return plugin.execute(&mut ctx);
                     }
@@ -825,6 +827,7 @@ impl<'a> ScriptEngine<'a> {
                             input_index: self.input_index,
                             input_amount: self.input_amount,
                             flags: &self.flags,
+                            taproot_internal_key: None,
                         };
                         plugin.execute(&mut ctx)?;
                     } else {

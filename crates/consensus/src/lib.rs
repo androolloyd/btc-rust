@@ -6,6 +6,7 @@ pub mod opcode_plugin;
 pub mod reorg;
 pub mod script_engine;
 pub mod sighash;
+pub mod signet;
 pub mod taproot;
 pub mod validation;
 pub mod versionbits;
@@ -15,7 +16,7 @@ pub mod witness;
 pub mod parallel;
 
 pub use block_template::{build_block_template, BlockTemplate};
-pub use opcode_plugin::{OpcodePlugin, OpcodeRegistry, OpcodeContext, OpcodeExecContext, OpCheckTemplateVerify, OpCat};
+pub use opcode_plugin::{OpcodePlugin, OpcodeRegistry, OpcodeContext, OpcodeExecContext, OpCheckTemplateVerify, OpCat, OpCheckSigFromStack, OpInternalKey};
 pub use chain::ChainState;
 pub use checkpoints::Checkpoints;
 pub use reorg::ReorgManager;

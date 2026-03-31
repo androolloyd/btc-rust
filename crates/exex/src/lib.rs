@@ -5,6 +5,8 @@
 //! [`ExEx`] trait and receive [`ExExNotification`]s through a broadcast channel
 //! managed by the [`ExExManager`].
 
+pub mod ordinals;
+
 use btc_consensus::utxo::UtxoSetUpdate;
 use btc_primitives::block::Block;
 use btc_primitives::hash::BlockHash;

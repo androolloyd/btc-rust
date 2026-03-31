@@ -5,6 +5,7 @@ pub mod connection;
 pub mod discovery;
 pub mod handshake;
 pub mod message;
+pub mod package_relay;
 pub mod peer;
 pub mod protocol;
 pub mod tx_relay;

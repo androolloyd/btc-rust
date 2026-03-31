@@ -1,6 +1,7 @@
 use btc_primitives::block::{Block, BlockHeader};
 use btc_primitives::hash::BlockHash;
 use btc_primitives::compact::CompactTarget;
+use btc_primitives::script::ScriptBuf;
 use btc_primitives::amount::Amount;
 use thiserror::Error;
 
@@ -103,6 +104,10 @@ pub struct ChainParams {
     /// that the scripts in historically-buried blocks have already been
     /// validated by the network.
     pub assume_valid: Option<BlockHash>,
+    /// Signet challenge script (BIP325). When set, signet blocks must include
+    /// a witness commitment satisfying this challenge script. Only applicable
+    /// to signet networks; `None` for mainnet/testnet/regtest.
+    pub signet_challenge: Option<ScriptBuf>,
 }
 
 impl ChainParams {
@@ -126,6 +131,7 @@ impl ChainParams {
             assume_valid: Some(BlockHash::from_hex(
                 "00000000000000000002c71f45de7cf52e0dfd1a8ce8b0a69f13bf67e9c53e67"
             ).unwrap()),
+            signet_challenge: None,
         }
     }
 
@@ -145,10 +151,17 @@ impl ChainParams {
             segwit_height: 834624,
             taproot_height: 0, // always active on testnet
             assume_valid: None,
+            signet_challenge: None,
         }
     }
 
     pub fn signet() -> Self {
+        // Default signet challenge: 1-of-2 multisig controlled by signet operators
+        let challenge_bytes = hex::decode(
+            "512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430\
+             2103348f40a18fc8ebbf4a26a07f8fb37c46eb9e6f1f87d3e0e5e8af20c6d26ae27852ae"
+        ).expect("valid hex for default signet challenge");
+
         ChainParams {
             network: btc_primitives::network::Network::Signet,
             genesis_hash: BlockHash::from_hex(
@@ -164,6 +177,7 @@ impl ChainParams {
             segwit_height: 1,
             taproot_height: 1,
             assume_valid: None,
+            signet_challenge: Some(ScriptBuf::from_bytes(challenge_bytes)),
         }
     }
 
@@ -183,6 +197,7 @@ impl ChainParams {
             segwit_height: 0,
             taproot_height: 0,
             assume_valid: None,
+            signet_challenge: None,
         }
     }
 
