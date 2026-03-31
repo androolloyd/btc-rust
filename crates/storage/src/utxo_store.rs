@@ -139,11 +139,18 @@ impl<DB: Database> PersistentUtxoSet<DB> {
 
         let tx = self.db.tx_mut()?;
 
-        // Delete spent UTXOs from DB
+        // Delete spent UTXOs from DB (only if they exist in DB)
         for outpoint in &self.pending_deletes {
-            tx.delete_utxo(outpoint)?;
-            let meta_outpoint = OutPoint::new(outpoint.txid, outpoint.vout | 0x8000_0000);
-            tx.delete_utxo(&meta_outpoint)?;
+            // Check if the UTXO exists in DB before deleting — QMDB panics on
+            // deleting non-existent keys. UTXOs created and spent within the same
+            // batch were never persisted, so skip those.
+            if tx.get_utxo(outpoint)?.is_some() {
+                tx.delete_utxo(outpoint)?;
+                let meta_outpoint = OutPoint::new(outpoint.txid, outpoint.vout | 0x8000_0000);
+                if tx.get_utxo(&meta_outpoint)?.is_some() {
+                    tx.delete_utxo(&meta_outpoint)?;
+                }
+            }
         }
 
         // Write created/cached UTXOs to DB
