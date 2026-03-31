@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -196,6 +197,10 @@ pub struct SyncManager {
     chain_params: ChainParams,
     /// Manages undo data for chain reorganisations.
     reorg_manager: ReorgManager,
+    /// Once we encounter the block whose hash matches `chain_params.assume_valid`,
+    /// we record its height here so that subsequent blocks can skip script
+    /// verification via `should_verify_scripts`.
+    assume_valid_height: Option<u64>,
     /// Optional broadcast sender for ExEx notifications.  When set, the sync
     /// manager emits `BlockCommitted` events after each block is validated.
     exex_sender: Option<broadcast::Sender<ExExNotification>>,
@@ -229,6 +234,7 @@ impl SyncManager {
             utxo_set: Arc::new(RwLock::new(InMemoryUtxoSet::new())),
             chain_params,
             reorg_manager: ReorgManager::new(Self::DEFAULT_MAX_UNDO_DEPTH),
+            assume_valid_height: None,
             exex_sender: None,
             node_state: None,
             datadir: None,
@@ -269,6 +275,7 @@ impl SyncManager {
             utxo_set: Arc::new(RwLock::new(InMemoryUtxoSet::new())),
             chain_params,
             reorg_manager: ReorgManager::new(Self::DEFAULT_MAX_UNDO_DEPTH),
+            assume_valid_height: None,
             exex_sender: None,
             node_state: None,
             datadir: Some(datadir),
@@ -725,23 +732,26 @@ impl SyncManager {
         while height <= to {
             let batch_end = (height + BLOCK_DOWNLOAD_BATCH_SIZE as u64 - 1).min(to);
 
-            // Collect the block hashes we need.  Use WitnessBlock (0x40000002)
-            // so that the peer sends full witness data (required for segwit
-            // networks like signet).
-            let inv_items = {
+            // Build a map of requested block hash -> expected height so we can
+            // verify that the peer sends the blocks we actually asked for
+            // (BUG 1 fix: verify received block hashes against requested hashes).
+            let (inv_items, expected_hash_to_height) = {
                 let cs = self.chain_state.read().await;
                 let mut items = Vec::new();
+                let mut hash_map: HashMap<BlockHash, u64> = HashMap::new();
                 for h in height..=batch_end {
                     if let Some(entry) = cs.get_header_by_height(h) {
+                        let block_hash = entry.header.block_hash();
                         items.push(InvItem {
                             inv_type: InvType::WitnessBlock,
                             hash: btc_primitives::hash::Hash256::from_bytes(
-                                *entry.header.block_hash().as_bytes(),
+                                *block_hash.as_bytes(),
                             ),
                         });
+                        hash_map.insert(block_hash, h);
                     }
                 }
-                items
+                (items, hash_map)
             };
 
             if inv_items.is_empty() {
@@ -751,6 +761,9 @@ impl SyncManager {
             }
 
             let expected_count = inv_items.len();
+
+            // Mutable copy of the hash map so we can remove entries as blocks arrive.
+            let mut pending_hashes = expected_hash_to_height;
 
             // Send getdata.
             if let Err(e) = peer.send_message(NetworkMessage::GetData(inv_items)).await {
@@ -797,9 +810,22 @@ impl SyncManager {
                 match msg {
                     NetworkMessage::Block(block) => {
                         received += 1;
-                        downloaded += 1;
                         let block_hash = block.block_hash();
-                        let block_height = height + received as u64 - 1;
+
+                        // Verify the received block hash was one we requested
+                        // and look up its expected height from the map.
+                        let block_height = match pending_hashes.remove(&block_hash) {
+                            Some(h) => h,
+                            None => {
+                                warn!(
+                                    hash = %block_hash,
+                                    "received unrequested block, skipping"
+                                );
+                                continue;
+                            }
+                        };
+
+                        downloaded += 1;
                         let tx_count = block.transactions.len();
 
                         debug!(
@@ -850,6 +876,22 @@ impl SyncManager {
                         };
 
                         // -------------------------------------------------
+                        // Track assume-valid height: if this block's hash
+                        // matches chain_params.assume_valid, record its
+                        // height so future blocks can skip scripts.
+                        // -------------------------------------------------
+                        if let Some(ref av_hash) = self.chain_params.assume_valid {
+                            if &block_hash == av_hash && self.assume_valid_height.is_none() {
+                                info!(
+                                    height = block_height,
+                                    hash = %block_hash,
+                                    "assume-valid block found, recording height"
+                                );
+                                self.assume_valid_height = Some(block_height);
+                            }
+                        }
+
+                        // -------------------------------------------------
                         // Step 3: Optionally verify scripts (skip when
                         // below assume-valid to speed up IBD).
                         // Must happen BEFORE applying the UTXO update so
@@ -859,7 +901,7 @@ impl SyncManager {
                         if self.chain_params.should_verify_scripts(
                             block_height,
                             &block_hash,
-                            None,
+                            self.assume_valid_height,
                         ) {
                             let utxo_set = self.utxo_set.read().await;
                             let validator = ParallelValidator::new(ParallelConfig::default());
@@ -1635,5 +1677,84 @@ mod tests {
             .filter(|i| matches!(i.inv_type, InvType::Block | InvType::WitnessBlock))
             .collect();
         assert_eq!(block_items.len(), 2, "should find 2 block inv items");
+    }
+
+    // -----------------------------------------------------------------------
+    // BUG 1: Verify received block hashes against requested hashes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_block_hash_lookup_map_construction() {
+        // Verify that the HashMap<BlockHash, u64> pattern used in sync_blocks
+        // correctly maps block hashes to their expected heights.
+        let mut hash_map: HashMap<BlockHash, u64> = HashMap::new();
+        let hash_a = BlockHash::from_bytes([0x01; 32]);
+        let hash_b = BlockHash::from_bytes([0x02; 32]);
+        let hash_c = BlockHash::from_bytes([0x03; 32]);
+
+        hash_map.insert(hash_a, 100);
+        hash_map.insert(hash_b, 101);
+        hash_map.insert(hash_c, 102);
+
+        // A known hash returns the correct height.
+        assert_eq!(hash_map.get(&hash_a), Some(&100));
+        assert_eq!(hash_map.get(&hash_b), Some(&101));
+        assert_eq!(hash_map.get(&hash_c), Some(&102));
+
+        // An unknown hash returns None (would be skipped in sync_blocks).
+        let unknown = BlockHash::from_bytes([0xff; 32]);
+        assert!(
+            hash_map.get(&unknown).is_none(),
+            "unknown hash should not be in the map"
+        );
+
+        // After removing a processed hash, it should no longer be found.
+        hash_map.remove(&hash_a);
+        assert!(
+            hash_map.get(&hash_a).is_none(),
+            "processed hash should be removed from the map"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // BUG 9: assume_valid_height tracking
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sync_manager_assume_valid_height_initially_none() {
+        let sm = make_sync_manager();
+        assert!(
+            sm.assume_valid_height.is_none(),
+            "assume_valid_height should start as None"
+        );
+    }
+
+    #[test]
+    fn test_sync_manager_assume_valid_height_can_be_set() {
+        let mut sm = make_sync_manager();
+        sm.assume_valid_height = Some(500_000);
+        assert_eq!(sm.assume_valid_height, Some(500_000));
+    }
+
+    #[test]
+    fn test_assume_valid_height_with_should_verify_scripts() {
+        // Verify that passing assume_valid_height to should_verify_scripts
+        // correctly skips scripts for blocks at or below that height.
+        let mut params = ChainParams::mainnet();
+        let av_hash = BlockHash::from_bytes([0xaa; 32]);
+        params.assume_valid = Some(av_hash);
+
+        let some_hash = BlockHash::from_bytes([0xbb; 32]);
+
+        // Without assume_valid_height, blocks below the assume-valid block
+        // would still require verification (unless their hash matches).
+        assert!(params.should_verify_scripts(100, &some_hash, None));
+
+        // With assume_valid_height set, blocks at or below should skip scripts.
+        assert!(!params.should_verify_scripts(100, &some_hash, Some(500_000)));
+        assert!(!params.should_verify_scripts(500_000, &some_hash, Some(500_000)));
+
+        // Blocks above the assume_valid_height should still verify.
+        assert!(params.should_verify_scripts(500_001, &some_hash, Some(500_000)));
     }
 }

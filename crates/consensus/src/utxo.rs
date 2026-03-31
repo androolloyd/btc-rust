@@ -30,6 +30,9 @@ pub enum UtxoError {
 
     #[error("coinbase reward too high: got {got}, max allowed {max}")]
     CoinbaseRewardTooHigh { got: Amount, max: Amount },
+
+    #[error("invalid transaction: {0}")]
+    InvalidTransaction(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -102,6 +105,11 @@ pub fn connect_block(
         let mut input_sum = Amount::ZERO;
 
         if !is_coinbase {
+            if tx.inputs.is_empty() {
+                return Err(UtxoError::InvalidTransaction(
+                    "non-coinbase transaction has no inputs".into(),
+                ));
+            }
             for input in &tx.inputs {
                 let outpoint = &input.previous_output;
 
@@ -651,5 +659,42 @@ mod tests {
         let removed = set.remove(&op);
         assert!(removed.is_some());
         assert!(set.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: reject non-coinbase transaction with zero inputs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reject_zero_input_non_coinbase() {
+        let utxo_set = InMemoryUtxoSet::new();
+        let subsidy = crate::validation::block_subsidy(0);
+        let coinbase = make_coinbase_tx(subsidy);
+
+        // A non-coinbase tx with no inputs (empty inputs vec).
+        let bad_tx = Transaction {
+            version: 1,
+            inputs: vec![],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x00, 0x14]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let block = make_block(vec![coinbase, bad_tx]);
+        let result = connect_block(&block, 0, &utxo_set);
+
+        assert!(result.is_err(), "should reject non-coinbase tx with no inputs");
+        match result.unwrap_err() {
+            UtxoError::InvalidTransaction(msg) => {
+                assert!(
+                    msg.contains("no inputs"),
+                    "error message should mention no inputs, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidTransaction, got: {other}"),
+        }
     }
 }

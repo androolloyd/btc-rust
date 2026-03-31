@@ -319,6 +319,13 @@ impl ChainState {
             return self.params.pow_limit;
         }
 
+        // On signet, difficulty is fixed to the genesis target (pow_limit).
+        // Signet blocks are signed by a trusted authority, so difficulty
+        // adjustment is not used.
+        if self.params.network == btc_primitives::network::Network::Signet {
+            return self.params.pow_limit;
+        }
+
         // Only adjust every DIFFICULTY_ADJUSTMENT_INTERVAL blocks.
         if height % DIFFICULTY_ADJUSTMENT_INTERVAL != 0 {
             return prev.header.bits;
@@ -957,5 +964,40 @@ mod tests {
             assert_eq!(entry.height, h);
         }
         assert!(chain.get_header_by_height(6).is_none());
+    }
+
+    // ---- Test: signet always uses fixed difficulty (pow_limit) ----
+
+    #[test]
+    fn test_signet_fixed_difficulty() {
+        let params = ChainParams::signet();
+        let chain = ChainState::new(params);
+        let genesis = chain.best_header().clone();
+
+        // At any height (e.g., height 1 and a non-retarget height), the
+        // expected difficulty should be pow_limit.
+        let dummy_header = BlockHeader {
+            version: 1,
+            prev_blockhash: genesis.header.block_hash(),
+            merkle_root: TxHash::from_bytes([0u8; 32]),
+            time: genesis.header.time + 600,
+            bits: chain.params.pow_limit,
+            nonce: 0,
+        };
+
+        let expected = chain.get_next_work_required(1, &dummy_header, &genesis);
+        assert_eq!(
+            expected.to_u32(),
+            chain.params.pow_limit.to_u32(),
+            "signet should always use pow_limit as target"
+        );
+
+        // Also verify at a retarget boundary (height 2016).
+        let expected_at_retarget = chain.get_next_work_required(2016, &dummy_header, &genesis);
+        assert_eq!(
+            expected_at_retarget.to_u32(),
+            chain.params.pow_limit.to_u32(),
+            "signet should use pow_limit even at retarget boundary"
+        );
     }
 }

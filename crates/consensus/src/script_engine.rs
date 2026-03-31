@@ -821,7 +821,13 @@ impl<'a> ScriptEngine<'a> {
                 }
 
                 // Pop dummy element (off-by-one bug compatibility with Bitcoin Core)
-                let _dummy = self.pop()?;
+                let dummy = self.pop()?;
+
+                // BIP147: NULLDUMMY enforcement — the dummy element must be
+                // empty when the NULLDUMMY flag is set.
+                if self.flags.verify_nulldummy && !dummy.is_empty() {
+                    return Err(ScriptError::VerifyFailed);
+                }
 
                 // Verify signatures: each signature must match a public key, and
                 // keys must be consumed in order (a key used for one sig cannot be
@@ -2790,5 +2796,141 @@ mod tests {
         let result = engine.execute(script.as_script());
         assert!(matches!(result, Err(ScriptError::UnsatisfiedLocktime)),
             "CSV should fail when tx sequence has disable flag (bit 31) set");
+    }
+
+    // ---- Test: BIP147 NULLDUMMY enforcement ----
+
+    #[test]
+    fn test_nulldummy_enforcement_rejects_non_empty_dummy() {
+        use crate::sighash::{sighash_legacy, SighashType};
+
+        let secp = secp256k1::Secp256k1::new();
+
+        // Generate 1 keypair for a simple 1-of-1 multisig
+        let (sk1, pk1) = secp.generate_keypair(&mut secp256k1::rand::thread_rng());
+        let pk1_bytes = pk1.serialize().to_vec();
+
+        // scriptPubKey: OP_1 <pk1> OP_1 OP_CHECKMULTISIG
+        let mut script_pubkey = ScriptBuf::new();
+        script_pubkey.push_opcode(Opcode::OP_1);
+        script_pubkey.push_slice(&pk1_bytes);
+        script_pubkey.push_opcode(Opcode::OP_1);
+        script_pubkey.push_opcode(Opcode::OP_CHECKMULTISIG);
+
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0xcc; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(40_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76, 0xa9]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let sighash = sighash_legacy(&tx, 0, script_pubkey.as_bytes(), SighashType::ALL).unwrap();
+        let sig1_bytes = sign_sighash(&secp, &sk1, &sighash);
+
+        // Build scriptSig with a NON-EMPTY dummy element (violates BIP147)
+        let mut script_sig = ScriptBuf::new();
+        script_sig.push_slice(&[0x01]); // non-empty dummy!
+        script_sig.push_slice(&sig1_bytes);
+
+        // With verify_nulldummy OFF, it should succeed
+        {
+            static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
+            let mut engine = ScriptEngine::new(
+                &VERIFIER,
+                ScriptFlags::none(), // nulldummy not enforced
+                Some(&tx),
+                0,
+                0,
+            );
+            engine.execute(script_sig.as_script()).unwrap();
+            engine.execute(script_pubkey.as_script()).unwrap();
+            assert!(engine.success(), "should succeed without NULLDUMMY enforcement");
+        }
+
+        // With verify_nulldummy ON, it should fail
+        {
+            static VERIFIER2: Secp256k1Verifier = Secp256k1Verifier;
+            let flags = ScriptFlags {
+                verify_nulldummy: true,
+                ..ScriptFlags::none()
+            };
+            let mut engine = ScriptEngine::new(
+                &VERIFIER2,
+                flags,
+                Some(&tx),
+                0,
+                0,
+            );
+            engine.execute(script_sig.as_script()).unwrap();
+            let result = engine.execute(script_pubkey.as_script());
+            assert!(
+                matches!(result, Err(ScriptError::VerifyFailed)),
+                "NULLDUMMY enforcement should reject non-empty dummy, got: {:?}",
+                result
+            );
+        }
+    }
+
+    #[test]
+    fn test_nulldummy_enforcement_allows_empty_dummy() {
+        use crate::sighash::{sighash_legacy, SighashType};
+
+        let secp = secp256k1::Secp256k1::new();
+        let (sk1, pk1) = secp.generate_keypair(&mut secp256k1::rand::thread_rng());
+        let pk1_bytes = pk1.serialize().to_vec();
+
+        let mut script_pubkey = ScriptBuf::new();
+        script_pubkey.push_opcode(Opcode::OP_1);
+        script_pubkey.push_slice(&pk1_bytes);
+        script_pubkey.push_opcode(Opcode::OP_1);
+        script_pubkey.push_opcode(Opcode::OP_CHECKMULTISIG);
+
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0xdd; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(40_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76, 0xa9]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let sighash = sighash_legacy(&tx, 0, script_pubkey.as_bytes(), SighashType::ALL).unwrap();
+        let sig1_bytes = sign_sighash(&secp, &sk1, &sighash);
+
+        // Build scriptSig with EMPTY dummy (OP_0 pushes empty)
+        let mut script_sig = ScriptBuf::new();
+        script_sig.push_opcode(Opcode::OP_0); // empty dummy -- valid
+        script_sig.push_slice(&sig1_bytes);
+
+        // With verify_nulldummy ON, empty dummy should pass
+        static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
+        let flags = ScriptFlags {
+            verify_nulldummy: true,
+            ..ScriptFlags::none()
+        };
+        let mut engine = ScriptEngine::new(
+            &VERIFIER,
+            flags,
+            Some(&tx),
+            0,
+            0,
+        );
+        engine.execute(script_sig.as_script()).unwrap();
+        engine.execute(script_pubkey.as_script()).unwrap();
+        assert!(engine.success(), "NULLDUMMY with empty dummy should succeed");
     }
 }
