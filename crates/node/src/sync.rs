@@ -1,6 +1,8 @@
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, info, warn};
 
@@ -18,6 +20,8 @@ use btc_network::message::{
 use btc_network::protocol::ProtocolVersion;
 use btc_primitives::hash::BlockHash;
 use btc_primitives::network::Network;
+use btc_storage::redb_backend::RedbDatabase;
+use btc_storage::PersistentUtxoSet;
 
 use crate::state::NodeState;
 
@@ -30,6 +34,58 @@ const MAX_HEADERS_PER_MESSAGE: usize = 2000;
 
 /// Number of blocks to request in a single `getdata` batch.
 const BLOCK_DOWNLOAD_BATCH_SIZE: usize = 16;
+
+// ---------------------------------------------------------------------------
+// Checkpoint persistence
+// ---------------------------------------------------------------------------
+
+/// Serializable checkpoint representing the sync progress.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Checkpoint {
+    pub height: u64,
+    pub hash: String,
+}
+
+impl Checkpoint {
+    /// Create a new checkpoint.
+    pub fn new(height: u64, hash: BlockHash) -> Self {
+        Self {
+            height,
+            hash: format!("{}", hash),
+        }
+    }
+}
+
+/// Save a checkpoint to `{datadir}/checkpoint.json`.
+pub fn save_checkpoint(datadir: &Path, checkpoint: &Checkpoint) -> std::io::Result<()> {
+    std::fs::create_dir_all(datadir)?;
+    let path = datadir.join("checkpoint.json");
+    let json = serde_json::to_string_pretty(checkpoint)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    std::fs::write(&path, json)?;
+    info!(height = checkpoint.height, path = %path.display(), "checkpoint saved");
+    Ok(())
+}
+
+/// Load a checkpoint from `{datadir}/checkpoint.json`, returning `None` if the
+/// file does not exist or cannot be parsed.
+pub fn load_checkpoint(datadir: &Path) -> Option<Checkpoint> {
+    let path = datadir.join("checkpoint.json");
+    let data = std::fs::read_to_string(&path).ok()?;
+    let cp: Checkpoint = serde_json::from_str(&data).ok()?;
+    info!(height = cp.height, path = %path.display(), "checkpoint loaded");
+    Some(cp)
+}
+
+/// Open (or create) a `PersistentUtxoSet` backed by a redb database at the
+/// given path. Returns `None` if the database cannot be opened.
+pub fn open_persistent_utxo_set(
+    db_path: &Path,
+) -> Option<PersistentUtxoSet<RedbDatabase>> {
+    let db = RedbDatabase::new(db_path).ok()?;
+    db.init_tables().ok()?;
+    Some(PersistentUtxoSet::new(Arc::new(db)))
+}
 
 // ---------------------------------------------------------------------------
 // SyncState
@@ -146,6 +202,12 @@ pub struct SyncManager {
     /// Optional shared node state.  When set, the sync manager updates the
     /// chain tip after each block is validated.
     node_state: Option<NodeState>,
+    /// Optional data directory for checkpoint and UTXO persistence.
+    datadir: Option<PathBuf>,
+    /// Optional persistent UTXO set backed by redb.  When set, UTXO updates
+    /// are also applied to this database so that the node can resume sync
+    /// without reprocessing all blocks.
+    persistent_utxo: Option<PersistentUtxoSet<RedbDatabase>>,
 }
 
 impl SyncManager {
@@ -169,6 +231,48 @@ impl SyncManager {
             reorg_manager: ReorgManager::new(Self::DEFAULT_MAX_UNDO_DEPTH),
             exex_sender: None,
             node_state: None,
+            datadir: None,
+            persistent_utxo: None,
+        }
+    }
+
+    /// Create a `SyncManager` with a data directory for checkpoint and UTXO
+    /// persistence.  If the redb database at `{datadir}/utxo.redb` can be
+    /// opened, a `PersistentUtxoSet` is initialised and UTXO updates are
+    /// persisted to disk during IBD.
+    pub fn with_datadir(
+        network: Network,
+        chain_state: Arc<RwLock<ChainState>>,
+        peer_manager: Arc<RwLock<PeerManager>>,
+        chain_params: ChainParams,
+        datadir: PathBuf,
+    ) -> Self {
+        // Attempt to load the checkpoint.
+        if let Some(cp) = load_checkpoint(&datadir) {
+            info!(height = cp.height, hash = %cp.hash, "loaded checkpoint from disk");
+        }
+
+        // Attempt to open the persistent UTXO database.
+        let db_path = datadir.join("utxo.redb");
+        let persistent_utxo = open_persistent_utxo_set(&db_path);
+        if persistent_utxo.is_some() {
+            info!(path = %db_path.display(), "persistent UTXO set opened");
+        } else {
+            warn!(path = %db_path.display(), "failed to open persistent UTXO set, using in-memory only");
+        }
+
+        SyncManager {
+            network,
+            chain_state,
+            peer_manager,
+            sync_state: SyncState::Idle,
+            utxo_set: Arc::new(RwLock::new(InMemoryUtxoSet::new())),
+            chain_params,
+            reorg_manager: ReorgManager::new(Self::DEFAULT_MAX_UNDO_DEPTH),
+            exex_sender: None,
+            node_state: None,
+            datadir: Some(datadir),
+            persistent_utxo,
         }
     }
 
@@ -186,6 +290,16 @@ impl SyncManager {
     /// Return a reference to the reorg manager (for testing / inspection).
     pub fn reorg_manager(&self) -> &ReorgManager {
         &self.reorg_manager
+    }
+
+    /// Return a reference to the datadir, if configured.
+    pub fn datadir(&self) -> Option<&Path> {
+        self.datadir.as_deref()
+    }
+
+    /// Return `true` if a persistent UTXO set is configured.
+    pub fn has_persistent_utxo(&self) -> bool {
+        self.persistent_utxo.is_some()
     }
 
     // ------------------------------------------------------------------
@@ -259,6 +373,16 @@ impl SyncManager {
         // Phase 4 -- header sync.
         let peer_tip = self.sync_headers(&mut conn).await?;
 
+        // Save checkpoint after header sync completes.
+        if let Some(ref datadir) = self.datadir {
+            let cs = self.chain_state.read().await;
+            let best = cs.best_header();
+            let cp = Checkpoint::new(cs.best_height(), best.header.block_hash());
+            if let Err(e) = save_checkpoint(datadir, &cp) {
+                warn!(error = %e, "failed to save checkpoint after header sync");
+            }
+        }
+
         // Phase 5 -- block sync.
         if peer_tip > best_height {
             self.sync_blocks(&mut conn, best_height + 1, peer_tip).await?;
@@ -272,7 +396,70 @@ impl SyncManager {
         };
         info!(height = final_height, "initial block download complete");
 
+        // Save checkpoint after block sync completes.
+        if let Some(ref datadir) = self.datadir {
+            let cs = self.chain_state.read().await;
+            let best = cs.best_header();
+            let cp = Checkpoint::new(cs.best_height(), best.header.block_hash());
+            if let Err(e) = save_checkpoint(datadir, &cp) {
+                warn!(error = %e, "failed to save checkpoint after block sync");
+            }
+        }
+
+        // Flush persistent UTXO cache if available.
+        if let Some(ref mut persistent) = self.persistent_utxo {
+            if let Err(e) = persistent.flush_cache() {
+                warn!(error = %e, "failed to flush persistent UTXO cache");
+            }
+        }
+
+        // Phase 7 -- steady-state listening for new blocks and transactions.
+        info!("entering steady state - listening for new blocks and transactions");
+        self.steady_state_loop(&mut conn).await;
+
         Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Steady-state loop
+    // ------------------------------------------------------------------
+
+    /// After IBD completes, listen for new block and transaction announcements.
+    async fn steady_state_loop(&mut self, peer: &mut Connection) {
+        loop {
+            match peer.recv_message().await {
+                Ok(NetworkMessage::Inv(items)) => {
+                    // Separate block and tx announcements.
+                    let block_items: Vec<_> = items.iter()
+                        .filter(|i| matches!(i.inv_type, InvType::Block | InvType::WitnessBlock))
+                        .collect();
+                    let tx_items: Vec<_> = items.iter()
+                        .filter(|i| matches!(i.inv_type, InvType::Tx | InvType::WitnessTx))
+                        .collect();
+
+                    if !block_items.is_empty() {
+                        debug!(count = block_items.len(), "steady state: received block inv");
+                    }
+                    if !tx_items.is_empty() {
+                        debug!(count = tx_items.len(), "steady state: received tx inv announcements");
+                    }
+                }
+                Ok(NetworkMessage::Tx(tx)) => {
+                    let txid = tx.txid();
+                    debug!(%txid, "steady state: received transaction from peer");
+                }
+                Ok(NetworkMessage::Ping(nonce)) => {
+                    peer.send_message(NetworkMessage::Pong(nonce)).await.ok();
+                }
+                Ok(other) => {
+                    debug!(cmd = other.command(), "steady state: ignoring message");
+                }
+                Err(e) => {
+                    warn!(error = %e, "peer disconnected in steady state");
+                    break;
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -559,7 +746,7 @@ impl SyncManager {
             }
 
             // Receive blocks.  Peers may interleave protocol messages (ping,
-            // sendcmpct, inv, getheaders, etc.) between blocks — skip those
+            // sendcmpct, inv, getheaders, etc.) between blocks -- skip those
             // and keep waiting.  Apply a generous per-message timeout so we
             // don't hang forever on a stalled peer.
             let mut received = 0;
@@ -696,6 +883,19 @@ impl SyncManager {
                         }
 
                         // -------------------------------------------------
+                        // Step 4b: Apply UTXO updates to persistent set
+                        // -------------------------------------------------
+                        if let Some(ref mut persistent) = self.persistent_utxo {
+                            if let Err(e) = persistent.apply_update(&utxo_update) {
+                                warn!(
+                                    height = block_height,
+                                    error = %e,
+                                    "failed to persist UTXO update"
+                                );
+                            }
+                        }
+
+                        // -------------------------------------------------
                         // Step 5: Store undo data for reorg protection and
                         // prune old entries beyond the configured depth.
                         // -------------------------------------------------
@@ -731,6 +931,19 @@ impl SyncManager {
                             progress: downloaded,
                             target: total,
                         };
+                    }
+                    NetworkMessage::Inv(items) => {
+                        // Handle tx announcements during block sync.
+                        let tx_items: Vec<_> = items.iter()
+                            .filter(|i| matches!(i.inv_type, InvType::Tx | InvType::WitnessTx))
+                            .collect();
+                        if !tx_items.is_empty() {
+                            debug!(count = tx_items.len(), "received tx inv announcements during block sync");
+                        }
+                    }
+                    NetworkMessage::Tx(tx) => {
+                        let txid = tx.txid();
+                        debug!(%txid, "received transaction from peer during block sync");
                     }
                     NetworkMessage::Ping(nonce) => {
                         if let Err(e) = peer.send_message(NetworkMessage::Pong(nonce)).await {
@@ -1267,5 +1480,138 @@ mod tests {
             mgr.get_undo(0).is_none(),
             "fresh reorg manager should have no undo data"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Checkpoint save/load tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_checkpoint_save_and_load() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let cp = Checkpoint::new(50_000, BlockHash::ZERO);
+
+        save_checkpoint(dir.path(), &cp).expect("save should succeed");
+
+        let loaded = load_checkpoint(dir.path());
+        assert!(loaded.is_some(), "checkpoint should be loadable");
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.height, 50_000);
+        assert_eq!(loaded, cp);
+    }
+
+    #[test]
+    fn test_checkpoint_load_missing() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let loaded = load_checkpoint(dir.path());
+        assert!(loaded.is_none(), "missing checkpoint should return None");
+    }
+
+    #[test]
+    fn test_checkpoint_load_corrupt() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("checkpoint.json");
+        std::fs::write(&path, "this is not json").expect("write should succeed");
+
+        let loaded = load_checkpoint(dir.path());
+        assert!(loaded.is_none(), "corrupt checkpoint should return None");
+    }
+
+    #[test]
+    fn test_checkpoint_serialization_roundtrip() {
+        let cp = Checkpoint {
+            height: 840_000,
+            hash: "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f".to_string(),
+        };
+        let json = serde_json::to_string(&cp).expect("serialize should succeed");
+        let deserialized: Checkpoint = serde_json::from_str(&json).expect("deserialize should succeed");
+        assert_eq!(cp, deserialized);
+    }
+
+    // -----------------------------------------------------------------------
+    // PersistentUtxoSet construction tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_persistent_utxo_set_construction() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let db_path = dir.path().join("utxo.redb");
+
+        let persistent = open_persistent_utxo_set(&db_path);
+        assert!(persistent.is_some(), "should be able to open persistent UTXO set");
+
+        let persistent = persistent.unwrap();
+        assert_eq!(persistent.cache_len(), 0, "fresh set should have empty cache");
+    }
+
+    #[test]
+    fn test_sync_manager_with_datadir() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+
+        let params = ChainParams::regtest();
+        let cs = Arc::new(RwLock::new(ChainState::new(params)));
+        let pm = Arc::new(RwLock::new(PeerManager::new(Network::Regtest)));
+        let sync_params = ChainParams::regtest();
+
+        let sm = SyncManager::with_datadir(
+            Network::Regtest,
+            cs,
+            pm,
+            sync_params,
+            dir.path().to_path_buf(),
+        );
+
+        assert_eq!(*sm.state(), SyncState::Idle);
+        assert!(sm.datadir().is_some());
+        assert!(sm.has_persistent_utxo(), "should have persistent UTXO set when datadir is configured");
+    }
+
+    #[test]
+    fn test_sync_manager_without_datadir_has_no_persistent_utxo() {
+        let sm = make_sync_manager();
+        assert!(sm.datadir().is_none());
+        assert!(!sm.has_persistent_utxo());
+    }
+
+    // -----------------------------------------------------------------------
+    // Steady-state inv handling tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_inv_type_filtering() {
+        // Verify that the inv type filter logic correctly separates
+        // block and tx items.
+        let items = vec![
+            InvItem {
+                inv_type: InvType::Tx,
+                hash: btc_primitives::hash::Hash256::from_bytes([0x01; 32]),
+            },
+            InvItem {
+                inv_type: InvType::WitnessTx,
+                hash: btc_primitives::hash::Hash256::from_bytes([0x02; 32]),
+            },
+            InvItem {
+                inv_type: InvType::Block,
+                hash: btc_primitives::hash::Hash256::from_bytes([0x03; 32]),
+            },
+            InvItem {
+                inv_type: InvType::WitnessBlock,
+                hash: btc_primitives::hash::Hash256::from_bytes([0x04; 32]),
+            },
+            InvItem {
+                inv_type: InvType::Error,
+                hash: btc_primitives::hash::Hash256::from_bytes([0x05; 32]),
+            },
+        ];
+
+        let tx_items: Vec<_> = items.iter()
+            .filter(|i| matches!(i.inv_type, InvType::Tx | InvType::WitnessTx))
+            .collect();
+        assert_eq!(tx_items.len(), 2, "should find 2 tx inv items");
+
+        let block_items: Vec<_> = items.iter()
+            .filter(|i| matches!(i.inv_type, InvType::Block | InvType::WitnessBlock))
+            .collect();
+        assert_eq!(block_items.len(), 2, "should find 2 block inv items");
     }
 }

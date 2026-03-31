@@ -5,6 +5,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use tracing::info;
 
+use btc_primitives::block::Block;
+use btc_primitives::encode::Decodable;
+
 use crate::methods::*;
 
 // ---------------------------------------------------------------------------
@@ -95,6 +98,8 @@ pub struct RpcHandler {
     peer_count: Arc<AtomicU64>,
     mempool_size: Arc<AtomicU64>,
     mempool_bytes: Arc<AtomicU64>,
+    /// Fee deltas for prioritised transactions (txid hex -> satoshi delta).
+    priority_deltas: Arc<RwLock<HashMap<String, i64>>>,
 }
 
 impl RpcHandler {
@@ -140,6 +145,7 @@ impl RpcHandler {
             peer_count,
             mempool_size,
             mempool_bytes,
+            priority_deltas: Arc::new(RwLock::new(HashMap::new())),
         };
 
         // --- getblockchaininfo ---
@@ -328,6 +334,163 @@ impl RpcHandler {
             });
         }
 
+        // ---------------------------------------------------------------
+        // Mining RPCs
+        // ---------------------------------------------------------------
+
+        // --- getblocktemplate ---
+        {
+            let height = handler.chain_height.clone();
+            let hash = handler.best_hash.clone();
+            handler.register(METHOD_GETBLOCKTEMPLATE, move |_params| {
+                let h = height.load(Ordering::SeqCst);
+                let bh = hash.read().unwrap().clone();
+                // Difficulty-1 target in compact form
+                let bits: u32 = 0x1d00ffff;
+                // Expand bits to 256-bit target hex
+                let target_hex = compact_bits_to_target_hex(bits);
+                let curtime = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0) as u64;
+                // Coinbase value: subsidy for next block height (no fees from empty tx list)
+                let subsidy = block_subsidy_sats(h + 1);
+
+                serde_json::json!({
+                    "version": 536870912_u32,
+                    "previousblockhash": bh,
+                    "transactions": [],
+                    "coinbasevalue": subsidy,
+                    "target": target_hex,
+                    "mintime": curtime.saturating_sub(600),
+                    "curtime": curtime,
+                    "height": h + 1,
+                    "bits": format!("{:08x}", bits)
+                })
+            });
+        }
+
+        // --- submitblock ---
+        handler.register(METHOD_SUBMITBLOCK, |params| {
+            let block_hex = match params.get(0).and_then(|v| v.as_str()) {
+                Some(h) => h,
+                None => {
+                    return serde_json::json!("invalid parameter: expected hex string");
+                }
+            };
+
+            let raw = match hex::decode(block_hex) {
+                Ok(b) => b,
+                Err(e) => {
+                    return serde_json::json!(format!("invalid hex: {}", e));
+                }
+            };
+
+            let mut cursor = std::io::Cursor::new(&raw[..]);
+            match Block::decode(&mut cursor) {
+                Ok(block) => {
+                    // Basic structural validation
+                    if block.transactions.is_empty() {
+                        return serde_json::json!("block must have at least one transaction");
+                    }
+                    if !block.transactions[0].is_coinbase() {
+                        return serde_json::json!("first transaction must be coinbase");
+                    }
+                    // Structural validation passed; full chain validation is not yet wired up.
+                    serde_json::json!(null)
+                }
+                Err(e) => {
+                    serde_json::json!(format!("decode error: {}", e))
+                }
+            }
+        });
+
+        // --- getmininginfo ---
+        {
+            let height = handler.chain_height.clone();
+            let net = handler.network.clone();
+            handler.register(METHOD_GETMININGINFO, move |_params| {
+                let h = height.load(Ordering::SeqCst);
+                let bits: u32 = 0x1d00ffff;
+                let difficulty = compact_bits_to_difficulty(bits);
+                // Simple estimate: difficulty * 2^32 / 600
+                let hashps = difficulty * 4_294_967_296.0 / 600.0;
+                serde_json::json!({
+                    "blocks": h,
+                    "difficulty": difficulty,
+                    "networkhashps": hashps,
+                    "chain": net
+                })
+            });
+        }
+
+        // --- getnetworkhashps ---
+        handler.register(METHOD_GETNETWORKHASHPS, |params| {
+            let _nblocks = params.get(0).and_then(|v| v.as_i64()).unwrap_or(120);
+            let _height = params.get(1).and_then(|v| v.as_i64()).unwrap_or(-1);
+            let bits: u32 = 0x1d00ffff;
+            let difficulty = compact_bits_to_difficulty(bits);
+            // Simple formula: difficulty * 2^32 / target_spacing(600s)
+            let hashps = difficulty * 4_294_967_296.0 / 600.0;
+            serde_json::json!(hashps)
+        });
+
+        // --- prioritisetransaction ---
+        {
+            let deltas = handler.priority_deltas.clone();
+            handler.register(METHOD_PRIORITISETRANSACTION, move |params| {
+                let txid = match params.get(0).and_then(|v| v.as_str()) {
+                    Some(t) => t.to_string(),
+                    None => {
+                        return serde_json::json!(false);
+                    }
+                };
+                // params[1] is the dummy value (ignored, for Bitcoin Core compat)
+                let fee_delta = match params.get(2).and_then(|v| v.as_i64())
+                    .or_else(|| params.get(1).and_then(|v| v.as_i64()))
+                {
+                    Some(d) => d,
+                    None => {
+                        return serde_json::json!(false);
+                    }
+                };
+                let mut guard = deltas.write().unwrap();
+                let entry = guard.entry(txid).or_insert(0);
+                *entry += fee_delta;
+                serde_json::json!(true)
+            });
+        }
+
+        // --- generatetoaddress ---
+        {
+            let net = handler.network.clone();
+            handler.register(METHOD_GENERATETOADDRESS, move |params| {
+                if net != "regtest" {
+                    return serde_json::json!({
+                        "error": "generatetoaddress is only available in regtest mode"
+                    });
+                }
+                let nblocks = match params.get(0).and_then(|v| v.as_u64()) {
+                    Some(n) => n,
+                    None => {
+                        return serde_json::json!(null);
+                    }
+                };
+                let _address = match params.get(1).and_then(|v| v.as_str()) {
+                    Some(a) => a.to_string(),
+                    None => {
+                        return serde_json::json!(null);
+                    }
+                };
+                // In regtest, generate nblocks placeholder hashes.
+                // Real block generation requires full chain integration.
+                let hashes: Vec<String> = (0..nblocks)
+                    .map(|i| format!("{:064x}", i + 1))
+                    .collect();
+                serde_json::json!(hashes)
+            });
+        }
+
         handler
     }
 
@@ -415,12 +578,75 @@ impl RpcHandler {
     pub fn should_shutdown(&self) -> bool {
         self.shutdown_flag.load(Ordering::SeqCst)
     }
+
+    /// Get the priority delta for a transaction (for testing/introspection).
+    pub fn get_priority_delta(&self, txid: &str) -> Option<i64> {
+        let guard = self.priority_deltas.read().unwrap();
+        guard.get(txid).copied()
+    }
 }
 
 impl Default for RpcHandler {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Mining helper functions
+// ---------------------------------------------------------------------------
+
+/// Compute block subsidy in satoshis for a given height.
+fn block_subsidy_sats(height: u64) -> u64 {
+    let halvings = height / 210_000;
+    if halvings >= 64 {
+        return 0;
+    }
+    50 * 100_000_000u64 >> halvings
+}
+
+/// Convert compact bits to floating-point difficulty.
+fn compact_bits_to_difficulty(bits: u32) -> f64 {
+    let exponent = (bits >> 24) as u32;
+    let mantissa = (bits & 0x00ff_ffff) as f64;
+    if mantissa == 0.0 {
+        return 0.0;
+    }
+    // difficulty_1_target mantissa / current mantissa * 2^(8*(0x1d - exponent))
+    let diff1_mantissa = 0x00ffffu64 as f64;
+    let shift = 8 * (0x1d_u32.wrapping_sub(exponent)) as i32;
+    diff1_mantissa / mantissa * 2f64.powi(shift)
+}
+
+/// Expand compact bits to a 64-hex-char target string (big-endian).
+fn compact_bits_to_target_hex(bits: u32) -> String {
+    let mut target = [0u8; 32];
+    let exponent = (bits >> 24) as usize;
+    let mantissa = bits & 0x00ff_ffff;
+    if mantissa != 0 && exponent > 0 && (bits & 0x0080_0000) == 0 {
+        if exponent <= 3 {
+            let m = mantissa >> (8 * (3 - exponent));
+            target[31] = (m & 0xff) as u8;
+            if exponent >= 2 {
+                target[30] = ((m >> 8) & 0xff) as u8;
+            }
+            if exponent >= 3 {
+                target[29] = ((m >> 16) & 0xff) as u8;
+            }
+        } else {
+            let start = 32usize.saturating_sub(exponent);
+            if start < 32 {
+                target[start] = ((mantissa >> 16) & 0xff) as u8;
+            }
+            if start + 1 < 32 {
+                target[start + 1] = ((mantissa >> 8) & 0xff) as u8;
+            }
+            if start + 2 < 32 {
+                target[start + 2] = (mantissa & 0xff) as u8;
+            }
+        }
+    }
+    hex::encode(target)
 }
 
 // ---------------------------------------------------------------------------
@@ -778,5 +1004,156 @@ mod tests {
                 "0000000000000000000000000000000000000000000000000000000000000000"
             )
         );
+    }
+
+    // -- Mining RPC tests --
+
+    #[test]
+    fn test_getblocktemplate_returns_valid_json() {
+        let handler = RpcHandler::new();
+        handler.update_chain_state(810000, "0000000000000000000000000000000000000000000000000000000000abcdef");
+        let req = make_request(METHOD_GETBLOCKTEMPLATE, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        let result = resp.result.unwrap();
+
+        // Required GBT fields
+        assert_eq!(result["version"], 536870912);
+        assert_eq!(
+            result["previousblockhash"],
+            "0000000000000000000000000000000000000000000000000000000000abcdef"
+        );
+        assert!(result["transactions"].is_array());
+        assert!(result["coinbasevalue"].is_number());
+        assert!(result["target"].is_string());
+        assert!(result["mintime"].is_number());
+        assert!(result["curtime"].is_number());
+        assert_eq!(result["height"], 810001);
+        assert!(result["bits"].is_string());
+        // bits should be 8 hex chars
+        assert_eq!(result["bits"].as_str().unwrap().len(), 8);
+    }
+
+    #[test]
+    fn test_submitblock_invalid_hex() {
+        let handler = RpcHandler::new();
+        let req = make_request(METHOD_SUBMITBLOCK, serde_json::json!(["zzzz_not_hex"]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none()); // returns a result, not an RPC-level error
+        let result = resp.result.unwrap();
+        let msg = result.as_str().unwrap();
+        assert!(msg.contains("invalid hex"), "expected hex error, got: {}", msg);
+    }
+
+    #[test]
+    fn test_submitblock_truncated_data() {
+        let handler = RpcHandler::new();
+        // Valid hex but not a valid block (too short)
+        let req = make_request(METHOD_SUBMITBLOCK, serde_json::json!(["aabbccdd"]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        let result = resp.result.unwrap();
+        let msg = result.as_str().unwrap();
+        assert!(msg.contains("decode error"), "expected decode error, got: {}", msg);
+    }
+
+    #[test]
+    fn test_getmininginfo_returns_required_fields() {
+        let handler = RpcHandler::new();
+        handler.update_chain_state(810000, "00000000000000000000");
+        let req = make_request(METHOD_GETMININGINFO, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        let result = resp.result.unwrap();
+
+        assert_eq!(result["blocks"], 810000);
+        assert!(result["difficulty"].is_number());
+        assert!(result["difficulty"].as_f64().unwrap() > 0.0);
+        assert!(result["networkhashps"].is_number());
+        assert_eq!(result["chain"], "main");
+    }
+
+    #[test]
+    fn test_getnetworkhashps_returns_number() {
+        let handler = RpcHandler::new();
+        let req = make_request(METHOD_GETNETWORKHASHPS, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        let result = resp.result.unwrap();
+        assert!(result.is_number());
+        assert!(result.as_f64().unwrap() > 0.0);
+    }
+
+    #[test]
+    fn test_prioritisetransaction_stores_delta() {
+        let handler = RpcHandler::new();
+        let txid = "aaaa000000000000000000000000000000000000000000000000000000000001";
+
+        // Should return true
+        let req = make_request(
+            METHOD_PRIORITISETRANSACTION,
+            serde_json::json!([txid, 0, 5000]),
+        );
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        assert_eq!(resp.result.unwrap(), serde_json::json!(true));
+
+        // Verify stored delta
+        assert_eq!(handler.get_priority_delta(txid), Some(5000));
+
+        // Apply another delta -- should accumulate
+        let req = make_request(
+            METHOD_PRIORITISETRANSACTION,
+            serde_json::json!([txid, 0, -2000]),
+        );
+        let resp = handler.handle(&req);
+        assert_eq!(resp.result.unwrap(), serde_json::json!(true));
+        assert_eq!(handler.get_priority_delta(txid), Some(3000));
+    }
+
+    #[test]
+    fn test_generatetoaddress_non_regtest_returns_error() {
+        // Default handler is "main" network
+        let handler = RpcHandler::new();
+        let req = make_request(
+            METHOD_GENERATETOADDRESS,
+            serde_json::json!([1, "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"]),
+        );
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        let result = resp.result.unwrap();
+        // Should contain an error message, not an array of hashes
+        assert!(result["error"].is_string());
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap()
+                .contains("regtest"),
+        );
+    }
+
+    #[test]
+    fn test_generatetoaddress_regtest_returns_hashes() {
+        let handler = RpcHandler::new_with_state(
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(RwLock::new("00".repeat(32))),
+            "regtest".to_string(),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        );
+        let req = make_request(
+            METHOD_GENERATETOADDRESS,
+            serde_json::json!([3, "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"]),
+        );
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        let result = resp.result.unwrap();
+        let arr = result.as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        // Each entry should be a 64-char hex hash
+        for hash in arr {
+            assert_eq!(hash.as_str().unwrap().len(), 64);
+        }
     }
 }
