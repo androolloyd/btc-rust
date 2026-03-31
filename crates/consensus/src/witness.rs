@@ -61,6 +61,12 @@ pub enum WitnessError {
 
     #[error("P2SH redeem script verification failed")]
     P2shRedeemFailed,
+
+    #[error("non-empty witness for non-witness input")]
+    UnexpectedWitness,
+
+    #[error("scriptSig must be empty for native segwit spend")]
+    ScriptSigNotEmpty,
 }
 
 /// Verify a witness program against its witness data.
@@ -410,7 +416,7 @@ pub fn verify_input(
     let input_amount = prev_output.value.as_sat();
 
     // Check for native segwit outputs
-    if script_pubkey.is_witness_program() {
+    if script_pubkey.is_witness_program() && flags.verify_witness {
         let spk_bytes = script_pubkey.as_bytes();
         // Extract witness version and program
         let version = match spk_bytes[0] {
@@ -420,10 +426,20 @@ pub fn verify_input(
         };
         let program = &spk_bytes[2..]; // skip version byte and push length byte
 
-        // Get the witness for this input
-        let witness = tx.witness.get(input_index)
-            .cloned()
-            .unwrap_or_default();
+        // For native segwit, scriptSig MUST be empty (BIP141 anti-malleability)
+        if !tx.inputs[input_index].script_sig.is_empty() {
+            return Err(WitnessError::ScriptSigNotEmpty);
+        }
+
+        // Get the witness for this input — check bounds properly rather than
+        // silently creating an empty witness with unwrap_or_default()
+        let witness = if input_index < tx.witness.len() {
+            tx.witness[input_index].clone()
+        } else {
+            // Transaction has no witness data for this input — it's a legacy tx
+            // spending a witness program, which is invalid
+            return Err(WitnessError::EmptyWitness);
+        };
 
         return verify_witness_program(
             version,
@@ -435,6 +451,9 @@ pub fn verify_input(
             sig_verifier,
             flags,
         );
+    } else if script_pubkey.is_witness_program() && !flags.verify_witness {
+        // Witness flag not set — treat as legacy (succeed)
+        return Ok(());
     }
 
     // Check for P2SH (which may wrap segwit)
@@ -465,9 +484,11 @@ pub fn verify_input(
                     return Err(WitnessError::P2shRedeemFailed);
                 }
 
-                let witness = tx.witness.get(input_index)
-                    .cloned()
-                    .unwrap_or_default();
+                let witness = if input_index < tx.witness.len() {
+                    tx.witness[input_index].clone()
+                } else {
+                    return Err(WitnessError::EmptyWitness);
+                };
 
                 return verify_witness_program(
                     version,
@@ -576,6 +597,14 @@ pub fn verify_input(
 
     if !engine.success() {
         return Err(WitnessError::LegacyScriptFailed);
+    }
+
+    // BIP141: reject non-empty witness for non-witness inputs
+    if flags.verify_witness {
+        let witness = tx.witness.get(input_index).cloned().unwrap_or_default();
+        if !witness.is_empty() {
+            return Err(WitnessError::UnexpectedWitness);
+        }
     }
 
     Ok(())
@@ -1289,5 +1318,171 @@ mod tests {
 
         let result = verify_witness_program(0, &program, &witness, &tx, 0, input_amount, &verifier, &flags);
         assert!(result.is_ok(), "P2WSH CHECKSIG with SIGHASH_ALL should succeed: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_verify_witness_flag_false_skips_verification() {
+        // When verify_witness is false, witness programs should be treated as
+        // legacy scripts and succeed without witness verification.
+        let verifier = Secp256k1Verifier;
+        let mut flags = ScriptFlags::all();
+        flags.verify_witness = false;
+
+        let pubkey_hash = [0xaa; 20];
+        let script_pubkey = ScriptBuf::p2wpkh(&pubkey_hash);
+        let input_amount: i64 = 50_000;
+
+        // Transaction with NO witness data at all -- would fail if witness
+        // verification were attempted, but should succeed when flag is off.
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0xaa; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(49_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76, 0xa9]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let prev_output = TxOut {
+            value: Amount::from_sat(input_amount),
+            script_pubkey,
+        };
+
+        let result = verify_input(&tx, 0, &prev_output, &verifier, &flags);
+        assert!(result.is_ok(), "verify_input with verify_witness=false should succeed: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_unexpected_witness_rejected() {
+        // A legacy (non-witness) input that has non-empty witness data
+        // should be rejected when verify_witness is true (BIP141).
+        let verifier = Secp256k1Verifier;
+        let secp = secp256k1::Secp256k1::new();
+        let (sk, pk) = secp.generate_keypair(&mut secp256k1::rand::thread_rng());
+        let pubkey = pk.serialize().to_vec();
+        let pubkey_hash = hash160(&pubkey);
+
+        // P2PKH scriptPubKey (legacy, not witness)
+        let script_pubkey = ScriptBuf::p2pkh(&pubkey_hash);
+        let input_amount: i64 = 50_000;
+
+        let mut tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0xbb; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(49_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76, 0xa9]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        // Compute legacy sighash and sign
+        let sighash = crate::sighash::sighash_legacy(&tx, 0, script_pubkey.as_bytes(), SighashType::ALL)
+            .expect("legacy sighash should succeed");
+        let msg = secp256k1::Message::from_digest(sighash);
+        let ecdsa_sig = secp.sign_ecdsa(&msg, &sk);
+        let mut sig_bytes = ecdsa_sig.serialize_der().to_vec();
+        sig_bytes.push(SighashType::ALL.0 as u8);
+
+        // Build scriptSig: <sig> <pubkey>
+        let mut script_sig = ScriptBuf::new();
+        script_sig.push_slice(&sig_bytes);
+        script_sig.push_slice(&pubkey);
+        tx.inputs[0].script_sig = script_sig;
+
+        // Add unexpected witness data to a legacy input
+        tx.witness = vec![Witness::from_items(vec![vec![0x01, 0x02, 0x03]])];
+
+        let prev_output = TxOut {
+            value: Amount::from_sat(input_amount),
+            script_pubkey,
+        };
+
+        let flags = ScriptFlags::all(); // verify_witness = true
+        let result = verify_input(&tx, 0, &prev_output, &verifier, &flags);
+        assert!(result.is_err(), "Legacy input with unexpected witness data should fail");
+        match result.unwrap_err() {
+            WitnessError::UnexpectedWitness => {} // expected
+            other => panic!("Expected UnexpectedWitness, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_scriptsig_must_be_empty_for_native_segwit() {
+        // For native segwit spends, scriptSig must be empty (BIP141).
+        let verifier = Secp256k1Verifier;
+        let (sk, pubkey) = generate_keypair();
+        let pubkey_hash = hash160(&pubkey);
+
+        let script_pubkey = ScriptBuf::p2wpkh(&pubkey_hash);
+        let input_amount: i64 = 50_000;
+
+        let mut tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0xaa; 32]), 0),
+                // Non-empty scriptSig for native segwit -- should be rejected
+                script_sig: ScriptBuf::from_bytes(vec![0x00]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(49_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76, 0xa9]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        // Build valid witness
+        let script_code = p2wpkh_script_code(&pubkey_hash);
+        let sighash = sighash_segwit_v0(&tx, 0, &script_code, input_amount, SighashType::ALL).unwrap();
+        let sig = sign_sighash(&sk, &sighash, SighashType::ALL);
+        let witness = Witness::from_items(vec![sig, pubkey]);
+        tx.witness = vec![witness];
+
+        let prev_output = TxOut {
+            value: Amount::from_sat(input_amount),
+            script_pubkey,
+        };
+
+        let flags = ScriptFlags::all();
+        let result = verify_input(&tx, 0, &prev_output, &verifier, &flags);
+        assert!(result.is_err(), "Native segwit with non-empty scriptSig should fail");
+        match result.unwrap_err() {
+            WitnessError::ScriptSigNotEmpty => {} // expected
+            other => panic!("Expected ScriptSigNotEmpty, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_future_witness_versions_succeed_in_verify_witness_program() {
+        // Future witness versions (2-16) must succeed unconditionally.
+        let verifier = Secp256k1Verifier;
+        let flags = ScriptFlags::all();
+        let witness = Witness::from_items(vec![vec![0x01]]);
+        let tx = make_simple_tx(witness.clone());
+
+        // Test version 2 through 16 with various program sizes
+        for version in 2..=16u8 {
+            let program = vec![0xab; 20];
+            let result = verify_witness_program(version, &program, &witness, &tx, 0, 50_000, &verifier, &flags);
+            assert!(result.is_ok(), "Witness version {} should succeed (soft-fork safe): {:?}", version, result.err());
+        }
+
+        // Also test v1 with non-32-byte program (should also succeed as future-safe)
+        let short_program = vec![0xcd; 20];
+        let result = verify_witness_program(1, &short_program, &witness, &tx, 0, 50_000, &verifier, &flags);
+        assert!(result.is_ok(), "Witness v1 with non-32-byte program should succeed: {:?}", result.err());
     }
 }
