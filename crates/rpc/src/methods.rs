@@ -16,3 +16,11 @@ pub const METHOD_GETNETWORKINFO: &str = "getnetworkinfo";
 pub const METHOD_GETBESTBLOCKHASH: &str = "getbestblockhash";
 pub const METHOD_ESTIMATEFEE: &str = "estimatefee";
 pub const METHOD_STOP: &str = "stop";
+
+// Mining RPCs
+pub const METHOD_GETBLOCKTEMPLATE: &str = "getblocktemplate";
+pub const METHOD_SUBMITBLOCK: &str = "submitblock";
+pub const METHOD_GETMININGINFO: &str = "getmininginfo";
+pub const METHOD_GETNETWORKHASHPS: &str = "getnetworkhashps";
+pub const METHOD_PRIORITISETRANSACTION: &str = "prioritisetransaction";
+pub const METHOD_GENERATETOADDRESS: &str = "generatetoaddress";

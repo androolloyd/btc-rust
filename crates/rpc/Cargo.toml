@@ -14,3 +14,4 @@ tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 eyre = { workspace = true }
+hex = { workspace = true }
