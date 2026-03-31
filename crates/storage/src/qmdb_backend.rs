@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -126,6 +127,7 @@ impl Database for QmdbDatabase {
             db: Arc::clone(&self.ads),
             next_height: Arc::clone(&self.next_height),
             ops: Mutex::new(Vec::new()),
+            created_keys: Mutex::new(HashSet::new()),
         })
     }
 }
@@ -227,6 +229,8 @@ pub struct QmdbTxMut {
     next_height: Arc<Mutex<i64>>,
     /// Interior mutability for write buffer — trait methods take `&self`
     ops: Mutex<Vec<WriteOp>>,
+    /// O(1) lookup for keys created in the current batch
+    created_keys: Mutex<HashSet<Vec<u8>>>,
 }
 
 unsafe impl Send for QmdbTxMut {}
@@ -261,11 +265,13 @@ impl QmdbTxMut {
             let (_, found) = shared.read_entry(-1, &key_hash, &key, &mut buf);
             found
         };
-        let mut ops = self.ops.lock().unwrap();
-        let created_in_batch = ops.iter().any(|op| op.key == key && op.op_type == OP_CREATE);
+        let created_in_batch = self.created_keys.lock().unwrap().contains(&key);
 
         let op_type = if exists || created_in_batch { OP_WRITE } else { OP_CREATE };
-        ops.push(WriteOp { op_type, key, value });
+        if op_type == OP_CREATE {
+            self.created_keys.lock().unwrap().insert(key.clone());
+        }
+        self.ops.lock().unwrap().push(WriteOp { op_type, key, value });
     }
 
     fn buffer_delete(&self, key: Vec<u8>, value: Vec<u8>) {

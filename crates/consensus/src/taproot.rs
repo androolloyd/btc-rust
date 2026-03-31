@@ -69,15 +69,7 @@ pub fn tap_leaf_hash(leaf_version: u8, script: &[u8]) -> [u8; 32] {
     let mut msg = Vec::with_capacity(1 + 5 + script.len());
     msg.push(leaf_version);
     // compact_size encoding of script length
-    if script.len() < 0xfd {
-        msg.push(script.len() as u8);
-    } else if script.len() <= 0xffff {
-        msg.push(0xfd);
-        msg.extend_from_slice(&(script.len() as u16).to_le_bytes());
-    } else {
-        msg.push(0xfe);
-        msg.extend_from_slice(&(script.len() as u32).to_le_bytes());
-    }
+    VarInt(script.len() as u64).encode(&mut msg).unwrap();
     msg.extend_from_slice(script);
     tagged_hash(b"TapLeaf", &msg)
 }
