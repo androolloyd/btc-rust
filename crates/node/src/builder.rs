@@ -306,11 +306,12 @@ impl Node {
         // 8. Start sync manager with ExEx sender for notifications
         // -----------------------------------------------------------------
         let sync_params = btc_consensus::validation::ChainParams::from_network(self.config.network);
-        let mut sync_mgr = crate::sync::SyncManager::new(
+        let mut sync_mgr = crate::sync::SyncManager::with_datadir(
             self.config.network,
             chain_state.clone(),
             peer_manager.clone(),
             sync_params,
+            self.config.datadir.clone(),
         );
         sync_mgr.set_exex_sender(exex_manager.sender().clone());
         sync_mgr.set_node_state(node_state.clone());
