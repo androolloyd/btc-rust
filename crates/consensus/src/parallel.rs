@@ -113,17 +113,24 @@ impl ParallelValidator {
 
         let mut work: Vec<WorkItem> = Vec::new();
 
-        for (tx_idx, tx) in block.transactions.iter().enumerate() {
-            // Skip coinbase
-            if tx_idx == 0 {
-                continue;
-            }
+        // Build an intra-block output map for outputs created earlier in this
+        // block that may be spent by later transactions (same-block spends).
+        let mut intra_block: std::collections::HashMap<
+            btc_primitives::transaction::OutPoint,
+            btc_primitives::transaction::TxOut,
+        > = std::collections::HashMap::new();
 
-            for (input_idx, input) in tx.inputs.iter().enumerate() {
-                let prev_output = match utxo_set.get_utxo(&input.previous_output) {
-                    Some(entry) => entry.txout.clone(),
-                    None => {
-                        // Missing UTXO — record as an error immediately.
+        for (tx_idx, tx) in block.transactions.iter().enumerate() {
+            // Skip coinbase inputs (but still register coinbase outputs)
+            if tx_idx > 0 {
+                for (input_idx, input) in tx.inputs.iter().enumerate() {
+                    // Look up the previous output: check intra-block first,
+                    // then fall back to the external UTXO set.
+                    let prev_output = if let Some(txout) = intra_block.get(&input.previous_output) {
+                        txout.clone()
+                    } else if let Some(entry) = utxo_set.get_utxo(&input.previous_output) {
+                        entry.txout.clone()
+                    } else {
                         return Err(vec![(
                             tx_idx,
                             input_idx,
@@ -132,14 +139,21 @@ impl ParallelValidator {
                                 input.previous_output
                             ),
                         )]);
-                    }
-                };
+                    };
 
-                work.push(WorkItem {
-                    tx_idx,
-                    input_idx,
-                    prev_output,
-                });
+                    work.push(WorkItem {
+                        tx_idx,
+                        input_idx,
+                        prev_output,
+                    });
+                }
+            }
+
+            // Register this transaction's outputs for intra-block spending
+            let txid = tx.txid();
+            for (vout, output) in tx.outputs.iter().enumerate() {
+                let outpoint = btc_primitives::transaction::OutPoint::new(txid, vout as u32);
+                intra_block.insert(outpoint, output.clone());
             }
         }
 
