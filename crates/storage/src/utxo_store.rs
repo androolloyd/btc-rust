@@ -54,6 +54,9 @@ pub struct PersistentUtxoSet<DB: Database> {
     ///    `&self` access can occur across threads.
     cache: UnsafeCell<HashMap<OutPoint, UtxoEntry>>,
     cache_size_limit: usize,
+    /// Outpoints that were spent via `apply_update_cached` and need to be
+    /// deleted from the DB on the next `flush_cache()`.
+    pending_deletes: Vec<OutPoint>,
 }
 
 // PersistentUtxoSet is Send if DB is Send (UnsafeCell is Send when inner is Send).
@@ -67,6 +70,7 @@ impl<DB: Database> PersistentUtxoSet<DB> {
             db,
             cache: UnsafeCell::new(HashMap::new()),
             cache_size_limit: DEFAULT_CACHE_SIZE_LIMIT,
+            pending_deletes: Vec::new(),
         }
     }
 
@@ -76,6 +80,7 @@ impl<DB: Database> PersistentUtxoSet<DB> {
             db,
             cache: UnsafeCell::new(HashMap::new()),
             cache_size_limit,
+            pending_deletes: Vec::new(),
         }
     }
 
@@ -112,9 +117,12 @@ impl<DB: Database> PersistentUtxoSet<DB> {
 
     /// Apply a UTXO update to the in-memory cache only (no DB write).
     /// Call `flush_cache()` periodically to persist to disk.
+    /// Tracks spent outpoints in `pending_deletes` so `flush_cache()`
+    /// can delete them from the DB.
     pub fn apply_update_cached(&mut self, update: &UtxoSetUpdate) {
         for (outpoint, _) in &update.spent {
             self.cache.get_mut().remove(outpoint);
+            self.pending_deletes.push(*outpoint);
         }
         for (outpoint, entry) in &update.created {
             self.cache.get_mut().insert(*outpoint, entry.clone());
@@ -122,17 +130,25 @@ impl<DB: Database> PersistentUtxoSet<DB> {
         self.evict_cache();
     }
 
-    /// Write all cached entries to the database and clear the cache.
+    /// Write all cached entries to the database, delete spent UTXOs, and clear.
     pub fn flush_cache(&mut self) -> Result<(), StorageError> {
         let cache = self.cache.get_mut();
-        if cache.is_empty() {
+        if cache.is_empty() && self.pending_deletes.is_empty() {
             return Ok(());
         }
 
         let tx = self.db.tx_mut()?;
+
+        // Delete spent UTXOs from DB
+        for outpoint in &self.pending_deletes {
+            tx.delete_utxo(outpoint)?;
+            let meta_outpoint = OutPoint::new(outpoint.txid, outpoint.vout | 0x8000_0000);
+            tx.delete_utxo(&meta_outpoint)?;
+        }
+
+        // Write created/cached UTXOs to DB
         for (outpoint, entry) in cache.iter() {
             tx.put_utxo(outpoint, &entry.txout)?;
-            // Inline metadata write to avoid borrowing `self`.
             let meta_outpoint = OutPoint::new(outpoint.txid, outpoint.vout | 0x8000_0000);
             let meta_txout = TxOut {
                 value: Amount::from_sat(entry.height as i64),
@@ -143,6 +159,7 @@ impl<DB: Database> PersistentUtxoSet<DB> {
         tx.commit()?;
 
         cache.clear();
+        self.pending_deletes.clear();
         Ok(())
     }
 

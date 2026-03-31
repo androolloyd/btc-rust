@@ -253,11 +253,9 @@ impl SyncManager {
         datadir: PathBuf,
     ) -> Self {
         // Load checkpoint — tells us where we left off
-        let checkpoint = load_checkpoint(&datadir);
-        let resume_height = checkpoint.as_ref().map(|cp| {
+        if let Some(cp) = load_checkpoint(&datadir) {
             info!(height = cp.height, hash = %cp.hash, "resuming from checkpoint");
-            cp.height
-        }).unwrap_or(0);
+        }
 
         // Open persistent UTXO database
         let db_path = datadir.join("utxo.qmdb");
