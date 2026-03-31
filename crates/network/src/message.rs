@@ -80,6 +80,20 @@ pub enum NetworkMessage {
     Addr(Vec<NetAddress>),
     SendHeaders,
     FeeFilter(u64),
+    WtxidRelay,
+    NotFound(Vec<InvItem>),
+    Reject {
+        message: String,
+        code: u8,
+        reason: String,
+        data: Vec<u8>,
+    },
+    MemPool,
+    GetAddr,
+    SendCmpct {
+        announce: bool,
+        version: u64,
+    },
     Unknown(String, Vec<u8>),
 }
 
@@ -100,6 +114,12 @@ impl NetworkMessage {
             NetworkMessage::Addr(_) => "addr",
             NetworkMessage::SendHeaders => "sendheaders",
             NetworkMessage::FeeFilter(_) => "feefilter",
+            NetworkMessage::WtxidRelay => "wtxidrelay",
+            NetworkMessage::NotFound(_) => "notfound",
+            NetworkMessage::Reject { .. } => "reject",
+            NetworkMessage::MemPool => "mempool",
+            NetworkMessage::GetAddr => "getaddr",
+            NetworkMessage::SendCmpct { .. } => "sendcmpct",
             NetworkMessage::Unknown(cmd, _) => cmd,
         }
     }
@@ -186,5 +206,23 @@ mod tests {
         assert_eq!(NetworkMessage::Verack.command(), "verack");
         assert_eq!(NetworkMessage::Ping(0).command(), "ping");
         assert_eq!(NetworkMessage::SendHeaders.command(), "sendheaders");
+        assert_eq!(NetworkMessage::WtxidRelay.command(), "wtxidrelay");
+        assert_eq!(NetworkMessage::NotFound(vec![]).command(), "notfound");
+        assert_eq!(NetworkMessage::MemPool.command(), "mempool");
+        assert_eq!(NetworkMessage::GetAddr.command(), "getaddr");
+        assert_eq!(
+            NetworkMessage::SendCmpct { announce: false, version: 1 }.command(),
+            "sendcmpct"
+        );
+        assert_eq!(
+            NetworkMessage::Reject {
+                message: String::new(),
+                code: 0,
+                reason: String::new(),
+                data: vec![],
+            }
+            .command(),
+            "reject"
+        );
     }
 }

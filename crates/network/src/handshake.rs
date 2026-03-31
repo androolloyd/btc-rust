@@ -5,6 +5,9 @@ use btc_primitives::network::Network;
 use crate::message::{NetAddress, NetworkMessage, VersionMessage};
 use crate::protocol::{ProtocolVersion, ServiceFlags, USER_AGENT};
 
+/// Compact block protocol version we support (BIP152).
+const SENDCMPCT_VERSION: u64 = 2;
+
 /// State machine for the Bitcoin version handshake.
 ///
 /// The outbound handshake follows this sequence:
@@ -100,9 +103,24 @@ impl Handshake {
 
         match msg {
             NetworkMessage::Version(ver) => {
+                let peer_version = ver.version;
                 self.peer_version = Some(ver.clone());
                 // After receiving version, send verack
                 responses.push(NetworkMessage::Verack);
+
+                // Send wtxidrelay if peer supports it (BIP339, protocol >= 70016)
+                if peer_version >= ProtocolVersion::WTXID_RELAY.0 {
+                    responses.push(NetworkMessage::WtxidRelay);
+                }
+
+                // Send sendcmpct if peer supports compact blocks (BIP152, protocol >= 70014)
+                if peer_version >= ProtocolVersion::COMPACT_BLOCKS.0 {
+                    responses.push(NetworkMessage::SendCmpct {
+                        announce: false,
+                        version: SENDCMPCT_VERSION,
+                    });
+                }
+
                 match self.state {
                     HandshakeState::VersionSent => {
                         self.state = HandshakeState::VerackSent;
@@ -186,8 +204,17 @@ mod tests {
         };
         let responses = hs.process_message(&NetworkMessage::Version(peer_version));
         assert_eq!(hs.state(), HandshakeState::VerackSent);
-        assert_eq!(responses.len(), 1);
+        // Should send: verack, wtxidrelay, sendcmpct
+        assert_eq!(responses.len(), 3);
         assert!(matches!(responses[0], NetworkMessage::Verack));
+        assert!(matches!(responses[1], NetworkMessage::WtxidRelay));
+        match &responses[2] {
+            NetworkMessage::SendCmpct { announce, version } => {
+                assert!(!announce);
+                assert_eq!(*version, SENDCMPCT_VERSION);
+            }
+            other => panic!("expected SendCmpct, got {:?}", other),
+        }
         assert!(hs.peer_version().is_some());
 
         // Step 3: we receive peer's verack

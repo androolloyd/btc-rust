@@ -280,6 +280,35 @@ pub fn encode_payload(msg: &NetworkMessage) -> Result<Vec<u8>, EncodeError> {
         NetworkMessage::FeeFilter(rate) => {
             buf.write_u64_le(*rate)?;
         }
+        NetworkMessage::WtxidRelay => {} // empty payload
+        NetworkMessage::NotFound(items) => {
+            encode_inv_vec(items, &mut buf)?;
+        }
+        NetworkMessage::Reject {
+            message,
+            code,
+            reason,
+            data,
+        } => {
+            // var_str message
+            let msg_bytes = message.as_bytes();
+            VarInt(msg_bytes.len() as u64).encode(&mut buf)?;
+            buf.write_all(msg_bytes)?;
+            // u8 code
+            buf.write_u8(*code)?;
+            // var_str reason
+            let reason_bytes = reason.as_bytes();
+            VarInt(reason_bytes.len() as u64).encode(&mut buf)?;
+            buf.write_all(reason_bytes)?;
+            // extra data (e.g. hash)
+            buf.extend_from_slice(data);
+        }
+        NetworkMessage::MemPool => {} // empty payload
+        NetworkMessage::GetAddr => {} // empty payload
+        NetworkMessage::SendCmpct { announce, version } => {
+            buf.write_u8(if *announce { 1 } else { 0 })?;
+            buf.write_u64_le(*version)?;
+        }
         NetworkMessage::Unknown(_, data) => {
             buf.extend_from_slice(data);
         }
@@ -317,6 +346,38 @@ pub fn decode_payload(command: &str, payload: &[u8]) -> Result<NetworkMessage, E
         "feefilter" => {
             let rate = cursor.read_u64_le()?;
             Ok(NetworkMessage::FeeFilter(rate))
+        }
+        "wtxidrelay" => Ok(NetworkMessage::WtxidRelay),
+        "notfound" => Ok(NetworkMessage::NotFound(decode_inv_vec(&mut cursor)?)),
+        "reject" => {
+            // var_str message
+            let msg_len = VarInt::decode(&mut cursor)?.0 as usize;
+            let msg_bytes = cursor.read_bytes(msg_len)?;
+            let message = String::from_utf8(msg_bytes)
+                .map_err(|e| EncodeError::InvalidData(e.to_string()))?;
+            // u8 code
+            let code = cursor.read_u8()?;
+            // var_str reason
+            let reason_len = VarInt::decode(&mut cursor)?.0 as usize;
+            let reason_bytes = cursor.read_bytes(reason_len)?;
+            let reason = String::from_utf8(reason_bytes)
+                .map_err(|e| EncodeError::InvalidData(e.to_string()))?;
+            // remaining bytes are extra data (e.g. txid/block hash)
+            let pos = cursor.position() as usize;
+            let data = payload[pos..].to_vec();
+            Ok(NetworkMessage::Reject {
+                message,
+                code,
+                reason,
+                data,
+            })
+        }
+        "mempool" => Ok(NetworkMessage::MemPool),
+        "getaddr" => Ok(NetworkMessage::GetAddr),
+        "sendcmpct" => {
+            let announce = cursor.read_u8()? != 0;
+            let version = cursor.read_u64_le()?;
+            Ok(NetworkMessage::SendCmpct { announce, version })
         }
         other => Ok(NetworkMessage::Unknown(
             other.to_string(),
@@ -823,6 +884,136 @@ mod tests {
         // Provide only part of the data
         let mut partial = buf.split_to(full_len - 1);
         assert!(codec.decode(&mut partial).unwrap().is_none());
+    }
+
+    // --- Roundtrip tests for new message types ---
+
+    #[test]
+    fn test_wtxidrelay_roundtrip() {
+        match roundtrip(NetworkMessage::WtxidRelay) {
+            NetworkMessage::WtxidRelay => {}
+            other => panic!("expected WtxidRelay, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_notfound_roundtrip() {
+        let items = vec![
+            InvItem {
+                inv_type: InvType::Tx,
+                hash: Hash256::from_bytes([0xdd; 32]),
+            },
+            InvItem {
+                inv_type: InvType::WitnessTx,
+                hash: Hash256::from_bytes([0xee; 32]),
+            },
+        ];
+        match roundtrip(NetworkMessage::NotFound(items.clone())) {
+            NetworkMessage::NotFound(decoded) => assert_eq!(decoded, items),
+            other => panic!("expected NotFound, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_notfound_empty_roundtrip() {
+        match roundtrip(NetworkMessage::NotFound(vec![])) {
+            NetworkMessage::NotFound(decoded) => assert!(decoded.is_empty()),
+            other => panic!("expected NotFound, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_reject_roundtrip() {
+        let msg = NetworkMessage::Reject {
+            message: "tx".to_string(),
+            code: 0x10, // REJECT_INVALID
+            reason: "mandatory-script-verify-flag-failed".to_string(),
+            data: vec![0xab; 32], // txid
+        };
+        match roundtrip(msg) {
+            NetworkMessage::Reject {
+                message,
+                code,
+                reason,
+                data,
+            } => {
+                assert_eq!(message, "tx");
+                assert_eq!(code, 0x10);
+                assert_eq!(reason, "mandatory-script-verify-flag-failed");
+                assert_eq!(data, vec![0xab; 32]);
+            }
+            other => panic!("expected Reject, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_reject_empty_data_roundtrip() {
+        let msg = NetworkMessage::Reject {
+            message: "version".to_string(),
+            code: 0x11,
+            reason: "obsolete".to_string(),
+            data: vec![],
+        };
+        match roundtrip(msg) {
+            NetworkMessage::Reject {
+                message,
+                code,
+                reason,
+                data,
+            } => {
+                assert_eq!(message, "version");
+                assert_eq!(code, 0x11);
+                assert_eq!(reason, "obsolete");
+                assert!(data.is_empty());
+            }
+            other => panic!("expected Reject, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_mempool_roundtrip() {
+        match roundtrip(NetworkMessage::MemPool) {
+            NetworkMessage::MemPool => {}
+            other => panic!("expected MemPool, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_getaddr_roundtrip() {
+        match roundtrip(NetworkMessage::GetAddr) {
+            NetworkMessage::GetAddr => {}
+            other => panic!("expected GetAddr, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_sendcmpct_roundtrip() {
+        let msg = NetworkMessage::SendCmpct {
+            announce: true,
+            version: 2,
+        };
+        match roundtrip(msg) {
+            NetworkMessage::SendCmpct { announce, version } => {
+                assert!(announce);
+                assert_eq!(version, 2);
+            }
+            other => panic!("expected SendCmpct, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_sendcmpct_no_announce_roundtrip() {
+        let msg = NetworkMessage::SendCmpct {
+            announce: false,
+            version: 1,
+        };
+        match roundtrip(msg) {
+            NetworkMessage::SendCmpct { announce, version } => {
+                assert!(!announce);
+                assert_eq!(version, 1);
+            }
+            other => panic!("expected SendCmpct, got {:?}", other),
+        }
     }
 
     #[test]
