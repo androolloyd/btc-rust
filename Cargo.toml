@@ -10,6 +10,7 @@ members = [
     "crates/node",
     "crates/mempool",
     "crates/exex",
+    "crates/test-harness",
 ]
 resolver = "2"
 
@@ -31,6 +32,7 @@ btc-rpc = { path = "crates/rpc" }
 btc-node = { path = "crates/node" }
 btc-mempool = { path = "crates/mempool" }
 btc-exex = { path = "crates/exex" }
+btc-test = { path = "crates/test-harness" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

@@ -1,0 +1,20 @@
+[package]
+name = "btc-test"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+btc-primitives = { workspace = true }
+btc-consensus = { workspace = true }
+btc-storage = { workspace = true }
+btc-mempool = { workspace = true }
+btc-network = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+secp256k1 = { workspace = true }
+sha2 = { workspace = true }
+ripemd = { workspace = true }
+rand = { workspace = true }
+hex = { workspace = true }

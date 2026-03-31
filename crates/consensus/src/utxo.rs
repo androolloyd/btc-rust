@@ -232,6 +232,11 @@ impl InMemoryUtxoSet {
         self.map.is_empty()
     }
 
+    /// Iterate over all entries in the UTXO set.
+    pub fn iter(&self) -> impl Iterator<Item = (&OutPoint, &UtxoEntry)> {
+        self.map.iter()
+    }
+
     /// Apply a `UtxoSetUpdate` forward (connect): remove spent, add created.
     pub fn apply_update(&mut self, update: &UtxoSetUpdate) {
         for (outpoint, _) in &update.spent {

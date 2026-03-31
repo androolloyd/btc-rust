@@ -12,6 +12,7 @@ btc-storage = { workspace = true }
 btc-network = { workspace = true }
 btc-stages = { workspace = true }
 btc-rpc = { workspace = true }
+btc-exex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 clap = { workspace = true }

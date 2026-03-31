@@ -2,6 +2,7 @@ pub mod block_filter;
 pub mod block_template;
 pub mod chain;
 pub mod checkpoints;
+pub mod opcode_plugin;
 pub mod reorg;
 pub mod script_engine;
 pub mod sighash;
@@ -14,6 +15,7 @@ pub mod witness;
 pub mod parallel;
 
 pub use block_template::{build_block_template, BlockTemplate};
+pub use opcode_plugin::{OpcodePlugin, OpcodeRegistry, OpcodeContext, OpcodeExecContext, OpCheckTemplateVerify, OpCat};
 pub use chain::ChainState;
 pub use checkpoints::Checkpoints;
 pub use reorg::ReorgManager;

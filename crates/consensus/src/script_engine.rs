@@ -3,6 +3,7 @@ use btc_primitives::hash::{sha256, sha256d, hash160};
 use btc_primitives::transaction::Transaction;
 use crate::sig_verify::SignatureVerifier;
 use crate::sighash::{sighash_legacy, SighashType};
+use crate::opcode_plugin::{OpcodeRegistry, OpcodeExecContext};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -74,6 +75,10 @@ pub struct ScriptEngine<'a> {
     last_codeseparator_pos: Option<usize>,
     /// Raw bytes of the currently executing script (set during execute())
     script_code_bytes: Vec<u8>,
+    /// Optional registry of pluggable opcodes. When set, the engine consults
+    /// this registry before returning `InvalidOpcode` (or `DisabledOpcode` if
+    /// a plugin overrides a disabled opcode like OP_CAT).
+    opcode_registry: Option<&'a OpcodeRegistry>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -129,6 +134,34 @@ impl<'a> ScriptEngine<'a> {
             input_amount,
             last_codeseparator_pos: None,
             script_code_bytes: Vec::new(),
+            opcode_registry: None,
+        }
+    }
+
+    /// Create a ScriptEngine with a pluggable opcode registry.
+    ///
+    /// The registry is consulted when the engine encounters an opcode byte that
+    /// would otherwise return `InvalidOpcode` (or `DisabledOpcode` when a
+    /// plugin overrides a disabled opcode like OP_CAT).
+    pub fn new_with_registry(
+        sig_verifier: &'a dyn SignatureVerifier,
+        flags: ScriptFlags,
+        tx: Option<&'a Transaction>,
+        input_index: usize,
+        input_amount: i64,
+        opcode_registry: Option<&'a OpcodeRegistry>,
+    ) -> Self {
+        ScriptEngine {
+            stack: Vec::new(),
+            altstack: Vec::new(),
+            sig_verifier,
+            flags,
+            tx,
+            input_index,
+            input_amount,
+            last_codeseparator_pos: None,
+            script_code_bytes: Vec::new(),
+            opcode_registry,
         }
     }
 
@@ -603,16 +636,46 @@ impl<'a> ScriptEngine<'a> {
                 }
             }
 
-            // NOPs (soft-fork safe)
+            // NOPs (soft-fork safe) — if a plugin is registered, delegate to it;
+            // otherwise treat as NOP (the original behavior).
             Opcode::OP_NOP1 | Opcode::OP_NOP4 | Opcode::OP_NOP5 |
             Opcode::OP_NOP6 | Opcode::OP_NOP7 | Opcode::OP_NOP8 |
-            Opcode::OP_NOP9 | Opcode::OP_NOP10 => {}
+            Opcode::OP_NOP9 | Opcode::OP_NOP10 => {
+                if let Some(registry) = self.opcode_registry {
+                    if let Some(plugin) = registry.get(op.to_u8()) {
+                        let mut ctx = OpcodeExecContext {
+                            stack: &mut self.stack,
+                            altstack: &mut self.altstack,
+                            tx: self.tx,
+                            input_index: self.input_index,
+                            input_amount: self.input_amount,
+                            flags: &self.flags,
+                        };
+                        plugin.execute(&mut ctx)?;
+                    }
+                }
+                // If no plugin registered, silently succeed (NOP behavior)
+            }
 
-            // Disabled opcodes
+            // Disabled opcodes — if a plugin overrides one (e.g. OP_CAT in
+            // tapscript), delegate to the plugin instead of failing.
             Opcode::OP_CAT | Opcode::OP_SUBSTR | Opcode::OP_LEFT | Opcode::OP_RIGHT |
             Opcode::OP_INVERT | Opcode::OP_AND | Opcode::OP_OR | Opcode::OP_XOR |
             Opcode::OP_2MUL | Opcode::OP_2DIV | Opcode::OP_MUL | Opcode::OP_DIV |
             Opcode::OP_MOD | Opcode::OP_LSHIFT | Opcode::OP_RSHIFT => {
+                if let Some(registry) = self.opcode_registry {
+                    if let Some(plugin) = registry.get(op.to_u8()) {
+                        let mut ctx = OpcodeExecContext {
+                            stack: &mut self.stack,
+                            altstack: &mut self.altstack,
+                            tx: self.tx,
+                            input_index: self.input_index,
+                            input_amount: self.input_amount,
+                            flags: &self.flags,
+                        };
+                        return plugin.execute(&mut ctx);
+                    }
+                }
                 return Err(ScriptError::DisabledOpcode(op));
             }
 
@@ -752,7 +815,25 @@ impl<'a> ScriptEngine<'a> {
                 }
             }
 
-            _ => return Err(ScriptError::InvalidOpcode(op)),
+            _ => {
+                if let Some(registry) = self.opcode_registry {
+                    if let Some(plugin) = registry.get(op.to_u8()) {
+                        let mut ctx = OpcodeExecContext {
+                            stack: &mut self.stack,
+                            altstack: &mut self.altstack,
+                            tx: self.tx,
+                            input_index: self.input_index,
+                            input_amount: self.input_amount,
+                            flags: &self.flags,
+                        };
+                        plugin.execute(&mut ctx)?;
+                    } else {
+                        return Err(ScriptError::InvalidOpcode(op));
+                    }
+                } else {
+                    return Err(ScriptError::InvalidOpcode(op));
+                }
+            }
         }
         Ok(())
     }
