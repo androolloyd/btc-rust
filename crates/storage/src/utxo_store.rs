@@ -110,6 +110,18 @@ impl<DB: Database> PersistentUtxoSet<DB> {
         Ok(())
     }
 
+    /// Apply a UTXO update to the in-memory cache only (no DB write).
+    /// Call `flush_cache()` periodically to persist to disk.
+    pub fn apply_update_cached(&mut self, update: &UtxoSetUpdate) {
+        for (outpoint, _) in &update.spent {
+            self.cache.get_mut().remove(outpoint);
+        }
+        for (outpoint, entry) in &update.created {
+            self.cache.get_mut().insert(*outpoint, entry.clone());
+        }
+        self.evict_cache();
+    }
+
     /// Write all cached entries to the database and clear the cache.
     pub fn flush_cache(&mut self) -> Result<(), StorageError> {
         let cache = self.cache.get_mut();

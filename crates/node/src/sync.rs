@@ -949,15 +949,18 @@ impl SyncManager {
                         }
 
                         // -------------------------------------------------
-                        // Step 4b: Apply UTXO updates to persistent set
+                        // Step 4b: Persist UTXO updates in batches of 500 blocks
+                        // The in-memory UTXO set (Step 4) has the authoritative
+                        // state; we only persist periodically for crash recovery.
                         // -------------------------------------------------
                         if let Some(ref mut persistent) = self.persistent_utxo {
-                            if let Err(e) = persistent.apply_update(&utxo_update) {
-                                warn!(
-                                    height = block_height,
-                                    error = %e,
-                                    "failed to persist UTXO update"
-                                );
+                            // Always apply (updates the in-memory cache inside PersistentUtxoSet)
+                            persistent.apply_update_cached(&utxo_update);
+                            // Flush to disk every 500 blocks
+                            if block_height % 500 == 0 {
+                                if let Err(e) = persistent.flush_cache() {
+                                    warn!(height = block_height, error = %e, "failed to flush UTXO cache");
+                                }
                             }
                         }
 
