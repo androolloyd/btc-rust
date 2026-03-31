@@ -1,0 +1,16 @@
+[package]
+name = "btc-exex"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+btc-primitives = { workspace = true }
+btc-consensus = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+eyre = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }

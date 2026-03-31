@@ -8,6 +8,7 @@ members = [
     "crates/rpc",
     "crates/node",
     "crates/mempool",
+    "crates/exex",
 ]
 resolver = "2"
 
@@ -28,6 +29,7 @@ btc-stages = { path = "crates/stages" }
 btc-rpc = { path = "crates/rpc" }
 btc-node = { path = "crates/node" }
 btc-mempool = { path = "crates/mempool" }
+btc-exex = { path = "crates/exex" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
