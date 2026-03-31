@@ -242,7 +242,7 @@ impl SyncManager {
     }
 
     /// Create a `SyncManager` with a data directory for checkpoint and UTXO
-    /// persistence.  If the redb database at `{datadir}/utxo.redb` can be
+    /// persistence.  If the redb database at `{datadir}/utxo.qmdb` can be
     /// opened, a `PersistentUtxoSet` is initialised and UTXO updates are
     /// persisted to disk during IBD.
     pub fn with_datadir(
@@ -258,7 +258,7 @@ impl SyncManager {
         }
 
         // Attempt to open the persistent UTXO database.
-        let db_path = datadir.join("utxo.redb");
+        let db_path = datadir.join("utxo.qmdb");
         let persistent_utxo = open_persistent_utxo_set(&db_path);
         if persistent_utxo.is_some() {
             info!(path = %db_path.display(), "persistent UTXO set opened");
@@ -1601,7 +1601,7 @@ mod tests {
     #[test]
     fn test_persistent_utxo_set_construction() {
         let dir = tempfile::tempdir().expect("failed to create temp dir");
-        let db_path = dir.path().join("utxo.redb");
+        let db_path = dir.path().join("utxo.qmdb");
 
         let persistent = open_persistent_utxo_set(&db_path);
         assert!(persistent.is_some(), "should be able to open persistent UTXO set");
