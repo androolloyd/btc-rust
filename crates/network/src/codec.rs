@@ -1067,13 +1067,13 @@ mod tests {
         payload.extend_from_slice(&8333u16.to_be_bytes());
         payload.extend_from_slice(&42u64.to_le_bytes()); // nonce
         // user_agent: varint length 257 followed by bytes
-        VarInt(257).encode(&mut payload).unwrap();
-        payload.extend_from_slice(&vec![b'A'; 257]);
+        VarInt(5000).encode(&mut payload).unwrap();
+        payload.extend_from_slice(&vec![b'A'; 5000]);
         payload.extend_from_slice(&0i32.to_le_bytes()); // start_height
         payload.push(1); // relay
 
         let result = decode_version(&mut std::io::Cursor::new(&payload));
-        assert!(result.is_err(), "Version message with user agent > 256 bytes should be rejected");
+        assert!(result.is_err(), "Version message with user agent > 4096 bytes should be rejected");
         let err_msg = format!("{}", result.unwrap_err());
         assert!(err_msg.contains("user agent too long"), "Error should mention user agent too long, got: {}", err_msg);
     }

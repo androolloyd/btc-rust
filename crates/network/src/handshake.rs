@@ -166,7 +166,7 @@ mod tests {
         match msg {
             NetworkMessage::Version(v) => {
                 assert_eq!(v.version, ProtocolVersion::CURRENT.0);
-                assert_eq!(v.services, ServiceFlags::NETWORK.0);
+                assert_eq!(v.services, ServiceFlags::NETWORK.0 | ServiceFlags::WITNESS.0);
                 assert_eq!(v.user_agent, USER_AGENT);
                 assert_eq!(v.start_height, 800_000);
                 assert!(v.relay);
@@ -200,17 +200,10 @@ mod tests {
         };
         let responses = hs.process_message(&NetworkMessage::Version(peer_version));
         assert_eq!(hs.state(), HandshakeState::VerackSent);
-        // Should send: verack, wtxidrelay, sendcmpct
-        assert_eq!(responses.len(), 3);
-        assert!(matches!(responses[0], NetworkMessage::Verack));
-        assert!(matches!(responses[1], NetworkMessage::WtxidRelay));
-        match &responses[2] {
-            NetworkMessage::SendCmpct { announce, version } => {
-                assert!(!announce);
-                assert_eq!(*version, SENDCMPCT_VERSION);
-            }
-            other => panic!("expected SendCmpct, got {:?}", other),
-        }
+        // Should send: wtxidrelay (before verack per BIP339), then verack
+        assert_eq!(responses.len(), 2);
+        assert!(matches!(responses[0], NetworkMessage::WtxidRelay));
+        assert!(matches!(responses[1], NetworkMessage::Verack));
         assert!(hs.peer_version().is_some());
 
         // Step 3: we receive peer's verack

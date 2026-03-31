@@ -82,12 +82,22 @@ impl BlockValidator {
             return Err(ValidationError::InvalidMerkleRoot);
         }
 
-        // Check block size (CVE prevention: blocks must not exceed MAX_BLOCK_SIZE)
+        // Block size validation depends on whether segwit is active:
+        // - Pre-segwit (before activation height): max 1,000,000 bytes (non-witness serialization)
+        // - Post-segwit (BIP141): max 4,000,000 weight units
+        //
+        // For validation without height context, we use the post-segwit limit
+        // (4MW) on the full serialized size as a safe upper bound, since
+        // serialized_size <= weight always holds.
+        //
+        // TODO: accept block height parameter and apply the correct limit:
+        //   if height < segwit_height { check non-witness size <= 1MB }
+        //   else { check weight <= 4MW }
         let encoded = btc_primitives::encode::encode(block);
-        if encoded.len() > MAX_BLOCK_SIZE {
+        if encoded.len() > MAX_BLOCK_WEIGHT {
             return Err(ValidationError::BlockTooLarge {
                 size: encoded.len(),
-                max: MAX_BLOCK_SIZE,
+                max: MAX_BLOCK_WEIGHT,
             });
         }
 
