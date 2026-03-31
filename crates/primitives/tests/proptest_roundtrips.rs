@@ -38,7 +38,8 @@ fn arb_txin() -> impl Strategy<Value = TxIn> {
 }
 
 fn arb_txout() -> impl Strategy<Value = TxOut> {
-    (any::<i64>(), arb_script(100)).prop_map(|(value, script_pubkey)| {
+    // Only generate valid (non-negative, <= MAX_MONEY) output values
+    (0i64..=2_100_000_000_000_000i64, arb_script(100)).prop_map(|(value, script_pubkey)| {
         TxOut {
             value: Amount::from_sat(value),
             script_pubkey,

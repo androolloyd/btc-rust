@@ -1051,4 +1051,56 @@ mod tests {
             other => panic!("expected Pong, got {:?}", other),
         }
     }
+
+    #[test]
+    fn test_version_message_rejects_long_user_agent() {
+        // Build a raw version message payload with a user agent > 256 bytes
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&70016u32.to_le_bytes()); // version
+        payload.extend_from_slice(&1u64.to_le_bytes());     // services
+        payload.extend_from_slice(&1_700_000_000i64.to_le_bytes()); // timestamp
+        // receiver net_address (26 bytes)
+        payload.extend_from_slice(&1u64.to_le_bytes()); // services
+        payload.extend_from_slice(&[0u8; 16]);           // ip
+        payload.extend_from_slice(&8333u16.to_be_bytes()); // port
+        // sender net_address (26 bytes)
+        payload.extend_from_slice(&1u64.to_le_bytes());
+        payload.extend_from_slice(&[0u8; 16]);
+        payload.extend_from_slice(&8333u16.to_be_bytes());
+        payload.extend_from_slice(&42u64.to_le_bytes()); // nonce
+        // user_agent: varint length 257 followed by bytes
+        VarInt(257).encode(&mut payload).unwrap();
+        payload.extend_from_slice(&vec![b'A'; 257]);
+        payload.extend_from_slice(&0i32.to_le_bytes()); // start_height
+        payload.push(1); // relay
+
+        let result = decode_version(&mut std::io::Cursor::new(&payload));
+        assert!(result.is_err(), "Version message with user agent > 256 bytes should be rejected");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("user agent too long"), "Error should mention user agent too long, got: {}", err_msg);
+    }
+
+    #[test]
+    fn test_version_message_accepts_valid_user_agent() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&70016u32.to_le_bytes());
+        payload.extend_from_slice(&1u64.to_le_bytes());
+        payload.extend_from_slice(&1_700_000_000i64.to_le_bytes());
+        payload.extend_from_slice(&1u64.to_le_bytes());
+        payload.extend_from_slice(&[0u8; 16]);
+        payload.extend_from_slice(&8333u16.to_be_bytes());
+        payload.extend_from_slice(&1u64.to_le_bytes());
+        payload.extend_from_slice(&[0u8; 16]);
+        payload.extend_from_slice(&8333u16.to_be_bytes());
+        payload.extend_from_slice(&42u64.to_le_bytes());
+        // user_agent: 10 bytes (valid)
+        VarInt(10).encode(&mut payload).unwrap();
+        payload.extend_from_slice(b"btc-rust/1");
+        payload.extend_from_slice(&0i32.to_le_bytes());
+        payload.push(1);
+
+        let result = decode_version(&mut std::io::Cursor::new(&payload));
+        assert!(result.is_ok(), "Version message with valid user agent should succeed");
+        assert_eq!(result.unwrap().user_agent, "btc-rust/1");
+    }
 }

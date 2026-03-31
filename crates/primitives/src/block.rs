@@ -234,4 +234,29 @@ mod tests {
         c3[32..].copy_from_slice(&p2);
         assert_eq!(root, sha256d(&c3));
     }
+
+    #[test]
+    fn test_block_decode_tx_count_limit() {
+        // Construct a raw block with tx_count > 100_000 in the header
+        let mut buf = Vec::new();
+        // Write a valid 80-byte block header
+        let header = BlockHeader {
+            version: 1,
+            prev_blockhash: BlockHash::ZERO,
+            merkle_root: TxHash::from_bytes([0u8; 32]),
+            time: 1231006505,
+            bits: CompactTarget::MAX_TARGET,
+            nonce: 0,
+        };
+        header.encode(&mut buf).unwrap();
+        // Write tx_count as varint > 100_000 (use 0xFE prefix for 4-byte varint)
+        // 100_001 = 0x000186A1
+        buf.push(0xFE); // varint prefix for 4-byte
+        buf.extend_from_slice(&100_001u32.to_le_bytes());
+
+        let result = encode::decode::<Block>(&buf);
+        assert!(result.is_err(), "Block with >100k transactions should be rejected");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("too many transactions"), "Error should mention too many transactions, got: {}", err_msg);
+    }
 }

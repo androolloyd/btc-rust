@@ -404,6 +404,39 @@ mod tests {
     }
 
     #[test]
+    fn test_negative_txout_value_rejected() {
+        // Build a raw TxOut with a negative value
+        let mut buf = Vec::new();
+        // value: -1 as i64 LE
+        buf.extend_from_slice(&(-1i64).to_le_bytes());
+        // script_pubkey: empty (varint 0)
+        buf.push(0x00);
+        let result = encode::decode::<TxOut>(&buf);
+        assert!(result.is_err(), "Negative TxOut value should be rejected");
+    }
+
+    #[test]
+    fn test_txout_value_exceeding_max_money_rejected() {
+        // Build a raw TxOut with value exceeding MAX_MONEY
+        let excessive = Amount::MAX_MONEY.as_sat() + 1;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&excessive.to_le_bytes());
+        buf.push(0x00); // empty script_pubkey
+        let result = encode::decode::<TxOut>(&buf);
+        assert!(result.is_err(), "TxOut value exceeding MAX_MONEY should be rejected");
+    }
+
+    #[test]
+    fn test_valid_txout_value_accepted() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(50_000i64).to_le_bytes());
+        buf.push(0x00);
+        let result = encode::decode::<TxOut>(&buf);
+        assert!(result.is_ok(), "Valid TxOut value should be accepted");
+        assert_eq!(result.unwrap().value.as_sat(), 50_000);
+    }
+
+    #[test]
     fn test_segwit_tx_decode() {
         // A simple segwit transaction (from Bitcoin test vectors)
         // version(4) + marker(1) + flag(1) + vin_count + vin + vout_count + vout + witness + locktime

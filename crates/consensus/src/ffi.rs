@@ -9,7 +9,7 @@
 use std::panic::catch_unwind;
 use std::slice;
 
-use btc_primitives::encode::{self, Decodable};
+use btc_primitives::encode;
 use btc_primitives::script::Script;
 use btc_primitives::transaction::Transaction;
 
@@ -144,10 +144,8 @@ pub extern "C" fn btc_verify_script(
             return 0;
         }
 
-        // The script system considers execution successful if the top of the
-        // stack is truthy after execution. Our engine already checks that
-        // inside `execute`, so reaching here means success.
-        1
+        // After executing both scripts, the top of the stack must be truthy.
+        if engine.success() { 1 } else { 0 }
     });
 
     result.unwrap_or(0)
@@ -226,8 +224,8 @@ pub extern "C" fn btc_sighash(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use btc_primitives::encode::{self, Encodable};
-    use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint, Witness};
+    use btc_primitives::encode;
+    use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint};
     use btc_primitives::script::ScriptBuf;
     use btc_primitives::amount::Amount;
     use btc_primitives::hash::TxHash;

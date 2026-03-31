@@ -11,7 +11,7 @@
 //! ECDH + input-aggregation protocol) but the data structures and address
 //! encoding match the real spec.
 
-use crate::bech32::{bech32_encode, bech32_decode, convert_bits, Bech32Variant, Bech32Error};
+use crate::bech32::{bech32_encode_long, bech32_decode_long, convert_bits, Bech32Variant, Bech32Error};
 use crate::hash::sha256;
 use crate::network::Network;
 use crate::transaction::Transaction;
@@ -83,13 +83,13 @@ impl SilentPaymentAddress {
         // BIP352 addresses don't include a witness-version prefix in the
         // 5-bit data the way segwit addresses do. We simply encode the raw
         // 5-bit groups with bech32m.
-        let encoded = bech32_encode(hrp, &data5, Bech32Variant::Bech32m)?;
+        let encoded = bech32_encode_long(hrp, &data5, Bech32Variant::Bech32m)?;
         Ok(encoded)
     }
 
     /// Decode from a bech32m string.
     pub fn decode(s: &str) -> Result<Self, SilentPaymentError> {
-        let (hrp, data5, variant) = bech32_decode(s)?;
+        let (hrp, data5, variant) = bech32_decode_long(s)?;
 
         if variant != Bech32Variant::Bech32m {
             return Err(SilentPaymentError::WrongVariant);
@@ -245,7 +245,7 @@ pub fn scan_transaction(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transaction::{Transaction, TxIn, TxOut, OutPoint, Witness};
+    use crate::transaction::{Transaction, TxIn, TxOut, OutPoint};
     use crate::script::ScriptBuf;
     use crate::amount::Amount;
     use crate::hash::TxHash;
@@ -318,8 +318,9 @@ mod tests {
     #[test]
     fn test_address_decode_invalid_hrp() {
         // Build a bech32m string with wrong HRP.
+        use crate::bech32::bech32_encode_long;
         let data5 = convert_bits(&[0u8; 67], 8, 5, true).unwrap();
-        let bad = bech32_encode("bc", &data5, Bech32Variant::Bech32m).unwrap();
+        let bad = bech32_encode_long("bc", &data5, Bech32Variant::Bech32m).unwrap();
         let err = SilentPaymentAddress::decode(&bad).unwrap_err();
         assert!(matches!(err, SilentPaymentError::InvalidHrp(_)));
     }

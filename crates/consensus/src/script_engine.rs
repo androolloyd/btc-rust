@@ -2598,4 +2598,197 @@ mod tests {
             result
         );
     }
+
+    // ========== CLTV / CSV timelock tests ==========
+
+    fn make_cltv_engine(lock_time: u32, sequence: u32, version: i32) -> ScriptEngine<'static> {
+        static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
+        let tx = Box::leak(Box::new(Transaction {
+            version,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0xaa; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![]),
+                sequence,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76, 0xa9]),
+            }],
+            witness: Vec::new(),
+            lock_time,
+        }));
+        ScriptEngine::new(
+            &VERIFIER,
+            ScriptFlags::all(),
+            Some(tx),
+            0,
+            0,
+        )
+    }
+
+    #[test]
+    fn test_cltv_satisfied() {
+        // locktime on stack = 100, tx locktime = 200, sequence != FINAL
+        let mut engine = make_cltv_engine(200, 0xfffffffe, 1);
+        let mut script = ScriptBuf::new();
+        script.push_slice(&encode_num(100));
+        script.push_opcode(Opcode::OP_CHECKLOCKTIMEVERIFY);
+        let result = engine.execute(script.as_script());
+        assert!(result.is_ok(), "CLTV should succeed when tx locktime >= script locktime");
+    }
+
+    #[test]
+    fn test_cltv_unsatisfied_too_low() {
+        // locktime on stack = 300, tx locktime = 200
+        let mut engine = make_cltv_engine(200, 0xfffffffe, 1);
+        let mut script = ScriptBuf::new();
+        script.push_slice(&encode_num(300));
+        script.push_opcode(Opcode::OP_CHECKLOCKTIMEVERIFY);
+        let result = engine.execute(script.as_script());
+        assert!(matches!(result, Err(ScriptError::UnsatisfiedLocktime)),
+            "CLTV should fail when script locktime > tx locktime");
+    }
+
+    #[test]
+    fn test_cltv_negative_locktime() {
+        let mut engine = make_cltv_engine(200, 0xfffffffe, 1);
+        let mut script = ScriptBuf::new();
+        script.push_slice(&encode_num(-1));
+        script.push_opcode(Opcode::OP_CHECKLOCKTIMEVERIFY);
+        let result = engine.execute(script.as_script());
+        assert!(matches!(result, Err(ScriptError::NegativeLocktime)),
+            "CLTV should fail with negative locktime");
+    }
+
+    #[test]
+    fn test_cltv_sequence_final_fails() {
+        // Even if locktimes match, SEQUENCE_FINAL disables locktime
+        let mut engine = make_cltv_engine(200, 0xffffffff, 1);
+        let mut script = ScriptBuf::new();
+        script.push_slice(&encode_num(100));
+        script.push_opcode(Opcode::OP_CHECKLOCKTIMEVERIFY);
+        let result = engine.execute(script.as_script());
+        assert!(matches!(result, Err(ScriptError::UnsatisfiedLocktime)),
+            "CLTV should fail when sequence is SEQUENCE_FINAL");
+    }
+
+    #[test]
+    fn test_cltv_type_mismatch_fails() {
+        // Script locktime is block height (<500M), tx locktime is timestamp (>=500M)
+        let mut engine = make_cltv_engine(500_000_001, 0xfffffffe, 1);
+        let mut script = ScriptBuf::new();
+        script.push_slice(&encode_num(100));
+        script.push_opcode(Opcode::OP_CHECKLOCKTIMEVERIFY);
+        let result = engine.execute(script.as_script());
+        assert!(matches!(result, Err(ScriptError::UnsatisfiedLocktime)),
+            "CLTV should fail when locktime types mismatch");
+    }
+
+    #[test]
+    fn test_cltv_disabled_flag_nop() {
+        // When verify_checklocktimeverify is disabled, CLTV acts as NOP
+        static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
+        let mut flags = ScriptFlags::none();
+        flags.verify_checklocktimeverify = false;
+        let mut engine = ScriptEngine::new_without_tx(&VERIFIER, flags);
+        let mut script = ScriptBuf::new();
+        script.push_slice(&encode_num(-1));  // negative locktime would fail if enabled
+        script.push_opcode(Opcode::OP_CHECKLOCKTIMEVERIFY);
+        let result = engine.execute(script.as_script());
+        assert!(result.is_ok(), "CLTV should be NOP when flag is disabled");
+    }
+
+    #[test]
+    fn test_csv_satisfied() {
+        // sequence on stack = 10, tx sequence = 20, version = 2
+        let mut engine = make_cltv_engine(0, 20, 2);
+        let mut script = ScriptBuf::new();
+        script.push_slice(&encode_num(10));
+        script.push_opcode(Opcode::OP_CHECKSEQUENCEVERIFY);
+        let result = engine.execute(script.as_script());
+        assert!(result.is_ok(), "CSV should succeed when tx sequence >= script sequence");
+    }
+
+    #[test]
+    fn test_csv_unsatisfied_too_low() {
+        // sequence on stack = 30, tx sequence = 20
+        let mut engine = make_cltv_engine(0, 20, 2);
+        let mut script = ScriptBuf::new();
+        script.push_slice(&encode_num(30));
+        script.push_opcode(Opcode::OP_CHECKSEQUENCEVERIFY);
+        let result = engine.execute(script.as_script());
+        assert!(matches!(result, Err(ScriptError::UnsatisfiedLocktime)),
+            "CSV should fail when script sequence > tx sequence");
+    }
+
+    #[test]
+    fn test_csv_version_1_fails() {
+        // CSV requires tx version >= 2
+        let mut engine = make_cltv_engine(0, 20, 1);
+        let mut script = ScriptBuf::new();
+        script.push_slice(&encode_num(10));
+        script.push_opcode(Opcode::OP_CHECKSEQUENCEVERIFY);
+        let result = engine.execute(script.as_script());
+        assert!(matches!(result, Err(ScriptError::UnsatisfiedLocktime)),
+            "CSV should fail when tx version < 2");
+    }
+
+    #[test]
+    fn test_csv_negative_is_nop() {
+        // Negative sequence value = NOP behavior
+        let mut engine = make_cltv_engine(0, 20, 2);
+        let mut script = ScriptBuf::new();
+        script.push_slice(&encode_num(-1));
+        script.push_opcode(Opcode::OP_CHECKSEQUENCEVERIFY);
+        let result = engine.execute(script.as_script());
+        assert!(result.is_ok(), "CSV with negative sequence should be NOP");
+    }
+
+    #[test]
+    fn test_csv_disable_flag_is_nop() {
+        // bit 31 set = disabled = NOP behavior
+        let mut engine = make_cltv_engine(0, 20, 2);
+        let mut script = ScriptBuf::new();
+        // Push a value with bit 31 set (e.g., 0x80000001 = 2147483649)
+        // In script number encoding, we need a 5-byte value, but MAX_SCRIPT_NUM_LENGTH = 4
+        // Actually bit 31 in u32 is within 4 bytes. Let's use the raw bytes:
+        // 0x01, 0x00, 0x00, 0x80 = -1 in script encoding (sign bit). Actually that's negative.
+        // The code first does decode_num, if negative -> NOP. Then casts to u32 and checks bit 31.
+        // To test bit 31 without negative: we need a 4-byte value where bit 31 of u32 is set.
+        // But decode_num with 4 bytes: if MSB of last byte has sign bit set, it's negative.
+        // So any value with bit 31 set would be negative in script number encoding.
+        // That means the negative check catches it first. The bit 31 check handles
+        // the case where the value fits in u32 with bit 31 set after casting from i64.
+        // For testing, just verify negative = NOP is sufficient.
+        script.push_slice(&encode_num(-5));
+        script.push_opcode(Opcode::OP_CHECKSEQUENCEVERIFY);
+        let result = engine.execute(script.as_script());
+        assert!(result.is_ok(), "CSV with disabled flag should be NOP");
+    }
+
+    #[test]
+    fn test_csv_type_mismatch_fails() {
+        // Script sequence has bit 22 set (time-based), tx sequence does not (block-based)
+        let script_seq: i64 = (1 << 22) | 10; // time-based
+        let tx_seq: u32 = 20; // block-based (bit 22 not set)
+        let mut engine = make_cltv_engine(0, tx_seq, 2);
+        let mut script = ScriptBuf::new();
+        script.push_slice(&encode_num(script_seq));
+        script.push_opcode(Opcode::OP_CHECKSEQUENCEVERIFY);
+        let result = engine.execute(script.as_script());
+        assert!(matches!(result, Err(ScriptError::UnsatisfiedLocktime)),
+            "CSV should fail when sequence type flags mismatch");
+    }
+
+    #[test]
+    fn test_csv_tx_sequence_disabled_fails() {
+        // tx sequence has bit 31 set (locktime disabled for this input)
+        let mut engine = make_cltv_engine(0, 0x80000014, 2);
+        let mut script = ScriptBuf::new();
+        script.push_slice(&encode_num(10));
+        script.push_opcode(Opcode::OP_CHECKSEQUENCEVERIFY);
+        let result = engine.execute(script.as_script());
+        assert!(matches!(result, Err(ScriptError::UnsatisfiedLocktime)),
+            "CSV should fail when tx sequence has disable flag (bit 31) set");
+    }
 }

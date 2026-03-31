@@ -247,6 +247,96 @@ pub fn bech32_decode(s: &str) -> Result<(String, Vec<u8>, Bech32Variant), Bech32
 }
 
 // ---------------------------------------------------------------------------
+// Long-form bech32 encode / decode (no 90-character limit)
+// ---------------------------------------------------------------------------
+
+/// Encode data as a bech32 string without the BIP173 90-character limit.
+///
+/// This is needed for protocols like BIP352 (Silent Payments) whose addresses
+/// are longer than 90 characters.
+pub fn bech32_encode_long(hrp: &str, data: &[u8], variant: Bech32Variant) -> Result<String, Bech32Error> {
+    if hrp.is_empty() {
+        return Err(Bech32Error::EmptyHrp);
+    }
+    if hrp.len() > 83 {
+        return Err(Bech32Error::HrpTooLong);
+    }
+    for b in hrp.bytes() {
+        if b < 33 || b > 126 {
+            return Err(Bech32Error::InvalidHrpChar);
+        }
+    }
+
+    let checksum = bech32_create_checksum(hrp, data, variant);
+
+    let mut result = String::with_capacity(hrp.len() + 1 + data.len() + 6);
+    for c in hrp.chars() {
+        result.push(c.to_ascii_lowercase());
+    }
+    result.push('1');
+    for &d in data.iter().chain(checksum.iter()) {
+        result.push(CHARSET[d as usize] as char);
+    }
+
+    Ok(result)
+}
+
+/// Decode a bech32 string without the BIP173 90-character limit.
+///
+/// Identical to `bech32_decode` but skips the length check, which is needed for
+/// BIP352 silent payment addresses.
+pub fn bech32_decode_long(s: &str) -> Result<(String, Vec<u8>, Bech32Variant), Bech32Error> {
+    let has_lower = s.chars().any(|c| c.is_ascii_lowercase());
+    let has_upper = s.chars().any(|c| c.is_ascii_uppercase());
+    if has_lower && has_upper {
+        return Err(Bech32Error::MixedCase);
+    }
+
+    let s_lower = s.to_ascii_lowercase();
+
+    // No 90-character limit here (unlike bech32_decode).
+
+    let sep_pos = s_lower.rfind('1').ok_or(Bech32Error::MissingSeparator)?;
+    if sep_pos == 0 {
+        return Err(Bech32Error::EmptyHrp);
+    }
+
+    let hrp = &s_lower[..sep_pos];
+    let data_part = &s_lower[sep_pos + 1..];
+
+    if data_part.len() < 6 {
+        return Err(Bech32Error::DataTooShort);
+    }
+
+    for b in hrp.bytes() {
+        if b < 33 || b > 126 {
+            return Err(Bech32Error::InvalidHrpChar);
+        }
+    }
+
+    let mut data: Vec<u8> = Vec::with_capacity(data_part.len());
+    for c in data_part.chars() {
+        let byte = c as u32;
+        if byte >= 128 {
+            return Err(Bech32Error::InvalidChar(c));
+        }
+        let val = CHARSET_REV[byte as usize];
+        if val < 0 {
+            return Err(Bech32Error::InvalidChar(c));
+        }
+        data.push(val as u8);
+    }
+
+    let variant = bech32_verify_checksum(hrp, &data)
+        .ok_or(Bech32Error::InvalidChecksum)?;
+
+    let data_len = data.len() - 6;
+    data.truncate(data_len);
+
+    Ok((hrp.to_string(), data, variant))
+}
+
+// ---------------------------------------------------------------------------
 // Bit conversion helpers
 // ---------------------------------------------------------------------------
 
