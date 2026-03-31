@@ -122,13 +122,11 @@ fn decode_inv_item<R: Read>(r: &mut R) -> Result<InvItem, EncodeError> {
         2 => InvType::Block,
         3 => InvType::FilteredBlock,
         4 => InvType::CompactBlock,
+        5 => InvType::WtxId,
         0x40000001 => InvType::WitnessTx,
         0x40000002 => InvType::WitnessBlock,
-        other => {
-            return Err(EncodeError::InvalidData(format!(
-                "unknown inv type: {other}"
-            )))
-        }
+        // Treat unknown inv types as Error rather than failing the entire message
+        _ => InvType::Error,
     };
     let hash = btc_primitives::hash::Hash256::from_bytes(r.read_hash256()?);
     Ok(InvItem { inv_type, hash })

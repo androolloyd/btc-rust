@@ -159,6 +159,7 @@ pub enum InvType {
     Block = 2,
     FilteredBlock = 3,
     CompactBlock = 4,
+    WtxId = 5,
     WitnessTx = 0x40000001,
     WitnessBlock = 0x40000002,
 }
