@@ -319,12 +319,9 @@ impl ChainState {
             return self.params.pow_limit;
         }
 
-        // On signet, difficulty is fixed to the genesis target (pow_limit).
-        // Signet blocks are signed by a trusted authority, so difficulty
-        // adjustment is not used.
-        if self.params.network == btc_primitives::network::Network::Signet {
-            return self.params.pow_limit;
-        }
+        // Signet uses the SAME difficulty retarget algorithm as mainnet.
+        // The only signet-specific validation is the block signing challenge
+        // (handled separately in signet.rs). Difficulty adjusts normally.
 
         // Only adjust every DIFFICULTY_ADJUSTMENT_INTERVAL blocks.
         if height % DIFFICULTY_ADJUSTMENT_INTERVAL != 0 {
