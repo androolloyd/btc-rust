@@ -394,13 +394,6 @@ pub fn sighash_taproot(
     let base = hash_type.base_type();
     let anyone_can_pay = hash_type.anyone_can_pay();
 
-    // BIP340 tagged hash: SHA256(SHA256("TapSighash") || SHA256("TapSighash") || msg)
-    static TAP_SIGHASH_TAG: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
-    let tag_hash = TAP_SIGHASH_TAG.get_or_init(|| sha256(b"TapSighash"));
-    let mut hasher_input = Vec::new();
-    hasher_input.extend_from_slice(tag_hash);
-    hasher_input.extend_from_slice(tag_hash);
-
     let mut msg = Vec::with_capacity(256);
 
     // Epoch (0x00)
@@ -500,8 +493,7 @@ pub fn sighash_taproot(
         msg.write_u32_le(0xffffffff)?; // code_separator_pos (none)
     }
 
-    hasher_input.extend_from_slice(&msg);
-    Ok(sha256(&hasher_input))
+    Ok(crate::taproot::tagged_hash(b"TapSighash", &msg))
 }
 
 /// Remove all occurrences of an opcode from a script.

@@ -5,6 +5,7 @@
 //! - BIP341: Taproot key path and script path spending
 //! - BIP342: Tapscript opcodes (OP_CHECKSIGADD, etc.)
 
+use btc_primitives::encode::{VarInt, Encodable};
 use btc_primitives::hash::sha256;
 use btc_primitives::script::{Opcode, Script, ScriptBuf};
 use btc_primitives::transaction::{Transaction, TxOut, Witness};

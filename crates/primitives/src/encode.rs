@@ -224,9 +224,17 @@ impl Encodable for Vec<u8> {
     }
 }
 
+/// Maximum size for a single decoded byte vector (32 MB — matches P2P max payload)
+const MAX_VEC_DECODE_SIZE: usize = 32 * 1024 * 1024;
+
 impl Decodable for Vec<u8> {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, EncodeError> {
         let len = VarInt::decode(reader)?.0 as usize;
+        if len > MAX_VEC_DECODE_SIZE {
+            return Err(EncodeError::InvalidData(
+                format!("vec length {} exceeds maximum {}", len, MAX_VEC_DECODE_SIZE)
+            ));
+        }
         reader.read_bytes(len)
     }
 }

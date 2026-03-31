@@ -172,6 +172,9 @@ fn encode_getheaders<W: Write>(
 fn decode_getheaders<R: Read>(r: &mut R) -> Result<GetHeadersMessage, EncodeError> {
     let version = r.read_u32_le()?;
     let count = VarInt::decode(r)?.0 as usize;
+    if count > 101 {
+        return Err(EncodeError::InvalidData("too many locator hashes".into()));
+    }
     let mut locator_hashes = Vec::with_capacity(count.min(101));
     for _ in 0..count {
         locator_hashes.push(btc_primitives::hash::BlockHash::from_bytes(
@@ -205,6 +208,9 @@ fn decode_headers<R: Read>(
     r: &mut R,
 ) -> Result<Vec<btc_primitives::block::BlockHeader>, EncodeError> {
     let count = VarInt::decode(r)?.0 as usize;
+    if count > 2_000 {
+        return Err(EncodeError::InvalidData("too many headers".into()));
+    }
     let mut headers = Vec::with_capacity(count.min(2000));
     for _ in 0..count {
         headers.push(btc_primitives::block::BlockHeader::decode(r)?);
@@ -226,6 +232,9 @@ fn encode_addr_vec<W: Write>(addrs: &[NetAddress], w: &mut W) -> Result<usize, E
 
 fn decode_addr_vec<R: Read>(r: &mut R) -> Result<Vec<NetAddress>, EncodeError> {
     let count = VarInt::decode(r)?.0 as usize;
+    if count > 1_000 {
+        return Err(EncodeError::InvalidData("too many addresses".into()));
+    }
     let mut addrs = Vec::with_capacity(count.min(1000));
     for _ in 0..count {
         let _timestamp = r.read_u32_le()?;

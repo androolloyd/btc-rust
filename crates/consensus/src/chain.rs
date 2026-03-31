@@ -350,19 +350,6 @@ impl ChainState {
         Some(current)
     }
 
-    /// Rebuild the height-to-hash mapping by walking back from the best tip.
-    fn rebuild_height_index(&mut self) {
-        self.height_index.clear();
-        let mut hash = self.best_header;
-        loop {
-            let entry = self.headers.get(&hash).expect("chain must be connected");
-            self.height_index.insert(entry.height, hash);
-            if entry.header.prev_blockhash == BlockHash::ZERO {
-                break;
-            }
-            hash = entry.header.prev_blockhash;
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

@@ -4,6 +4,7 @@ use std::io::{Read, Write};
 
 /// A reference to a script (immutable view)
 #[derive(PartialEq, Eq, Hash)]
+#[repr(transparent)]
 pub struct Script([u8]);
 
 impl Script {
@@ -223,9 +224,17 @@ impl Encodable for ScriptBuf {
     }
 }
 
+/// Maximum script size for decoding (10 KB consensus limit + margin)
+const MAX_SCRIPT_DECODE_SIZE: usize = 100_000;
+
 impl Decodable for ScriptBuf {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, EncodeError> {
         let len = VarInt::decode(reader)?.0 as usize;
+        if len > MAX_SCRIPT_DECODE_SIZE {
+            return Err(EncodeError::InvalidData(
+                format!("script length {} exceeds maximum", len)
+            ));
+        }
         let data = reader.read_bytes(len)?;
         Ok(ScriptBuf(data))
     }

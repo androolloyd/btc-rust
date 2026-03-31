@@ -8,6 +8,7 @@
 //! Reference: https://github.com/bitcoin/bips/blob/master/bip-0158.mediawiki
 
 use btc_primitives::block::Block;
+use btc_primitives::encode::{VarInt, Encodable, Decodable};
 use btc_primitives::hash::{sha256d, BlockHash};
 use btc_primitives::script::Script;
 
@@ -436,7 +437,7 @@ impl BasicFilter {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         // Encode N as CompactSize (varint)
-        encode_compact_size(&mut out, self.n as u64);
+        VarInt(self.n as u64).encode(&mut out).unwrap();
         out.extend_from_slice(&self.filter_data);
         out
     }
@@ -448,7 +449,9 @@ impl BasicFilter {
         prev_filter_header: &[u8; 32],
         data: &[u8],
     ) -> Option<Self> {
-        let (n, offset) = decode_compact_size(data)?;
+        let mut cursor = std::io::Cursor::new(data);
+        let n = VarInt::decode(&mut cursor).ok()?.0;
+        let offset = cursor.position() as usize;
         let filter_data = data[offset..].to_vec();
 
         let filter_bytes = &data[..]; // full serialization for hashing
@@ -542,7 +545,7 @@ fn deduplicated_count(builder: &GcsBuilder) -> u32 {
 /// Serialize filter as CompactSize(N) || filter_data (BIP158 wire format).
 fn serialize_filter(n: u32, filter_data: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    encode_compact_size(&mut out, n as u64);
+    VarInt(n as u64).encode(&mut out).unwrap();
     out.extend_from_slice(filter_data);
     out
 }
@@ -567,54 +570,7 @@ pub fn compute_filter_header(
     sha256d(&data)
 }
 
-// ---------------------------------------------------------------------------
-// CompactSize (varint) helpers
-// ---------------------------------------------------------------------------
-
-fn encode_compact_size(buf: &mut Vec<u8>, n: u64) {
-    if n < 0xfd {
-        buf.push(n as u8);
-    } else if n <= 0xffff {
-        buf.push(0xfd);
-        buf.extend_from_slice(&(n as u16).to_le_bytes());
-    } else if n <= 0xffff_ffff {
-        buf.push(0xfe);
-        buf.extend_from_slice(&(n as u32).to_le_bytes());
-    } else {
-        buf.push(0xff);
-        buf.extend_from_slice(&n.to_le_bytes());
-    }
-}
-
-fn decode_compact_size(data: &[u8]) -> Option<(u64, usize)> {
-    if data.is_empty() {
-        return Some((0, 0));
-    }
-    match data[0] {
-        0xff => {
-            if data.len() < 9 {
-                return None;
-            }
-            let v = u64::from_le_bytes(data[1..9].try_into().unwrap());
-            Some((v, 9))
-        }
-        0xfe => {
-            if data.len() < 5 {
-                return None;
-            }
-            let v = u32::from_le_bytes(data[1..5].try_into().unwrap()) as u64;
-            Some((v, 5))
-        }
-        0xfd => {
-            if data.len() < 3 {
-                return None;
-            }
-            let v = u16::from_le_bytes(data[1..3].try_into().unwrap()) as u64;
-            Some((v, 3))
-        }
-        n => Some((n as u64, 1)),
-    }
-}
+// CompactSize encoding/decoding now uses btc_primitives::encode::VarInt
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -956,8 +912,8 @@ mod tests {
     fn test_compact_size_roundtrip() {
         for &n in &[0u64, 1, 0xfc, 0xfd, 0xffff, 0x10000, 0xffff_ffff, 0x1_0000_0000] {
             let mut buf = Vec::new();
-            encode_compact_size(&mut buf, n);
-            let (decoded, _) = decode_compact_size(&buf).unwrap();
+            VarInt(n).encode(&mut buf).unwrap();
+            let decoded = VarInt::decode(&mut std::io::Cursor::new(&buf)).unwrap().0;
             assert_eq!(n, decoded, "compact size roundtrip failed for {}", n);
         }
     }
