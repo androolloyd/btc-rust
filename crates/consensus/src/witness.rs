@@ -1164,4 +1164,130 @@ mod tests {
         assert_eq!(pushes[0], &[0xaa]);
         assert_eq!(pushes[1], &[0xbb, 0xcc]);
     }
+
+    #[test]
+    fn test_segwit_verifier_uses_correct_sighash_type() {
+        // Test that SegwitSignatureVerifier correctly identifies the sighash type
+        // from the legacy sighash rather than brute-forcing ECDSA verification.
+        let verifier = Secp256k1Verifier;
+        let flags = ScriptFlags::all();
+        let (sk, pubkey) = generate_keypair();
+
+        let pubkey_hash = hash160(&pubkey);
+        let input_amount: i64 = 50_000;
+
+        // Test with SIGHASH_ALL
+        let mut tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0xaa; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(49_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76, 0xa9]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let script_code = p2wpkh_script_code(&pubkey_hash);
+        let sighash = sighash_segwit_v0(&tx, 0, &script_code, input_amount, SighashType::ALL)
+            .expect("sighash computation should succeed");
+
+        let sig = sign_sighash(&sk, &sighash, SighashType::ALL);
+        let witness = Witness::from_items(vec![sig, pubkey.clone()]);
+        tx.witness = vec![witness.clone()];
+
+        let script_pubkey = ScriptBuf::p2wpkh(&pubkey_hash);
+        let program = &script_pubkey.as_bytes()[2..];
+        let result = verify_witness_program(0, program, &witness, &tx, 0, input_amount, &verifier, &flags);
+        assert!(result.is_ok(), "P2WPKH with SIGHASH_ALL should succeed: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_segwit_verifier_sighash_none() {
+        // Test P2WPKH verification with SIGHASH_NONE
+        let verifier = Secp256k1Verifier;
+        let flags = ScriptFlags::all();
+        let (sk, pubkey) = generate_keypair();
+
+        let pubkey_hash = hash160(&pubkey);
+        let input_amount: i64 = 50_000;
+
+        let mut tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0xbb; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(49_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76, 0xa9]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let script_code = p2wpkh_script_code(&pubkey_hash);
+        let sighash = sighash_segwit_v0(&tx, 0, &script_code, input_amount, SighashType::NONE)
+            .expect("sighash computation should succeed");
+
+        let sig = sign_sighash(&sk, &sighash, SighashType::NONE);
+        let witness = Witness::from_items(vec![sig, pubkey.clone()]);
+        tx.witness = vec![witness.clone()];
+
+        let script_pubkey = ScriptBuf::p2wpkh(&pubkey_hash);
+        let program = &script_pubkey.as_bytes()[2..];
+        let result = verify_witness_program(0, program, &witness, &tx, 0, input_amount, &verifier, &flags);
+        assert!(result.is_ok(), "P2WPKH with SIGHASH_NONE should succeed: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_p2wsh_checksig_with_sighash_all() {
+        // Test P2WSH with a simple <pubkey> OP_CHECKSIG witness script
+        // This exercises the SegwitSignatureVerifier for P2WSH
+        let verifier = Secp256k1Verifier;
+        let flags = ScriptFlags::all();
+        let (sk, pubkey) = generate_keypair();
+
+        // Build witness script: <pubkey> OP_CHECKSIG
+        let mut witness_script = ScriptBuf::new();
+        witness_script.push_slice(&pubkey);
+        witness_script.push_opcode(Opcode::OP_CHECKSIG);
+        let witness_script_bytes = witness_script.as_bytes().to_vec();
+
+        let program = sha256(&witness_script_bytes);
+        let input_amount: i64 = 100_000;
+
+        let mut tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0xdd; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(90_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76, 0xa9]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        // Compute BIP143 sighash using the witness script as script_code
+        let sighash = sighash_segwit_v0(&tx, 0, &witness_script_bytes, input_amount, SighashType::ALL)
+            .expect("sighash should succeed");
+
+        let sig = sign_sighash(&sk, &sighash, SighashType::ALL);
+
+        // Witness items: [sig, witness_script]
+        let witness = Witness::from_items(vec![sig, witness_script_bytes]);
+        tx.witness = vec![witness.clone()];
+
+        let result = verify_witness_program(0, &program, &witness, &tx, 0, input_amount, &verifier, &flags);
+        assert!(result.is_ok(), "P2WSH CHECKSIG with SIGHASH_ALL should succeed: {:?}", result.err());
+    }
 }
