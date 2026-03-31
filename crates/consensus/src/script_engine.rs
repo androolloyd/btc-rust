@@ -1299,4 +1299,991 @@ mod tests {
         let result = engine.execute(script.as_script());
         assert!(result.is_err(), "OP_CHECKSIG without tx context should error");
     }
+
+    // ========== Stack operation tests ==========
+
+    #[test]
+    fn test_op_drop() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_2);
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_DROP);
+        engine.execute(script.as_script()).unwrap();
+        assert_eq!(engine.stack().len(), 1);
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_op_2drop() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_1);
+        script.push_opcode(Opcode::OP_2);
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_2DROP);
+        engine.execute(script.as_script()).unwrap();
+        assert_eq!(engine.stack().len(), 1);
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_op_2dup() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_4);
+        script.push_opcode(Opcode::OP_5);
+        script.push_opcode(Opcode::OP_2DUP);
+        engine.execute(script.as_script()).unwrap();
+        // Stack should be [4, 5, 4, 5]
+        assert_eq!(engine.stack().len(), 4);
+        assert_eq!(decode_num(&engine.stack()[0]).unwrap(), 4);
+        assert_eq!(decode_num(&engine.stack()[1]).unwrap(), 5);
+        assert_eq!(decode_num(&engine.stack()[2]).unwrap(), 4);
+        assert_eq!(decode_num(&engine.stack()[3]).unwrap(), 5);
+    }
+
+    #[test]
+    fn test_op_3dup() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_4);
+        script.push_opcode(Opcode::OP_5);
+        script.push_opcode(Opcode::OP_3DUP);
+        engine.execute(script.as_script()).unwrap();
+        // Stack should be [3, 4, 5, 3, 4, 5]
+        assert_eq!(engine.stack().len(), 6);
+        assert_eq!(decode_num(&engine.stack()[0]).unwrap(), 3);
+        assert_eq!(decode_num(&engine.stack()[1]).unwrap(), 4);
+        assert_eq!(decode_num(&engine.stack()[2]).unwrap(), 5);
+        assert_eq!(decode_num(&engine.stack()[3]).unwrap(), 3);
+        assert_eq!(decode_num(&engine.stack()[4]).unwrap(), 4);
+        assert_eq!(decode_num(&engine.stack()[5]).unwrap(), 5);
+    }
+
+    #[test]
+    fn test_op_nip() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_2);
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_NIP);
+        engine.execute(script.as_script()).unwrap();
+        // NIP removes second-to-top, leaving [3]
+        assert_eq!(engine.stack().len(), 1);
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 3);
+    }
+
+    #[test]
+    fn test_op_over() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_2);
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_OVER);
+        engine.execute(script.as_script()).unwrap();
+        // OVER copies second-to-top to top: [2, 3, 2]
+        assert_eq!(engine.stack().len(), 3);
+        assert_eq!(decode_num(&engine.stack()[0]).unwrap(), 2);
+        assert_eq!(decode_num(&engine.stack()[1]).unwrap(), 3);
+        assert_eq!(decode_num(&engine.stack()[2]).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_op_swap() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_2);
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_SWAP);
+        engine.execute(script.as_script()).unwrap();
+        // Stack should be [3, 2]
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 2);
+        assert_eq!(decode_num(&engine.stack()[engine.stack().len() - 2]).unwrap(), 3);
+    }
+
+    #[test]
+    fn test_op_rot() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_1);
+        script.push_opcode(Opcode::OP_2);
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_ROT);
+        engine.execute(script.as_script()).unwrap();
+        // ROT moves third-to-top to top: [2, 3, 1]
+        assert_eq!(engine.stack().len(), 3);
+        assert_eq!(decode_num(&engine.stack()[0]).unwrap(), 2);
+        assert_eq!(decode_num(&engine.stack()[1]).unwrap(), 3);
+        assert_eq!(decode_num(&engine.stack()[2]).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_op_tuck() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_2);
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_TUCK);
+        engine.execute(script.as_script()).unwrap();
+        // TUCK copies top and inserts before second-to-top: [3, 2, 3]
+        assert_eq!(engine.stack().len(), 3);
+        assert_eq!(decode_num(&engine.stack()[0]).unwrap(), 3);
+        assert_eq!(decode_num(&engine.stack()[1]).unwrap(), 2);
+        assert_eq!(decode_num(&engine.stack()[2]).unwrap(), 3);
+    }
+
+    #[test]
+    fn test_op_ifdup_true() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_5);
+        script.push_opcode(Opcode::OP_IFDUP);
+        engine.execute(script.as_script()).unwrap();
+        // 5 is truthy, so it gets duplicated: [5, 5]
+        assert_eq!(engine.stack().len(), 2);
+        assert_eq!(decode_num(&engine.stack()[0]).unwrap(), 5);
+        assert_eq!(decode_num(&engine.stack()[1]).unwrap(), 5);
+    }
+
+    #[test]
+    fn test_op_ifdup_false() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_0);
+        script.push_opcode(Opcode::OP_IFDUP);
+        engine.execute(script.as_script()).unwrap();
+        // 0 is falsy, so no duplication: [<empty>]
+        assert_eq!(engine.stack().len(), 1);
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_op_depth() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_1);
+        script.push_opcode(Opcode::OP_2);
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_DEPTH);
+        engine.execute(script.as_script()).unwrap();
+        // Stack was [1,2,3], depth = 3, now [1,2,3,3]
+        assert_eq!(engine.stack().len(), 4);
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 3);
+    }
+
+    #[test]
+    fn test_op_toaltstack_fromaltstack() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_7);
+        script.push_opcode(Opcode::OP_TOALTSTACK);
+        // Main stack is now empty, push something else
+        script.push_opcode(Opcode::OP_1);
+        script.push_opcode(Opcode::OP_FROMALTSTACK);
+        engine.execute(script.as_script()).unwrap();
+        // Stack should be [1, 7]
+        assert_eq!(engine.stack().len(), 2);
+        assert_eq!(decode_num(&engine.stack()[0]).unwrap(), 1);
+        assert_eq!(decode_num(&engine.stack()[1]).unwrap(), 7);
+    }
+
+    #[test]
+    fn test_op_size() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_slice(b"hello");
+        script.push_opcode(Opcode::OP_SIZE);
+        engine.execute(script.as_script()).unwrap();
+        // Stack should be ["hello", 5]
+        assert_eq!(engine.stack().len(), 2);
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 5);
+    }
+
+    #[test]
+    fn test_op_pick() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_7);
+        script.push_opcode(Opcode::OP_8);
+        script.push_opcode(Opcode::OP_9);
+        script.push_opcode(Opcode::OP_2); // pick index 2 (third from top = 7)
+        script.push_opcode(Opcode::OP_PICK);
+        engine.execute(script.as_script()).unwrap();
+        // Stack: [7, 8, 9, 7]
+        assert_eq!(engine.stack().len(), 4);
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 7);
+    }
+
+    #[test]
+    fn test_op_roll() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_7);
+        script.push_opcode(Opcode::OP_8);
+        script.push_opcode(Opcode::OP_9);
+        script.push_opcode(Opcode::OP_2); // roll index 2 (third from top = 7, move to top)
+        script.push_opcode(Opcode::OP_ROLL);
+        engine.execute(script.as_script()).unwrap();
+        // Stack: [8, 9, 7]
+        assert_eq!(engine.stack().len(), 3);
+        assert_eq!(decode_num(&engine.stack()[0]).unwrap(), 8);
+        assert_eq!(decode_num(&engine.stack()[1]).unwrap(), 9);
+        assert_eq!(decode_num(&engine.stack()[2]).unwrap(), 7);
+    }
+
+    #[test]
+    fn test_op_2over() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_1);
+        script.push_opcode(Opcode::OP_2);
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_4);
+        script.push_opcode(Opcode::OP_2OVER);
+        engine.execute(script.as_script()).unwrap();
+        // 2OVER copies the pair below the top pair: [1, 2, 3, 4, 1, 2]
+        assert_eq!(engine.stack().len(), 6);
+        assert_eq!(decode_num(&engine.stack()[0]).unwrap(), 1);
+        assert_eq!(decode_num(&engine.stack()[1]).unwrap(), 2);
+        assert_eq!(decode_num(&engine.stack()[2]).unwrap(), 3);
+        assert_eq!(decode_num(&engine.stack()[3]).unwrap(), 4);
+        assert_eq!(decode_num(&engine.stack()[4]).unwrap(), 1);
+        assert_eq!(decode_num(&engine.stack()[5]).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_op_2rot() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_1);
+        script.push_opcode(Opcode::OP_2);
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_4);
+        script.push_opcode(Opcode::OP_5);
+        script.push_opcode(Opcode::OP_6);
+        script.push_opcode(Opcode::OP_2ROT);
+        engine.execute(script.as_script()).unwrap();
+        // 2ROT moves the bottom pair to top: [3, 4, 5, 6, 1, 2]
+        assert_eq!(engine.stack().len(), 6);
+        assert_eq!(decode_num(&engine.stack()[0]).unwrap(), 3);
+        assert_eq!(decode_num(&engine.stack()[1]).unwrap(), 4);
+        assert_eq!(decode_num(&engine.stack()[2]).unwrap(), 5);
+        assert_eq!(decode_num(&engine.stack()[3]).unwrap(), 6);
+        assert_eq!(decode_num(&engine.stack()[4]).unwrap(), 1);
+        assert_eq!(decode_num(&engine.stack()[5]).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_op_2swap() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_1);
+        script.push_opcode(Opcode::OP_2);
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_4);
+        script.push_opcode(Opcode::OP_2SWAP);
+        engine.execute(script.as_script()).unwrap();
+        // 2SWAP swaps top two pairs: [3, 4, 1, 2]
+        assert_eq!(engine.stack().len(), 4);
+        assert_eq!(decode_num(&engine.stack()[0]).unwrap(), 3);
+        assert_eq!(decode_num(&engine.stack()[1]).unwrap(), 4);
+        assert_eq!(decode_num(&engine.stack()[2]).unwrap(), 1);
+        assert_eq!(decode_num(&engine.stack()[3]).unwrap(), 2);
+    }
+
+    // ========== Flow control tests ==========
+
+    #[test]
+    fn test_op_verify_success() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_1);
+        script.push_opcode(Opcode::OP_VERIFY);
+        // Push something truthy so success() works
+        script.push_opcode(Opcode::OP_1);
+        engine.execute(script.as_script()).unwrap();
+        assert!(engine.success());
+    }
+
+    #[test]
+    fn test_op_verify_failure() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_0);
+        script.push_opcode(Opcode::OP_VERIFY);
+        let result = engine.execute(script.as_script());
+        assert!(matches!(result, Err(ScriptError::VerifyFailed)));
+    }
+
+    #[test]
+    fn test_op_notif_true_branch() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_0); // false -> NOTIF takes the "then" branch
+        script.push_opcode(Opcode::OP_NOTIF);
+        script.push_opcode(Opcode::OP_5);
+        script.push_opcode(Opcode::OP_ELSE);
+        script.push_opcode(Opcode::OP_6);
+        script.push_opcode(Opcode::OP_ENDIF);
+        engine.execute(script.as_script()).unwrap();
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 5);
+    }
+
+    #[test]
+    fn test_op_notif_false_branch() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_1); // true -> NOTIF skips to ELSE branch
+        script.push_opcode(Opcode::OP_NOTIF);
+        script.push_opcode(Opcode::OP_5);
+        script.push_opcode(Opcode::OP_ELSE);
+        script.push_opcode(Opcode::OP_6);
+        script.push_opcode(Opcode::OP_ENDIF);
+        engine.execute(script.as_script()).unwrap();
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 6);
+    }
+
+    #[test]
+    fn test_op_nop() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_1);
+        script.push_opcode(Opcode::OP_NOP);
+        engine.execute(script.as_script()).unwrap();
+        assert_eq!(engine.stack().len(), 1);
+        assert!(engine.success());
+    }
+
+    #[test]
+    fn test_op_1negate() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_1NEGATE);
+        engine.execute(script.as_script()).unwrap();
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), -1);
+    }
+
+    // ========== Arithmetic operation tests ==========
+
+    #[test]
+    fn test_op_1add() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_5);
+        script.push_opcode(Opcode::OP_1ADD);
+        engine.execute(script.as_script()).unwrap();
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 6);
+    }
+
+    #[test]
+    fn test_op_1sub() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_5);
+        script.push_opcode(Opcode::OP_1SUB);
+        engine.execute(script.as_script()).unwrap();
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 4);
+    }
+
+    #[test]
+    fn test_op_negate() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_5);
+        script.push_opcode(Opcode::OP_NEGATE);
+        engine.execute(script.as_script()).unwrap();
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), -5);
+    }
+
+    #[test]
+    fn test_op_negate_negative() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_1NEGATE);
+        script.push_opcode(Opcode::OP_NEGATE);
+        engine.execute(script.as_script()).unwrap();
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_op_abs() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_1NEGATE);
+        script.push_opcode(Opcode::OP_ABS);
+        engine.execute(script.as_script()).unwrap();
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_op_abs_positive() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_5);
+        script.push_opcode(Opcode::OP_ABS);
+        engine.execute(script.as_script()).unwrap();
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 5);
+    }
+
+    #[test]
+    fn test_op_not_zero() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_0);
+        script.push_opcode(Opcode::OP_NOT);
+        engine.execute(script.as_script()).unwrap();
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_op_not_nonzero() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_5);
+        script.push_opcode(Opcode::OP_NOT);
+        engine.execute(script.as_script()).unwrap();
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_op_0notequal_zero() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_0);
+        script.push_opcode(Opcode::OP_0NOTEQUAL);
+        engine.execute(script.as_script()).unwrap();
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_op_0notequal_nonzero() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_5);
+        script.push_opcode(Opcode::OP_0NOTEQUAL);
+        engine.execute(script.as_script()).unwrap();
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_op_sub() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_7);
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_SUB);
+        engine.execute(script.as_script()).unwrap();
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 4);
+    }
+
+    #[test]
+    fn test_op_booland_both_true() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_1);
+        script.push_opcode(Opcode::OP_2);
+        script.push_opcode(Opcode::OP_BOOLAND);
+        engine.execute(script.as_script()).unwrap();
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_op_booland_one_false() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_0);
+        script.push_opcode(Opcode::OP_2);
+        script.push_opcode(Opcode::OP_BOOLAND);
+        engine.execute(script.as_script()).unwrap();
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_op_boolor_both_false() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_0);
+        script.push_opcode(Opcode::OP_0);
+        script.push_opcode(Opcode::OP_BOOLOR);
+        engine.execute(script.as_script()).unwrap();
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_op_boolor_one_true() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_0);
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_BOOLOR);
+        engine.execute(script.as_script()).unwrap();
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_op_numequal_true() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_4);
+        script.push_opcode(Opcode::OP_4);
+        script.push_opcode(Opcode::OP_NUMEQUAL);
+        engine.execute(script.as_script()).unwrap();
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_op_numequal_false() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_4);
+        script.push_opcode(Opcode::OP_5);
+        script.push_opcode(Opcode::OP_NUMEQUAL);
+        engine.execute(script.as_script()).unwrap();
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_op_numequalverify_success() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_NUMEQUALVERIFY);
+        script.push_opcode(Opcode::OP_1); // push truthy value so test can check success
+        engine.execute(script.as_script()).unwrap();
+        assert!(engine.success());
+    }
+
+    #[test]
+    fn test_op_numequalverify_failure() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_4);
+        script.push_opcode(Opcode::OP_NUMEQUALVERIFY);
+        let result = engine.execute(script.as_script());
+        assert!(matches!(result, Err(ScriptError::VerifyFailed)));
+    }
+
+    #[test]
+    fn test_op_numnotequal_true() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_4);
+        script.push_opcode(Opcode::OP_NUMNOTEQUAL);
+        engine.execute(script.as_script()).unwrap();
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_op_numnotequal_false() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_NUMNOTEQUAL);
+        engine.execute(script.as_script()).unwrap();
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_op_lessthan_true() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_2);
+        script.push_opcode(Opcode::OP_5);
+        script.push_opcode(Opcode::OP_LESSTHAN);
+        engine.execute(script.as_script()).unwrap();
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_op_lessthan_false() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_5);
+        script.push_opcode(Opcode::OP_2);
+        script.push_opcode(Opcode::OP_LESSTHAN);
+        engine.execute(script.as_script()).unwrap();
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_op_greaterthan_true() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_5);
+        script.push_opcode(Opcode::OP_2);
+        script.push_opcode(Opcode::OP_GREATERTHAN);
+        engine.execute(script.as_script()).unwrap();
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_op_greaterthan_false() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_2);
+        script.push_opcode(Opcode::OP_5);
+        script.push_opcode(Opcode::OP_GREATERTHAN);
+        engine.execute(script.as_script()).unwrap();
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_op_lessthanorequal_true() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_LESSTHANOREQUAL);
+        engine.execute(script.as_script()).unwrap();
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_op_lessthanorequal_false() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_5);
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_LESSTHANOREQUAL);
+        engine.execute(script.as_script()).unwrap();
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_op_greaterthanorequal_true() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_GREATERTHANOREQUAL);
+        engine.execute(script.as_script()).unwrap();
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_op_greaterthanorequal_false() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_2);
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_GREATERTHANOREQUAL);
+        engine.execute(script.as_script()).unwrap();
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_op_min() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_7);
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_MIN);
+        engine.execute(script.as_script()).unwrap();
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 3);
+    }
+
+    #[test]
+    fn test_op_max() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_7);
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_MAX);
+        engine.execute(script.as_script()).unwrap();
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 7);
+    }
+
+    #[test]
+    fn test_op_within_true() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_3); // x
+        script.push_opcode(Opcode::OP_2); // min
+        script.push_opcode(Opcode::OP_5); // max
+        script.push_opcode(Opcode::OP_WITHIN);
+        engine.execute(script.as_script()).unwrap();
+        // 3 >= 2 && 3 < 5 => true
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_op_within_false() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_5); // x
+        script.push_opcode(Opcode::OP_2); // min
+        script.push_opcode(Opcode::OP_5); // max
+        script.push_opcode(Opcode::OP_WITHIN);
+        engine.execute(script.as_script()).unwrap();
+        // 5 >= 2 && 5 < 5 => false (upper bound exclusive)
+        assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 0);
+    }
+
+    // ========== Crypto operation tests ==========
+
+    #[test]
+    fn test_op_ripemd160() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_slice(b"hello");
+        script.push_opcode(Opcode::OP_RIPEMD160);
+        engine.execute(script.as_script()).unwrap();
+        let result = engine.stack().last().unwrap();
+        assert_eq!(result.len(), 20);
+        // Known RIPEMD160("hello") = 108f07b8382412612c048d07d13f814118445acd
+        assert_eq!(hex::encode(result), "108f07b8382412612c048d07d13f814118445acd");
+    }
+
+    #[test]
+    fn test_op_sha256() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_slice(b"hello");
+        script.push_opcode(Opcode::OP_SHA256);
+        engine.execute(script.as_script()).unwrap();
+        let result = engine.stack().last().unwrap();
+        assert_eq!(result.len(), 32);
+        // Known SHA256("hello") = 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
+        assert_eq!(hex::encode(result), "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
+    }
+
+    #[test]
+    fn test_op_hash256() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_slice(b"hello");
+        script.push_opcode(Opcode::OP_HASH256);
+        engine.execute(script.as_script()).unwrap();
+        let result = engine.stack().last().unwrap();
+        assert_eq!(result.len(), 32);
+        // HASH256 is double SHA256: SHA256(SHA256("hello"))
+        let expected = btc_primitives::hash::sha256d(b"hello");
+        assert_eq!(result.as_slice(), expected.as_slice());
+    }
+
+    // ========== Equality tests ==========
+
+    #[test]
+    fn test_op_equal_true() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_5);
+        script.push_opcode(Opcode::OP_5);
+        script.push_opcode(Opcode::OP_EQUAL);
+        engine.execute(script.as_script()).unwrap();
+        assert!(engine.success());
+    }
+
+    #[test]
+    fn test_op_equal_false() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_5);
+        script.push_opcode(Opcode::OP_6);
+        script.push_opcode(Opcode::OP_EQUAL);
+        engine.execute(script.as_script()).unwrap();
+        assert!(!engine.success());
+    }
+
+    // ========== Misc tests ==========
+
+    #[test]
+    fn test_op_checklocktimeverify_as_nop() {
+        // With flag disabled, CLTV should act as NOP
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_1);
+        script.push_opcode(Opcode::OP_CHECKLOCKTIMEVERIFY);
+        engine.execute(script.as_script()).unwrap();
+        // Stack should still have [1]
+        assert_eq!(engine.stack().len(), 1);
+        assert!(engine.success());
+    }
+
+    #[test]
+    fn test_op_checksequenceverify_as_nop() {
+        // With flag disabled, CSV should act as NOP
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_1);
+        script.push_opcode(Opcode::OP_CHECKSEQUENCEVERIFY);
+        engine.execute(script.as_script()).unwrap();
+        assert_eq!(engine.stack().len(), 1);
+        assert!(engine.success());
+    }
+
+    #[test]
+    fn test_op_nop1() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_1);
+        script.push_opcode(Opcode::OP_NOP1);
+        engine.execute(script.as_script()).unwrap();
+        assert!(engine.success());
+    }
+
+    #[test]
+    fn test_op_push_numbers() {
+        // Test all OP_1 through OP_16
+        for n in 1..=16i64 {
+            let mut engine = make_engine();
+            let mut script = ScriptBuf::new();
+            let opcode = Opcode::from_u8(0x50 + n as u8); // OP_1=0x51 ... OP_16=0x60
+            script.push_opcode(opcode);
+            engine.execute(script.as_script()).unwrap();
+            assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), n,
+                "OP_{} should push {}", n, n);
+        }
+    }
+
+    #[test]
+    fn test_op_equalverify_failure() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_4);
+        script.push_opcode(Opcode::OP_EQUALVERIFY);
+        let result = engine.execute(script.as_script());
+        assert!(matches!(result, Err(ScriptError::EqualVerifyFailed)));
+    }
+
+    #[test]
+    fn test_unbalanced_if() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_1);
+        script.push_opcode(Opcode::OP_IF);
+        // Missing ENDIF
+        let result = engine.execute(script.as_script());
+        assert!(matches!(result, Err(ScriptError::UnbalancedConditional)));
+    }
+
+    #[test]
+    fn test_unbalanced_else() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_ELSE);
+        let result = engine.execute(script.as_script());
+        assert!(matches!(result, Err(ScriptError::UnbalancedConditional)));
+    }
+
+    #[test]
+    fn test_unbalanced_endif() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_ENDIF);
+        let result = engine.execute(script.as_script());
+        assert!(matches!(result, Err(ScriptError::UnbalancedConditional)));
+    }
+
+    #[test]
+    fn test_op_codeseparator() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_1);
+        script.push_opcode(Opcode::OP_CODESEPARATOR);
+        engine.execute(script.as_script()).unwrap();
+        assert!(engine.success());
+    }
+
+    #[test]
+    fn test_stack_underflow() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_DUP); // stack empty, should underflow
+        let result = engine.execute(script.as_script());
+        assert!(matches!(result, Err(ScriptError::StackUnderflow)));
+    }
+
+    #[test]
+    fn test_op_sha1() {
+        // SHA1 is implemented as a stub returning 20 zero bytes
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_slice(b"test");
+        script.push_opcode(Opcode::OP_SHA1);
+        engine.execute(script.as_script()).unwrap();
+        let result = engine.stack().last().unwrap();
+        assert_eq!(result.len(), 20);
+    }
+
+    #[test]
+    fn test_checkmultisig_1_of_1() {
+        use crate::sighash::{sighash_legacy, SighashType};
+
+        let secp = secp256k1::Secp256k1::new();
+        let (sk1, pk1) = secp.generate_keypair(&mut secp256k1::rand::thread_rng());
+        let pk1_bytes = pk1.serialize().to_vec();
+
+        // scriptPubKey: OP_1 <pk1> OP_1 OP_CHECKMULTISIG
+        let mut script_pubkey = ScriptBuf::new();
+        script_pubkey.push_opcode(Opcode::OP_1);
+        script_pubkey.push_slice(&pk1_bytes);
+        script_pubkey.push_opcode(Opcode::OP_1);
+        script_pubkey.push_opcode(Opcode::OP_CHECKMULTISIG);
+
+        let tx = make_test_tx();
+        let sighash = sighash_legacy(&tx, 0, script_pubkey.as_bytes(), SighashType::ALL).unwrap();
+        let sig1_bytes = sign_sighash(&secp, &sk1, &sighash);
+
+        // scriptSig: OP_0 <sig1>
+        let mut script_sig = ScriptBuf::new();
+        script_sig.push_opcode(Opcode::OP_0); // dummy
+        script_sig.push_slice(&sig1_bytes);
+
+        static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
+        let mut engine = ScriptEngine::new(
+            &VERIFIER,
+            ScriptFlags::none(),
+            Some(&tx),
+            0,
+            0,
+        );
+        engine.execute(script_sig.as_script()).unwrap();
+        engine.execute(script_pubkey.as_script()).unwrap();
+        assert!(engine.success(), "1-of-1 OP_CHECKMULTISIG should succeed");
+    }
+
+    #[test]
+    fn test_checkmultisigverify() {
+        use crate::sighash::{sighash_legacy, SighashType};
+
+        let secp = secp256k1::Secp256k1::new();
+        let (sk1, pk1) = secp.generate_keypair(&mut secp256k1::rand::thread_rng());
+        let pk1_bytes = pk1.serialize().to_vec();
+
+        // scriptPubKey: OP_1 <pk1> OP_1 OP_CHECKMULTISIGVERIFY OP_1
+        let mut script_pubkey = ScriptBuf::new();
+        script_pubkey.push_opcode(Opcode::OP_1);
+        script_pubkey.push_slice(&pk1_bytes);
+        script_pubkey.push_opcode(Opcode::OP_1);
+        script_pubkey.push_opcode(Opcode::OP_CHECKMULTISIGVERIFY);
+        script_pubkey.push_opcode(Opcode::OP_1);
+
+        let tx = make_test_tx();
+        let sighash = sighash_legacy(&tx, 0, script_pubkey.as_bytes(), SighashType::ALL).unwrap();
+        let sig1_bytes = sign_sighash(&secp, &sk1, &sighash);
+
+        let mut script_sig = ScriptBuf::new();
+        script_sig.push_opcode(Opcode::OP_0);
+        script_sig.push_slice(&sig1_bytes);
+
+        static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
+        let mut engine = ScriptEngine::new(
+            &VERIFIER,
+            ScriptFlags::none(),
+            Some(&tx),
+            0,
+            0,
+        );
+        engine.execute(script_sig.as_script()).unwrap();
+        engine.execute(script_pubkey.as_script()).unwrap();
+        assert!(engine.success(), "OP_CHECKMULTISIGVERIFY should succeed and leave OP_1 on stack");
+    }
 }
