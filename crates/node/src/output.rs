@@ -137,6 +137,324 @@ fn format_scalar(v: &serde_json::Value) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // OutputFormat
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_output_format_from_str_json() {
+        assert_eq!(OutputFormat::from_str_opt(Some("json")), OutputFormat::Json);
+    }
+
+    #[test]
+    fn test_output_format_from_str_text() {
+        assert_eq!(OutputFormat::from_str_opt(Some("text")), OutputFormat::Text);
+    }
+
+    #[test]
+    fn test_output_format_from_str_none_auto() {
+        // When piped (test environment) this should be Json
+        let f = OutputFormat::from_str_opt(None);
+        // In a test env, stdout is NOT a TTY, so auto should be Json
+        assert_eq!(f, OutputFormat::Json);
+    }
+
+    #[test]
+    fn test_output_format_from_str_unknown_auto() {
+        let f = OutputFormat::from_str_opt(Some("xml"));
+        // Unknown falls through to auto detect
+        assert_eq!(f, OutputFormat::auto());
+    }
+
+    #[test]
+    fn test_output_format_debug() {
+        let _ = format!("{:?}", OutputFormat::Json);
+        let _ = format!("{:?}", OutputFormat::Text);
+    }
+
+    #[test]
+    fn test_output_format_clone_eq() {
+        let a = OutputFormat::Json;
+        let b = a;
+        assert_eq!(a, b);
+
+        let c = OutputFormat::Text;
+        assert_ne!(a, c);
+    }
+
+    // -----------------------------------------------------------------------
+    // format_scalar
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_scalar_string() {
+        let v = serde_json::Value::String("hello".into());
+        assert_eq!(format_scalar(&v), "hello");
+    }
+
+    #[test]
+    fn test_format_scalar_number() {
+        let v = serde_json::json!(42);
+        assert_eq!(format_scalar(&v), "42");
+    }
+
+    #[test]
+    fn test_format_scalar_float() {
+        let v = serde_json::json!(3.14);
+        assert_eq!(format_scalar(&v), "3.14");
+    }
+
+    #[test]
+    fn test_format_scalar_bool_true() {
+        let v = serde_json::json!(true);
+        assert_eq!(format_scalar(&v), "true");
+    }
+
+    #[test]
+    fn test_format_scalar_bool_false() {
+        let v = serde_json::json!(false);
+        assert_eq!(format_scalar(&v), "false");
+    }
+
+    #[test]
+    fn test_format_scalar_null() {
+        let v = serde_json::Value::Null;
+        assert_eq!(format_scalar(&v), "null");
+    }
+
+    #[test]
+    fn test_format_scalar_array() {
+        let v = serde_json::json!([1, 2, 3]);
+        // Arrays are not scalars, should fall through to JSON serialization
+        let result = format_scalar(&v);
+        assert!(result.contains("[1,2,3]"));
+    }
+
+    #[test]
+    fn test_format_scalar_object() {
+        let v = serde_json::json!({"a": 1});
+        let result = format_scalar(&v);
+        assert!(result.contains("\"a\""));
+    }
+
+    // -----------------------------------------------------------------------
+    // emit (JSON mode)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_emit_json_serializes_struct() {
+        // emit writes to stdout which we can't easily capture in tests,
+        // but we can verify the serialization path doesn't panic
+        let status = NodeStatus {
+            network: "mainnet".into(),
+            chain_height: 100,
+            best_block_hash: "0".repeat(64),
+            peer_count: 5,
+            mempool_size: 10,
+            syncing: false,
+            sync_progress: 0.5,
+            version: "0.1.0".into(),
+        };
+        // Verify it serializes without error
+        let json = serde_json::to_string(&status).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["network"], "mainnet");
+        assert_eq!(parsed["chain_height"], 100);
+        assert_eq!(parsed["peer_count"], 5);
+    }
+
+    // -----------------------------------------------------------------------
+    // emit_progress
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_emit_progress_does_not_panic() {
+        // emit_progress writes to stderr, just verify it doesn't panic
+        emit_progress("test_event", &serde_json::json!({"key": "value"}));
+    }
+
+    // -----------------------------------------------------------------------
+    // Response types serialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_node_status_serialization() {
+        let status = NodeStatus {
+            network: "testnet".into(),
+            chain_height: 42,
+            best_block_hash: "abc".into(),
+            peer_count: 3,
+            mempool_size: 100,
+            syncing: true,
+            sync_progress: 0.75,
+            version: "1.0".into(),
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["network"], "testnet");
+        assert_eq!(json["chain_height"], 42);
+        assert_eq!(json["syncing"], true);
+        assert!((json["sync_progress"].as_f64().unwrap() - 0.75).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_peer_entry_serialization() {
+        let peer = PeerEntry {
+            addr: "127.0.0.1:8333".into(),
+            version: 70016,
+            user_agent: "/btc-rust:0.1.0/".into(),
+            start_height: 800000,
+            inbound: false,
+        };
+        let json = serde_json::to_value(&peer).unwrap();
+        assert_eq!(json["addr"], "127.0.0.1:8333");
+        assert_eq!(json["version"], 70016);
+        assert_eq!(json["inbound"], false);
+        assert_eq!(json["start_height"], 800000);
+    }
+
+    #[test]
+    fn test_sync_status_serialization() {
+        let sync = SyncStatus {
+            syncing: true,
+            current_height: 500,
+            target_height: 1000,
+            progress: 0.5,
+            stage: "downloading_blocks".into(),
+            peers: 8,
+        };
+        let json = serde_json::to_value(&sync).unwrap();
+        assert_eq!(json["syncing"], true);
+        assert_eq!(json["current_height"], 500);
+        assert_eq!(json["target_height"], 1000);
+        assert_eq!(json["stage"], "downloading_blocks");
+        assert_eq!(json["peers"], 8);
+    }
+
+    // -----------------------------------------------------------------------
+    // print_value_as_text (indirect testing via emit)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_print_value_as_text_object() {
+        // Just verify it doesn't panic
+        let v = serde_json::json!({
+            "key": "value",
+            "number": 42,
+            "nested": {"inner": true},
+            "array": [1, 2, 3],
+        });
+        print_value_as_text(&v, 0);
+    }
+
+    #[test]
+    fn test_print_value_as_text_array() {
+        let v = serde_json::json!([1, 2, 3]);
+        print_value_as_text(&v, 0);
+    }
+
+    #[test]
+    fn test_print_value_as_text_scalar() {
+        print_value_as_text(&serde_json::json!("hello"), 0);
+        print_value_as_text(&serde_json::json!(42), 0);
+        print_value_as_text(&serde_json::json!(true), 0);
+        print_value_as_text(&serde_json::json!(null), 0);
+    }
+
+    #[test]
+    fn test_print_value_as_text_with_indent() {
+        let v = serde_json::json!({"a": {"b": "c"}});
+        print_value_as_text(&v, 4);
+    }
+
+    #[test]
+    fn test_emit_json_mode() {
+        let value = serde_json::json!({"test": true, "count": 42});
+        // This writes to stdout. We can't capture it but verify no panic.
+        emit(OutputFormat::Json, &value);
+    }
+
+    #[test]
+    fn test_emit_text_mode() {
+        let value = serde_json::json!({"test": true, "count": 42});
+        emit(OutputFormat::Text, &value);
+    }
+
+    #[test]
+    fn test_emit_text_mode_struct() {
+        let status = NodeStatus {
+            network: "mainnet".into(),
+            chain_height: 0,
+            best_block_hash: "abc".into(),
+            peer_count: 0,
+            mempool_size: 0,
+            syncing: false,
+            sync_progress: 0.0,
+            version: "test".into(),
+        };
+        emit(OutputFormat::Text, &status);
+    }
+
+    #[test]
+    fn test_emit_json_mode_struct() {
+        let status = SyncStatus {
+            syncing: true,
+            current_height: 100,
+            target_height: 200,
+            progress: 0.5,
+            stage: "downloading".into(),
+            peers: 5,
+        };
+        emit(OutputFormat::Json, &status);
+    }
+
+    #[test]
+    fn test_emit_text_mode_array() {
+        let peers: Vec<PeerEntry> = vec![
+            PeerEntry {
+                addr: "127.0.0.1:8333".into(),
+                version: 70016,
+                user_agent: "/test/".into(),
+                start_height: 0,
+                inbound: false,
+            },
+        ];
+        emit(OutputFormat::Text, &peers);
+    }
+
+    #[test]
+    fn test_emit_json_mode_empty_array() {
+        let peers: Vec<PeerEntry> = vec![];
+        emit(OutputFormat::Json, &peers);
+    }
+
+    #[test]
+    fn test_emit_progress_with_nested_data() {
+        emit_progress(
+            "block_validated",
+            &serde_json::json!({
+                "height": 100,
+                "hash": "abc",
+                "nested": {"inner": true},
+            }),
+        );
+    }
+
+    #[test]
+    fn test_output_format_auto_in_test_env() {
+        // In a test environment, stdout is typically not a TTY
+        let f = OutputFormat::auto();
+        assert_eq!(f, OutputFormat::Json);
+    }
+}
+
 // Standard response types for CLI commands
 
 #[derive(Serialize)]

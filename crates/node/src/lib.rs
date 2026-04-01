@@ -1,4 +1,5 @@
 pub mod builder;
+pub mod cli;
 pub mod explorer;
 pub mod http;
 pub mod nostr;

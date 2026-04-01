@@ -559,6 +559,60 @@ mod tests {
     }
 
     #[test]
+    fn test_route_api_bare() {
+        assert_eq!(
+            match_explorer_route("/api"),
+            Some(ExplorerRoute::Api("/api".into()))
+        );
+    }
+
+    #[test]
+    fn test_route_with_query_string() {
+        // Query string is stripped before routing
+        assert_eq!(
+            match_explorer_route("/?foo=bar"),
+            Some(ExplorerRoute::Index)
+        );
+    }
+
+    #[test]
+    fn test_route_trailing_slash_block() {
+        let hash = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+        let route = match_explorer_route(&format!("/block/{}/", hash));
+        // This should still match since trailing slash is stripped
+        assert!(route.is_some());
+    }
+
+    #[test]
+    fn test_handle_metrics_through_explorer() {
+        let m = make_metrics();
+        let resp = handle_explorer_request(&make_request("/metrics"), &m);
+        assert_eq!(resp.status, 200);
+        let body = std::str::from_utf8(&resp.body).unwrap();
+        assert!(body.contains("btc_chain_height"));
+    }
+
+    #[test]
+    fn test_explorer_route_debug() {
+        let route = ExplorerRoute::Index;
+        let debug = format!("{:?}", route);
+        assert!(debug.contains("Index"));
+    }
+
+    #[test]
+    fn test_explorer_route_clone() {
+        let route = ExplorerRoute::BlockDetail("abc".to_string());
+        let route2 = route.clone();
+        assert_eq!(route, route2);
+    }
+
+    #[test]
+    fn test_explorer_route_eq() {
+        assert_eq!(ExplorerRoute::Index, ExplorerRoute::Index);
+        assert_ne!(ExplorerRoute::Index, ExplorerRoute::Api("/api".into()));
+    }
+
+    #[test]
     fn test_handle_non_get_returns_400() {
         let m = make_metrics();
         let req = HttpRequest {

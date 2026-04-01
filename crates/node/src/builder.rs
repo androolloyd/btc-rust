@@ -397,6 +397,106 @@ mod tests {
     }
 
     #[test]
+    fn test_node_config_testnet() {
+        let config = NodeConfig::new(Network::Testnet);
+        assert_eq!(config.rpc_port, 18332);
+        assert_eq!(config.p2p_port, 18333);
+    }
+
+    #[test]
+    fn test_node_config_signet() {
+        let config = NodeConfig::new(Network::Signet);
+        assert_eq!(config.network, Network::Signet);
+    }
+
+    #[test]
+    fn test_node_config_regtest() {
+        let config = NodeConfig::new(Network::Regtest);
+        assert_eq!(config.rpc_port, 18443);
+        assert_eq!(config.p2p_port, 18444);
+    }
+
+    #[test]
+    fn test_node_config_default_datadir() {
+        let config = NodeConfig::new(Network::Mainnet);
+        assert_eq!(config.datadir, PathBuf::from("~/.btc-rust"));
+    }
+
+    #[test]
+    fn test_node_config_clone() {
+        let config = NodeConfig::new(Network::Mainnet)
+            .with_rpc_port(9999)
+            .with_p2p_port(9998);
+        let config2 = config.clone();
+        assert_eq!(config2.rpc_port, 9999);
+        assert_eq!(config2.p2p_port, 9998);
+        assert_eq!(config2.network, Network::Mainnet);
+    }
+
+    #[test]
+    fn test_node_config_debug() {
+        let config = NodeConfig::new(Network::Mainnet);
+        let debug = format!("{:?}", config);
+        assert!(debug.contains("NodeConfig"));
+    }
+
+    #[test]
+    fn test_database_handle_debug() {
+        let db = DatabaseHandle {
+            path: PathBuf::from("/tmp/test"),
+        };
+        let debug = format!("{:?}", db);
+        assert!(debug.contains("DatabaseHandle"));
+    }
+
+    #[test]
+    fn test_network_handle_debug() {
+        let net = NetworkHandle { port: 8333 };
+        let debug = format!("{:?}", net);
+        assert!(debug.contains("NetworkHandle"));
+    }
+
+    #[test]
+    fn test_builder_config_accessor() {
+        let config = NodeConfig::new(Network::Mainnet);
+        let builder = NodeBuilder::new(config);
+        assert_eq!(builder.config().network, Network::Mainnet);
+        assert_eq!(builder.config().rpc_port, 8332);
+    }
+
+    #[test]
+    fn test_builder_config_accessor_after_partial() {
+        let config = NodeConfig::new(Network::Testnet);
+        let builder = NodeBuilder::new(config)
+            .with_database(DatabaseHandle {
+                path: PathBuf::from("/tmp"),
+            });
+        assert_eq!(builder.config().network, Network::Testnet);
+    }
+
+    #[test]
+    fn test_node_fields_after_build() {
+        let config = NodeConfig::new(Network::Regtest)
+            .with_rpc_port(1234)
+            .with_p2p_port(5678)
+            .with_datadir("/my/data");
+        let node = NodeBuilder::new(config)
+            .with_database(DatabaseHandle {
+                path: PathBuf::from("/my/db"),
+            })
+            .with_network(NetworkHandle { port: 5678 })
+            .with_pipeline(Pipeline::new())
+            .build()
+            .unwrap();
+
+        assert_eq!(node.config.rpc_port, 1234);
+        assert_eq!(node.config.p2p_port, 5678);
+        assert_eq!(node.config.datadir, PathBuf::from("/my/data"));
+        assert_eq!(node.database.path, PathBuf::from("/my/db"));
+        assert_eq!(node.network.port, 5678);
+    }
+
+    #[test]
     fn test_node_config_overrides() {
         let config = NodeConfig::new(Network::Mainnet)
             .with_datadir("/data/btc")
@@ -408,5 +508,152 @@ mod tests {
         assert_eq!(config.p2p_port, 9998);
         assert_eq!(config.datadir, PathBuf::from("/data/btc"));
         assert_eq!(config.log_level, "debug");
+    }
+
+    // ===================================================================
+    // Additional builder tests for coverage
+    // ===================================================================
+
+    #[test]
+    fn test_builder_pipeline_then_database_then_network() {
+        // Verify all 6 permutations of component attachment order
+        let node = NodeBuilder::new(NodeConfig::new(Network::Regtest))
+            .with_pipeline(Pipeline::new())
+            .with_database(DatabaseHandle { path: PathBuf::from("/tmp") })
+            .with_network(NetworkHandle { port: 18444 })
+            .build()
+            .unwrap();
+        assert_eq!(node.config.network, Network::Regtest);
+    }
+
+    #[test]
+    fn test_builder_network_then_pipeline_then_database() {
+        let node = NodeBuilder::new(NodeConfig::new(Network::Regtest))
+            .with_network(NetworkHandle { port: 18444 })
+            .with_pipeline(Pipeline::new())
+            .with_database(DatabaseHandle { path: PathBuf::from("/tmp") })
+            .build()
+            .unwrap();
+        assert_eq!(node.config.network, Network::Regtest);
+    }
+
+    #[test]
+    fn test_builder_network_then_database_then_pipeline() {
+        let node = NodeBuilder::new(NodeConfig::new(Network::Regtest))
+            .with_network(NetworkHandle { port: 18444 })
+            .with_database(DatabaseHandle { path: PathBuf::from("/tmp") })
+            .with_pipeline(Pipeline::new())
+            .build()
+            .unwrap();
+        assert_eq!(node.config.network, Network::Regtest);
+    }
+
+    #[test]
+    fn test_builder_database_then_pipeline_then_network() {
+        let node = NodeBuilder::new(NodeConfig::new(Network::Regtest))
+            .with_database(DatabaseHandle { path: PathBuf::from("/tmp") })
+            .with_pipeline(Pipeline::new())
+            .with_network(NetworkHandle { port: 18444 })
+            .build()
+            .unwrap();
+        assert_eq!(node.config.network, Network::Regtest);
+    }
+
+    #[test]
+    fn test_builder_config_accessible_from_all_states() {
+        // No components
+        let b0 = NodeBuilder::new(NodeConfig::new(Network::Mainnet));
+        assert_eq!(b0.config().network, Network::Mainnet);
+
+        // One component
+        let b1 = b0.with_database(DatabaseHandle { path: PathBuf::from("/tmp") });
+        assert_eq!(b1.config().network, Network::Mainnet);
+
+        // Two components
+        let b2 = b1.with_network(NetworkHandle { port: 8333 });
+        assert_eq!(b2.config().network, Network::Mainnet);
+
+        // All three (before build)
+        let b3 = b2.with_pipeline(Pipeline::new());
+        assert_eq!(b3.config().network, Network::Mainnet);
+    }
+
+    #[test]
+    fn test_node_config_all_networks() {
+        for network in [Network::Mainnet, Network::Testnet, Network::Signet, Network::Regtest] {
+            let config = NodeConfig::new(network);
+            assert_eq!(config.network, network);
+            // Ports should differ from 0
+            assert!(config.rpc_port > 0);
+            assert!(config.p2p_port > 0);
+            // RPC and P2P ports should differ
+            assert_ne!(config.rpc_port, config.p2p_port);
+        }
+    }
+
+    #[test]
+    fn test_node_config_builder_chain() {
+        // Test that all builder methods chain correctly
+        let config = NodeConfig::new(Network::Mainnet)
+            .with_datadir("/a")
+            .with_rpc_port(1)
+            .with_p2p_port(2)
+            .with_log_level("trace");
+        assert_eq!(config.datadir, PathBuf::from("/a"));
+        assert_eq!(config.rpc_port, 1);
+        assert_eq!(config.p2p_port, 2);
+        assert_eq!(config.log_level, "trace");
+    }
+
+    #[test]
+    fn test_node_config_datadir_string() {
+        let config = NodeConfig::new(Network::Mainnet)
+            .with_datadir("/home/user/.btc-rust");
+        assert_eq!(config.datadir, PathBuf::from("/home/user/.btc-rust"));
+    }
+
+    #[test]
+    fn test_node_config_datadir_pathbuf() {
+        let config = NodeConfig::new(Network::Mainnet)
+            .with_datadir(PathBuf::from("/home/user/data"));
+        assert_eq!(config.datadir, PathBuf::from("/home/user/data"));
+    }
+
+    #[test]
+    fn test_node_config_log_level_string() {
+        let config = NodeConfig::new(Network::Mainnet)
+            .with_log_level(String::from("warn"));
+        assert_eq!(config.log_level, "warn");
+    }
+
+    #[test]
+    fn test_node_config_log_level_str() {
+        let config = NodeConfig::new(Network::Mainnet)
+            .with_log_level("error");
+        assert_eq!(config.log_level, "error");
+    }
+
+    #[test]
+    fn test_build_produces_correct_components() {
+        let config = NodeConfig::new(Network::Regtest)
+            .with_rpc_port(1111)
+            .with_p2p_port(2222)
+            .with_datadir("/test/dir")
+            .with_log_level("trace");
+
+        let node = NodeBuilder::new(config)
+            .with_database(DatabaseHandle { path: PathBuf::from("/db/path") })
+            .with_network(NetworkHandle { port: 2222 })
+            .with_pipeline(Pipeline::new())
+            .build()
+            .unwrap();
+
+        assert_eq!(node.config.rpc_port, 1111);
+        assert_eq!(node.config.p2p_port, 2222);
+        assert_eq!(node.config.datadir, PathBuf::from("/test/dir"));
+        assert_eq!(node.config.log_level, "trace");
+        assert_eq!(node.config.network, Network::Regtest);
+        assert_eq!(node.database.path, PathBuf::from("/db/path"));
+        assert_eq!(node.network.port, 2222);
     }
 }

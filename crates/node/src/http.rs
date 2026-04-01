@@ -1055,6 +1055,219 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    fn test_response_json_content_type() {
+        let resp = HttpResponse::json(r#"{"ok":true}"#);
+        let ct = resp.headers.iter().find(|(k, _)| k == "Content-Type").unwrap();
+        assert_eq!(ct.1, "application/json");
+    }
+
+    #[test]
+    fn test_response_text_content_type() {
+        let resp = HttpResponse::text("hello world");
+        assert_eq!(resp.status, 200);
+        let ct = resp.headers.iter().find(|(k, _)| k == "Content-Type").unwrap();
+        assert_eq!(ct.1, "text/plain; charset=utf-8");
+        assert_eq!(resp.body, b"hello world");
+    }
+
+    #[test]
+    fn test_response_html_content_type() {
+        let resp = HttpResponse::html("<h1>Hello</h1>");
+        assert_eq!(resp.status, 200);
+        let ct = resp.headers.iter().find(|(k, _)| k == "Content-Type").unwrap();
+        assert_eq!(ct.1, "text/html; charset=utf-8");
+        assert_eq!(resp.body, b"<h1>Hello</h1>");
+    }
+
+    #[test]
+    fn test_response_not_found_body() {
+        let resp = HttpResponse::not_found();
+        assert_eq!(resp.status, 404);
+        assert_eq!(resp.status_text, "Not Found");
+        let body = std::str::from_utf8(&resp.body).unwrap();
+        assert!(body.contains("not found"));
+    }
+
+    #[test]
+    fn test_response_bad_request_body() {
+        let resp = HttpResponse::bad_request("custom error message");
+        assert_eq!(resp.status, 400);
+        let body = std::str::from_utf8(&resp.body).unwrap();
+        assert!(body.contains("custom error message"));
+    }
+
+    #[test]
+    fn test_response_internal_error_body() {
+        let resp = HttpResponse::internal_error("internal failure");
+        assert_eq!(resp.status, 500);
+        assert_eq!(resp.status_text, "Internal Server Error");
+        let body = std::str::from_utf8(&resp.body).unwrap();
+        assert!(body.contains("internal failure"));
+    }
+
+    #[test]
+    fn test_response_to_bytes_not_found() {
+        let resp = HttpResponse::not_found();
+        let bytes = resp.to_bytes();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.starts_with("HTTP/1.1 404 Not Found\r\n"));
+        assert!(text.contains("Content-Length: "));
+    }
+
+    #[test]
+    fn test_response_to_bytes_text() {
+        let resp = HttpResponse::text("hello");
+        let bytes = resp.to_bytes();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(text.contains("Content-Length: 5\r\n"));
+        assert!(text.ends_with("hello"));
+    }
+
+    #[test]
+    fn test_response_to_bytes_html() {
+        let resp = HttpResponse::html("<b>hi</b>");
+        let bytes = resp.to_bytes();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("text/html"));
+        assert!(text.ends_with("<b>hi</b>"));
+    }
+
+    #[test]
+    fn test_response_to_bytes_internal_error() {
+        let resp = HttpResponse::internal_error("boom");
+        let bytes = resp.to_bytes();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.starts_with("HTTP/1.1 500 Internal Server Error\r\n"));
+    }
+
+    #[test]
+    fn test_response_clone() {
+        let resp = HttpResponse::json(r#"{"ok":true}"#);
+        let resp2 = resp.clone();
+        assert_eq!(resp.status, resp2.status);
+        assert_eq!(resp.body, resp2.body);
+    }
+
+    #[test]
+    fn test_response_debug() {
+        let resp = HttpResponse::json(r#"{"ok":true}"#);
+        let debug = format!("{:?}", resp);
+        assert!(debug.contains("HttpResponse"));
+    }
+
+    #[test]
+    fn test_parse_request_with_empty_header_line() {
+        // Headers section has an empty line mid-stream (before the blank separator)
+        let raw = b"GET /path HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let req = parse_request(raw).unwrap();
+        assert_eq!(req.method, "GET");
+        assert_eq!(req.path, "/path");
+    }
+
+    #[test]
+    fn test_parse_request_with_no_body_after_headers() {
+        let raw = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+        let req = parse_request(raw).unwrap();
+        assert!(req.body.is_empty());
+    }
+
+    #[test]
+    fn test_handle_address_txs_empty_address() {
+        let m = make_metrics();
+        // The address segment itself must be non-empty for the route to match
+        // but the handler checks for empty address
+        let req = HttpRequest {
+            method: "GET".into(),
+            path: "/api/address//txs".into(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        let resp = handle_request(&req, &m);
+        // This path won't match the route pattern with empty address segment
+        assert!(resp.status == 400 || resp.status == 404);
+    }
+
+    #[test]
+    fn test_handle_address_utxo_empty_address() {
+        let m = make_metrics();
+        let req = HttpRequest {
+            method: "GET".into(),
+            path: "/api/address//utxo".into(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        let resp = handle_request(&req, &m);
+        assert!(resp.status == 400 || resp.status == 404);
+    }
+
+    #[test]
+    fn test_metrics_default_impl() {
+        let m = MetricsCollector::default();
+        assert_eq!(m.chain_height.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_metrics_best_block_hash_default() {
+        let m = MetricsCollector::new();
+        let hash = m.get_best_block_hash();
+        assert_eq!(hash.len(), 64);
+        assert!(hash.chars().all(|c| c == '0'));
+    }
+
+    #[test]
+    fn test_parse_request_without_double_crlf() {
+        // No \r\n\r\n separator - should still parse the request line
+        let raw = b"GET /path HTTP/1.1";
+        // This should be None since there's no proper HTTP request separator
+        // Actually looking at the code, it handles missing \r\n\r\n by using
+        // the whole text as head
+        let result = parse_request(raw);
+        assert!(result.is_some());
+        let req = result.unwrap();
+        assert_eq!(req.method, "GET");
+        assert_eq!(req.path, "/path");
+    }
+
+    #[test]
+    fn test_handle_request_with_query_params_on_all_endpoints() {
+        let m = make_metrics();
+        // Query string should be stripped
+        let resp = handle_request(&make_request("/api/blocks/tip/hash?format=json"), &m);
+        assert_eq!(resp.status, 200);
+    }
+
+    #[test]
+    fn test_handle_block_hash_too_short() {
+        let m = make_metrics();
+        let resp = handle_request(&make_request("/api/block/abc"), &m);
+        assert_eq!(resp.status, 400);
+    }
+
+    #[test]
+    fn test_handle_block_hash_not_hex() {
+        let m = make_metrics();
+        let hash = "x".repeat(64);
+        let resp = handle_request(&make_request(&format!("/api/block/{}", hash)), &m);
+        assert_eq!(resp.status, 400);
+    }
+
+    #[test]
+    fn test_handle_tx_too_short() {
+        let m = make_metrics();
+        let resp = handle_request(&make_request("/api/tx/abc"), &m);
+        assert_eq!(resp.status, 400);
+    }
+
+    #[test]
+    fn test_handle_tx_not_hex() {
+        let m = make_metrics();
+        let txid = "g".repeat(64);
+        let resp = handle_request(&make_request(&format!("/api/tx/{}", txid)), &m);
+        assert_eq!(resp.status, 400);
+    }
+
+    #[test]
     fn test_http_server_port() {
         let m = MetricsCollector::new();
         let server = HttpServer::new(8080, m);

@@ -1,18 +1,13 @@
 use std::io::Write;
 
 use clap::{Parser, Subcommand};
-use sha2::{Digest, Sha256};
 
 use btc_consensus::script_engine::{ScriptEngine, ScriptFlags};
 use btc_consensus::sig_verify::Secp256k1Verifier;
-use btc_forge::miniscript::Policy;
 use btc_node::builder::{DatabaseHandle, NetworkHandle, NodeBuilder, NodeConfig};
+use btc_node::cli::{self, ScriptItem};
 use btc_node::output::{self, OutputFormat};
-use btc_primitives::address::Address;
-use btc_primitives::block::BlockHeader;
-use btc_primitives::encode::Encodable;
-use btc_primitives::script::{Instruction, Opcode, Script, ScriptBuf};
-use btc_primitives::transaction::Transaction;
+use btc_primitives::script::{Instruction, ScriptBuf};
 use btc_primitives::Network;
 use btc_stages::Pipeline;
 
@@ -165,19 +160,6 @@ enum Commands {
     },
 }
 
-fn parse_network(s: &str) -> Network {
-    match s {
-        "mainnet" => Network::Mainnet,
-        "testnet" => Network::Testnet,
-        "signet" => Network::Signet,
-        "regtest" => Network::Regtest,
-        _ => {
-            tracing::warn!(network = %s, "unknown network, defaulting to mainnet");
-            Network::Mainnet
-        }
-    }
-}
-
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
     let cli = Cli::parse();
@@ -194,7 +176,7 @@ async fn main() -> eyre::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let network = parse_network(&cli.network);
+    let network = cli::parse_network(&cli.network);
 
     let mut config = NodeConfig::new(network)
         .with_datadir(&cli.datadir)
@@ -317,30 +299,13 @@ async fn cmd_run(
 }
 
 fn cmd_status(config: NodeConfig, format: OutputFormat) -> eyre::Result<()> {
-    let status = output::NodeStatus {
-        network: config.network.to_string(),
-        chain_height: 0,
-        best_block_hash: "0000000000000000000000000000000000000000000000000000000000000000"
-            .to_string(),
-        peer_count: 0,
-        mempool_size: 0,
-        syncing: false,
-        sync_progress: 0.0,
-        version: env!("CARGO_PKG_VERSION").to_string(),
-    };
+    let status = cli::build_status(&config);
     output::emit(format, &status);
     Ok(())
 }
 
 fn cmd_sync(_config: NodeConfig, format: OutputFormat) -> eyre::Result<()> {
-    let status = output::SyncStatus {
-        syncing: false,
-        current_height: 0,
-        target_height: 0,
-        progress: 0.0,
-        stage: "idle".to_string(),
-        peers: 0,
-    };
+    let status = cli::build_sync_status();
     output::emit(format, &status);
     Ok(())
 }
@@ -352,13 +317,7 @@ fn cmd_peers(_config: NodeConfig, format: OutputFormat) -> eyre::Result<()> {
 }
 
 fn cmd_config(config: NodeConfig, format: OutputFormat) -> eyre::Result<()> {
-    let info = serde_json::json!({
-        "network": config.network.to_string(),
-        "datadir": config.datadir.display().to_string(),
-        "rpc_port": config.rpc_port,
-        "p2p_port": config.p2p_port,
-        "log_level": config.log_level,
-    });
+    let info = cli::build_config(&config);
     output::emit(format, &info);
     Ok(())
 }
@@ -379,13 +338,7 @@ fn cmd_init(config: NodeConfig, format: OutputFormat) -> eyre::Result<()> {
 }
 
 fn cmd_version(format: OutputFormat) -> eyre::Result<()> {
-    let info = serde_json::json!({
-        "name": "btc-node",
-        "version": env!("CARGO_PKG_VERSION"),
-        "rust_version": "1.82+",
-        "database": "qmdb",
-        "features": ["legacy", "segwit", "taproot"],
-    });
+    let info = cli::build_version();
     output::emit(format, &info);
     Ok(())
 }
@@ -396,39 +349,7 @@ fn cmd_rpc(
     method: &str,
     params: &[String],
 ) -> eyre::Result<()> {
-    let params_json: serde_json::Value = if params.is_empty() {
-        serde_json::Value::Array(vec![])
-    } else {
-        let parsed: Vec<serde_json::Value> = params
-            .iter()
-            .map(|p| serde_json::from_str(p).unwrap_or(serde_json::Value::String(p.clone())))
-            .collect();
-        serde_json::Value::Array(parsed)
-    };
-
-    let request = serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": method,
-        "params": params_json,
-        "id": 1,
-    });
-
-    // In a live node, this would send the JSON-RPC request and forward
-    // the response directly. For now, emit the JSON-RPC envelope so agents
-    // can see the exact request shape.
-    let result = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "result": null,
-        "error": {
-            "code": -32600,
-            "message": "RPC client not yet connected",
-            "data": {
-                "request": request,
-                "target": format!("127.0.0.1:{}", config.rpc_port),
-            }
-        }
-    });
+    let result = cli::build_rpc_request(method, params, config.rpc_port);
     // Always emit JSON-RPC responses as JSON (the protocol is JSON-native)
     output::emit(OutputFormat::Json, &result);
     Ok(())
@@ -438,93 +359,20 @@ fn cmd_rpc(
 // Decode subcommands
 // ---------------------------------------------------------------------------
 
-fn script_type(script: &Script) -> &str {
-    if script.is_p2pkh() {
-        "p2pkh"
-    } else if script.is_p2sh() {
-        "p2sh"
-    } else if script.is_p2wpkh() {
-        "p2wpkh"
-    } else if script.is_p2wsh() {
-        "p2wsh"
-    } else if script.is_p2tr() {
-        "p2tr"
-    } else if script.is_op_return() {
-        "op_return"
-    } else {
-        "unknown"
-    }
-}
-
 fn cmd_decode_tx(hex_str: &str, format: OutputFormat) -> eyre::Result<()> {
-    let bytes = hex::decode(hex_str)?;
-    let tx: Transaction = btc_primitives::decode(&bytes)?;
-    let info = serde_json::json!({
-        "txid": tx.txid().to_hex(),
-        "version": tx.version,
-        "locktime": tx.lock_time,
-        "inputs": tx.inputs.len(),
-        "outputs": tx.outputs.len(),
-        "is_segwit": tx.is_segwit(),
-        "is_coinbase": tx.is_coinbase(),
-        "size": bytes.len(),
-        "vin": tx.inputs.iter().map(|i| serde_json::json!({
-            "txid": i.previous_output.txid.to_hex(),
-            "vout": i.previous_output.vout,
-            "script_sig_hex": hex::encode(i.script_sig.as_bytes()),
-            "sequence": i.sequence,
-        })).collect::<Vec<_>>(),
-        "vout": tx.outputs.iter().enumerate().map(|(n, o)| serde_json::json!({
-            "n": n,
-            "value": o.value.as_sat(),
-            "value_btc": o.value.as_btc(),
-            "script_pubkey_hex": hex::encode(o.script_pubkey.as_bytes()),
-            "type": script_type(&o.script_pubkey),
-        })).collect::<Vec<_>>(),
-    });
+    let info = cli::decode_tx(hex_str)?;
     output::emit(format, &info);
     Ok(())
 }
 
 fn cmd_decode_script(hex_str: &str, format: OutputFormat) -> eyre::Result<()> {
-    let bytes = hex::decode(hex_str)?;
-    let script = Script::from_bytes(&bytes);
-
-    let mut ops = Vec::new();
-    for instruction in script.instructions() {
-        match instruction {
-            Ok(Instruction::Op(op)) => ops.push(format!("{:?}", op)),
-            Ok(Instruction::PushBytes(data)) => {
-                ops.push(format!("PUSH({})", hex::encode(data)))
-            }
-            Err(e) => ops.push(format!("ERROR: {}", e)),
-        }
-    }
-
-    let info = serde_json::json!({
-        "hex": hex_str,
-        "size": bytes.len(),
-        "type": script_type(script),
-        "is_witness_program": script.is_witness_program(),
-        "asm": ops.join(" "),
-        "opcodes": ops,
-    });
+    let info = cli::decode_script(hex_str)?;
     output::emit(format, &info);
     Ok(())
 }
 
 fn cmd_decode_header(hex_str: &str, format: OutputFormat) -> eyre::Result<()> {
-    let bytes = hex::decode(hex_str)?;
-    let header: BlockHeader = btc_primitives::decode(&bytes)?;
-    let info = serde_json::json!({
-        "hash": header.block_hash().to_hex(),
-        "version": header.version,
-        "prev_blockhash": header.prev_blockhash.to_hex(),
-        "merkle_root": header.merkle_root.to_hex(),
-        "time": header.time,
-        "bits": format!("{:#010x}", header.bits.to_u32()),
-        "nonce": header.nonce,
-    });
+    let info = cli::decode_header(hex_str)?;
     output::emit(format, &info);
     Ok(())
 }
@@ -534,13 +382,7 @@ fn cmd_decode_header(hex_str: &str, format: OutputFormat) -> eyre::Result<()> {
 // ---------------------------------------------------------------------------
 
 fn cmd_explore(config: NodeConfig, format: OutputFormat, explorer_port: u16) -> eyre::Result<()> {
-    let info = serde_json::json!({
-        "event": "explorer_starting",
-        "network": config.network.to_string(),
-        "explorer_url": format!("http://127.0.0.1:{}", explorer_port),
-        "api_url": format!("http://127.0.0.1:{}/api", explorer_port),
-        "rpc_port": config.rpc_port,
-    });
+    let info = cli::build_explore(&config, explorer_port);
     output::emit(format, &info);
     eprintln!(
         "Block explorer starting at http://127.0.0.1:{} (network: {})",
@@ -556,48 +398,16 @@ fn cmd_explore(config: NodeConfig, format: OutputFormat, explorer_port: u16) -> 
 // ---------------------------------------------------------------------------
 
 fn cmd_watch(address_str: &str, network: Network, format: OutputFormat) -> eyre::Result<()> {
-    // Try parsing as bech32 first, then base58
-    let addr = Address::from_bech32(address_str, network)
-        .or_else(|_| Address::from_base58(address_str, network))
-        .map_err(|e| eyre::eyre!("failed to parse address '{}': {}", address_str, e))?;
-
-    let script_pubkey = addr.script_pubkey();
-    let spk_bytes = script_pubkey.as_bytes();
-
-    // Compute script hash (SHA256 of the scriptPubKey)
-    let mut hasher = Sha256::new();
-    hasher.update(spk_bytes);
-    let script_hash: [u8; 32] = hasher.finalize().into();
-
-    let addr_type = match &addr {
-        Address::P2pkh { .. } => "p2pkh",
-        Address::P2sh { .. } => "p2sh",
-        Address::P2wpkh { .. } => "p2wpkh",
-        Address::P2wsh { .. } => "p2wsh",
-        Address::P2tr { .. } => "p2tr",
-    };
-
+    let info = cli::watch_address(address_str, network)?;
     // Emit watch-started event (JSON line to stderr for agents)
     output::emit_progress(
         "watch_started",
         &serde_json::json!({
             "address": address_str,
-            "type": addr_type,
-            "script_hash": hex::encode(&script_hash),
+            "type": info["type"],
+            "script_hash": info["script_hash"],
         }),
     );
-
-    // Emit the structured status to stdout
-    let info = serde_json::json!({
-        "event": "watch_status",
-        "address": address_str,
-        "type": addr_type,
-        "network": network.to_string(),
-        "script_pubkey_hex": hex::encode(spk_bytes),
-        "script_hash": hex::encode(script_hash),
-        "status": "watching",
-        "note": "In a live node, JSON-line events will stream here for each matching transaction.",
-    });
     output::emit(format, &info);
     Ok(())
 }
@@ -607,96 +417,7 @@ fn cmd_watch(address_str: &str, network: Network, format: OutputFormat) -> eyre:
 // ---------------------------------------------------------------------------
 
 fn cmd_simulate_tx(hex_str: &str, format: OutputFormat) -> eyre::Result<()> {
-    let bytes = hex::decode(hex_str)
-        .map_err(|e| eyre::eyre!("invalid hex: {}", e))?;
-    let tx: Transaction = btc_primitives::decode(&bytes)
-        .map_err(|e| eyre::eyre!("failed to decode transaction: {}", e))?;
-
-    // Compute sizes
-    let legacy_size = {
-        let mut buf = Vec::new();
-        // We compute legacy size by encoding without witness
-        let legacy_tx = Transaction {
-            version: tx.version,
-            inputs: tx.inputs.clone(),
-            outputs: tx.outputs.clone(),
-            witness: Vec::new(),
-            lock_time: tx.lock_time,
-        };
-        let _ = legacy_tx.encode(&mut buf);
-        buf.len()
-    };
-
-    let total_size = {
-        let mut buf = Vec::new();
-        let _ = tx.encode(&mut buf);
-        buf.len()
-    };
-
-    // Weight = base_size * 3 + total_size  (BIP141)
-    let weight = legacy_size * 3 + total_size;
-    let vsize = (weight + 3) / 4; // ceiling division
-
-    // Check if it's a coinbase
-    let is_coinbase = tx.is_coinbase();
-
-    // Compute total output value
-    let total_output: i64 = tx.outputs.iter().map(|o| o.value.as_sat()).sum();
-
-    // For a real simulation, we'd look up each input's UTXO to get the input
-    // values and run script verification. Since we don't have the UTXO set
-    // available in CLI-only mode, we report what we can.
-    let mut input_details: Vec<serde_json::Value> = Vec::new();
-    for (i, inp) in tx.inputs.iter().enumerate() {
-        let mut detail = serde_json::json!({
-            "index": i,
-            "prev_txid": inp.previous_output.txid.to_hex(),
-            "prev_vout": inp.previous_output.vout,
-            "sequence": inp.sequence,
-            "script_sig_size": inp.script_sig.len(),
-        });
-        if tx.is_segwit() {
-            if let Some(w) = tx.witness.get(i) {
-                detail["witness_items"] = serde_json::json!(w.len());
-            }
-        }
-        input_details.push(detail);
-    }
-
-    let mut output_details: Vec<serde_json::Value> = Vec::new();
-    for (i, out) in tx.outputs.iter().enumerate() {
-        output_details.push(serde_json::json!({
-            "index": i,
-            "value_sat": out.value.as_sat(),
-            "value_btc": out.value.as_btc(),
-            "script_pubkey_hex": hex::encode(out.script_pubkey.as_bytes()),
-            "type": script_type(&out.script_pubkey),
-        }));
-    }
-
-    // Build result
-    let result = serde_json::json!({
-        "txid": tx.txid().to_hex(),
-        "version": tx.version,
-        "locktime": tx.lock_time,
-        "is_segwit": tx.is_segwit(),
-        "is_coinbase": is_coinbase,
-        "inputs_count": tx.inputs.len(),
-        "outputs_count": tx.outputs.len(),
-        "total_output_sat": total_output,
-        "total_output_btc": total_output as f64 / 100_000_000.0,
-        "size": total_size,
-        "weight": weight,
-        "vsize": vsize,
-        "inputs": input_details,
-        "outputs": output_details,
-        "simulation": {
-            "utxo_lookup": "unavailable (no running node connection)",
-            "fee": "unknown (requires UTXO lookup for input values)",
-            "script_verification": "skipped (requires UTXO data)",
-            "valid": "indeterminate (dry-run without UTXO set)",
-        },
-    });
+    let result = cli::simulate_tx(hex_str)?;
     output::emit(format, &result);
     Ok(())
 }
@@ -706,31 +427,7 @@ fn cmd_simulate_tx(hex_str: &str, format: OutputFormat) -> eyre::Result<()> {
 // ---------------------------------------------------------------------------
 
 fn cmd_compile(policy_str: &str, format: OutputFormat) -> eyre::Result<()> {
-    let policy = Policy::parse(policy_str)
-        .map_err(|e| eyre::eyre!("failed to parse policy: {}", e))?;
-
-    let script = policy.compile();
-    let script_ref = script.as_script();
-
-    // Disassemble
-    let mut asm_ops = Vec::new();
-    for instruction in script_ref.instructions() {
-        match instruction {
-            Ok(Instruction::Op(op)) => asm_ops.push(format!("{:?}", op)),
-            Ok(Instruction::PushBytes(data)) => {
-                asm_ops.push(format!("PUSH({})", hex::encode(data)))
-            }
-            Err(e) => asm_ops.push(format!("ERROR: {}", e)),
-        }
-    }
-
-    let info = serde_json::json!({
-        "policy": policy_str,
-        "script_hex": hex::encode(script.as_bytes()),
-        "script_size": script.len(),
-        "asm": asm_ops.join(" "),
-        "opcodes": asm_ops,
-    });
+    let info = cli::compile_policy(policy_str)?;
     output::emit(format, &info);
     Ok(())
 }
@@ -739,151 +436,8 @@ fn cmd_compile(policy_str: &str, format: OutputFormat) -> eyre::Result<()> {
 // Script playground
 // ---------------------------------------------------------------------------
 
-enum ScriptItem {
-    Op(Opcode),
-    Data(Vec<u8>),
-}
-
-fn parse_opcode_or_data(input: &str) -> Option<ScriptItem> {
-    let upper = input.to_uppercase();
-
-    let try_names: Vec<String> = if upper.starts_with("OP_") {
-        vec![upper.clone()]
-    } else {
-        vec![format!("OP_{}", upper), upper.clone()]
-    };
-
-    for name in &try_names {
-        let matched = match name.as_str() {
-            "OP_0" | "OP_FALSE" => Some(Opcode::OP_0),
-            "OP_1NEGATE" => Some(Opcode::OP_1NEGATE),
-            "OP_1" | "OP_TRUE" => Some(Opcode::OP_1),
-            "OP_2" => Some(Opcode::OP_2),
-            "OP_3" => Some(Opcode::OP_3),
-            "OP_4" => Some(Opcode::OP_4),
-            "OP_5" => Some(Opcode::OP_5),
-            "OP_6" => Some(Opcode::OP_6),
-            "OP_7" => Some(Opcode::OP_7),
-            "OP_8" => Some(Opcode::OP_8),
-            "OP_9" => Some(Opcode::OP_9),
-            "OP_10" => Some(Opcode::OP_10),
-            "OP_11" => Some(Opcode::OP_11),
-            "OP_12" => Some(Opcode::OP_12),
-            "OP_13" => Some(Opcode::OP_13),
-            "OP_14" => Some(Opcode::OP_14),
-            "OP_15" => Some(Opcode::OP_15),
-            "OP_16" => Some(Opcode::OP_16),
-            "OP_NOP" => Some(Opcode::OP_NOP),
-            "OP_IF" => Some(Opcode::OP_IF),
-            "OP_NOTIF" => Some(Opcode::OP_NOTIF),
-            "OP_ELSE" => Some(Opcode::OP_ELSE),
-            "OP_ENDIF" => Some(Opcode::OP_ENDIF),
-            "OP_VERIFY" => Some(Opcode::OP_VERIFY),
-            "OP_RETURN" => Some(Opcode::OP_RETURN),
-            "OP_TOALTSTACK" => Some(Opcode::OP_TOALTSTACK),
-            "OP_FROMALTSTACK" => Some(Opcode::OP_FROMALTSTACK),
-            "OP_2DROP" => Some(Opcode::OP_2DROP),
-            "OP_2DUP" => Some(Opcode::OP_2DUP),
-            "OP_3DUP" => Some(Opcode::OP_3DUP),
-            "OP_2OVER" => Some(Opcode::OP_2OVER),
-            "OP_2ROT" => Some(Opcode::OP_2ROT),
-            "OP_2SWAP" => Some(Opcode::OP_2SWAP),
-            "OP_IFDUP" => Some(Opcode::OP_IFDUP),
-            "OP_DEPTH" => Some(Opcode::OP_DEPTH),
-            "OP_DROP" => Some(Opcode::OP_DROP),
-            "OP_DUP" => Some(Opcode::OP_DUP),
-            "OP_NIP" => Some(Opcode::OP_NIP),
-            "OP_OVER" => Some(Opcode::OP_OVER),
-            "OP_PICK" => Some(Opcode::OP_PICK),
-            "OP_ROLL" => Some(Opcode::OP_ROLL),
-            "OP_ROT" => Some(Opcode::OP_ROT),
-            "OP_SWAP" => Some(Opcode::OP_SWAP),
-            "OP_TUCK" => Some(Opcode::OP_TUCK),
-            "OP_SIZE" => Some(Opcode::OP_SIZE),
-            "OP_EQUAL" => Some(Opcode::OP_EQUAL),
-            "OP_EQUALVERIFY" => Some(Opcode::OP_EQUALVERIFY),
-            "OP_1ADD" => Some(Opcode::OP_1ADD),
-            "OP_1SUB" => Some(Opcode::OP_1SUB),
-            "OP_NEGATE" => Some(Opcode::OP_NEGATE),
-            "OP_ABS" => Some(Opcode::OP_ABS),
-            "OP_NOT" => Some(Opcode::OP_NOT),
-            "OP_0NOTEQUAL" => Some(Opcode::OP_0NOTEQUAL),
-            "OP_ADD" => Some(Opcode::OP_ADD),
-            "OP_SUB" => Some(Opcode::OP_SUB),
-            "OP_BOOLAND" => Some(Opcode::OP_BOOLAND),
-            "OP_BOOLOR" => Some(Opcode::OP_BOOLOR),
-            "OP_NUMEQUAL" => Some(Opcode::OP_NUMEQUAL),
-            "OP_NUMEQUALVERIFY" => Some(Opcode::OP_NUMEQUALVERIFY),
-            "OP_NUMNOTEQUAL" => Some(Opcode::OP_NUMNOTEQUAL),
-            "OP_LESSTHAN" => Some(Opcode::OP_LESSTHAN),
-            "OP_GREATERTHAN" => Some(Opcode::OP_GREATERTHAN),
-            "OP_LESSTHANOREQUAL" => Some(Opcode::OP_LESSTHANOREQUAL),
-            "OP_GREATERTHANOREQUAL" => Some(Opcode::OP_GREATERTHANOREQUAL),
-            "OP_MIN" => Some(Opcode::OP_MIN),
-            "OP_MAX" => Some(Opcode::OP_MAX),
-            "OP_WITHIN" => Some(Opcode::OP_WITHIN),
-            "OP_RIPEMD160" => Some(Opcode::OP_RIPEMD160),
-            "OP_SHA1" => Some(Opcode::OP_SHA1),
-            "OP_SHA256" => Some(Opcode::OP_SHA256),
-            "OP_HASH160" => Some(Opcode::OP_HASH160),
-            "OP_HASH256" => Some(Opcode::OP_HASH256),
-            "OP_CODESEPARATOR" => Some(Opcode::OP_CODESEPARATOR),
-            "OP_CHECKSIG" => Some(Opcode::OP_CHECKSIG),
-            "OP_CHECKSIGVERIFY" => Some(Opcode::OP_CHECKSIGVERIFY),
-            "OP_CHECKMULTISIG" => Some(Opcode::OP_CHECKMULTISIG),
-            "OP_CHECKMULTISIGVERIFY" => Some(Opcode::OP_CHECKMULTISIGVERIFY),
-            "OP_NOP1" => Some(Opcode::OP_NOP1),
-            "OP_CHECKLOCKTIMEVERIFY" | "OP_CLTV" => Some(Opcode::OP_CHECKLOCKTIMEVERIFY),
-            "OP_CHECKSEQUENCEVERIFY" | "OP_CSV" => Some(Opcode::OP_CHECKSEQUENCEVERIFY),
-            "OP_NOP4" => Some(Opcode::OP_NOP4),
-            "OP_NOP5" => Some(Opcode::OP_NOP5),
-            "OP_NOP6" => Some(Opcode::OP_NOP6),
-            "OP_NOP7" => Some(Opcode::OP_NOP7),
-            "OP_NOP8" => Some(Opcode::OP_NOP8),
-            "OP_NOP9" => Some(Opcode::OP_NOP9),
-            "OP_NOP10" => Some(Opcode::OP_NOP10),
-            "OP_CHECKSIGADD" => Some(Opcode::OP_CHECKSIGADD),
-            _ => None,
-        };
-        if let Some(op) = matched {
-            return Some(ScriptItem::Op(op));
-        }
-    }
-
-    // Try parsing as hex data push
-    if let Ok(data) = hex::decode(input) {
-        if !data.is_empty() {
-            return Some(ScriptItem::Data(data));
-        }
-    }
-
-    None
-}
-
 fn format_stack(stack: &[Vec<u8>]) {
-    if stack.is_empty() {
-        println!("  (empty)");
-    } else {
-        for (i, item) in stack.iter().enumerate().rev() {
-            let hex_str = hex::encode(item);
-            let int_repr = if item.is_empty() {
-                " (0)".to_string()
-            } else if item.len() <= 4 {
-                // Script number encoding: little-endian, sign bit in MSB
-                let mut val: i64 = 0;
-                for (j, &b) in item.iter().enumerate() {
-                    val |= (b as i64) << (j * 8);
-                }
-                if !item.is_empty() && (item.last().unwrap() & 0x80) != 0 {
-                    val = -(val & !(0x80i64 << ((item.len() - 1) * 8)));
-                }
-                format!(" ({})", val)
-            } else {
-                String::new()
-            };
-            println!("  [{}] {}{}", i, hex_str, int_repr);
-        }
-    }
+    println!("{}", cli::format_stack_to_string(stack));
 }
 
 fn cmd_playground() -> eyre::Result<()> {
@@ -1017,7 +571,7 @@ fn cmd_playground() -> eyre::Result<()> {
             }
             _ => {
                 for token in line.split_whitespace() {
-                    match parse_opcode_or_data(token) {
+                    match cli::parse_opcode_or_data(token) {
                         Some(ScriptItem::Op(op)) => {
                             script.push_opcode(op);
                             println!("+ {:?}", op);

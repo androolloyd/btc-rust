@@ -371,6 +371,124 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[test]
+    fn test_pubkey_from_secret_deterministic() {
+        let key = test_key();
+        let pk1 = pubkey_from_secret(&key);
+        let pk2 = pubkey_from_secret(&key);
+        assert_eq!(pk1, pk2);
+        assert_eq!(pk1.len(), 32);
+    }
+
+    #[test]
+    fn test_pubkey_from_secret_different_keys() {
+        let key1 = [0x01; 32];
+        let key2 = [0x02; 32];
+        let pk1 = pubkey_from_secret(&key1);
+        let pk2 = pubkey_from_secret(&key2);
+        assert_ne!(pk1, pk2);
+    }
+
+    #[test]
+    fn test_compute_event_id_deterministic() {
+        let pubkey = hex::encode(pubkey_from_secret(&test_key()));
+        let tags = vec![vec!["t".to_string(), "bitcoin".to_string()]];
+        let id1 = compute_event_id(&pubkey, 1000, 1, &tags, "test content");
+        let id2 = compute_event_id(&pubkey, 1000, 1, &tags, "test content");
+        assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn test_compute_event_id_differs_with_content() {
+        let pubkey = hex::encode(pubkey_from_secret(&test_key()));
+        let tags = vec![];
+        let id1 = compute_event_id(&pubkey, 1000, 1, &tags, "content A");
+        let id2 = compute_event_id(&pubkey, 1000, 1, &tags, "content B");
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_compute_event_id_differs_with_kind() {
+        let pubkey = hex::encode(pubkey_from_secret(&test_key()));
+        let tags = vec![];
+        let id1 = compute_event_id(&pubkey, 1000, 1, &tags, "same");
+        let id2 = compute_event_id(&pubkey, 1000, 2, &tags, "same");
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_compute_event_id_differs_with_timestamp() {
+        let pubkey = hex::encode(pubkey_from_secret(&test_key()));
+        let tags = vec![];
+        let id1 = compute_event_id(&pubkey, 1000, 1, &tags, "same");
+        let id2 = compute_event_id(&pubkey, 2000, 1, &tags, "same");
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_estimate_total_fees_coinbase() {
+        let block = make_test_block();
+        let fees = NostrPublisher::estimate_total_fees(&block);
+        assert_eq!(fees.as_sat(), 50_0000_0000);
+    }
+
+    #[test]
+    fn test_estimate_total_fees_empty_block() {
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_blockhash: BlockHash::ZERO,
+                merkle_root: TxHash::ZERO,
+                time: 1231006505,
+                bits: CompactTarget::MAX_TARGET,
+                nonce: 0,
+            },
+            transactions: vec![],
+        };
+        let fees = NostrPublisher::estimate_total_fees(&block);
+        assert_eq!(fees.as_sat(), 0);
+    }
+
+    #[test]
+    fn test_nostr_event_has_correct_tags() {
+        let publisher = NostrPublisher::new(vec![], test_key());
+        let event = publisher.build_block_event(
+            1,
+            "00000000839a8e6886ab5951d76f411475428afc90947ee320161bbf18eb6048",
+            1,
+            Amount::from_sat(50_0000_0000),
+        );
+        assert_eq!(event.tags.len(), 3);
+        assert_eq!(event.tags[0], vec!["t", "bitcoin"]);
+        assert_eq!(event.tags[1], vec!["t", "block"]);
+        assert_eq!(event.tags[2][0], "block_height");
+        assert_eq!(event.tags[2][1], "1");
+    }
+
+    #[test]
+    fn test_nostr_event_content_format() {
+        let publisher = NostrPublisher::new(vec![], test_key());
+        let event = publisher.build_block_event(
+            42,
+            "abcdef",
+            5,
+            Amount::from_sat(100_000),
+        );
+        assert!(event.content.contains("42"));
+        assert!(event.content.contains("abcdef"));
+        assert!(event.content.contains("5"));
+    }
+
+    #[test]
+    fn test_nostr_publisher_relay_urls() {
+        let relays = vec![
+            "wss://relay1.example.com".to_string(),
+            "wss://relay2.example.com".to_string(),
+        ];
+        let publisher = NostrPublisher::new(relays.clone(), test_key());
+        assert_eq!(publisher.relay_urls, relays);
+    }
+
     #[tokio::test]
     async fn test_nostr_exex_receives_block() {
         use btc_consensus::utxo::UtxoSetUpdate;

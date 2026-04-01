@@ -990,6 +990,119 @@ mod tests {
     }
 
     #[test]
+    fn test_zmq_config_new() {
+        let config = ZmqConfig::new();
+        assert!(!config.enabled);
+        assert_eq!(config.port, 28332);
+    }
+
+    #[test]
+    fn test_zmq_config_clone() {
+        let config = ZmqConfig::enabled_on(29000);
+        let config2 = config.clone();
+        assert_eq!(config2.port, 29000);
+        assert!(config2.enabled);
+    }
+
+    #[test]
+    fn test_zmq_config_debug() {
+        let config = ZmqConfig::default();
+        let debug = format!("{:?}", config);
+        assert!(debug.contains("ZmqConfig"));
+    }
+
+    #[test]
+    fn test_publisher_has_topic_false() {
+        let config = ZmqConfig {
+            enabled: true,
+            port: 28332,
+            topics: vec!["hashblock".to_string()],
+        };
+        let pub_ = ZmqPublisher::from_config(&config);
+        assert!(!pub_.has_topic(TOPIC_HASHTX));
+    }
+
+    #[test]
+    fn test_zmq_message_debug() {
+        let msg = ZmqMessage {
+            topic: "test".to_string(),
+            body: vec![0x01],
+            sequence: 0,
+        };
+        let debug = format!("{:?}", msg);
+        assert!(debug.contains("ZmqMessage"));
+    }
+
+    #[test]
+    fn test_zmq_message_clone() {
+        let msg = ZmqMessage {
+            topic: "hashblock".to_string(),
+            body: vec![0xab; 32],
+            sequence: 42,
+        };
+        let msg2 = msg.clone();
+        assert_eq!(msg, msg2);
+    }
+
+    #[test]
+    fn test_zmq_message_from_bytes_truncated_body() {
+        // topic_len=4, topic="test", body_len=100 but not enough bytes
+        let mut data = Vec::new();
+        data.extend_from_slice(&4u16.to_le_bytes());
+        data.extend_from_slice(b"test");
+        data.extend_from_slice(&100u32.to_le_bytes()); // claims 100 body bytes
+        data.extend_from_slice(&[0u8; 10]); // only 10 bytes
+        assert!(ZmqMessage::from_bytes(&data).is_none());
+    }
+
+    #[test]
+    fn test_zmq_message_from_bytes_truncated_sequence() {
+        // topic + body present but sequence truncated
+        let mut data = Vec::new();
+        data.extend_from_slice(&4u16.to_le_bytes());
+        data.extend_from_slice(b"test");
+        data.extend_from_slice(&2u32.to_le_bytes());
+        data.extend_from_slice(&[0u8; 2]); // 2 byte body
+        data.extend_from_slice(&[0u8; 2]); // only 2 of 4 sequence bytes
+        assert!(ZmqMessage::from_bytes(&data).is_none());
+    }
+
+    #[test]
+    fn test_zmq_message_wire_format_details() {
+        let msg = ZmqMessage {
+            topic: "ab".to_string(),
+            body: vec![0x01, 0x02, 0x03],
+            sequence: 7,
+        };
+        let bytes = msg.to_bytes();
+        // topic_len: 2 bytes LE = [2, 0]
+        assert_eq!(bytes[0], 2);
+        assert_eq!(bytes[1], 0);
+        // topic: "ab"
+        assert_eq!(&bytes[2..4], b"ab");
+        // body_len: 4 bytes LE = [3, 0, 0, 0]
+        assert_eq!(bytes[4], 3);
+        assert_eq!(bytes[5], 0);
+        assert_eq!(bytes[6], 0);
+        assert_eq!(bytes[7], 0);
+        // body
+        assert_eq!(&bytes[8..11], &[1, 2, 3]);
+        // sequence: 4 bytes LE = [7, 0, 0, 0]
+        assert_eq!(bytes[11], 7);
+        assert_eq!(bytes[12], 0);
+    }
+
+    #[test]
+    fn test_sequence_counters_multiple_increments() {
+        let topics = all_topics_set();
+        let counters = SequenceCounters::new(&topics);
+        assert_eq!(counters.next(TOPIC_HASHBLOCK), 0);
+        assert_eq!(counters.next(TOPIC_HASHBLOCK), 1);
+        assert_eq!(counters.next(TOPIC_HASHBLOCK), 2);
+        assert_eq!(counters.current(TOPIC_HASHBLOCK), 3);
+    }
+
+    #[test]
     fn test_config_effective_topics_filters_invalid() {
         let config = ZmqConfig {
             enabled: true,

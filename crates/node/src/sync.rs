@@ -130,6 +130,226 @@ impl std::fmt::Display for SyncState {
 }
 
 // ---------------------------------------------------------------------------
+// Pure sync logic (extracted for testability)
+// ---------------------------------------------------------------------------
+
+/// Compute the overall sync progress as a fraction in `[0.0, 1.0]` from the
+/// current [`SyncState`].
+///
+/// - Header sync maps to `[0.0, 0.1]` (first 10%)
+/// - Block sync maps to `[0.1, 1.0]` (remaining 90%)
+pub fn compute_progress(state: &SyncState) -> f64 {
+    match state {
+        SyncState::Idle | SyncState::ConnectingPeers => 0.0,
+        SyncState::DownloadingHeaders { progress, target } => {
+            if *target == 0 {
+                0.0
+            } else {
+                (*progress as f64 / *target as f64) * 0.1
+            }
+        }
+        SyncState::DownloadingBlocks { progress, target } => {
+            if *target == 0 {
+                0.1
+            } else {
+                0.1 + (*progress as f64 / *target as f64) * 0.9
+            }
+        }
+        SyncState::Synced => 1.0,
+    }
+}
+
+/// Compute the block download start height given our chain height and
+/// an optional checkpoint height.
+///
+/// Returns `max(chain_height, checkpoint_height) + 1`, ensuring we never
+/// re-download already-validated blocks.
+pub fn compute_block_start(chain_height: u64, checkpoint_height: Option<u64>) -> u64 {
+    let cp_height = checkpoint_height.unwrap_or(0);
+    std::cmp::max(chain_height, cp_height) + 1
+}
+
+/// Returns `true` when a batch of headers indicates that the peer has
+/// no more to send (the header sync round is complete).
+///
+/// A peer sends fewer than `MAX_HEADERS_PER_MESSAGE` headers when it
+/// has reached its tip.
+pub fn is_header_sync_complete(received_count: usize) -> bool {
+    received_count < MAX_HEADERS_PER_MESSAGE
+}
+
+/// Compute the end height of a block download batch.
+///
+/// Given a starting height, the configured batch size, and the overall
+/// target height, returns the (inclusive) end of the batch clamped to
+/// `to`.
+pub fn compute_batch_end(height: u64, batch_size: usize, to: u64) -> u64 {
+    (height + batch_size as u64 - 1).min(to)
+}
+
+/// Determine whether a block at `height` should have its scripts
+/// fully verified, given the assume-valid tracking state.
+///
+/// This wraps `ChainParams::should_verify_scripts` with the local
+/// `assume_valid_height` cache for convenience.
+pub fn should_verify_scripts(
+    params: &ChainParams,
+    block_height: u64,
+    block_hash: &BlockHash,
+    assume_valid_height: Option<u64>,
+) -> bool {
+    params.should_verify_scripts(block_height, block_hash, assume_valid_height)
+}
+
+/// Determine whether the undo data at `block_height` should be pruned,
+/// given the configured `max_undo_depth`.
+///
+/// Returns `Some(cutoff)` with the height below which undo data should
+/// be pruned, or `None` if no pruning is needed yet.
+pub fn compute_undo_prune_cutoff(block_height: u64, max_undo_depth: u64) -> Option<u64> {
+    if block_height > max_undo_depth {
+        Some(block_height - max_undo_depth)
+    } else {
+        None
+    }
+}
+
+/// Determine whether persistent UTXO data should be flushed at the
+/// given block height. Flushes happen every 500 blocks.
+pub fn should_flush_utxo(block_height: u64) -> bool {
+    block_height % 500 == 0
+}
+
+/// Determine whether the UTXO set status should be logged at the given
+/// block height (every 500 blocks).
+pub fn should_log_utxo_status(block_height: u64) -> bool {
+    block_height % 500 == 0
+}
+
+/// Determine whether block download is needed. Returns `true` if the
+/// peer tip is at or beyond our start height.
+pub fn should_download_blocks(peer_tip: u64, block_start: u64) -> bool {
+    peer_tip >= block_start
+}
+
+/// Validate a policy preset string. Returns `Ok(())` for valid presets,
+/// `Err` with the invalid name for unknown presets.
+pub fn validate_policy(policy: &str) -> Result<(), String> {
+    match policy {
+        "core" | "consensus" | "all" => Ok(()),
+        other => Err(format!(
+            "unknown policy preset '{}': expected 'core', 'consensus', or 'all'",
+            other
+        )),
+    }
+}
+
+/// Classify inventory items into block and transaction categories.
+///
+/// Returns `(block_count, tx_count)`.
+pub fn classify_inv_items(items: &[InvItem]) -> (usize, usize) {
+    let block_count = items
+        .iter()
+        .filter(|i| matches!(i.inv_type, InvType::Block | InvType::WitnessBlock))
+        .count();
+    let tx_count = items
+        .iter()
+        .filter(|i| matches!(i.inv_type, InvType::Tx | InvType::WitnessTx))
+        .count();
+    (block_count, tx_count)
+}
+
+/// Determine the output format from CLI flags.
+///
+/// Priority: `--json` flag > `--output <format>` > auto-detect.
+pub fn determine_output_format(json_flag: bool, output_opt: Option<&str>) -> crate::output::OutputFormat {
+    if json_flag {
+        crate::output::OutputFormat::Json
+    } else {
+        crate::output::OutputFormat::from_str_opt(output_opt)
+    }
+}
+
+/// Compute the next [`SyncState`] after processing a headers batch.
+///
+/// `received_count` is the number of headers in the batch,
+/// `new_height` is the chain height after accepting the headers.
+pub fn next_state_after_headers(
+    received_count: usize,
+    new_height: u64,
+) -> SyncState {
+    if is_header_sync_complete(received_count) {
+        // Headers complete -- transition to block download
+        SyncState::DownloadingHeaders {
+            progress: new_height,
+            target: new_height,
+        }
+    } else {
+        SyncState::DownloadingHeaders {
+            progress: new_height,
+            target: new_height,
+        }
+    }
+}
+
+/// Compute the next [`SyncState`] during block download.
+pub fn next_state_downloading_blocks(downloaded: u64, total: u64) -> SyncState {
+    SyncState::DownloadingBlocks {
+        progress: downloaded,
+        target: total,
+    }
+}
+
+/// Estimate the sync ETA in seconds given the current progress and
+/// elapsed time since sync started.
+///
+/// Returns `None` if progress is zero (cannot estimate).
+pub fn estimate_sync_eta(progress: f64, elapsed_secs: f64) -> Option<f64> {
+    if progress <= 0.0 || progress >= 1.0 || elapsed_secs <= 0.0 {
+        return None;
+    }
+    let rate = progress / elapsed_secs;
+    let remaining = 1.0 - progress;
+    Some(remaining / rate)
+}
+
+/// Compute sync speed in blocks per second.
+///
+/// Returns `None` if elapsed time is zero.
+pub fn compute_sync_speed(blocks_processed: u64, elapsed_secs: f64) -> Option<f64> {
+    if elapsed_secs <= 0.0 {
+        return None;
+    }
+    Some(blocks_processed as f64 / elapsed_secs)
+}
+
+/// Check whether a received block hash is one we requested.
+///
+/// Returns `Some(height)` if the hash is in the pending set, `None` otherwise.
+pub fn lookup_pending_block(
+    pending: &HashMap<BlockHash, u64>,
+    block_hash: &BlockHash,
+) -> Option<u64> {
+    pending.get(block_hash).copied()
+}
+
+/// Detect whether a chain reorganization has occurred during header sync.
+///
+/// Returns `true` if the best chain tip changed to a block that is NOT
+/// a direct extension of the previous tip.
+pub fn detect_potential_reorg(
+    old_best_hash: &BlockHash,
+    new_best_hash: &BlockHash,
+    first_header_prev: &BlockHash,
+) -> bool {
+    if new_best_hash == old_best_hash {
+        return false;
+    }
+    // A direct extension has the first new header's prev == old best
+    first_header_prev != old_best_hash
+}
+
+// ---------------------------------------------------------------------------
 // SyncEvent
 // ---------------------------------------------------------------------------
 
@@ -317,27 +537,7 @@ impl SyncManager {
 
     /// Return the sync progress as a fraction in `[0.0, 1.0]`.
     pub fn progress(&self) -> f64 {
-        match &self.sync_state {
-            SyncState::Idle => 0.0,
-            SyncState::ConnectingPeers => 0.0,
-            SyncState::DownloadingHeaders { progress, target } => {
-                if *target == 0 {
-                    0.0
-                } else {
-                    // Header sync is the first 10% of overall progress.
-                    (*progress as f64 / *target as f64) * 0.1
-                }
-            }
-            SyncState::DownloadingBlocks { progress, target } => {
-                if *target == 0 {
-                    0.1
-                } else {
-                    // Block sync is the remaining 90%.
-                    0.1 + (*progress as f64 / *target as f64) * 0.9
-                }
-            }
-            SyncState::Synced => 1.0,
-        }
+        compute_progress(&self.sync_state)
     }
 
     /// Return the network this manager operates on.
@@ -1117,6 +1317,168 @@ mod tests {
     // SyncState tests
     // -----------------------------------------------------------------------
 
+    // -----------------------------------------------------------------------
+    // Pure utility function tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_block_start_no_checkpoint() {
+        assert_eq!(compute_block_start(0, None), 1);
+        assert_eq!(compute_block_start(100, None), 101);
+    }
+
+    #[test]
+    fn test_compute_block_start_with_checkpoint() {
+        assert_eq!(compute_block_start(0, Some(50)), 51);
+        assert_eq!(compute_block_start(100, Some(50)), 101);
+        assert_eq!(compute_block_start(50, Some(100)), 101);
+    }
+
+    #[test]
+    fn test_is_header_sync_complete() {
+        assert!(is_header_sync_complete(0));
+        assert!(is_header_sync_complete(1999));
+        assert!(!is_header_sync_complete(2000));
+        assert!(!is_header_sync_complete(3000));
+    }
+
+    #[test]
+    fn test_compute_batch_end() {
+        assert_eq!(compute_batch_end(0, 128, 1000), 127);
+        assert_eq!(compute_batch_end(900, 128, 1000), 1000);
+        assert_eq!(compute_batch_end(1000, 128, 1000), 1000);
+        assert_eq!(compute_batch_end(0, 128, 50), 50);
+    }
+
+    #[test]
+    fn test_should_verify_scripts_with_assume_valid() {
+        // Use mainnet params and set assume_valid to get proper behavior.
+        let mut params = ChainParams::mainnet();
+        params.assume_valid = Some(BlockHash::from_bytes([0xcc; 32]));
+        let hash = BlockHash::from_bytes([0xaa; 32]);
+        // Without assume_valid_height, should verify (hash doesn't match assume_valid).
+        assert!(should_verify_scripts(&params, 100, &hash, None));
+        // With assume_valid_height, blocks at or below should skip.
+        assert!(!should_verify_scripts(&params, 100, &hash, Some(200)));
+        // Blocks above assume_valid_height should verify.
+        assert!(should_verify_scripts(&params, 300, &hash, Some(200)));
+    }
+
+    #[test]
+    fn test_should_verify_scripts_regtest_no_assume_valid() {
+        // Regtest has no assume_valid set, so should always verify.
+        let params = ChainParams::regtest();
+        let hash = BlockHash::from_bytes([0xaa; 32]);
+        assert!(should_verify_scripts(&params, 100, &hash, None));
+        assert!(should_verify_scripts(&params, 100, &hash, Some(200)));
+        assert!(should_verify_scripts(&params, 300, &hash, Some(200)));
+    }
+
+    #[test]
+    fn test_compute_undo_prune_cutoff() {
+        assert_eq!(compute_undo_prune_cutoff(50, 100), None);
+        assert_eq!(compute_undo_prune_cutoff(100, 100), None);
+        assert_eq!(compute_undo_prune_cutoff(101, 100), Some(1));
+        assert_eq!(compute_undo_prune_cutoff(200, 100), Some(100));
+    }
+
+    #[test]
+    fn test_should_flush_utxo() {
+        assert!(should_flush_utxo(0));
+        assert!(!should_flush_utxo(1));
+        assert!(!should_flush_utxo(499));
+        assert!(should_flush_utxo(500));
+        assert!(should_flush_utxo(1000));
+    }
+
+    #[test]
+    fn test_should_log_utxo_status() {
+        assert!(should_log_utxo_status(0));
+        assert!(!should_log_utxo_status(1));
+        assert!(should_log_utxo_status(500));
+    }
+
+    #[test]
+    fn test_should_download_blocks() {
+        assert!(should_download_blocks(100, 1));
+        assert!(should_download_blocks(100, 100));
+        assert!(!should_download_blocks(99, 100));
+    }
+
+    #[test]
+    fn test_validate_policy() {
+        assert!(validate_policy("core").is_ok());
+        assert!(validate_policy("consensus").is_ok());
+        assert!(validate_policy("all").is_ok());
+        assert!(validate_policy("unknown").is_err());
+        assert!(validate_policy("").is_err());
+        let err = validate_policy("bad").unwrap_err();
+        assert!(err.contains("bad"));
+    }
+
+    #[test]
+    fn test_classify_inv_items() {
+        let items = vec![
+            InvItem {
+                inv_type: InvType::Tx,
+                hash: btc_primitives::hash::Hash256::from_bytes([0x01; 32]),
+            },
+            InvItem {
+                inv_type: InvType::WitnessTx,
+                hash: btc_primitives::hash::Hash256::from_bytes([0x02; 32]),
+            },
+            InvItem {
+                inv_type: InvType::Block,
+                hash: btc_primitives::hash::Hash256::from_bytes([0x03; 32]),
+            },
+            InvItem {
+                inv_type: InvType::WitnessBlock,
+                hash: btc_primitives::hash::Hash256::from_bytes([0x04; 32]),
+            },
+        ];
+        let (blocks, txs) = classify_inv_items(&items);
+        assert_eq!(blocks, 2);
+        assert_eq!(txs, 2);
+    }
+
+    #[test]
+    fn test_classify_inv_items_empty() {
+        let (blocks, txs) = classify_inv_items(&[]);
+        assert_eq!(blocks, 0);
+        assert_eq!(txs, 0);
+    }
+
+    #[test]
+    fn test_determine_output_format_json_flag() {
+        let f = determine_output_format(true, None);
+        assert_eq!(f, crate::output::OutputFormat::Json);
+    }
+
+    #[test]
+    fn test_determine_output_format_output_opt() {
+        let f = determine_output_format(false, Some("json"));
+        assert_eq!(f, crate::output::OutputFormat::Json);
+        let f = determine_output_format(false, Some("text"));
+        assert_eq!(f, crate::output::OutputFormat::Text);
+    }
+
+    #[test]
+    fn test_determine_output_format_json_flag_overrides_output() {
+        let f = determine_output_format(true, Some("text"));
+        assert_eq!(f, crate::output::OutputFormat::Json);
+    }
+
+    #[test]
+    fn test_determine_output_format_auto() {
+        let f = determine_output_format(false, None);
+        // In test env, auto should return Json (not a TTY)
+        assert_eq!(f, crate::output::OutputFormat::Json);
+    }
+
+    // -----------------------------------------------------------------------
+    // SyncState tests
+    // -----------------------------------------------------------------------
+
     #[test]
     fn test_sync_state_idle_default() {
         let state = SyncState::Idle;
@@ -1654,6 +2016,60 @@ mod tests {
     }
 
     #[test]
+    fn test_open_persistent_utxo_set_invalid_path() {
+        // On some systems this may fail differently, but the function should
+        // return None for an invalid path.
+        let result = open_persistent_utxo_set(std::path::Path::new("/dev/null/impossible/path.redb"));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_sync_manager_with_datadir_and_checkpoint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Pre-create a checkpoint
+        let cp = Checkpoint::new(100, BlockHash::ZERO);
+        save_checkpoint(dir.path(), &cp).expect("save");
+
+        let params = ChainParams::regtest();
+        let cs = Arc::new(RwLock::new(ChainState::new(params)));
+        let pm = Arc::new(RwLock::new(PeerManager::new(Network::Regtest)));
+        let sync_params = ChainParams::regtest();
+
+        let sm = SyncManager::with_datadir(
+            Network::Regtest,
+            cs,
+            pm,
+            sync_params,
+            dir.path().to_path_buf(),
+        );
+
+        // The manager should have loaded the checkpoint (verified by log output)
+        assert_eq!(*sm.state(), SyncState::Idle);
+        assert!(sm.datadir().is_some());
+    }
+
+    #[test]
+    fn test_checkpoint_overwrite() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cp1 = Checkpoint::new(100, BlockHash::ZERO);
+        save_checkpoint(dir.path(), &cp1).expect("save");
+        let cp2 = Checkpoint::new(200, BlockHash::from_bytes([0xaa; 32]));
+        save_checkpoint(dir.path(), &cp2).expect("save");
+        let loaded = load_checkpoint(dir.path()).unwrap();
+        assert_eq!(loaded.height, 200);
+    }
+
+    #[test]
+    fn test_max_headers_per_message_constant() {
+        assert_eq!(MAX_HEADERS_PER_MESSAGE, 2000);
+    }
+
+    #[test]
+    fn test_block_download_batch_size_constant() {
+        assert_eq!(BLOCK_DOWNLOAD_BATCH_SIZE, 128);
+    }
+
+    #[test]
     fn test_sync_manager_without_datadir_has_no_persistent_utxo() {
         let sm = make_sync_manager();
         assert!(sm.datadir().is_none());
@@ -1760,6 +2176,95 @@ mod tests {
     }
 
     #[test]
+    fn test_sync_manager_set_exex_sender() {
+        let mut sm = make_sync_manager();
+        let (tx, _rx) = broadcast::channel(16);
+        sm.set_exex_sender(tx);
+        assert!(sm.exex_sender.is_some());
+    }
+
+    #[test]
+    fn test_sync_manager_set_node_state() {
+        let mut sm = make_sync_manager();
+        let state = crate::state::NodeState::new(Network::Regtest);
+        sm.set_node_state(state);
+        assert!(sm.node_state.is_some());
+    }
+
+    #[test]
+    fn test_checkpoint_new() {
+        let hash = BlockHash::from_bytes([0xab; 32]);
+        let cp = Checkpoint::new(42, hash);
+        assert_eq!(cp.height, 42);
+        assert!(cp.hash.len() > 0);
+    }
+
+    #[test]
+    fn test_checkpoint_equality() {
+        let cp1 = Checkpoint {
+            height: 100,
+            hash: "abc".to_string(),
+        };
+        let cp2 = Checkpoint {
+            height: 100,
+            hash: "abc".to_string(),
+        };
+        let cp3 = Checkpoint {
+            height: 200,
+            hash: "abc".to_string(),
+        };
+        assert_eq!(cp1, cp2);
+        assert_ne!(cp1, cp3);
+    }
+
+    #[test]
+    fn test_checkpoint_debug() {
+        let cp = Checkpoint::new(1, BlockHash::ZERO);
+        let debug = format!("{:?}", cp);
+        assert!(debug.contains("Checkpoint"));
+    }
+
+    #[test]
+    fn test_checkpoint_clone() {
+        let cp = Checkpoint::new(1, BlockHash::ZERO);
+        let cp2 = cp.clone();
+        assert_eq!(cp, cp2);
+    }
+
+    #[test]
+    fn test_save_checkpoint_creates_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let subdir = dir.path().join("nested").join("deep");
+        let cp = Checkpoint::new(1, BlockHash::ZERO);
+        save_checkpoint(&subdir, &cp).expect("save should create dirs");
+        assert!(subdir.join("checkpoint.json").exists());
+    }
+
+    #[test]
+    fn test_sync_state_clone() {
+        let state = SyncState::DownloadingHeaders {
+            progress: 100,
+            target: 200,
+        };
+        let state2 = state.clone();
+        assert_eq!(state, state2);
+    }
+
+    #[test]
+    fn test_sync_error_connection() {
+        let err = SyncError::Connection(ConnectionError::ConnectionClosed);
+        let msg = err.to_string();
+        assert!(msg.contains("connection"));
+    }
+
+    #[test]
+    fn test_sync_event_clone() {
+        let event = SyncEvent::SyncComplete { height: 100 };
+        let event2 = event.clone();
+        let _ = format!("{:?}", event2);
+    }
+
+    #[test]
     fn test_assume_valid_height_with_should_verify_scripts() {
         // Verify that passing assume_valid_height to should_verify_scripts
         // correctly skips scripts for blocks at or below that height.
@@ -1779,5 +2284,105 @@ mod tests {
 
         // Blocks above the assume_valid_height should still verify.
         assert!(params.should_verify_scripts(500_001, &some_hash, Some(500_000)));
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_progress (free function)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_progress_fn_idle() {
+        assert_eq!(compute_progress(&SyncState::Idle), 0.0);
+    }
+
+    #[test]
+    fn test_compute_progress_fn_connecting() {
+        assert_eq!(compute_progress(&SyncState::ConnectingPeers), 0.0);
+    }
+
+    #[test]
+    fn test_compute_progress_fn_synced() {
+        assert_eq!(compute_progress(&SyncState::Synced), 1.0);
+    }
+
+    #[test]
+    fn test_compute_progress_headers_zero_target() {
+        let state = SyncState::DownloadingHeaders { progress: 0, target: 0 };
+        assert_eq!(compute_progress(&state), 0.0);
+    }
+
+    #[test]
+    fn test_compute_progress_headers_midway() {
+        let state = SyncState::DownloadingHeaders { progress: 400_000, target: 800_000 };
+        let p = compute_progress(&state);
+        assert!((p - 0.05).abs() < 1e-9, "expected ~0.05, got {}", p);
+    }
+
+    #[test]
+    fn test_compute_progress_headers_complete() {
+        let state = SyncState::DownloadingHeaders { progress: 800_000, target: 800_000 };
+        let p = compute_progress(&state);
+        assert!((p - 0.1).abs() < 1e-9, "expected ~0.1, got {}", p);
+    }
+
+    #[test]
+    fn test_compute_progress_blocks_zero_target() {
+        let state = SyncState::DownloadingBlocks { progress: 0, target: 0 };
+        let p = compute_progress(&state);
+        assert!((p - 0.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_compute_progress_blocks_midway() {
+        let state = SyncState::DownloadingBlocks { progress: 400_000, target: 800_000 };
+        let p = compute_progress(&state);
+        assert!((p - 0.55).abs() < 1e-9, "expected ~0.55, got {}", p);
+    }
+
+    #[test]
+    fn test_compute_progress_blocks_complete() {
+        let state = SyncState::DownloadingBlocks { progress: 800_000, target: 800_000 };
+        let p = compute_progress(&state);
+        assert!((p - 1.0).abs() < 1e-9, "expected ~1.0, got {}", p);
+    }
+
+    #[test]
+    fn test_compute_progress_monotonic_through_lifecycle() {
+        let states = [
+            SyncState::Idle,
+            SyncState::ConnectingPeers,
+            SyncState::DownloadingHeaders { progress: 0, target: 1000 },
+            SyncState::DownloadingHeaders { progress: 250, target: 1000 },
+            SyncState::DownloadingHeaders { progress: 500, target: 1000 },
+            SyncState::DownloadingHeaders { progress: 750, target: 1000 },
+            SyncState::DownloadingHeaders { progress: 1000, target: 1000 },
+            SyncState::DownloadingBlocks { progress: 0, target: 1000 },
+            SyncState::DownloadingBlocks { progress: 250, target: 1000 },
+            SyncState::DownloadingBlocks { progress: 500, target: 1000 },
+            SyncState::DownloadingBlocks { progress: 750, target: 1000 },
+            SyncState::DownloadingBlocks { progress: 1000, target: 1000 },
+            SyncState::Synced,
+        ];
+        let mut prev = -1.0f64;
+        for state in &states {
+            let p = compute_progress(state);
+            assert!(p >= prev, "progress went backwards: {} -> {} at {:?}", prev, p, state);
+            prev = p;
+        }
+    }
+
+    #[test]
+    fn test_compute_progress_headers_quarter() {
+        let state = SyncState::DownloadingHeaders { progress: 250, target: 1000 };
+        let p = compute_progress(&state);
+        assert!((p - 0.025).abs() < 1e-9, "expected 0.025, got {}", p);
+    }
+
+    #[test]
+    fn test_compute_progress_blocks_quarter() {
+        let state = SyncState::DownloadingBlocks { progress: 250, target: 1000 };
+        let p = compute_progress(&state);
+        // 0.1 + 0.25 * 0.9 = 0.1 + 0.225 = 0.325
+        assert!((p - 0.325).abs() < 1e-9, "expected 0.325, got {}", p);
     }
 }

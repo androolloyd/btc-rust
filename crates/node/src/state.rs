@@ -204,6 +204,74 @@ mod tests {
     }
 
     #[test]
+    fn test_node_state_new_testnet() {
+        let state = NodeState::new(Network::Testnet);
+        assert_eq!(
+            *state.best_hash.read().unwrap(),
+            "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943"
+        );
+        assert_eq!(state.network, Network::Testnet);
+    }
+
+    #[test]
+    fn test_node_state_new_signet() {
+        let state = NodeState::new(Network::Signet);
+        assert_eq!(
+            *state.best_hash.read().unwrap(),
+            "00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6"
+        );
+        assert_eq!(state.network, Network::Signet);
+    }
+
+    #[test]
+    fn test_update_chain_tip_zero() {
+        let state = NodeState::new(Network::Mainnet);
+        state.update_chain_tip(0, "deadbeef");
+        assert_eq!(state.chain_height.load(Ordering::SeqCst), 0);
+        assert_eq!(*state.best_hash.read().unwrap(), "deadbeef");
+    }
+
+    #[test]
+    fn test_update_chain_tip_large_height() {
+        let state = NodeState::new(Network::Mainnet);
+        state.update_chain_tip(u64::MAX, "ffffffff");
+        assert_eq!(state.chain_height.load(Ordering::SeqCst), u64::MAX);
+    }
+
+    #[test]
+    fn test_update_peers_zero() {
+        let state = NodeState::new(Network::Mainnet);
+        state.update_peers(100);
+        state.update_peers(0);
+        assert_eq!(state.peer_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_update_mempool_zero() {
+        let state = NodeState::new(Network::Mainnet);
+        state.update_mempool(0, 0);
+        assert_eq!(state.mempool_size.load(Ordering::SeqCst), 0);
+        assert_eq!(state.mempool_bytes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_syncing_flag() {
+        let state = NodeState::new(Network::Mainnet);
+        assert!(!state.syncing.load(Ordering::SeqCst));
+        state.syncing.store(true, Ordering::SeqCst);
+        assert!(state.syncing.load(Ordering::SeqCst));
+        state.syncing.store(false, Ordering::SeqCst);
+        assert!(!state.syncing.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_node_state_debug() {
+        let state = NodeState::new(Network::Mainnet);
+        let debug = format!("{:?}", state);
+        assert!(debug.contains("NodeState"));
+    }
+
+    #[test]
     fn test_rpc_handler_reflects_node_state() {
         use btc_rpc::handler::RpcHandler;
 
