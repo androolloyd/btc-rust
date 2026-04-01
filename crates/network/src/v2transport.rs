@@ -13,6 +13,10 @@
 //! additional dependencies.
 
 use sha2::{Digest, Sha256};
+use chacha20poly1305::{
+    aead::{AeadInPlace, KeyInit},
+    ChaCha20Poly1305 as ChaCha20Poly1305Aead, Nonce, Tag,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -75,6 +79,56 @@ impl V2Cipher for NullCipher {
         _ciphertext: &mut Vec<u8>,
     ) -> bool {
         true
+    }
+}
+
+/// A real ChaCha20-Poly1305 AEAD cipher for BIP324 v2 transport.
+///
+/// Uses the `chacha20poly1305` crate (RustCrypto) for authenticated
+/// encryption. Each call constructs a fresh cipher instance from the
+/// provided key so the struct itself is zero-sized.
+#[derive(Debug, Clone)]
+pub struct ChaCha20Poly1305Cipher;
+
+impl V2Cipher for ChaCha20Poly1305Cipher {
+    fn encrypt(&self, key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], plaintext: &mut Vec<u8>) {
+        let cipher = ChaCha20Poly1305Aead::new(key.into());
+        let nonce = Nonce::from_slice(nonce);
+        // encrypt_in_place_detached returns the 16-byte tag
+        let tag = cipher
+            .encrypt_in_place_detached(nonce, aad, plaintext)
+            .expect("ChaCha20-Poly1305 encryption should never fail");
+        plaintext.extend_from_slice(tag.as_slice());
+    }
+
+    fn decrypt(
+        &self,
+        key: &[u8; 32],
+        nonce: &[u8; 12],
+        aad: &[u8],
+        ciphertext: &mut Vec<u8>,
+    ) -> bool {
+        if ciphertext.len() < 16 {
+            return false;
+        }
+        let tag_offset = ciphertext.len() - 16;
+        let mut tag_bytes = [0u8; 16];
+        tag_bytes.copy_from_slice(&ciphertext[tag_offset..]);
+        ciphertext.truncate(tag_offset);
+
+        let cipher = ChaCha20Poly1305Aead::new(key.into());
+        let nonce = Nonce::from_slice(nonce);
+        let tag = Tag::from_slice(&tag_bytes);
+        cipher
+            .decrypt_in_place_detached(nonce, aad, ciphertext, tag)
+            .is_ok()
+    }
+}
+
+impl V2Transport<ChaCha20Poly1305Cipher> {
+    /// Create a new v2 transport with real ChaCha20-Poly1305 encryption.
+    pub fn new_encrypted(initiator: bool) -> Self {
+        Self::new(initiator, ChaCha20Poly1305Cipher)
     }
 }
 
@@ -740,10 +794,21 @@ impl<C: V2Cipher> V2Transport<C> {
     /// Placeholder: compute a shared secret from our private key and the
     /// peer's ElligatorSwift-encoded public key.  Real code would decode
     /// the ElligatorSwift encoding and perform secp256k1 ECDH.
+    ///
+    /// This placeholder derives the "public key" from the private key via
+    /// `derive_public_key`, then hashes `SHA256(our_pub XOR peer_pub)`.
+    /// The XOR makes the result symmetric: both sides compute the same value
+    /// regardless of who is initiator vs responder.
     fn compute_ecdh(our_privkey: &[u8; 32], peer_pubkey: &[u8; ELLIGATOR_SWIFT_KEY_LEN]) -> [u8; 32] {
+        let our_pubkey = Self::derive_public_key(our_privkey);
+        // XOR is commutative, so both sides get the same input.
+        let mut xored = [0u8; ELLIGATOR_SWIFT_KEY_LEN];
+        for i in 0..ELLIGATOR_SWIFT_KEY_LEN {
+            xored[i] = our_pubkey[i] ^ peer_pubkey[i];
+        }
         let mut h = Sha256::new();
-        h.update(our_privkey);
-        h.update(peer_pubkey);
+        h.update(b"placeholder_ecdh");
+        h.update(&xored);
         let result = h.finalize();
         let mut out = [0u8; 32];
         out.copy_from_slice(&result);
@@ -1593,5 +1658,216 @@ mod tests {
         // Both should be in SendGarbage state
         assert_eq!(init.state(), V2HandshakeState::SendGarbage);
         assert_eq!(resp.state(), V2HandshakeState::SendGarbage);
+    }
+
+    // --- ChaCha20Poly1305Cipher tests ----------------------------------------
+
+    #[test]
+    fn test_chacha20poly1305_encrypt_decrypt_roundtrip() {
+        let cipher = ChaCha20Poly1305Cipher;
+        let key = [0x42u8; 32];
+        let nonce = [0u8; 12];
+        let plaintext = b"hello, bitcoin!".to_vec();
+        let original = plaintext.clone();
+
+        let mut buf = plaintext;
+        cipher.encrypt(&key, &nonce, &[], &mut buf);
+        // Should be 16 bytes longer (tag appended)
+        assert_eq!(buf.len(), original.len() + 16);
+        // Ciphertext should differ from plaintext
+        assert_ne!(&buf[..original.len()], &original[..]);
+
+        // Decrypt should succeed and recover original
+        let ok = cipher.decrypt(&key, &nonce, &[], &mut buf);
+        assert!(ok);
+        assert_eq!(buf, original);
+    }
+
+    #[test]
+    fn test_chacha20poly1305_decrypt_tampered_fails() {
+        let cipher = ChaCha20Poly1305Cipher;
+        let key = [0xAB; 32];
+        let nonce = [0u8; 12];
+
+        let mut buf = b"some secret data".to_vec();
+        cipher.encrypt(&key, &nonce, &[], &mut buf);
+
+        // Tamper with one byte of the ciphertext
+        buf[0] ^= 0xFF;
+        let ok = cipher.decrypt(&key, &nonce, &[], &mut buf);
+        assert!(!ok, "decryption should fail on tampered data");
+    }
+
+    #[test]
+    fn test_chacha20poly1305_decrypt_wrong_key_fails() {
+        let cipher = ChaCha20Poly1305Cipher;
+        let key1 = [0x01; 32];
+        let key2 = [0x02; 32];
+        let nonce = [0u8; 12];
+
+        let mut buf = b"message".to_vec();
+        cipher.encrypt(&key1, &nonce, &[], &mut buf);
+
+        let ok = cipher.decrypt(&key2, &nonce, &[], &mut buf);
+        assert!(!ok, "decryption should fail with wrong key");
+    }
+
+    #[test]
+    fn test_chacha20poly1305_decrypt_too_short() {
+        let cipher = ChaCha20Poly1305Cipher;
+        let key = [0u8; 32];
+        let nonce = [0u8; 12];
+
+        // Less than 16 bytes (the tag size)
+        let mut buf = vec![0u8; 10];
+        let ok = cipher.decrypt(&key, &nonce, &[], &mut buf);
+        assert!(!ok, "decryption of too-short data should fail");
+    }
+
+    #[test]
+    fn test_chacha20poly1305_with_aad() {
+        let cipher = ChaCha20Poly1305Cipher;
+        let key = [0x55u8; 32];
+        let nonce = [1u8; 12];
+        let aad = b"additional data";
+
+        let original = b"payload".to_vec();
+        let mut buf = original.clone();
+        cipher.encrypt(&key, &nonce, aad, &mut buf);
+
+        // Decrypt with correct AAD
+        let ok = cipher.decrypt(&key, &nonce, aad, &mut buf);
+        assert!(ok);
+        assert_eq!(buf, original);
+
+        // Re-encrypt and try with wrong AAD
+        let mut buf2 = original.clone();
+        cipher.encrypt(&key, &nonce, aad, &mut buf2);
+        let ok = cipher.decrypt(&key, &nonce, b"wrong aad", &mut buf2);
+        assert!(!ok, "decryption should fail with wrong AAD");
+    }
+
+    #[test]
+    fn test_chacha20poly1305_different_nonces_produce_different_ciphertext() {
+        let cipher = ChaCha20Poly1305Cipher;
+        let key = [0x99u8; 32];
+        let nonce1 = [0u8; 12];
+        let nonce2 = [1u8; 12];
+
+        let msg = b"test message".to_vec();
+        let mut buf1 = msg.clone();
+        let mut buf2 = msg.clone();
+        cipher.encrypt(&key, &nonce1, &[], &mut buf1);
+        cipher.encrypt(&key, &nonce2, &[], &mut buf2);
+        assert_ne!(buf1, buf2, "different nonces should produce different ciphertext");
+    }
+
+    /// Helper: create a paired (initiator, responder) set of ChaCha20-Poly1305
+    /// transports that have completed the handshake.
+    fn make_chacha_pair() -> (V2Transport<ChaCha20Poly1305Cipher>, V2Transport<ChaCha20Poly1305Cipher>) {
+        let mut init = V2Transport::new_encrypted(true);
+        let mut resp = V2Transport::new_encrypted(false);
+
+        // Exchange public keys
+        init.sent_key();
+        resp.sent_key();
+
+        let init_pk = *init.our_pubkey();
+        let resp_pk = *resp.our_pubkey();
+
+        init.receive_key(&resp_pk);
+        resp.receive_key(&init_pk);
+
+        init.complete_key_exchange();
+        resp.complete_key_exchange();
+
+        init.sent_garbage();
+        resp.sent_garbage();
+
+        init.received_garbage();
+        resp.received_garbage();
+
+        assert!(init.is_ready());
+        assert!(resp.is_ready());
+        (init, resp)
+    }
+
+    #[test]
+    fn test_v2transport_chacha20_encrypt_decrypt() {
+        let (mut init, mut resp) = make_chacha_pair();
+
+        // Initiator encrypts, responder decrypts
+        let msg = V2Message::from_short(V2Command::Ping, vec![0x42]).unwrap();
+        let packet = init.encrypt_message(&msg).unwrap();
+
+        // Packet must include 16-byte tag
+        assert!(packet.len() >= 3 + msg.encode().len() + 16);
+
+        // Responder decrypts
+        let decrypted = resp.decrypt_message(&packet[3..]).unwrap();
+        assert_eq!(decrypted.command, V2Command::Ping);
+        assert_eq!(decrypted.payload, vec![0x42]);
+    }
+
+    #[test]
+    fn test_v2transport_chacha20_multiple_messages() {
+        let (mut init, mut resp) = make_chacha_pair();
+
+        for i in 0..10u8 {
+            let msg = V2Message::from_short(V2Command::Pong, vec![i]).unwrap();
+            let packet = init.encrypt_message(&msg).unwrap();
+            let decrypted = resp.decrypt_message(&packet[3..]).unwrap();
+            assert_eq!(decrypted.command, V2Command::Pong);
+            assert_eq!(decrypted.payload, vec![i]);
+        }
+        assert_eq!(init.send_nonce, 10);
+        assert_eq!(resp.recv_nonce, 10);
+    }
+
+    #[test]
+    fn test_v2transport_chacha20_bidirectional() {
+        let (mut init, mut resp) = make_chacha_pair();
+
+        // Initiator -> Responder
+        let msg1 = V2Message::from_short(V2Command::Ping, vec![1]).unwrap();
+        let pkt1 = init.encrypt_message(&msg1).unwrap();
+        let dec1 = resp.decrypt_message(&pkt1[3..]).unwrap();
+        assert_eq!(dec1.command, V2Command::Ping);
+        assert_eq!(dec1.payload, vec![1]);
+
+        // Responder -> Initiator
+        let msg2 = V2Message::from_short(V2Command::Pong, vec![2]).unwrap();
+        let pkt2 = resp.encrypt_message(&msg2).unwrap();
+        let dec2 = init.decrypt_message(&pkt2[3..]).unwrap();
+        assert_eq!(dec2.command, V2Command::Pong);
+        assert_eq!(dec2.payload, vec![2]);
+    }
+
+    #[test]
+    fn test_v2transport_chacha20_extended_command() {
+        let (mut init, mut resp) = make_chacha_pair();
+
+        let msg = V2Message::from_extended("customcmd", vec![0xaa, 0xbb, 0xcc]);
+        let packet = init.encrypt_message(&msg).unwrap();
+        let decrypted = resp.decrypt_message(&packet[3..]).unwrap();
+        assert_eq!(
+            decrypted.command,
+            V2Command::Extended("customcmd".to_string())
+        );
+        assert_eq!(decrypted.payload, vec![0xaa, 0xbb, 0xcc]);
+    }
+
+    #[test]
+    fn test_v2transport_chacha20_tampered_packet_fails() {
+        let (mut init, mut resp) = make_chacha_pair();
+
+        let msg = V2Message::from_short(V2Command::Ping, vec![0x42]).unwrap();
+        let mut packet = init.encrypt_message(&msg).unwrap();
+
+        // Tamper with the ciphertext (after the 3-byte length prefix)
+        packet[4] ^= 0xFF;
+
+        let result = resp.decrypt_message(&packet[3..]);
+        assert!(result.is_none(), "tampered packet should fail decryption");
     }
 }

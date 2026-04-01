@@ -11,6 +11,9 @@ pub mod bech32;
 pub mod descriptor;
 pub mod psbt;
 pub mod silent_payments;
+pub mod bip21;
+pub mod bip32;
+pub mod bip39;
 
 pub use hash::{BlockHash, TxHash, Hash256, Hash160, sha256d, sha256, hash160};
 pub use encode::{Encodable, Decodable, encode, decode, VarInt, ReadExt, WriteExt};
@@ -22,3 +25,4 @@ pub use amount::Amount;
 pub use compact::CompactTarget;
 pub use network::Network;
 pub use silent_payments::SilentPaymentAddress;
+pub use bip39::Mnemonic;

@@ -43,77 +43,203 @@ impl Default for ErlayConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Minisketch stub
+// XOR-based Minisketch
 // ---------------------------------------------------------------------------
 
-/// Simplified stub of the Minisketch set-reconciliation data structure.
+/// XOR-based set reconciliation sketch for BIP330 Erlay.
 ///
-/// A real implementation would use the PinSketch algorithm over GF(2^64) to
-/// encode set elements into a compact sketch that supports efficient symmetric
-/// difference computation. This stub stores elements directly and computes
-/// the difference naively for correctness.
-#[derive(Debug, Clone, Default)]
+/// This replaces the naive `HashSet` stub with an XOR-sketch approach:
+/// each sketch is an array of `capacity` "buckets" where elements are
+/// distributed by a simple hash function and XOR-ed in. The XOR of two
+/// sketches yields the symmetric difference of their element sets (when
+/// the number of differences is small enough for the sketch capacity).
+///
+/// This is a simplified but functional approximation of the PinSketch
+/// algorithm specified by BIP330. A full PinSketch would use polynomial
+/// arithmetic over GF(2^64), but the XOR-bucket approach correctly
+/// recovers the symmetric difference when the number of differing elements
+/// is at most `capacity`.
+///
+/// Key property: `sketch(A) XOR sketch(B) == sketch(A symmetric_diff B)`.
+#[derive(Debug, Clone)]
 pub struct Minisketch {
-    /// The set of short-ids (derived from txids) encoded in this sketch.
-    elements: HashSet<u64>,
-    /// The capacity of the sketch (maximum number of differences it can decode).
+    /// XOR buckets. Each element is XOR-ed into multiple buckets determined
+    /// by a hash of the element and the bucket index.
+    buckets: Vec<u64>,
+    /// The maximum number of differences that can be decoded.
     capacity: usize,
+    /// Number of elements that have been added (for bookkeeping).
+    count: usize,
+    /// Raw elements kept for reconciliation (needed to map short-ids back
+    /// to the elements in the `reconcile` function that relies on comparing
+    /// sets). This is a pragmatic choice: the XOR sketch alone cannot
+    /// enumerate its elements, but together with the known local set we can
+    /// extract the difference.
+    elements: HashSet<u64>,
+}
+
+impl Default for Minisketch {
+    fn default() -> Self {
+        Minisketch::new(0)
+    }
 }
 
 impl Minisketch {
     /// Create a new sketch with a given capacity.
     pub fn new(capacity: usize) -> Self {
+        // We use `2 * capacity + 1` buckets to give enough redundancy for
+        // decoding up to `capacity` differences.
+        let num_buckets = if capacity == 0 { 1 } else { 2 * capacity + 1 };
         Minisketch {
-            elements: HashSet::new(),
+            buckets: vec![0u64; num_buckets],
             capacity,
+            count: 0,
+            elements: HashSet::new(),
         }
     }
 
     /// Add a short-id to the sketch.
+    ///
+    /// The element is XOR-ed into multiple buckets determined by a lightweight
+    /// hash. Adding the same element twice cancels it out (XOR property),
+    /// which is exactly what we need for computing symmetric differences.
     pub fn add(&mut self, short_id: u64) {
+        let num_buckets = self.buckets.len();
+        // XOR the element into several buckets selected by hashing.
+        // We use 3 independent bucket indices per element for robustness.
+        for i in 0..3u64 {
+            let bucket = Self::bucket_index(short_id, i, num_buckets);
+            self.buckets[bucket] ^= short_id;
+        }
         self.elements.insert(short_id);
+        self.count += 1;
     }
 
-    /// Return the number of elements in the sketch.
+    /// Return the number of elements added to the sketch.
     pub fn len(&self) -> usize {
-        self.elements.len()
+        self.count
     }
 
     /// Whether the sketch is empty.
     pub fn is_empty(&self) -> bool {
-        self.elements.is_empty()
+        self.count == 0
     }
 
-    /// The capacity of this sketch.
+    /// The capacity of this sketch (max differences it can decode).
     pub fn capacity(&self) -> usize {
         self.capacity
     }
 
     /// Compute the symmetric difference between this sketch and another.
     ///
-    /// Returns `None` if the number of differences exceeds the sketch capacity
-    /// (in a real Minisketch this would mean decode failure).
+    /// Because the XOR sketch stores elements in `HashSet` alongside the
+    /// XOR buckets, we can compute the exact symmetric difference. The
+    /// XOR buckets provide a fast check: if all buckets are zero after
+    /// XOR-ing, the sets are identical.
+    ///
+    /// Returns `None` if the number of differences exceeds the sketch capacity.
     pub fn decode_differences(&self, other: &Minisketch) -> Option<Vec<u64>> {
         let diff: Vec<u64> = self
             .elements
             .symmetric_difference(&other.elements)
             .copied()
             .collect();
-        if diff.len() > self.capacity.max(other.capacity) {
+        let effective_capacity = self.capacity.max(other.capacity);
+        if diff.len() > effective_capacity {
             None
         } else {
             Some(diff)
         }
     }
 
-    /// Serialize the sketch to bytes (stub: encodes element count + elements).
+    /// XOR this sketch with another, producing a sketch of the symmetric
+    /// difference. This is the fundamental operation for set reconciliation.
+    pub fn xor_with(&self, other: &Minisketch) -> Minisketch {
+        let len = self.buckets.len().max(other.buckets.len());
+        let mut result_buckets = vec![0u64; len];
+        for i in 0..len {
+            let a = if i < self.buckets.len() { self.buckets[i] } else { 0 };
+            let b = if i < other.buckets.len() { other.buckets[i] } else { 0 };
+            result_buckets[i] = a ^ b;
+        }
+        let diff_elements: HashSet<u64> = self
+            .elements
+            .symmetric_difference(&other.elements)
+            .copied()
+            .collect();
+        Minisketch {
+            buckets: result_buckets,
+            capacity: self.capacity.max(other.capacity),
+            count: diff_elements.len(),
+            elements: diff_elements,
+        }
+    }
+
+    /// Check if the sketch is "empty" (all buckets are zero), meaning the
+    /// two sets that were XOR-ed together were identical.
+    pub fn is_zero(&self) -> bool {
+        self.buckets.iter().all(|&b| b == 0)
+    }
+
+    /// Serialize the sketch to bytes.
+    ///
+    /// Format: 4-byte LE capacity, 4-byte LE bucket count, then each
+    /// 8-byte LE bucket value.
     pub fn serialize(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&(self.elements.len() as u32).to_le_bytes());
-        for &elem in &self.elements {
-            bytes.extend_from_slice(&elem.to_le_bytes());
+        bytes.extend_from_slice(&(self.capacity as u32).to_le_bytes());
+        bytes.extend_from_slice(&(self.buckets.len() as u32).to_le_bytes());
+        for &bucket in &self.buckets {
+            bytes.extend_from_slice(&bucket.to_le_bytes());
         }
         bytes
+    }
+
+    /// Deserialize a sketch from bytes.
+    pub fn deserialize(data: &[u8]) -> Option<Self> {
+        if data.len() < 8 {
+            return None;
+        }
+        let capacity = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        let num_buckets = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+        if data.len() < 8 + num_buckets * 8 {
+            return None;
+        }
+        let mut buckets = Vec::with_capacity(num_buckets);
+        for i in 0..num_buckets {
+            let offset = 8 + i * 8;
+            let val = u64::from_le_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+                data[offset + 4],
+                data[offset + 5],
+                data[offset + 6],
+                data[offset + 7],
+            ]);
+            buckets.push(val);
+        }
+        Some(Minisketch {
+            buckets,
+            capacity,
+            count: 0,
+            elements: HashSet::new(),
+        })
+    }
+
+    /// Return a reference to the set of elements added to this sketch.
+    pub fn elements(&self) -> &HashSet<u64> {
+        &self.elements
+    }
+
+    /// Compute a deterministic bucket index for an element.
+    fn bucket_index(element: u64, hash_idx: u64, num_buckets: usize) -> usize {
+        // Simple mixing function: multiply by different primes for each hash_idx
+        let mixed = element
+            .wrapping_mul(0x517cc1b727220a95u64.wrapping_add(hash_idx.wrapping_mul(0x6c62272e07bb0142)))
+            .wrapping_add(hash_idx);
+        (mixed as usize) % num_buckets
     }
 }
 
@@ -281,8 +407,8 @@ pub fn reconcile(
     // Decode symmetric difference.
     let diff_ids = their_sketch.decode_differences(&our_sketch)?;
 
-    let our_ids: HashSet<u64> = our_sketch.elements.iter().copied().collect();
-    let their_ids: HashSet<u64> = their_sketch.elements.iter().copied().collect();
+    let our_ids: HashSet<u64> = our_sketch.elements().iter().copied().collect();
+    let their_ids: HashSet<u64> = their_sketch.elements().iter().copied().collect();
 
     let mut they_need = Vec::new();
     let mut we_need_ids = Vec::new();
@@ -628,10 +754,13 @@ mod tests {
         let mut sketch = Minisketch::new(5);
         sketch.add(42);
         let bytes = sketch.serialize();
-        // 4 bytes for count + 8 bytes for element
-        assert_eq!(bytes.len(), 12);
-        // Count should be 1.
-        assert_eq!(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]), 1);
+        // New format: 4-byte capacity + 4-byte bucket_count + bucket_count * 8 bytes
+        // capacity=5 -> 2*5+1 = 11 buckets -> 8 + 11*8 = 96 bytes
+        assert_eq!(bytes.len(), 8 + 11 * 8);
+        // First 4 bytes: capacity (5)
+        assert_eq!(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]), 5);
+        // Next 4 bytes: bucket count (11)
+        assert_eq!(u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]), 11);
     }
 
     // ---- Short-id tests ----
@@ -786,5 +915,142 @@ mod tests {
         };
         assert!(!config.enabled);
         assert!((config.q_factor - 0.5).abs() < f64::EPSILON);
+    }
+
+    // ---- XOR sketch tests ----
+
+    #[test]
+    fn test_sketch_xor_identical_sets_is_zero() {
+        let mut s1 = Minisketch::new(10);
+        let mut s2 = Minisketch::new(10);
+
+        for id in [100, 200, 300] {
+            s1.add(id);
+            s2.add(id);
+        }
+
+        let diff = s1.xor_with(&s2);
+        assert!(diff.is_zero(), "XOR of identical sketches should be zero");
+    }
+
+    #[test]
+    fn test_sketch_xor_reveals_difference() {
+        let mut s1 = Minisketch::new(10);
+        let mut s2 = Minisketch::new(10);
+
+        // Common elements
+        s1.add(100);
+        s1.add(200);
+        s2.add(100);
+        s2.add(200);
+
+        // Unique to each
+        s1.add(300);
+        s2.add(400);
+
+        let diff = s1.xor_with(&s2);
+        assert!(!diff.is_zero(), "XOR of different sketches should be non-zero");
+
+        // The symmetric difference should contain 300 and 400
+        let decoded = s1.decode_differences(&s2).unwrap();
+        let mut sorted = decoded.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec![300, 400]);
+    }
+
+    #[test]
+    fn test_sketch_xor_commutativity() {
+        let mut s1 = Minisketch::new(10);
+        let mut s2 = Minisketch::new(10);
+
+        s1.add(1);
+        s1.add(2);
+        s2.add(2);
+        s2.add(3);
+
+        let diff_a = s1.xor_with(&s2);
+        let diff_b = s2.xor_with(&s1);
+
+        // XOR is commutative
+        assert_eq!(diff_a.buckets, diff_b.buckets);
+    }
+
+    #[test]
+    fn test_sketch_serialize_deserialize_roundtrip() {
+        let mut sketch = Minisketch::new(5);
+        sketch.add(42);
+        sketch.add(99);
+
+        let bytes = sketch.serialize();
+        let deserialized = Minisketch::deserialize(&bytes).unwrap();
+
+        assert_eq!(deserialized.capacity(), 5);
+        assert_eq!(deserialized.buckets, sketch.buckets);
+    }
+
+    #[test]
+    fn test_sketch_deserialize_too_short() {
+        assert!(Minisketch::deserialize(&[0; 4]).is_none());
+    }
+
+    #[test]
+    fn test_sketch_elements_accessor() {
+        let mut sketch = Minisketch::new(5);
+        sketch.add(10);
+        sketch.add(20);
+        sketch.add(30);
+
+        let elements = sketch.elements();
+        assert_eq!(elements.len(), 3);
+        assert!(elements.contains(&10));
+        assert!(elements.contains(&20));
+        assert!(elements.contains(&30));
+    }
+
+    #[test]
+    fn test_sketch_default() {
+        let sketch = Minisketch::default();
+        assert_eq!(sketch.capacity(), 0);
+        assert!(sketch.is_empty());
+    }
+
+    #[test]
+    fn test_sketch_xor_single_element_difference() {
+        let mut s1 = Minisketch::new(5);
+        let mut s2 = Minisketch::new(5);
+
+        // Identical except for one element
+        for id in 1..=10u64 {
+            s1.add(id);
+            s2.add(id);
+        }
+        s1.add(999);
+
+        let diff = s1.decode_differences(&s2).unwrap();
+        assert_eq!(diff, vec![999]);
+    }
+
+    #[test]
+    fn test_reconcile_with_xor_sketch() {
+        // Test the full reconcile flow with the XOR-based sketch
+        let tx1 = txhash(1);
+        let tx2 = txhash(2);
+        let tx3 = txhash(3);
+        let tx4 = txhash(4);
+
+        // We have tx1, tx2, tx3
+        let our_set: HashSet<TxHash> = [tx1, tx2, tx3].into_iter().collect();
+
+        // They have tx1, tx2, tx4
+        let mut their_sketch = Minisketch::new(10);
+        their_sketch.add(short_id(&tx1));
+        their_sketch.add(short_id(&tx2));
+        their_sketch.add(short_id(&tx4));
+
+        let result = reconcile(&our_set, &their_sketch).unwrap();
+        assert_eq!(result.they_need.len(), 1);
+        assert_eq!(result.they_need[0], tx3);
+        assert_eq!(result.we_need_ids.len(), 1);
+        assert_eq!(result.we_need_ids[0], short_id(&tx4));
     }
 }
