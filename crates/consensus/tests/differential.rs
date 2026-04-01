@@ -259,7 +259,7 @@ fn opcode_from_name(name: &str) -> Option<Opcode> {
         "OP_15" => Some(Opcode::OP_15),
         "OP_16" => Some(Opcode::OP_16),
         "OP_NOP" => Some(Opcode::OP_NOP),
-        "OP_VER" | "OP_VER" => Some(Opcode::OP_VER),
+        "OP_VER" => Some(Opcode::OP_VER),
         "OP_IF" => Some(Opcode::OP_IF),
         "OP_NOTIF" => Some(Opcode::OP_NOTIF),
         "OP_VERIF" => Some(Opcode::OP_VERIF),
@@ -511,23 +511,34 @@ fn differential_script_tests() {
         let mut engine = ScriptEngine::new_without_tx(&verifier, flags);
 
         let sig_result = engine.execute(script_sig.as_script());
-        let pub_result = if sig_result.is_ok() {
-            engine.execute(script_pubkey.as_script())
-        } else {
-            // sig failed — pubkey execution is moot, but record the error
-            Err(sig_result.unwrap_err())
+        let sig_ok = sig_result.is_ok();
+        let sig_err_msg = match &sig_result {
+            Err(e) => Some(format!("scriptSig error: {e}")),
+            Ok(_) => None,
         };
 
-        let our_ok = engine_succeeded(&sig_result, &pub_result, engine.success());
+        let pub_result = if sig_ok {
+            engine.execute(script_pubkey.as_script())
+        } else {
+            // Carry forward the failure; pubkey not executed
+            Err(sig_result.unwrap_err())
+        };
+        let pub_ok = pub_result.is_ok();
+        let pub_err_msg = match &pub_result {
+            Err(e) => Some(format!("scriptPubKey error: {e}")),
+            Ok(_) => None,
+        };
+
+        let our_ok = sig_ok && pub_ok && engine.success();
 
         if our_ok == expected_ok {
             passed += 1;
         } else {
             failed += 1;
-            let err_detail = if let Err(ref e) = sig_result {
-                format!("scriptSig error: {e}")
-            } else if let Err(ref e) = pub_result {
-                format!("scriptPubKey error: {e}")
+            let err_detail = if let Some(ref m) = sig_err_msg {
+                m.clone()
+            } else if let Some(ref m) = pub_err_msg {
+                m.clone()
             } else {
                 format!("stack top = {}", engine.success())
             };
@@ -594,7 +605,7 @@ fn differential_tx_valid() {
     let mut tested = 0u32;
     let mut passed = 0u32;
     let mut failed = 0u32;
-    let mut skipped = 0u32;
+    let skipped = 0u32;
     let mut divergences: Vec<String> = Vec::new();
 
     for (idx, vector) in vectors.as_array().unwrap().iter().enumerate() {
@@ -671,7 +682,6 @@ fn differential_tx_valid() {
             "  NOTE: {failed} divergence(s) remain — see details above."
         );
     }
-    let _ = skipped; // suppress unused warning
 }
 
 // ========================== TEST 3: tx_invalid.json ========================
