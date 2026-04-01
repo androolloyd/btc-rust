@@ -26,4 +26,5 @@ pub use btc_primitives::hash::TxHash;
 pub use btc_primitives::script::{Opcode, Script, ScriptBuf};
 pub use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut, Witness};
 
-// Tests are in individual module files and crates/forge/tests/
+#[cfg(test)]
+mod tests;

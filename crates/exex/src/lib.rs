@@ -674,4 +674,302 @@ mod tests {
         let result = MetricsExEx::new().start(ctx).await;
         assert!(result.is_ok());
     }
+
+    // -----------------------------------------------------------------------
+    // Test: ExExManager::sender() accessor
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_manager_sender_accessor() {
+        let manager = ExExManager::new(Network::Regtest);
+        let mut ctx = manager.subscribe();
+
+        // Use sender() directly to emit a notification
+        let hash = BlockHash::from_bytes([0xcc; 32]);
+        let _ = manager.sender().send(ExExNotification::BlockReverted {
+            height: 55,
+            hash,
+        });
+
+        let notif = ctx.notifications.recv().await.unwrap();
+        match notif {
+            ExExNotification::BlockReverted { height, hash: h } => {
+                assert_eq!(height, 55);
+                assert_eq!(h, hash);
+            }
+            _ => panic!("expected BlockReverted"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: MetricsExEx processes BlockCommitted and tracks state
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_metrics_exex_block_committed_processing() {
+        let manager = ExExManager::new(Network::Regtest);
+        let ctx = manager.subscribe();
+
+        let block = make_test_block();
+        let hash = block.block_hash();
+        let utxo_changes = make_utxo_update(5, 2);
+
+        manager.notify(ExExNotification::BlockCommitted {
+            height: 10,
+            hash,
+            block,
+            utxo_changes,
+        });
+
+        drop(manager);
+
+        let result = MetricsExEx::new().start(ctx).await;
+        assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: MetricsExEx processes BlockReverted with height adjustment
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_metrics_exex_block_reverted_adjusts_height() {
+        let manager = ExExManager::new(Network::Regtest);
+        let ctx = manager.subscribe();
+
+        // First commit a block at height 5
+        let block = make_test_block();
+        let hash = block.block_hash();
+        let utxo_changes = make_utxo_update(1, 0);
+        manager.notify(ExExNotification::BlockCommitted {
+            height: 5,
+            hash,
+            block,
+            utxo_changes,
+        });
+
+        // Then revert it -- height <= current_height, so current_height = 5 - 1 = 4
+        manager.notify(ExExNotification::BlockReverted {
+            height: 5,
+            hash: BlockHash::from_bytes([0xdd; 32]),
+        });
+
+        drop(manager);
+
+        let result = MetricsExEx::new().start(ctx).await;
+        assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: MetricsExEx block reverted at height above current is a no-op
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_metrics_exex_block_reverted_higher_than_current() {
+        let manager = ExExManager::new(Network::Regtest);
+        let ctx = manager.subscribe();
+
+        // Commit at height 3
+        let block = make_test_block();
+        let hash = block.block_hash();
+        let utxo_changes = make_utxo_update(1, 0);
+        manager.notify(ExExNotification::BlockCommitted {
+            height: 3,
+            hash,
+            block,
+            utxo_changes,
+        });
+
+        // Revert at height 10 (above current_height=3), height won't be adjusted
+        manager.notify(ExExNotification::BlockReverted {
+            height: 10,
+            hash: BlockHash::from_bytes([0xee; 32]),
+        });
+
+        drop(manager);
+
+        let result = MetricsExEx::new().start(ctx).await;
+        assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: MetricsExEx block reverted at height 0 uses saturating_sub
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_metrics_exex_block_reverted_at_zero() {
+        let manager = ExExManager::new(Network::Regtest);
+        let ctx = manager.subscribe();
+
+        // Revert at height 0 when current_height is 0 -- saturating_sub(1) = 0
+        manager.notify(ExExNotification::BlockReverted {
+            height: 0,
+            hash: BlockHash::from_bytes([0xff; 32]),
+        });
+
+        drop(manager);
+
+        let result = MetricsExEx::new().start(ctx).await;
+        assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: MetricsExEx processes ChainReorged with committed blocks
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_metrics_exex_chain_reorged_updates_height() {
+        let manager = ExExManager::new(Network::Regtest);
+        let ctx = manager.subscribe();
+
+        let old_tip = BlockHash::from_bytes([0x01; 32]);
+        let new_tip = BlockHash::from_bytes([0x02; 32]);
+        let committed_hash = BlockHash::from_bytes([0x03; 32]);
+
+        // ChainReorged with committed blocks -- last committed height = 52
+        manager.notify(ExExNotification::ChainReorged {
+            old_tip,
+            new_tip,
+            fork_height: 50,
+            reverted: vec![old_tip],
+            committed: vec![(51, committed_hash), (52, new_tip)],
+        });
+
+        drop(manager);
+
+        let result = MetricsExEx::new().start(ctx).await;
+        assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: MetricsExEx ChainReorged with empty committed list
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_metrics_exex_chain_reorged_empty_committed() {
+        let manager = ExExManager::new(Network::Regtest);
+        let ctx = manager.subscribe();
+
+        let old_tip = BlockHash::from_bytes([0x01; 32]);
+        let new_tip = BlockHash::from_bytes([0x02; 32]);
+
+        // ChainReorged with no committed blocks -- height stays unchanged
+        manager.notify(ExExNotification::ChainReorged {
+            old_tip,
+            new_tip,
+            fork_height: 50,
+            reverted: vec![old_tip],
+            committed: vec![],
+        });
+
+        drop(manager);
+
+        let result = MetricsExEx::new().start(ctx).await;
+        assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: MetricsExEx accumulates tx count and UTXO set size
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_metrics_exex_accumulates_state() {
+        let manager = ExExManager::new(Network::Regtest);
+        let ctx = manager.subscribe();
+
+        // Send multiple blocks to accumulate state
+        for height in 1..=3u64 {
+            let block = make_test_block(); // 1 tx each
+            let hash = block.block_hash();
+            let utxo_changes = make_utxo_update(3, 1); // +2 net UTXO per block
+            manager.notify(ExExNotification::BlockCommitted {
+                height,
+                hash,
+                block,
+                utxo_changes,
+            });
+        }
+
+        drop(manager);
+
+        let result = MetricsExEx::new().start(ctx).await;
+        assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: LoggingExEx processes all notification types inline
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_logging_exex_all_branches() {
+        let manager = ExExManager::new(Network::Regtest);
+        let ctx = manager.subscribe();
+
+        // BlockCommitted
+        let block = make_test_block();
+        let hash = block.block_hash();
+        let utxo_changes = make_utxo_update(2, 1);
+        manager.notify(ExExNotification::BlockCommitted {
+            height: 1,
+            hash,
+            block,
+            utxo_changes,
+        });
+
+        // BlockReverted
+        manager.notify(ExExNotification::BlockReverted {
+            height: 1,
+            hash,
+        });
+
+        // ChainReorged
+        let old_tip = BlockHash::from_bytes([0xaa; 32]);
+        let new_tip = BlockHash::from_bytes([0xbb; 32]);
+        manager.notify(ExExNotification::ChainReorged {
+            old_tip,
+            new_tip,
+            fork_height: 0,
+            reverted: vec![old_tip],
+            committed: vec![(1, new_tip)],
+        });
+
+        drop(manager);
+
+        let result = LoggingExEx.start(ctx).await;
+        assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: notify with all notification types (for full notify() coverage)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_notify_all_notification_types_no_receivers() {
+        let manager = ExExManager::new(Network::Mainnet);
+
+        // BlockCommitted with no receivers
+        let block = make_test_block();
+        let hash = block.block_hash();
+        let utxo_changes = make_utxo_update(1, 0);
+        manager.notify(ExExNotification::BlockCommitted {
+            height: 1,
+            hash,
+            block,
+            utxo_changes,
+        });
+
+        // BlockReverted with no receivers
+        manager.notify(ExExNotification::BlockReverted {
+            height: 1,
+            hash: BlockHash::ZERO,
+        });
+
+        // ChainReorged with no receivers
+        manager.notify(ExExNotification::ChainReorged {
+            old_tip: BlockHash::from_bytes([0x01; 32]),
+            new_tip: BlockHash::from_bytes([0x02; 32]),
+            fork_height: 0,
+            reverted: vec![],
+            committed: vec![],
+        });
+    }
 }

@@ -813,4 +813,581 @@ mod tests {
         assert_eq!(script[0], OP_RETURN);
         assert_eq!(script[1], RUNE_PROTOCOL_MARKER);
     }
+
+    // -------------------------------------------------------------------
+    // read_push edge cases
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_read_push_op_0() {
+        // OP_0 pushes empty bytes
+        let data = [0x00];
+        let (bytes, new_pos) = read_push(&data, 0).unwrap();
+        assert!(bytes.is_empty());
+        assert_eq!(new_pos, 1);
+    }
+
+    #[test]
+    fn test_read_push_small_push() {
+        // opcode 1..=75 pushes that many bytes
+        let data = [0x03, 0xAA, 0xBB, 0xCC];
+        let (bytes, new_pos) = read_push(&data, 0).unwrap();
+        assert_eq!(bytes, &[0xAA, 0xBB, 0xCC]);
+        assert_eq!(new_pos, 4);
+    }
+
+    #[test]
+    fn test_read_push_small_push_truncated() {
+        // opcode says 3 bytes but only 2 available
+        let data = [0x03, 0xAA, 0xBB];
+        assert!(read_push(&data, 0).is_none());
+    }
+
+    #[test]
+    fn test_read_push_pushdata1() {
+        let mut data = vec![Opcode::OP_PUSHDATA1 as u8, 0x04]; // length=4
+        data.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]);
+        let (bytes, new_pos) = read_push(&data, 0).unwrap();
+        assert_eq!(bytes, &[0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(new_pos, 6);
+    }
+
+    #[test]
+    fn test_read_push_pushdata1_truncated_length() {
+        // OP_PUSHDATA1 but no length byte
+        let data = [Opcode::OP_PUSHDATA1 as u8];
+        assert!(read_push(&data, 0).is_none());
+    }
+
+    #[test]
+    fn test_read_push_pushdata1_truncated_data() {
+        // OP_PUSHDATA1 + length 5, but only 3 bytes of data
+        let data = [Opcode::OP_PUSHDATA1 as u8, 0x05, 0x01, 0x02, 0x03];
+        assert!(read_push(&data, 0).is_none());
+    }
+
+    #[test]
+    fn test_read_push_pushdata2() {
+        let mut data = vec![Opcode::OP_PUSHDATA2 as u8];
+        data.extend_from_slice(&3u16.to_le_bytes()); // length=3
+        data.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        let (bytes, new_pos) = read_push(&data, 0).unwrap();
+        assert_eq!(bytes, &[0xAA, 0xBB, 0xCC]);
+        assert_eq!(new_pos, 6);
+    }
+
+    #[test]
+    fn test_read_push_pushdata2_truncated_length() {
+        // OP_PUSHDATA2 but only 1 length byte (needs 2)
+        let data = [Opcode::OP_PUSHDATA2 as u8, 0x00];
+        assert!(read_push(&data, 0).is_none());
+    }
+
+    #[test]
+    fn test_read_push_pushdata2_truncated_data() {
+        let mut data = vec![Opcode::OP_PUSHDATA2 as u8];
+        data.extend_from_slice(&10u16.to_le_bytes()); // length=10
+        data.extend_from_slice(&[0x01, 0x02, 0x03]); // only 3 bytes
+        assert!(read_push(&data, 0).is_none());
+    }
+
+    #[test]
+    fn test_read_push_unknown_opcode() {
+        // An opcode that is not 0, not 1..75, not PUSHDATA1/2
+        // e.g. OP_RETURN (0x6a) which is > 75 and not a pushdata op
+        let data = [0x6a];
+        assert!(read_push(&data, 0).is_none());
+    }
+
+    #[test]
+    fn test_read_push_past_end() {
+        let data = [0x01, 0x02];
+        assert!(read_push(&data, 5).is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // decode_leb128 edge cases
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_leb128_empty() {
+        assert!(decode_leb128(&[]).is_none());
+    }
+
+    #[test]
+    fn test_decode_leb128_zero() {
+        let (val, consumed) = decode_leb128(&[0x00]).unwrap();
+        assert_eq!(val, 0);
+        assert_eq!(consumed, 1);
+    }
+
+    #[test]
+    fn test_decode_leb128_unterminated() {
+        // All bytes have continuation bit set, never terminates
+        let data = vec![0x80; 20]; // 20 bytes, all continuation
+        assert!(decode_leb128(&data).is_none());
+    }
+
+    #[test]
+    fn test_decode_leb128_shift_overflow() {
+        // Create a sequence that would shift >= 128 bits
+        // Each byte adds 7 bits of shift. 19 bytes = 133 bits of shift.
+        // The 19th byte (shift=126) is valid. The 20th (shift=133) would overflow.
+        let mut data = vec![0x80; 19]; // 19 continuation bytes
+        data.push(0x01); // terminator at shift=133 -- but shift check happens before
+        // Actually the check is shift >= 128, which triggers at byte index 19 (shift=133)
+        // The 18th byte is index 18, shift = 18*7 = 126. Still ok.
+        // The 19th byte is index 19, shift = 19*7 = 133 >= 128 -> None
+        assert!(decode_leb128(&data).is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // encode/decode rune name edge cases
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_rune_name_zero() {
+        assert_eq!(decode_rune_name(0), "A");
+    }
+
+    #[test]
+    fn test_encode_rune_name_empty() {
+        assert_eq!(encode_rune_name(""), 0);
+    }
+
+    #[test]
+    fn test_encode_rune_name_non_alpha() {
+        // Non-alpha characters should be skipped
+        assert_eq!(encode_rune_name("A-B"), encode_rune_name("AB"));
+        assert_eq!(encode_rune_name("TEST!@#"), encode_rune_name("TEST"));
+    }
+
+    #[test]
+    fn test_encode_rune_name_lowercase() {
+        // Lowercase is converted to uppercase
+        assert_eq!(encode_rune_name("test"), encode_rune_name("TEST"));
+    }
+
+    // -------------------------------------------------------------------
+    // parse_runestone_payload edge cases
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_runestone_payload_empty() {
+        let ops = parse_runestone_payload(&[]);
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn test_parse_runestone_payload_unknown_tag() {
+        // Build a payload with an unknown tag (e.g. tag=99)
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&encode_leb128(99)); // unknown tag
+        payload.extend_from_slice(&encode_leb128(42)); // value
+        // Also add a known tag so the ops list isn't empty
+        payload.extend_from_slice(&encode_leb128(tags::RUNE_NAME));
+        payload.extend_from_slice(&encode_leb128(encode_rune_name("TEST")));
+        payload.extend_from_slice(&encode_leb128(tags::AMOUNT));
+        payload.extend_from_slice(&encode_leb128(100));
+
+        let ops = parse_runestone_payload(&payload);
+        assert_eq!(ops.len(), 1);
+        match &ops[0] {
+            RuneOperation::Etch { name, .. } => assert_eq!(name, "TEST"),
+            _ => panic!("expected Etch"),
+        }
+    }
+
+    #[test]
+    fn test_parse_runestone_payload_etch_without_supply() {
+        // Etch with name but no AMOUNT tag -- supply defaults to 0
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&encode_leb128(tags::RUNE_NAME));
+        payload.extend_from_slice(&encode_leb128(encode_rune_name("NOSUPPLY")));
+
+        let ops = parse_runestone_payload(&payload);
+        assert_eq!(ops.len(), 1);
+        match &ops[0] {
+            RuneOperation::Etch { name, supply, .. } => {
+                assert_eq!(name, "NOSUPPLY");
+                assert_eq!(*supply, 0);
+            }
+            _ => panic!("expected Etch"),
+        }
+    }
+
+    #[test]
+    fn test_parse_runestone_payload_multiple_transfers() {
+        // Build a payload with two edicts (transfers) in the body
+        let mut payload = Vec::new();
+        // First edict via BODY tag
+        payload.extend_from_slice(&encode_leb128(tags::BODY)); // tag=0
+        payload.extend_from_slice(&encode_leb128(100)); // block
+        payload.extend_from_slice(&encode_leb128(5)); // tx_idx
+        payload.extend_from_slice(&encode_leb128(1000)); // amount
+        payload.extend_from_slice(&encode_leb128(0)); // output
+
+        // Second edict (in body mode, tag=block_delta, value=tx_idx)
+        payload.extend_from_slice(&encode_leb128(200)); // block
+        payload.extend_from_slice(&encode_leb128(3)); // tx_idx
+        payload.extend_from_slice(&encode_leb128(2000)); // amount
+        payload.extend_from_slice(&encode_leb128(1)); // output
+
+        let ops = parse_runestone_payload(&payload);
+        assert_eq!(ops.len(), 2);
+        match &ops[0] {
+            RuneOperation::Transfer { rune_id, amount } => {
+                assert_eq!(rune_id, "100:5");
+                assert_eq!(*amount, 1000);
+            }
+            _ => panic!("expected Transfer"),
+        }
+        match &ops[1] {
+            RuneOperation::Transfer { rune_id, amount } => {
+                assert_eq!(rune_id, "200:3");
+                assert_eq!(*amount, 2000);
+            }
+            _ => panic!("expected Transfer"),
+        }
+    }
+
+    #[test]
+    fn test_parse_runestone_payload_body_truncated_after_block() {
+        // Body tag starts but missing tx_idx/amount/output
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&encode_leb128(tags::BODY));
+        payload.extend_from_slice(&encode_leb128(100)); // block value
+        // Missing tx_idx, amount, output -> should break out
+
+        let ops = parse_runestone_payload(&payload);
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn test_parse_runestone_payload_body_truncated_after_tx_idx() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&encode_leb128(tags::BODY));
+        payload.extend_from_slice(&encode_leb128(100)); // block
+        payload.extend_from_slice(&encode_leb128(5)); // tx_idx (consumed as first value)
+        // Actually, looking at the code: tag=BODY, value=block=100. Then it reads tx_idx.
+        // Wait, let me re-read: tag=0 (BODY), value is consumed. value = block (100).
+        // Then reads tx_idx (5). Then needs amount -> truncated.
+
+        let ops = parse_runestone_payload(&payload);
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn test_parse_runestone_payload_body_truncated_after_amount() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&encode_leb128(tags::BODY));
+        payload.extend_from_slice(&encode_leb128(100)); // block
+        payload.extend_from_slice(&encode_leb128(5)); // tx_idx
+        payload.extend_from_slice(&encode_leb128(1000)); // amount
+        // Missing output -> should break out
+
+        let ops = parse_runestone_payload(&payload);
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn test_parse_runestone_payload_additional_edict_truncated() {
+        // First edict succeeds, second edict truncated
+        let mut payload = Vec::new();
+        // First edict
+        payload.extend_from_slice(&encode_leb128(tags::BODY));
+        payload.extend_from_slice(&encode_leb128(100));
+        payload.extend_from_slice(&encode_leb128(5));
+        payload.extend_from_slice(&encode_leb128(1000));
+        payload.extend_from_slice(&encode_leb128(0));
+        // Second edict -- truncated after block
+        payload.extend_from_slice(&encode_leb128(200));
+        payload.extend_from_slice(&encode_leb128(3));
+        // Missing amount and output
+
+        let ops = parse_runestone_payload(&payload);
+        // Only the first edict should be parsed
+        assert_eq!(ops.len(), 1);
+        match &ops[0] {
+            RuneOperation::Transfer { rune_id, amount } => {
+                assert_eq!(rune_id, "100:5");
+                assert_eq!(*amount, 1000);
+            }
+            _ => panic!("expected Transfer"),
+        }
+    }
+
+    #[test]
+    fn test_parse_runestone_payload_etch_and_mint_combined() {
+        // A payload with both etch fields AND a mint tag
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&encode_leb128(tags::RUNE_NAME));
+        payload.extend_from_slice(&encode_leb128(encode_rune_name("COMBO")));
+        payload.extend_from_slice(&encode_leb128(tags::SYMBOL));
+        payload.extend_from_slice(&encode_leb128('$' as u128));
+        payload.extend_from_slice(&encode_leb128(tags::AMOUNT));
+        payload.extend_from_slice(&encode_leb128(5000));
+        payload.extend_from_slice(&encode_leb128(tags::MINT));
+        payload.extend_from_slice(&encode_leb128(840000 * 1000 + 1)); // block=840000, tx=1
+
+        let ops = parse_runestone_payload(&payload);
+        // Should produce both an Etch and a Mint
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(&ops[0], RuneOperation::Etch { name, .. } if name == "COMBO"));
+        assert!(matches!(&ops[1], RuneOperation::Mint { rune_id } if rune_id == "840000:1"));
+    }
+
+    // -------------------------------------------------------------------
+    // build_runestone_script with larger payloads (OP_PUSHDATA1/2)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_build_runestone_script_pushdata1() {
+        // Payload > 75 bytes but <= 255 bytes -> OP_PUSHDATA1
+        let payload = vec![0x42; 100];
+        let script = build_runestone_script(&payload);
+        assert_eq!(script[0], OP_RETURN);
+        assert_eq!(script[1], RUNE_PROTOCOL_MARKER);
+        assert_eq!(script[2], Opcode::OP_PUSHDATA1 as u8);
+        assert_eq!(script[3], 100u8);
+        assert_eq!(&script[4..], &payload[..]);
+    }
+
+    #[test]
+    fn test_build_runestone_script_pushdata2() {
+        // Payload > 255 bytes -> OP_PUSHDATA2
+        let payload = vec![0x42; 300];
+        let script = build_runestone_script(&payload);
+        assert_eq!(script[0], OP_RETURN);
+        assert_eq!(script[1], RUNE_PROTOCOL_MARKER);
+        assert_eq!(script[2], Opcode::OP_PUSHDATA2 as u8);
+        let len = u16::from_le_bytes([script[3], script[4]]);
+        assert_eq!(len, 300);
+        assert_eq!(&script[5..], &payload[..]);
+    }
+
+    // -------------------------------------------------------------------
+    // parse_runestone with OP_PUSHDATA1 payloads
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_runestone_with_pushdata1_payload() {
+        // Build a script manually with OP_PUSHDATA1
+        let etch_payload = build_etch_payload("BIGNAME", 'B', 999);
+        // Pad to > 75 bytes
+        let mut big_payload = etch_payload.clone();
+        // Add unknown tags to pad
+        while big_payload.len() <= 75 {
+            big_payload.extend_from_slice(&encode_leb128(99)); // unknown tag
+            big_payload.extend_from_slice(&encode_leb128(0));  // value
+        }
+
+        let mut script = Vec::new();
+        script.push(OP_RETURN);
+        script.push(RUNE_PROTOCOL_MARKER);
+        script.push(Opcode::OP_PUSHDATA1 as u8);
+        script.push(big_payload.len() as u8);
+        script.extend_from_slice(&big_payload);
+
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0xAA; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![]),
+                sequence: TxIn::SEQUENCE_FINAL,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(0),
+                script_pubkey: ScriptBuf::from_bytes(script),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let ops = parse_runestone(&tx).expect("should find runestone");
+        assert!(ops.iter().any(|op| matches!(op, RuneOperation::Etch { name, .. } if name == "BIGNAME")));
+    }
+
+    // -------------------------------------------------------------------
+    // parse_runestone with too-short scripts
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_runestone_script_too_short() {
+        // Script with only 1 byte
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0xBB; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![]),
+                sequence: TxIn::SEQUENCE_FINAL,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(0),
+                script_pubkey: ScriptBuf::from_bytes(vec![OP_RETURN]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        assert!(parse_runestone(&tx).is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // RuneEntry struct
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_rune_entry_construction() {
+        let entry = RuneEntry {
+            name: "TEST".to_string(),
+            symbol: '$',
+            rune_id: "840000:1".to_string(),
+            txid: TxHash::from_bytes([0x01; 32]),
+        };
+        assert_eq!(entry.name, "TEST");
+        assert_eq!(entry.symbol, '$');
+        assert_eq!(entry.rune_id, "840000:1");
+    }
+
+    // -------------------------------------------------------------------
+    // RuneOperation equality
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_rune_operation_equality() {
+        let op1 = RuneOperation::Etch {
+            name: "A".into(),
+            symbol: 'X',
+            supply: 100,
+        };
+        let op2 = op1.clone();
+        assert_eq!(op1, op2);
+
+        let op3 = RuneOperation::Mint {
+            rune_id: "1:0".into(),
+        };
+        assert_ne!(op1, op3);
+    }
+
+    // -------------------------------------------------------------------
+    // RunesExEx: BlockReverted and ChainReorged branches
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_runes_exex_block_reverted() {
+        let manager = ExExManager::new(Network::Regtest);
+        let ctx = manager.subscribe();
+
+        manager.notify(ExExNotification::BlockReverted {
+            height: 10,
+            hash: BlockHash::from_bytes([0xcc; 32]),
+        });
+
+        drop(manager);
+        let result = RunesExEx::new().start(ctx).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_runes_exex_chain_reorged() {
+        let manager = ExExManager::new(Network::Regtest);
+        let ctx = manager.subscribe();
+
+        manager.notify(ExExNotification::ChainReorged {
+            old_tip: BlockHash::from_bytes([0x01; 32]),
+            new_tip: BlockHash::from_bytes([0x02; 32]),
+            fork_height: 5,
+            reverted: vec![BlockHash::from_bytes([0x01; 32])],
+            committed: vec![(6, BlockHash::from_bytes([0x02; 32]))],
+        });
+
+        drop(manager);
+        let result = RunesExEx::new().start(ctx).await;
+        assert!(result.is_ok());
+    }
+
+    // -------------------------------------------------------------------
+    // RunesExEx: processes block with rune ops and counts them
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_runes_exex_processes_etch_mint_transfer() {
+        use btc_consensus::utxo::{UtxoEntry, UtxoSetUpdate};
+        use btc_primitives::block::{Block, BlockHeader};
+        use btc_primitives::compact::CompactTarget;
+        use btc_primitives::hash::BlockHash;
+
+        let manager = ExExManager::new(Network::Regtest);
+        let ctx = manager.subscribe();
+
+        // Three rune txs in one block
+        let etch_tx = make_rune_tx(&build_etch_payload("ALPHA", 'A', 1000), 0xE1);
+        let mint_tx = make_rune_tx(&build_mint_payload(100, 0), 0xE2);
+        let transfer_tx = make_rune_tx(&build_transfer_payload(100, 0, 500, 1), 0xE3);
+
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_blockhash: BlockHash::ZERO,
+                merkle_root: TxHash::ZERO,
+                time: 1231006505,
+                bits: CompactTarget::MAX_TARGET,
+                nonce: 0,
+            },
+            transactions: vec![etch_tx, mint_tx, transfer_tx],
+        };
+        let hash = block.block_hash();
+
+        let utxo_changes = UtxoSetUpdate {
+            created: vec![],
+            spent: vec![],
+        };
+
+        manager.notify(ExExNotification::BlockCommitted {
+            height: 1,
+            hash,
+            block,
+            utxo_changes,
+        });
+
+        drop(manager);
+        let result = RunesExEx::new().start(ctx).await;
+        assert!(result.is_ok());
+    }
+
+    // -------------------------------------------------------------------
+    // Malformed LEB128 in payload
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_runestone_payload_malformed_leb128() {
+        // A single byte with continuation bit set but nothing after
+        let payload = vec![0x80];
+        let ops = parse_runestone_payload(&payload);
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn test_parse_runestone_payload_tag_ok_value_malformed() {
+        // Valid tag (e.g. 2 for RUNE_NAME), but value is truncated
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&encode_leb128(tags::RUNE_NAME)); // tag = 2
+        payload.push(0x80); // start of value, continuation set, but no more bytes
+        let ops = parse_runestone_payload(&payload);
+        assert!(ops.is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // LEB128 edge: large valid value
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_leb128_large_value() {
+        let value = u128::MAX / 4;
+        let encoded = encode_leb128(value);
+        let (decoded, consumed) = decode_leb128(&encoded).unwrap();
+        assert_eq!(decoded, value);
+        assert_eq!(consumed, encoded.len());
+    }
 }
