@@ -213,7 +213,7 @@ pub fn disconnect_block(utxo_set: &mut InMemoryUtxoSet, update: &UtxoSetUpdate) 
 /// Maximum number of entries kept in the in-memory UTXO set.
 /// Beyond this limit, oldest entries (by HashMap iteration order) are evicted.
 /// With a persistent redb backend, evicted entries can be re-read from disk.
-const MAX_IN_MEMORY_UTXOS: usize = 5_000_000;
+const MAX_IN_MEMORY_UTXOS: usize = 50_000_000;
 
 /// A simple `HashMap`-backed UTXO set suitable for tests and initial block
 /// download (before switching to a persistent store).
