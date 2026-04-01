@@ -9,7 +9,7 @@ use btc_consensus::sig_verify::Secp256k1Verifier;
 use btc_primitives::amount::Amount;
 use btc_primitives::encode::Decodable;
 use btc_primitives::hash::TxHash;
-use btc_primitives::script::{Opcode, ScriptBuf};
+use btc_primitives::script::{Opcode, Script, ScriptBuf};
 use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut, Witness};
 
 // ---------------------------------------------------------------------------
@@ -418,30 +418,305 @@ fn expected_success(result_str: &str) -> bool {
 // Mock transaction builder
 // ---------------------------------------------------------------------------
 
-/// Build a minimal mock transaction for CHECKSIG support in script_tests.json.
+/// Build the "credit" transaction that creates an output with the given
+/// scriptPubKey and amount. This matches Bitcoin Core's test framework
+/// (`CTransaction BuildCreditingTransaction()`).
 ///
-/// Bitcoin Core's test vectors assume a transaction context exists even when
-/// none is provided in the vector itself. The sighash is computed over:
-///   - version = 1
-///   - one input spending a dummy outpoint with the given scriptSig
-///   - one output with the given amount
-///   - locktime = 0
-///   - sequence = 0xffffffff
-fn build_mock_tx(script_sig: &ScriptBuf, amount_sat: i64) -> Transaction {
+/// Format:
+/// - version = 1
+/// - 1 input: coinbase (null hash, vout=0xFFFFFFFF), scriptSig = (OP_0 OP_0), sequence = 0xFFFFFFFF
+/// - 1 output: value = amount, scriptPubKey = the test's scriptPubKey
+/// - locktime = 0
+fn build_credit_tx(script_pubkey: &ScriptBuf, amount_sat: i64) -> Transaction {
+    // Bitcoin Core's credit tx scriptSig is simply "OP_0 OP_0"
+    let mut credit_script_sig = ScriptBuf::new();
+    credit_script_sig.push_opcode(Opcode::OP_0);
+    credit_script_sig.push_opcode(Opcode::OP_0);
+
     Transaction {
         version: 1,
         inputs: vec![TxIn {
             previous_output: OutPoint::new(TxHash::ZERO, 0xffffffff),
-            script_sig: script_sig.clone(),
+            script_sig: credit_script_sig,
             sequence: 0xffffffff,
         }],
         outputs: vec![TxOut {
             value: Amount::from_sat(amount_sat),
+            script_pubkey: script_pubkey.clone(),
+        }],
+        witness: vec![],
+        lock_time: 0,
+    }
+}
+
+/// Build the "spending" transaction that spends the credit tx output.
+/// This matches Bitcoin Core's test framework (`CTransaction BuildSpendingTransaction()`).
+///
+/// Format:
+/// - version = 1
+/// - 1 input: spending from credit_tx (credit_txid, vout=0), scriptSig = test's scriptSig, sequence = 0xFFFFFFFF
+/// - 1 output: value = credit_tx.outputs[0].value, scriptPubKey = empty
+/// - locktime = 0
+fn build_mock_tx(script_sig: &ScriptBuf, script_pubkey: &ScriptBuf, amount_sat: i64) -> Transaction {
+    let credit_tx = build_credit_tx(script_pubkey, amount_sat);
+    let credit_txid = credit_tx.txid();
+
+    Transaction {
+        version: 1,
+        inputs: vec![TxIn {
+            previous_output: OutPoint::new(credit_txid, 0),
+            script_sig: script_sig.clone(),
+            sequence: 0xffffffff,
+        }],
+        outputs: vec![TxOut {
+            value: Amount::from_sat(credit_tx.outputs[0].value.as_sat()),
             script_pubkey: ScriptBuf::new(),
         }],
         witness: vec![],
         lock_time: 0,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Core script verification logic (mirrors Bitcoin Core's VerifyScript)
+// ---------------------------------------------------------------------------
+
+/// Extract the last push data from a script (for P2SH redeem script extraction).
+/// Returns the pushed data bytes if the script's last instruction is a push.
+fn extract_last_push_data(script: &ScriptBuf) -> Option<Vec<u8>> {
+    let mut last_push = None;
+    for instruction in script.as_script().instructions() {
+        match instruction {
+            Ok(btc_primitives::script::Instruction::PushBytes(data)) => {
+                last_push = Some(data.to_vec());
+            }
+            Ok(btc_primitives::script::Instruction::Op(op)) => {
+                // For OP_0..OP_16 and OP_1NEGATE, compute the push value
+                let b = op as u8;
+                if op == Opcode::OP_0 {
+                    last_push = Some(vec![]);
+                } else if op == Opcode::OP_1NEGATE {
+                    last_push = Some(encode_num(-1));
+                } else if b >= Opcode::OP_1 as u8 && b <= Opcode::OP_16 as u8 {
+                    last_push = Some(encode_num((b - Opcode::OP_1 as u8 + 1) as i64));
+                } else {
+                    last_push = None; // Non-push opcode resets
+                }
+            }
+            Err(_) => { last_push = None; }
+        }
+    }
+    last_push
+}
+
+/// Run a script test following Bitcoin Core's VerifyScript() logic.
+/// Returns true if the script succeeds, false otherwise.
+fn run_script_test(
+    verifier: &Secp256k1Verifier,
+    flags: ScriptFlags,
+    mock_tx: &Transaction,
+    amount_sat: i64,
+    script_sig: &ScriptBuf,
+    script_pubkey: &ScriptBuf,
+) -> bool {
+    // Step 0: Detect witness programs
+    // When the WITNESS flag is set and the scriptPubKey is a witness program,
+    // we need witness data. Since our non-witness test vectors don't have
+    // witness data, this should fail.
+    if flags.verify_witness && script_pubkey.as_script().is_witness_program() {
+        // We don't have witness data in this test path, so we can't verify.
+        // The test should fail (witness program requires witness data).
+        return false;
+    }
+
+    // Step 1: SIGPUSHONLY check (if enabled or P2SH)
+    if flags.verify_sigpushonly {
+        if !is_push_only(script_sig.as_script()) {
+            return false;
+        }
+    }
+
+    // Step 2: Execute scriptSig
+    let mut engine = ScriptEngine::new(
+        verifier,
+        flags,
+        Some(mock_tx),
+        0,
+        amount_sat,
+    );
+
+    if engine.execute(script_sig.as_script()).is_err() {
+        return false;
+    }
+
+    // Save the stack after scriptSig execution (for P2SH)
+    let stack_after_sig: Vec<Vec<u8>> = engine.stack().to_vec();
+
+    // Clear altstack between scriptSig and scriptPubKey (Bitcoin Core does not
+    // share the altstack between the two script evaluations)
+    engine.clear_altstack();
+
+    // Step 3: Execute scriptPubKey
+    if engine.execute(script_pubkey.as_script()).is_err() {
+        return false;
+    }
+
+    if !engine.success() {
+        return false;
+    }
+
+    // Step 4: P2SH handling
+    if flags.verify_p2sh && script_pubkey.as_script().is_p2sh() {
+        // P2SH requires scriptSig to be push-only
+        if !is_push_only(script_sig.as_script()) {
+            return false;
+        }
+
+        // The serialized redeem script is the last item pushed by scriptSig
+        let serialized_redeem = match stack_after_sig.last() {
+            Some(data) => data.clone(),
+            None => return false,
+        };
+
+        // Build a new engine with the stack from scriptSig (minus the redeem script)
+        let mut p2sh_engine = ScriptEngine::new(
+            verifier,
+            flags,
+            Some(mock_tx),
+            0,
+            amount_sat,
+        );
+
+        // Push all items from scriptSig stack EXCEPT the last one (the redeem script)
+        // Actually, in Bitcoin Core's P2SH, the stack from executing scriptSig+scriptPubKey
+        // is discarded. Instead, we use the stack from scriptSig execution (before
+        // scriptPubKey), and then execute the redeem script on that stack.
+        // But actually, the correct behavior is:
+        // 1. Execute scriptSig -> stack = S
+        // 2. Copy stack S (for P2SH)
+        // 3. Execute scriptPubKey on stack S -> this does HASH160 <hash> EQUAL
+        // 4. If scriptPubKey succeeds, take the copied stack S
+        // 5. The top of S is the serialized redeem script
+        // 6. Pop the redeem script, execute it on the remaining stack
+
+        // Push items from the saved scriptSig stack (before scriptPubKey ran)
+        // but drop the last item (the redeem script itself, which was consumed by HASH160)
+        for item in &stack_after_sig[..stack_after_sig.len() - 1] {
+            if p2sh_engine.push_item(item.clone()).is_err() {
+                return false;
+            }
+        }
+
+        let redeem_script = ScriptBuf::from_bytes(serialized_redeem);
+        if p2sh_engine.execute(redeem_script.as_script()).is_err() {
+            return false;
+        }
+
+        if !p2sh_engine.success() {
+            return false;
+        }
+
+        // CLEANSTACK for P2SH checks the redeem script stack
+        if flags.verify_cleanstack {
+            if p2sh_engine.stack().len() != 1 {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    // Step 5: CLEANSTACK check (non-P2SH)
+    if flags.verify_cleanstack {
+        if engine.stack().len() != 1 {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Run script test and return error detail string (for divergence reporting).
+fn run_script_test_detail(
+    verifier: &Secp256k1Verifier,
+    flags: ScriptFlags,
+    script_sig: &ScriptBuf,
+    script_pubkey: &ScriptBuf,
+    amount_sat: i64,
+) -> String {
+    if flags.verify_sigpushonly && !is_push_only(script_sig.as_script()) {
+        return "SIGPUSHONLY failed".to_string();
+    }
+
+    let mock_tx = build_mock_tx(script_sig, script_pubkey, amount_sat);
+    let mut engine = ScriptEngine::new(
+        verifier,
+        flags,
+        Some(&mock_tx),
+        0,
+        amount_sat,
+    );
+
+    match engine.execute(script_sig.as_script()) {
+        Err(e) => return format!("scriptSig error: {e}"),
+        Ok(_) => {}
+    }
+
+    let stack_after_sig: Vec<Vec<u8>> = engine.stack().to_vec();
+    engine.clear_altstack();
+
+    match engine.execute(script_pubkey.as_script()) {
+        Err(e) => return format!("scriptPubKey error: {e}"),
+        Ok(_) => {}
+    }
+
+    if !engine.success() {
+        return "stack top = false".to_string();
+    }
+
+    if flags.verify_p2sh && script_pubkey.as_script().is_p2sh() {
+        if !is_push_only(script_sig.as_script()) {
+            return "P2SH: scriptSig not push-only".to_string();
+        }
+        let serialized_redeem = match stack_after_sig.last() {
+            Some(data) => data.clone(),
+            None => return "P2SH: no redeem script on stack".to_string(),
+        };
+
+        let mut p2sh_engine = ScriptEngine::new(
+            verifier,
+            flags,
+            Some(&mock_tx),
+            0,
+            amount_sat,
+        );
+
+        for item in &stack_after_sig[..stack_after_sig.len() - 1] {
+            let _ = p2sh_engine.push_item(item.clone());
+        }
+
+        let redeem_script = ScriptBuf::from_bytes(serialized_redeem);
+        match p2sh_engine.execute(redeem_script.as_script()) {
+            Err(e) => return format!("P2SH redeem error: {e}"),
+            Ok(_) => {}
+        }
+
+        if !p2sh_engine.success() {
+            return "P2SH redeem: stack top = false".to_string();
+        }
+
+        if flags.verify_cleanstack && p2sh_engine.stack().len() != 1 {
+            return "P2SH cleanstack: stack not clean".to_string();
+        }
+
+        return "P2SH: OK".to_string();
+    }
+
+    if flags.verify_cleanstack && engine.stack().len() != 1 {
+        return format!("cleanstack: stack has {} elements", engine.stack().len());
+    }
+
+    format!("stack top = {}", engine.success())
 }
 
 // ========================== TEST 1: script_tests.json ======================
@@ -536,83 +811,34 @@ fn differential_script_tests() {
         // ---- Build a mock transaction for CHECKSIG support ---------------
         // Bitcoin Core's script_tests.json assumes a transaction context exists.
         // We build a minimal spending transaction so that sighash computation works.
-        let mock_tx = build_mock_tx(&script_sig, _amount_sat);
+        let mock_tx = build_mock_tx(&script_sig, &script_pubkey, _amount_sat);
 
-        // ---- Execute: scriptSig then scriptPubKey -------------------------
-        let mut engine = ScriptEngine::new(
+        // ---- Execute following Bitcoin Core's VerifyScript() logic --------
+        let our_ok = run_script_test(
             &verifier,
             flags,
-            Some(&mock_tx),
-            0,
+            &mock_tx,
             _amount_sat,
+            &script_sig,
+            &script_pubkey,
         );
 
-        // SIGPUSHONLY check: scriptSig must contain only push operations
-        let sigpushonly_fail = if flags.verify_sigpushonly {
-            !is_push_only(script_sig.as_script())
-        } else {
-            false
-        };
-
-        let our_ok = if sigpushonly_fail {
-            false
-        } else {
-            let sig_result = engine.execute(script_sig.as_script());
-            let sig_ok = sig_result.is_ok();
-
-            let pub_result = if sig_ok {
-                engine.execute(script_pubkey.as_script())
-            } else {
-                Err(sig_result.unwrap_err())
-            };
-            let pub_ok = pub_result.is_ok();
-
-            if sig_ok && pub_ok && engine.success() {
-                // CLEANSTACK check: after execution, stack must have exactly 1 element
-                engine.check_cleanstack().is_ok()
-            } else {
-                false
-            }
-        };
-
-        // Compute error detail for divergence reporting
-        let err_detail = if sigpushonly_fail {
-            "SIGPUSHONLY failed".to_string()
-        } else {
-            // Re-execute to get the error message for reporting
-            let mut engine2 = ScriptEngine::new(
+        // Compute error detail for divergence reporting (only when divergence found)
+        let err_detail_fn = || -> String {
+            run_script_test_detail(
                 &verifier,
                 flags,
-                Some(&mock_tx),
-                0,
+                &script_sig,
+                &script_pubkey,
                 _amount_sat,
-            );
-            let sig_result = engine2.execute(script_sig.as_script());
-            match sig_result {
-                Err(e) => format!("scriptSig error: {e}"),
-                Ok(_) => {
-                    let pub_result = engine2.execute(script_pubkey.as_script());
-                    match pub_result {
-                        Err(e) => format!("scriptPubKey error: {e}"),
-                        Ok(_) => {
-                            if !engine2.success() {
-                                format!("stack top = false")
-                            } else {
-                                match engine2.check_cleanstack() {
-                                    Err(e) => format!("cleanstack: {e}"),
-                                    Ok(_) => format!("stack top = {}", engine2.success()),
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            )
         };
 
         if our_ok == expected_ok {
             passed += 1;
         } else {
             failed += 1;
+            let err_detail = err_detail_fn();
             let desc = format!(
                 "  [#{idx}] DIVERGENCE: expected={expected_str} got_ok={our_ok} | \
                  sig=\"{script_sig_str}\" pub=\"{script_pubkey_str}\" flags={flag_str} \

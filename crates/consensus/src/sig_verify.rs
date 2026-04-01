@@ -25,7 +25,12 @@ impl SignatureVerifier for Secp256k1Verifier {
     fn verify_ecdsa(&self, msg_hash: &[u8; 32], sig: &[u8], pubkey: &[u8]) -> Result<bool, SigError> {
         let secp = secp256k1::Secp256k1::verification_only();
         let message = secp256k1::Message::from_digest(*msg_hash);
-        let signature = secp256k1::ecdsa::Signature::from_der(sig)?;
+        // Use from_der_lax for consensus compatibility — Bitcoin accepted
+        // non-strict DER encodings before BIP66. Strict DER enforcement is
+        // checked separately when the DERSIG flag is set.
+        let mut signature = secp256k1::ecdsa::Signature::from_der_lax(sig)?;
+        // Normalize S value (Bitcoin Core normalizes low-S before verification)
+        signature.normalize_s();
         let public_key = secp256k1::PublicKey::from_slice(pubkey)?;
         Ok(secp.verify_ecdsa(&message, &signature, &public_key).is_ok())
     }

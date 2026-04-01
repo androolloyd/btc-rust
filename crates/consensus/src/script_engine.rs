@@ -91,6 +91,8 @@ pub struct ScriptEngine<'a> {
     /// this registry before returning `InvalidOpcode` (or `DisabledOpcode` if
     /// a plugin overrides a disabled opcode like OP_CAT).
     opcode_registry: Option<&'a OpcodeRegistry>,
+    /// Whether we are executing inside a witness script (for MINIMALIF enforcement).
+    is_witness_execution: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -161,6 +163,7 @@ impl<'a> ScriptEngine<'a> {
             last_codeseparator_pos: None,
             script_code_bytes: Vec::new(),
             opcode_registry: None,
+            is_witness_execution: false,
         }
     }
 
@@ -188,7 +191,13 @@ impl<'a> ScriptEngine<'a> {
             last_codeseparator_pos: None,
             script_code_bytes: Vec::new(),
             opcode_registry,
+            is_witness_execution: false,
         }
+    }
+
+    /// Mark this engine as executing a witness script (for MINIMALIF enforcement).
+    pub fn set_witness_execution(&mut self, is_witness: bool) {
+        self.is_witness_execution = is_witness;
     }
 
     /// Create a ScriptEngine without transaction context (for standalone script testing).
@@ -226,25 +235,26 @@ impl<'a> ScriptEngine<'a> {
                 Instruction::PushBytes(data) => {
                     let len = data.len();
                     // Determine the opcode byte used for this push (for MINIMALDATA checking)
-                    let push_opcode_byte = if len == 0 {
-                        byte_pos += 1;
-                        Opcode::OP_0 as u8
+                    let push_opcode_byte = script_bytes[_instr_start];
+                    if len == 0 {
+                        // Could be OP_0 (1 byte) or OP_PUSHDATA1 with len=0 (2 bytes), etc.
+                        if push_opcode_byte == Opcode::OP_PUSHDATA1 as u8 {
+                            byte_pos += 2; // opcode + length byte
+                        } else if push_opcode_byte == Opcode::OP_PUSHDATA2 as u8 {
+                            byte_pos += 3; // opcode + 2 length bytes
+                        } else if push_opcode_byte == Opcode::OP_PUSHDATA4 as u8 {
+                            byte_pos += 5; // opcode + 4 length bytes
+                        } else {
+                            byte_pos += 1; // OP_0
+                        }
                     } else if len <= 75 {
-                        let ob = script_bytes[_instr_start];
                         byte_pos += 1 + len;
-                        ob
                     } else if len <= 0xff {
-                        let ob = script_bytes[_instr_start];
                         byte_pos += 2 + len; // OP_PUSHDATA1 + 1 byte len
-                        ob
                     } else if len <= 0xffff {
-                        let ob = script_bytes[_instr_start];
                         byte_pos += 3 + len; // OP_PUSHDATA2 + 2 byte len
-                        ob
                     } else {
-                        let ob = script_bytes[_instr_start];
                         byte_pos += 5 + len; // OP_PUSHDATA4 + 4 byte len
-                        ob
                     };
 
                     if data.len() > MAX_PUSH_SIZE {
@@ -288,8 +298,12 @@ impl<'a> ScriptEngine<'a> {
                             let mut val = false;
                             if executing(&exec_stack) {
                                 let top = self.pop()?;
-                                // MINIMALIF: argument must be empty or exactly 0x01
-                                if self.flags.verify_minimalif {
+                                // MINIMALIF: argument must be empty or exactly 0x01.
+                                // Note: in Bitcoin Core, MINIMALIF is only enforced for
+                                // segwit scripts. The `verify_minimalif_segwit` flag is set
+                                // by the witness execution layer when executing inside a
+                                // witness script context.
+                                if self.flags.verify_minimalif && self.is_witness_execution {
                                     if !top.is_empty() && top != [0x01] {
                                         return Err(ScriptError::MinimalIf);
                                     }
@@ -376,6 +390,34 @@ impl<'a> ScriptEngine<'a> {
             return Ok(false);
         }
 
+        // DERSIG, STRICTENC, or LOW_S all require strict DER encoding
+        if self.flags.verify_dersig || self.flags.verify_strictenc || self.flags.verify_low_s {
+            let der_sig = &sig[..sig.len() - 1];
+            if !is_valid_der_signature(der_sig) {
+                return Err(ScriptError::SigVerify("non-strict DER signature".into()));
+            }
+        }
+
+        // STRICTENC: validate sighash type and pubkey encoding
+        if self.flags.verify_strictenc {
+            let hash_type_byte = sig[sig.len() - 1];
+            if !is_defined_hashtype(hash_type_byte) {
+                return Err(ScriptError::SigVerify("undefined hashtype".into()));
+            }
+            // Also validate pubkey encoding
+            if !is_valid_pubkey_encoding(pubkey) {
+                return Err(ScriptError::SigVerify("invalid pubkey type".into()));
+            }
+        }
+
+        // LOW_S: check for low S value
+        if self.flags.verify_low_s {
+            let der_sig = &sig[..sig.len() - 1];
+            if !is_low_der_signature(der_sig) {
+                return Err(ScriptError::SigVerify("non-low-S signature".into()));
+            }
+        }
+
         // Need transaction context to compute sighash
         let tx = match self.tx {
             Some(tx) => tx,
@@ -427,6 +469,37 @@ impl<'a> ScriptEngine<'a> {
     /// Return the flags being used by this engine.
     pub fn flags(&self) -> &ScriptFlags {
         &self.flags
+    }
+
+    /// Push an item onto the stack from external code (used for P2SH setup).
+    pub fn push_item(&mut self, data: Vec<u8>) -> Result<(), ScriptError> {
+        self.push(data)
+    }
+
+    /// Clear the altstack. Called between scriptSig and scriptPubKey execution
+    /// since Bitcoin Core does not share the altstack between them.
+    pub fn clear_altstack(&mut self) {
+        self.altstack.clear();
+    }
+
+    /// Pop a value from the stack and decode it as a script number,
+    /// enforcing MINIMALDATA if the flag is set.
+    fn pop_num(&mut self) -> Result<i64, ScriptError> {
+        let data = self.pop()?;
+        if self.flags.verify_minimaldata && !is_minimal_script_num(&data) {
+            return Err(ScriptError::InvalidNumberEncoding);
+        }
+        decode_num(&data)
+    }
+
+    /// Peek at the top of stack and decode it as a script number,
+    /// enforcing MINIMALDATA if the flag is set.
+    fn top_num(&self) -> Result<i64, ScriptError> {
+        let data = self.top()?;
+        if self.flags.verify_minimaldata && !is_minimal_script_num(data) {
+            return Err(ScriptError::InvalidNumberEncoding);
+        }
+        decode_num(data)
     }
 
     fn push(&mut self, data: Vec<u8>) -> Result<(), ScriptError> {
@@ -561,100 +634,100 @@ impl<'a> ScriptEngine<'a> {
 
             // Arithmetic
             Opcode::OP_1ADD => {
-                let a = decode_num(&self.pop()?)?;
+                let a = self.pop_num()?;
                 self.push(encode_num(a + 1))?;
             }
             Opcode::OP_1SUB => {
-                let a = decode_num(&self.pop()?)?;
+                let a = self.pop_num()?;
                 self.push(encode_num(a - 1))?;
             }
             Opcode::OP_NEGATE => {
-                let a = decode_num(&self.pop()?)?;
+                let a = self.pop_num()?;
                 self.push(encode_num(-a))?;
             }
             Opcode::OP_ABS => {
-                let a = decode_num(&self.pop()?)?;
+                let a = self.pop_num()?;
                 self.push(encode_num(a.abs()))?;
             }
             Opcode::OP_NOT => {
-                let a = decode_num(&self.pop()?)?;
+                let a = self.pop_num()?;
                 self.push(encode_num(if a == 0 { 1 } else { 0 }))?;
             }
             Opcode::OP_0NOTEQUAL => {
-                let a = decode_num(&self.pop()?)?;
+                let a = self.pop_num()?;
                 self.push(encode_num(if a != 0 { 1 } else { 0 }))?;
             }
             Opcode::OP_ADD => {
-                let b = decode_num(&self.pop()?)?;
-                let a = decode_num(&self.pop()?)?;
+                let b = self.pop_num()?;
+                let a = self.pop_num()?;
                 self.push(encode_num(a + b))?;
             }
             Opcode::OP_SUB => {
-                let b = decode_num(&self.pop()?)?;
-                let a = decode_num(&self.pop()?)?;
+                let b = self.pop_num()?;
+                let a = self.pop_num()?;
                 self.push(encode_num(a - b))?;
             }
             Opcode::OP_BOOLAND => {
-                let b = decode_num(&self.pop()?)?;
-                let a = decode_num(&self.pop()?)?;
+                let b = self.pop_num()?;
+                let a = self.pop_num()?;
                 self.push(encode_num(if a != 0 && b != 0 { 1 } else { 0 }))?;
             }
             Opcode::OP_BOOLOR => {
-                let b = decode_num(&self.pop()?)?;
-                let a = decode_num(&self.pop()?)?;
+                let b = self.pop_num()?;
+                let a = self.pop_num()?;
                 self.push(encode_num(if a != 0 || b != 0 { 1 } else { 0 }))?;
             }
             Opcode::OP_NUMEQUAL => {
-                let b = decode_num(&self.pop()?)?;
-                let a = decode_num(&self.pop()?)?;
+                let b = self.pop_num()?;
+                let a = self.pop_num()?;
                 self.push(encode_num(if a == b { 1 } else { 0 }))?;
             }
             Opcode::OP_NUMEQUALVERIFY => {
-                let b = decode_num(&self.pop()?)?;
-                let a = decode_num(&self.pop()?)?;
+                let b = self.pop_num()?;
+                let a = self.pop_num()?;
                 if a != b {
                     return Err(ScriptError::VerifyFailed);
                 }
             }
             Opcode::OP_NUMNOTEQUAL => {
-                let b = decode_num(&self.pop()?)?;
-                let a = decode_num(&self.pop()?)?;
+                let b = self.pop_num()?;
+                let a = self.pop_num()?;
                 self.push(encode_num(if a != b { 1 } else { 0 }))?;
             }
             Opcode::OP_LESSTHAN => {
-                let b = decode_num(&self.pop()?)?;
-                let a = decode_num(&self.pop()?)?;
+                let b = self.pop_num()?;
+                let a = self.pop_num()?;
                 self.push(encode_num(if a < b { 1 } else { 0 }))?;
             }
             Opcode::OP_GREATERTHAN => {
-                let b = decode_num(&self.pop()?)?;
-                let a = decode_num(&self.pop()?)?;
+                let b = self.pop_num()?;
+                let a = self.pop_num()?;
                 self.push(encode_num(if a > b { 1 } else { 0 }))?;
             }
             Opcode::OP_LESSTHANOREQUAL => {
-                let b = decode_num(&self.pop()?)?;
-                let a = decode_num(&self.pop()?)?;
+                let b = self.pop_num()?;
+                let a = self.pop_num()?;
                 self.push(encode_num(if a <= b { 1 } else { 0 }))?;
             }
             Opcode::OP_GREATERTHANOREQUAL => {
-                let b = decode_num(&self.pop()?)?;
-                let a = decode_num(&self.pop()?)?;
+                let b = self.pop_num()?;
+                let a = self.pop_num()?;
                 self.push(encode_num(if a >= b { 1 } else { 0 }))?;
             }
             Opcode::OP_MIN => {
-                let b = decode_num(&self.pop()?)?;
-                let a = decode_num(&self.pop()?)?;
+                let b = self.pop_num()?;
+                let a = self.pop_num()?;
                 self.push(encode_num(a.min(b)))?;
             }
             Opcode::OP_MAX => {
-                let b = decode_num(&self.pop()?)?;
-                let a = decode_num(&self.pop()?)?;
+                let b = self.pop_num()?;
+                let a = self.pop_num()?;
                 self.push(encode_num(a.max(b)))?;
             }
             Opcode::OP_WITHIN => {
-                let max = decode_num(&self.pop()?)?;
-                let min = decode_num(&self.pop()?)?;
-                let x = decode_num(&self.pop()?)?;
+                let max = self.pop_num()?;
+                let min = self.pop_num()?;
+                let x = self.pop_num()?;
                 self.push(encode_num(if x >= min && x < max { 1 } else { 0 }))?;
             }
 
@@ -707,7 +780,12 @@ impl<'a> ScriptEngine<'a> {
                 if !self.flags.verify_checklocktimeverify {
                     // Treat as NOP
                 } else {
-                    let locktime = decode_num(self.top()?)?;
+                    // CLTV uses 5-byte numbers (BIP65)
+                    let data = self.top()?;
+                    if self.flags.verify_minimaldata && !is_minimal_script_num(data) {
+                        return Err(ScriptError::InvalidNumberEncoding);
+                    }
+                    let locktime = decode_num_ext(data, 5)?;
                     if locktime < 0 {
                         return Err(ScriptError::NegativeLocktime);
                     }
@@ -735,7 +813,12 @@ impl<'a> ScriptEngine<'a> {
                 if !self.flags.verify_checksequenceverify {
                     // Treat as NOP
                 } else {
-                    let sequence = decode_num(self.top()?)?;
+                    // CSV uses 5-byte numbers (BIP112)
+                    let data = self.top()?;
+                    if self.flags.verify_minimaldata && !is_minimal_script_num(data) {
+                        return Err(ScriptError::InvalidNumberEncoding);
+                    }
+                    let sequence = decode_num_ext(data, 5)?;
                     if sequence < 0 {
                         return Err(ScriptError::NegativeLocktime);
                     } else {
@@ -816,7 +899,7 @@ impl<'a> ScriptEngine<'a> {
 
             // Pick/Roll
             Opcode::OP_PICK => {
-                let n_val = decode_num(&self.pop()?)?;
+                let n_val = self.pop_num()?;
                 if n_val < 0 { return Err(ScriptError::InvalidStackOperation); }
                 let n = n_val as usize;
                 if n >= self.stack.len() { return Err(ScriptError::StackUnderflow); }
@@ -824,7 +907,7 @@ impl<'a> ScriptEngine<'a> {
                 self.push(val)?;
             }
             Opcode::OP_ROLL => {
-                let n_val = decode_num(&self.pop()?)?;
+                let n_val = self.pop_num()?;
                 if n_val < 0 { return Err(ScriptError::InvalidStackOperation); }
                 let n = n_val as usize;
                 if n >= self.stack.len() { return Err(ScriptError::StackUnderflow); }
@@ -871,7 +954,7 @@ impl<'a> ScriptEngine<'a> {
 
             Opcode::OP_CHECKMULTISIG | Opcode::OP_CHECKMULTISIGVERIFY => {
                 // Pop number of keys
-                let n_keys_val = decode_num(&self.pop()?)?;
+                let n_keys_val = self.pop_num()?;
                 if n_keys_val < 0 {
                     return Err(ScriptError::InvalidStackOperation);
                 }
@@ -893,7 +976,7 @@ impl<'a> ScriptEngine<'a> {
                 }
 
                 // Pop number of sigs
-                let n_sigs_val = decode_num(&self.pop()?)?;
+                let n_sigs_val = self.pop_num()?;
                 if n_sigs_val < 0 {
                     return Err(ScriptError::InvalidStackOperation);
                 }
@@ -920,29 +1003,38 @@ impl<'a> ScriptEngine<'a> {
                 // Verify signatures: each signature must match a public key, and
                 // keys must be consumed in order (a key used for one sig cannot be
                 // reused for a later sig).
+                //
+                // This matches Bitcoin Core's CHECKMULTISIG loop structure:
+                // for each sig, try keys in sequence. After each key is tried,
+                // check if there are enough remaining keys for remaining sigs.
+                // Exit early if not.
                 let mut key_idx = 0;
+                let mut sig_idx = 0;
                 let mut success = true;
+                let mut n_sigs_remaining = n_sigs;
+                let mut n_keys_remaining = n_keys;
 
-                for sig in &sigs {
+                while success && n_sigs_remaining > 0 {
+                    let sig = &sigs[sig_idx];
+
                     if sig.is_empty() {
                         // Empty signatures always fail
                         success = false;
                         break;
                     }
 
-                    let mut matched = false;
-                    while key_idx < n_keys {
-                        let result = self.verify_signature(sig, &pubkeys[key_idx])?;
-                        key_idx += 1;
-                        if result {
-                            matched = true;
-                            break;
-                        }
+                    let result = self.verify_signature(sig, &pubkeys[key_idx])?;
+                    if result {
+                        sig_idx += 1;
+                        n_sigs_remaining -= 1;
                     }
 
-                    if !matched {
+                    key_idx += 1;
+                    n_keys_remaining -= 1;
+
+                    // Early exit: not enough remaining keys for remaining sigs
+                    if n_sigs_remaining > n_keys_remaining {
                         success = false;
-                        break;
                     }
                 }
 
@@ -1016,13 +1108,19 @@ pub fn encode_num(n: i64) -> Vec<u8> {
     result
 }
 
-/// Decode a script number
+/// Decode a script number (default 4-byte limit)
 pub fn decode_num(data: &[u8]) -> Result<i64, ScriptError> {
+    decode_num_ext(data, MAX_SCRIPT_NUM_LENGTH)
+}
+
+/// Decode a script number with a configurable maximum size.
+/// Used for CLTV and CSV which accept 5-byte numbers.
+pub fn decode_num_ext(data: &[u8], max_len: usize) -> Result<i64, ScriptError> {
     if data.is_empty() {
         return Ok(0);
     }
 
-    if data.len() > MAX_SCRIPT_NUM_LENGTH {
+    if data.len() > max_len {
         return Err(ScriptError::NumberOverflow);
     }
 
@@ -1040,6 +1138,119 @@ pub fn decode_num(data: &[u8]) -> Result<i64, ScriptError> {
     }
 
     Ok(result)
+}
+
+/// Check if a script number encoding is minimal.
+/// Returns true if the encoding is the shortest possible representation.
+pub fn is_minimal_script_num(data: &[u8]) -> bool {
+    if data.is_empty() {
+        return true;
+    }
+    // If the last byte is 0x00 and the second-to-last byte does NOT have
+    // the high bit set, then the number could be encoded with fewer bytes.
+    // (The 0x00 padding byte is unnecessary.)
+    if data.last() == Some(&0x00) && (data.len() < 2 || data[data.len() - 2] & 0x80 == 0) {
+        return false;
+    }
+    // If the last byte is 0x80 and the second-to-last byte does NOT have
+    // the high bit set, then we have unnecessary negative-zero padding.
+    if data.last() == Some(&0x80) && (data.len() < 2 || data[data.len() - 2] & 0x80 == 0) {
+        return false;
+    }
+    true
+}
+
+/// Check if a DER-encoded ECDSA signature is strictly valid (BIP66).
+/// This validates the DER encoding only — NOT the signature itself.
+fn is_valid_der_signature(sig: &[u8]) -> bool {
+    // Minimum DER signature: 30 06 02 01 R 02 01 S
+    if sig.len() < 8 { return false; }
+    if sig.len() > 72 { return false; }
+
+    // Compound type tag
+    if sig[0] != 0x30 { return false; }
+
+    // Total length should cover the rest
+    let total_len = sig[1] as usize;
+    if total_len + 2 != sig.len() { return false; }
+
+    // First element: R integer
+    if sig[2] != 0x02 { return false; }
+    let r_len = sig[3] as usize;
+    if r_len == 0 { return false; }
+    if 4 + r_len >= sig.len() { return false; }
+
+    // Check R is not negative (high bit set without padding byte)
+    if sig[4] & 0x80 != 0 { return false; }
+    // Check R has no excess padding
+    if r_len > 1 && sig[4] == 0 && sig[5] & 0x80 == 0 { return false; }
+
+    // Second element: S integer
+    let s_pos = 4 + r_len;
+    if s_pos >= sig.len() { return false; }
+    if sig[s_pos] != 0x02 { return false; }
+    if s_pos + 1 >= sig.len() { return false; }
+    let s_len = sig[s_pos + 1] as usize;
+    if s_len == 0 { return false; }
+    if s_pos + 2 + s_len != sig.len() { return false; }
+
+    // Check S is not negative
+    if sig[s_pos + 2] & 0x80 != 0 { return false; }
+    // Check S has no excess padding
+    if s_len > 1 && sig[s_pos + 2] == 0 && sig[s_pos + 3] & 0x80 == 0 { return false; }
+
+    true
+}
+
+/// Check if a DER signature has low S value (BIP62 rule 5).
+/// S must be <= order/2.
+fn is_low_der_signature(sig: &[u8]) -> bool {
+    if !is_valid_der_signature(sig) { return false; }
+
+    // Extract S value
+    let r_len = sig[3] as usize;
+    let s_pos = 4 + r_len;
+    let s_len = sig[s_pos + 1] as usize;
+    let s_bytes = &sig[s_pos + 2..s_pos + 2 + s_len];
+
+    // secp256k1 half-order (order/2):
+    // 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0
+    let half_order: [u8; 32] = [
+        0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0x5D, 0x57, 0x6E, 0x73, 0x57, 0xA4, 0x50, 0x1D,
+        0xDF, 0xE9, 0x2F, 0x46, 0x68, 0x1B, 0x20, 0xA0,
+    ];
+
+    // Pad S to 32 bytes for comparison
+    let mut s_padded = [0u8; 32];
+    if s_bytes.len() > 32 { return false; }
+    let offset = 32 - s_bytes.len();
+    s_padded[offset..].copy_from_slice(s_bytes);
+
+    // S must be <= half_order
+    s_padded <= half_order
+}
+
+/// Check if the hashtype byte is one of the defined types (STRICTENC).
+fn is_defined_hashtype(hash_type: u8) -> bool {
+    let base = hash_type & 0x1f;
+    let anyonecanpay = hash_type & 0x80 != 0;
+    let rest = hash_type & !0x9f; // bits besides base and ANYONECANPAY
+    if rest != 0 { return false; }
+    matches!(base, 1 | 2 | 3) // ALL, NONE, SINGLE
+}
+
+/// Check if a public key has valid encoding (STRICTENC).
+/// Valid encodings: compressed (02/03 + 32 bytes) or uncompressed (04 + 64 bytes).
+/// Hybrid keys (06/07) are NOT valid under STRICTENC.
+fn is_valid_pubkey_encoding(pubkey: &[u8]) -> bool {
+    if pubkey.is_empty() { return false; }
+    match pubkey[0] {
+        0x02 | 0x03 => pubkey.len() == 33,
+        0x04 => pubkey.len() == 65,
+        _ => false, // 0x06, 0x07 (hybrid) and others are invalid
+    }
 }
 
 /// Check if a script contains only push operations (no opcodes > OP_16 except push data ops).
@@ -2779,9 +2990,14 @@ mod tests {
             witness: Vec::new(),
             lock_time,
         }));
+        // Use flags with CLTV and CSV enabled, but without MINIMALDATA
+        // (which would reject push_slice-encoded numbers that should use OP_N)
+        let mut flags = ScriptFlags::none();
+        flags.verify_checklocktimeverify = true;
+        flags.verify_checksequenceverify = true;
         ScriptEngine::new(
             &VERIFIER,
-            ScriptFlags::all(),
+            flags,
             Some(tx),
             0,
             0,
@@ -2896,36 +3112,31 @@ mod tests {
     }
 
     #[test]
-    fn test_csv_negative_is_nop() {
-        // Negative sequence value = NOP behavior
+    fn test_csv_negative_fails() {
+        // Negative sequence value = NegativeLocktime error (matches Bitcoin Core)
         let mut engine = make_cltv_engine(0, 20, 2);
         let mut script = ScriptBuf::new();
         script.push_slice(&encode_num(-1));
         script.push_opcode(Opcode::OP_CHECKSEQUENCEVERIFY);
         let result = engine.execute(script.as_script());
-        assert!(result.is_ok(), "CSV with negative sequence should be NOP");
+        assert!(matches!(result, Err(ScriptError::NegativeLocktime)),
+            "CSV with negative sequence should return NegativeLocktime");
     }
 
     #[test]
-    fn test_csv_disable_flag_is_nop() {
-        // bit 31 set = disabled = NOP behavior
+    fn test_csv_disable_flag_bit31() {
+        // bit 31 set on a positive 5-byte value = disabled = NOP behavior.
+        // For a 5-byte script number, bit 31 is in the 4th byte and isn't the sign bit.
+        // E.g., 0x00000080 00 = 0x80000000 = 2147483648 as unsigned, which is positive
+        // in 5-byte encoding (sign bit is bit 39).
+        // Use raw bytes: [0x00, 0x00, 0x00, 0x80, 0x00] = 0x80000000 positive
         let mut engine = make_cltv_engine(0, 20, 2);
         let mut script = ScriptBuf::new();
-        // Push a value with bit 31 set (e.g., 0x80000001 = 2147483649)
-        // In script number encoding, we need a 5-byte value, but MAX_SCRIPT_NUM_LENGTH = 4
-        // Actually bit 31 in u32 is within 4 bytes. Let's use the raw bytes:
-        // 0x01, 0x00, 0x00, 0x80 = -1 in script encoding (sign bit). Actually that's negative.
-        // The code first does decode_num, if negative -> NOP. Then casts to u32 and checks bit 31.
-        // To test bit 31 without negative: we need a 4-byte value where bit 31 of u32 is set.
-        // But decode_num with 4 bytes: if MSB of last byte has sign bit set, it's negative.
-        // So any value with bit 31 set would be negative in script number encoding.
-        // That means the negative check catches it first. The bit 31 check handles
-        // the case where the value fits in u32 with bit 31 set after casting from i64.
-        // For testing, just verify negative = NOP is sufficient.
-        script.push_slice(&encode_num(-5));
+        // Push raw bytes for 0x80000000 (bit 31 set, positive in 5-byte encoding)
+        script.push_slice(&[0x00, 0x00, 0x00, 0x80, 0x00]);
         script.push_opcode(Opcode::OP_CHECKSEQUENCEVERIFY);
         let result = engine.execute(script.as_script());
-        assert!(result.is_ok(), "CSV with disabled flag should be NOP");
+        assert!(result.is_ok(), "CSV with bit 31 set (disabled) should be NOP");
     }
 
     #[test]
