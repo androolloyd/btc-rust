@@ -17,7 +17,7 @@ pub use script_builder::ForgeScript;
 pub use debugger::{ScriptDebugger, DebugStep};
 pub use tx_builder::TxBuilder;
 pub use weight::{analyze_script, estimate_witness_weight, ScriptAnalysis, ScriptBranch};
-pub use miniscript::{Policy, MiniscriptError};
+pub use miniscript::{Miniscript, Policy, MiniscriptError};
 
 // Re-export core types for convenience so users do not need to depend on
 // lower-level crates directly.
