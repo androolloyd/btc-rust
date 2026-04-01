@@ -1638,6 +1638,7 @@ fn test_csv_disabled_flag_acts_as_nop() {
 // 11. OP_CAT with plugin (Merkle proof in script)
 // ============================================================================
 
+#[cfg(feature = "covenants")]
 #[test]
 fn test_merkle_proof_with_op_cat() {
     // Verify a simple 2-level Merkle proof:
@@ -1673,6 +1674,7 @@ fn test_merkle_proof_with_op_cat() {
     assert!(engine.success(), "Merkle proof with OP_CAT should verify");
 }
 
+#[cfg(feature = "covenants")]
 #[test]
 fn test_merkle_proof_3_level_with_op_cat() {
     // 3-level Merkle tree: 4 leaves, prove inclusion of leaf_a

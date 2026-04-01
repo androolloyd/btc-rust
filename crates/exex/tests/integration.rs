@@ -1,3 +1,4 @@
+#![cfg(all(feature = "ordinals", feature = "runes"))]
 //! Comprehensive integration tests for the ExEx (Execution Extensions) system.
 //!
 //! Tests cover the full pipeline: manager notification dispatch, extension

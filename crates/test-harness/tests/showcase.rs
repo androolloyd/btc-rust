@@ -18,6 +18,7 @@ use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut, Witness};
 // 1. Pluggable CTV Covenant
 // ============================================================================
 
+#[cfg(feature = "covenants")]
 #[test]
 fn showcase_pluggable_ctv_covenant() {
     // Demonstrate CTV: create a transaction that can ONLY be spent
@@ -117,6 +118,7 @@ fn showcase_pluggable_ctv_covenant() {
 // 2. OP_CAT Script Concatenation
 // ============================================================================
 
+#[cfg(feature = "covenants")]
 #[test]
 fn showcase_op_cat_script() {
     // Demonstrate OP_CAT: concatenate stack elements in tapscript.
@@ -310,6 +312,7 @@ fn showcase_parallel_verification() {
 // 5. ExEx: Ordinals Inscription Detection
 // ============================================================================
 
+#[cfg(feature = "ordinals")]
 #[test]
 fn showcase_exex_ordinals_detection() {
     // Create a transaction with an inscription, run the ordinals scanner,
@@ -374,6 +377,7 @@ fn showcase_exex_ordinals_detection() {
 // 6. ExEx: Runes Etch Detection
 // ============================================================================
 
+#[cfg(feature = "runes")]
 #[test]
 fn showcase_exex_runes_etch() {
     // Create a transaction with a rune etch, run the runes parser,

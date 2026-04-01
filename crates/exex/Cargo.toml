@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = ["ordinals", "runes"]
+runes = []           # Runes protocol indexer
+ordinals = []        # Ordinals/inscriptions indexer
+
 [dependencies]
 btc-primitives = { workspace = true }
 btc-consensus = { workspace = true }

@@ -298,7 +298,7 @@ impl<DB: Database> UtxoSet for PersistentUtxoSet<DB> {
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, feature = "redb"))]
 mod tests {
     use super::*;
     use crate::redb_backend::RedbDatabase;

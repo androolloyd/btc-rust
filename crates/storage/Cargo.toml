@@ -5,11 +5,18 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = ["redb", "qmdb", "leveldb", "snapshot"]
+redb = ["dep:redb"]         # redb storage backend
+qmdb = ["dep:qmdb"]         # QMDB storage backend (LayerZero's Quick Merkle Database)
+leveldb = []                 # Bitcoin Core chainstate adapter (read-only)
+snapshot = []                # AssumeUTXO snapshot loading
+
 [dependencies]
 btc-primitives = { workspace = true }
 btc-consensus = { workspace = true }
-redb = { workspace = true }
-qmdb = { workspace = true }
+redb = { workspace = true, optional = true }
+qmdb = { workspace = true, optional = true }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

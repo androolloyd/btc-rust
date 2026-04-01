@@ -6,8 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-default = []
-ffi = []
+default = ["taproot", "segwit", "covenants"]
+taproot = []        # BIP341/342 taproot + tapscript
+segwit = []         # BIP141/143/144 segregated witness
+covenants = []      # CTV, CAT, ANYPREVOUT, CSFS, TXHASH opcode plugins
+ffi = []            # C-compatible FFI bindings
 
 [lib]
 crate-type = ["rlib", "cdylib"]

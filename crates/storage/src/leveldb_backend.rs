@@ -739,6 +739,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "redb")]
     fn test_import_to_stub_returns_error() {
         use crate::redb_backend::RedbDatabase;
 

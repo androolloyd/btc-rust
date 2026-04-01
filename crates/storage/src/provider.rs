@@ -79,7 +79,7 @@ impl<DB: Database> BlockchainProvider<DB> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "redb"))]
 mod tests {
     use super::*;
     use crate::redb_backend::RedbDatabase;

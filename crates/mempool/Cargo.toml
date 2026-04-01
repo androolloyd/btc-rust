@@ -3,6 +3,11 @@ name = "btc-mempool"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["cluster", "truc"]
+cluster = []         # Cluster mempool (Bitcoin Core v31 style)
+truc = []            # TRUC/v3 transaction policy
+
 [dependencies]
 btc-primitives = { workspace = true }
 btc-consensus = { workspace = true }

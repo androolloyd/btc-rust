@@ -5,7 +5,10 @@
 //! [`ExEx`] trait and receive [`ExExNotification`]s through a broadcast channel
 //! managed by the [`ExExManager`].
 
+#[cfg(feature = "ordinals")]
 pub mod ordinals;
+
+#[cfg(feature = "runes")]
 pub mod runes;
 
 use btc_consensus::utxo::UtxoSetUpdate;

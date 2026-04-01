@@ -9,9 +9,19 @@ keywords = ["bitcoin", "crypto", "blockchain"]
 categories = ["cryptography::cryptocurrencies"]
 readme = "README.md"
 
+[features]
+default = ["bip32", "bip39", "bip21", "psbt", "descriptor", "silent-payments", "serde"]
+bip32 = []              # HD key derivation (BIP32)
+bip39 = []              # Mnemonic seed phrases (BIP39)
+bip21 = []              # Bitcoin URI parsing (BIP21)
+psbt = []               # Partially Signed Bitcoin Transactions
+descriptor = []         # Output descriptors (BIP380-387)
+silent-payments = []    # Silent payments (BIP352)
+serde = ["dep:serde"]   # Optional serde support
+
 [dependencies]
-serde = { workspace = true }
-serde_json = { workspace = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
 pbkdf2 = { workspace = true }

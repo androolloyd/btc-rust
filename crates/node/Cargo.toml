@@ -5,6 +5,17 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = ["full"]
+full = [
+    "btc-consensus/default",
+    "btc-storage/default",
+    "btc-network/default",
+    "btc-mempool/default",
+    "btc-rpc/default",
+    "btc-exex/default",
+]
+
 [dependencies]
 btc-primitives = { workspace = true }
 btc-consensus = { workspace = true }

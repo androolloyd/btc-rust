@@ -372,6 +372,7 @@ fn test_cltv_rejects_premature_spend() {
 // Pluggable opcode chaos tests
 // ============================================================================
 
+#[cfg(feature = "covenants")]
 #[test]
 fn test_opcat_stress() {
     use btc_consensus::opcode_plugin::{OpCat, OpcodeRegistry};
@@ -409,6 +410,7 @@ fn test_opcat_stress() {
     assert!(engine.success());
 }
 
+#[cfg(feature = "covenants")]
 #[test]
 fn test_opcat_rejects_oversized() {
     use btc_consensus::opcode_plugin::{OpCat, OpcodeRegistry};

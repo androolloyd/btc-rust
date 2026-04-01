@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = ["json-rpc"]
+json-rpc = []        # Bitcoin Core-compatible JSON-RPC server
+esplora = []         # Esplora-compatible REST API
+
 [dependencies]
 btc-primitives = { workspace = true }
 btc-storage = { workspace = true }

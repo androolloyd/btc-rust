@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["ordinals", "runes", "covenants"]
+ordinals = ["btc-exex/ordinals"]     # Enable ordinals test support
+runes = ["btc-exex/runes"]           # Enable runes test support
+covenants = ["btc-consensus/covenants"] # Enable covenant opcode tests
+
 [dependencies]
 btc-primitives = { workspace = true }
 btc-consensus = { workspace = true }
