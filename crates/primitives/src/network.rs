@@ -3,6 +3,8 @@
 pub enum Network {
     Mainnet,
     Testnet,
+    /// Testnet4 (BIP94) — replacement for testnet3 with proper difficulty adjustment.
+    Testnet4,
     Signet,
     Regtest,
 }
@@ -13,6 +15,7 @@ impl Network {
         match self {
             Network::Mainnet => [0xf9, 0xbe, 0xb4, 0xd9],
             Network::Testnet => [0x0b, 0x11, 0x09, 0x07],
+            Network::Testnet4 => [0x1c, 0x16, 0x3f, 0x28],
             Network::Signet => [0x0a, 0x03, 0xcf, 0x40],
             Network::Regtest => [0xfa, 0xbf, 0xb5, 0xda],
         }
@@ -23,6 +26,7 @@ impl Network {
         match self {
             Network::Mainnet => 8333,
             Network::Testnet => 18333,
+            Network::Testnet4 => 48333,
             Network::Signet => 38333,
             Network::Regtest => 18444,
         }
@@ -33,6 +37,7 @@ impl Network {
         match self {
             Network::Mainnet => 8332,
             Network::Testnet => 18332,
+            Network::Testnet4 => 48332,
             Network::Signet => 38332,
             Network::Regtest => 18443,
         }
@@ -42,7 +47,7 @@ impl Network {
     pub fn p2pkh_version(self) -> u8 {
         match self {
             Network::Mainnet => 0x00,
-            Network::Testnet | Network::Signet | Network::Regtest => 0x6f,
+            Network::Testnet | Network::Testnet4 | Network::Signet | Network::Regtest => 0x6f,
         }
     }
 
@@ -50,7 +55,7 @@ impl Network {
     pub fn p2sh_version(self) -> u8 {
         match self {
             Network::Mainnet => 0x05,
-            Network::Testnet | Network::Signet | Network::Regtest => 0xc4,
+            Network::Testnet | Network::Testnet4 | Network::Signet | Network::Regtest => 0xc4,
         }
     }
 
@@ -58,7 +63,7 @@ impl Network {
     pub fn bech32_hrp(self) -> &'static str {
         match self {
             Network::Mainnet => "bc",
-            Network::Testnet => "tb",
+            Network::Testnet | Network::Testnet4 => "tb",
             Network::Signet => "tb",
             Network::Regtest => "bcrt",
         }
@@ -92,6 +97,7 @@ impl std::fmt::Display for Network {
         match self {
             Network::Mainnet => write!(f, "mainnet"),
             Network::Testnet => write!(f, "testnet"),
+            Network::Testnet4 => write!(f, "testnet4"),
             Network::Signet => write!(f, "signet"),
             Network::Regtest => write!(f, "regtest"),
         }
@@ -124,14 +130,17 @@ mod tests {
     fn test_all_networks_magic() {
         assert_eq!(Network::Signet.magic(), [0x0a, 0x03, 0xcf, 0x40]);
         assert_eq!(Network::Regtest.magic(), [0xfa, 0xbf, 0xb5, 0xda]);
+        assert_eq!(Network::Testnet4.magic(), [0x1c, 0x16, 0x3f, 0x28]);
     }
 
     #[test]
     fn test_all_networks_ports() {
         assert_eq!(Network::Testnet.default_port(), 18333);
+        assert_eq!(Network::Testnet4.default_port(), 48333);
         assert_eq!(Network::Signet.default_port(), 38333);
         assert_eq!(Network::Regtest.default_port(), 18444);
         assert_eq!(Network::Testnet.default_rpc_port(), 18332);
+        assert_eq!(Network::Testnet4.default_rpc_port(), 48332);
         assert_eq!(Network::Signet.default_rpc_port(), 38332);
         assert_eq!(Network::Regtest.default_rpc_port(), 18443);
     }
@@ -140,6 +149,7 @@ mod tests {
     fn test_p2sh_versions() {
         assert_eq!(Network::Mainnet.p2sh_version(), 0x05);
         assert_eq!(Network::Testnet.p2sh_version(), 0xc4);
+        assert_eq!(Network::Testnet4.p2sh_version(), 0xc4);
         assert_eq!(Network::Signet.p2sh_version(), 0xc4);
         assert_eq!(Network::Regtest.p2sh_version(), 0xc4);
     }
@@ -147,6 +157,7 @@ mod tests {
     #[test]
     fn test_p2pkh_versions_all() {
         assert_eq!(Network::Signet.p2pkh_version(), 0x6f);
+        assert_eq!(Network::Testnet4.p2pkh_version(), 0x6f);
         assert_eq!(Network::Regtest.p2pkh_version(), 0x6f);
     }
 
@@ -154,6 +165,7 @@ mod tests {
     fn test_bech32_hrp() {
         assert_eq!(Network::Mainnet.bech32_hrp(), "bc");
         assert_eq!(Network::Testnet.bech32_hrp(), "tb");
+        assert_eq!(Network::Testnet4.bech32_hrp(), "tb");
         assert_eq!(Network::Signet.bech32_hrp(), "tb");
         assert_eq!(Network::Regtest.bech32_hrp(), "bcrt");
     }
@@ -181,7 +193,21 @@ mod tests {
     fn test_network_display() {
         assert_eq!(Network::Mainnet.to_string(), "mainnet");
         assert_eq!(Network::Testnet.to_string(), "testnet");
+        assert_eq!(Network::Testnet4.to_string(), "testnet4");
         assert_eq!(Network::Signet.to_string(), "signet");
         assert_eq!(Network::Regtest.to_string(), "regtest");
+    }
+
+    #[test]
+    fn test_testnet4_properties() {
+        let net = Network::Testnet4;
+        assert_eq!(net.magic(), [0x1c, 0x16, 0x3f, 0x28]);
+        assert_eq!(net.default_port(), 48333);
+        assert_eq!(net.default_rpc_port(), 48332);
+        assert_eq!(net.p2pkh_version(), 0x6f);
+        assert_eq!(net.p2sh_version(), 0xc4);
+        assert_eq!(net.bech32_hrp(), "tb");
+        assert_eq!(net.xprv_version(), [0x04, 0x35, 0x83, 0x94]);
+        assert_eq!(net.xpub_version(), [0x04, 0x35, 0x87, 0xCF]);
     }
 }

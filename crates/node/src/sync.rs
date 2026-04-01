@@ -432,6 +432,10 @@ pub struct SyncManager {
     /// are also applied to this database so that the node can resume sync
     /// without reprocessing all blocks.
     persistent_utxo: Option<PersistentUtxoSet<RedbDatabase>>,
+    /// When an AssumeUTXO snapshot has been loaded, this records the snapshot
+    /// height so the sync manager starts block download from snapshot_height + 1.
+    /// Background validation from genesis is a TODO.
+    snapshot_height: Option<u64>,
 }
 
 impl SyncManager {
@@ -458,6 +462,7 @@ impl SyncManager {
             node_state: None,
             datadir: None,
             persistent_utxo: None,
+            snapshot_height: None,
         }
     }
 
@@ -497,6 +502,7 @@ impl SyncManager {
             node_state: None,
             datadir: Some(datadir),
             persistent_utxo,
+            snapshot_height: None,
         }
     }
 
@@ -524,6 +530,21 @@ impl SyncManager {
     /// Return `true` if a persistent UTXO set is configured.
     pub fn has_persistent_utxo(&self) -> bool {
         self.persistent_utxo.is_some()
+    }
+
+    /// Set the AssumeUTXO snapshot height.  When set, the sync manager will
+    /// start block download from `snapshot_height + 1` instead of genesis.
+    ///
+    /// TODO: implement background validation from genesis to snapshot height
+    /// to fully validate the snapshot.
+    pub fn set_snapshot_height(&mut self, height: u64) {
+        info!(height, "AssumeUTXO snapshot height set — will sync from snapshot");
+        self.snapshot_height = Some(height);
+    }
+
+    /// Return the snapshot height if an AssumeUTXO snapshot has been loaded.
+    pub fn snapshot_height(&self) -> Option<u64> {
+        self.snapshot_height
     }
 
     // ------------------------------------------------------------------
@@ -581,15 +602,26 @@ impl SyncManager {
         // to prevent skipping block download on restart.
 
         // Phase 5 -- block sync.
-        // Use checkpoint height if available — skip blocks we already validated.
+        // Use checkpoint height, snapshot height, or chain state height —
+        // skip blocks we already validated or that are covered by the snapshot.
         let block_start = {
             let cp_height = self.datadir.as_ref()
                 .and_then(|d| load_checkpoint(d))
                 .map(|cp| cp.height)
                 .unwrap_or(0);
-            // Start from whichever is higher: chain_state height or checkpoint
-            std::cmp::max(best_height, cp_height) + 1
+            let snap_height = self.snapshot_height.unwrap_or(0);
+            // Start from whichever is highest: chain_state height, checkpoint, or snapshot
+            let max_validated = std::cmp::max(best_height, std::cmp::max(cp_height, snap_height));
+            max_validated + 1
         };
+        if self.snapshot_height.is_some() {
+            info!(
+                snapshot_height = self.snapshot_height.unwrap(),
+                block_start,
+                "AssumeUTXO: skipping to post-snapshot sync"
+            );
+            // TODO: spawn background validation from genesis to snapshot_height
+        }
         if peer_tip >= block_start {
             info!(from = block_start, to = peer_tip, "starting block download (skipping already-validated blocks)");
             self.sync_blocks(&mut conn, block_start, peer_tip).await?;

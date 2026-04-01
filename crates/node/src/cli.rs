@@ -26,6 +26,7 @@ pub fn parse_network(s: &str) -> Network {
     match s {
         "mainnet" => Network::Mainnet,
         "testnet" => Network::Testnet,
+        "testnet4" => Network::Testnet4,
         "signet" => Network::Signet,
         "regtest" => Network::Regtest,
         _ => {
@@ -51,6 +52,8 @@ pub fn script_type(script: &Script) -> &str {
         "p2wsh"
     } else if script.is_p2tr() {
         "p2tr"
+    } else if script.is_p2a() {
+        "p2a"
     } else if script.is_op_return() {
         "op_return"
     } else {

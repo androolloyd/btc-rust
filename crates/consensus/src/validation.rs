@@ -302,6 +302,24 @@ pub fn validate_bip34_coinbase(
     Ok(())
 }
 
+/// Parameters for AssumeUTXO snapshot-based fast sync.
+///
+/// Allows a node to bootstrap from a serialized UTXO set snapshot at a known
+/// block height, then immediately begin syncing from that height while
+/// optionally background-validating the full chain from genesis.
+#[derive(Debug, Clone)]
+pub struct AssumeUtxoParams {
+    /// Block height of the snapshot.
+    pub snapshot_height: u64,
+    /// Expected block hash at the snapshot height.
+    pub snapshot_hash: BlockHash,
+    /// Total number of transaction outputs in the snapshot.
+    pub snapshot_txout_count: u64,
+    /// MuHash digest of the serialized UTXO set at the snapshot height.
+    /// Used to verify snapshot integrity.
+    pub snapshot_muhash: [u8; 32],
+}
+
 /// Chain parameters — network-specific consensus rules
 pub struct ChainParams {
     pub network: btc_primitives::network::Network,
@@ -324,6 +342,10 @@ pub struct ChainParams {
     /// a witness commitment satisfying this challenge script. Only applicable
     /// to signet networks; `None` for mainnet/testnet/regtest.
     pub signet_challenge: Option<ScriptBuf>,
+    /// AssumeUTXO parameters for snapshot-based fast sync.
+    /// When set, the node can load a UTXO snapshot at the specified height
+    /// and begin syncing from there.
+    pub assume_utxo: Option<AssumeUtxoParams>,
 }
 
 impl ChainParams {
@@ -348,6 +370,20 @@ impl ChainParams {
                 "00000000000000000002c71f45de7cf52e0dfd1a8ce8b0a69f13bf67e9c53e67"
             ).unwrap()),
             signet_challenge: None,
+            // AssumeUTXO snapshot at block 840,000 (matching Bitcoin Core v28)
+            assume_utxo: Some(AssumeUtxoParams {
+                snapshot_height: 840_000,
+                snapshot_hash: BlockHash::from_hex(
+                    "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5"
+                ).unwrap(),
+                snapshot_txout_count: 180_932_459,
+                snapshot_muhash: [
+                    0x6a, 0x29, 0x07, 0xf7, 0xc8, 0x16, 0x26, 0x09,
+                    0xbf, 0x30, 0x53, 0x39, 0xaa, 0x78, 0x0e, 0x96,
+                    0xf0, 0x2e, 0x03, 0xb5, 0x50, 0x5c, 0x56, 0xaa,
+                    0x57, 0x0b, 0x5c, 0x1c, 0x8e, 0x23, 0xa8, 0x06,
+                ],
+            }),
         }
     }
 
@@ -368,6 +404,30 @@ impl ChainParams {
             taproot_height: 0, // always active on testnet
             assume_valid: None,
             signet_challenge: None,
+            assume_utxo: None,
+        }
+    }
+
+    /// Testnet4 (BIP94) — replacement for testnet3 with proper difficulty
+    /// adjustment (no 20-minute rule) and a fresh genesis block.
+    pub fn testnet4() -> Self {
+        ChainParams {
+            network: btc_primitives::network::Network::Testnet4,
+            genesis_hash: BlockHash::from_hex(
+                "00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043"
+            ).unwrap(),
+            pow_limit: CompactTarget::MAX_TARGET,
+            pow_target_timespan: 14 * 24 * 60 * 60,
+            pow_target_spacing: 10 * 60,
+            subsidy_halving_interval: 210_000,
+            bip34_height: 1,    // active from genesis on testnet4
+            bip65_height: 1,
+            bip66_height: 1,
+            segwit_height: 1,
+            taproot_height: 1,
+            assume_valid: None,
+            signet_challenge: None,
+            assume_utxo: None,
         }
     }
 
@@ -398,6 +458,7 @@ impl ChainParams {
                 "0000003a3b62a0d42a58b3898e7e4e27fce68a0e5ab5c11a45fc56e8388554a4"
             ).unwrap()),
             signet_challenge: Some(ScriptBuf::from_bytes(challenge_bytes)),
+            assume_utxo: None,
         }
     }
 
@@ -418,6 +479,7 @@ impl ChainParams {
             taproot_height: 0,
             assume_valid: None,
             signet_challenge: None,
+            assume_utxo: None,
         }
     }
 
@@ -425,6 +487,7 @@ impl ChainParams {
         match network {
             btc_primitives::network::Network::Mainnet => Self::mainnet(),
             btc_primitives::network::Network::Testnet => Self::testnet(),
+            btc_primitives::network::Network::Testnet4 => Self::testnet4(),
             btc_primitives::network::Network::Signet => Self::signet(),
             btc_primitives::network::Network::Regtest => Self::regtest(),
         }
@@ -1630,5 +1693,73 @@ mod tests {
         };
         // validate_bip34_coinbase with no transactions returns Ok
         assert!(validate_bip34_coinbase(&block, 300_000, 227931).is_ok());
+    }
+
+    // ---- Coverage: Testnet4 (BIP94) ----
+
+    #[test]
+    fn test_testnet4_params() {
+        let params = ChainParams::testnet4();
+        assert_eq!(params.network, btc_primitives::network::Network::Testnet4);
+        assert_eq!(params.pow_target_spacing, 600);
+        assert_eq!(params.pow_target_timespan, 1_209_600);
+        assert_eq!(params.subsidy_halving_interval, 210_000);
+        // All soft forks active from height 1
+        assert_eq!(params.bip34_height, 1);
+        assert_eq!(params.bip65_height, 1);
+        assert_eq!(params.bip66_height, 1);
+        assert_eq!(params.segwit_height, 1);
+        assert_eq!(params.taproot_height, 1);
+        // No assume-valid or signet challenge
+        assert!(params.assume_valid.is_none());
+        assert!(params.signet_challenge.is_none());
+        assert!(params.assume_utxo.is_none());
+    }
+
+    #[test]
+    fn test_testnet4_from_network() {
+        use btc_primitives::network::Network;
+        let p = ChainParams::from_network(Network::Testnet4);
+        assert_eq!(p.network, Network::Testnet4);
+        assert_eq!(
+            p.genesis_hash.to_hex(),
+            "00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043"
+        );
+    }
+
+    #[test]
+    fn test_testnet4_difficulty_is_mainnet_style() {
+        // Testnet4 uses the same difficulty adjustment as mainnet (no 20-minute rule)
+        let mainnet = ChainParams::mainnet();
+        let testnet4 = ChainParams::testnet4();
+        assert_eq!(mainnet.pow_target_timespan, testnet4.pow_target_timespan);
+        assert_eq!(mainnet.pow_target_spacing, testnet4.pow_target_spacing);
+    }
+
+    // ---- Coverage: AssumeUTXO params ----
+
+    #[test]
+    fn test_mainnet_assume_utxo_params() {
+        let params = ChainParams::mainnet();
+        let au = params.assume_utxo.expect("mainnet should have assume_utxo");
+        assert_eq!(au.snapshot_height, 840_000);
+        assert_eq!(au.snapshot_txout_count, 180_932_459);
+        assert_eq!(au.snapshot_muhash.len(), 32);
+        assert_eq!(
+            au.snapshot_hash.to_hex(),
+            "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5"
+        );
+    }
+
+    #[test]
+    fn test_regtest_no_assume_utxo() {
+        let params = ChainParams::regtest();
+        assert!(params.assume_utxo.is_none());
+    }
+
+    #[test]
+    fn test_testnet_no_assume_utxo() {
+        let params = ChainParams::testnet();
+        assert!(params.assume_utxo.is_none());
     }
 }

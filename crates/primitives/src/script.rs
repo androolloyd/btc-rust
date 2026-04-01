@@ -88,6 +88,19 @@ impl Script {
         !self.0.is_empty() && self.0[0] == Opcode::OP_RETURN as u8
     }
 
+    /// Check if this is a Pay-to-Anchor (P2A) output script.
+    ///
+    /// P2A is a 4-byte witness v1 program: `OP_1 0x02 0x4e 0x73`
+    /// (OP_1 followed by a 2-byte push of `0x4e73`).
+    /// Anyone can spend it, designed for CPFP fee bumping with TRUC transactions.
+    pub fn is_p2a(&self) -> bool {
+        self.0.len() == 4
+            && self.0[0] == Opcode::OP_1 as u8
+            && self.0[1] == 0x02
+            && self.0[2] == 0x4e
+            && self.0[3] == 0x73
+    }
+
     /// Iterate over script instructions (opcodes + push data)
     pub fn instructions(&self) -> ScriptInstructions<'_> {
         ScriptInstructions { data: &self.0, pos: 0 }
@@ -189,6 +202,14 @@ impl ScriptBuf {
         s.0.push(0x20);
         s.0.extend_from_slice(script_hash);
         s
+    }
+
+    /// Build a Pay-to-Anchor (P2A) output script.
+    ///
+    /// P2A: `OP_1 0x02 0x4e 0x73` — a 4-byte witness v1 program that anyone
+    /// can spend, used for CPFP fee bumping with TRUC (v3) transactions.
+    pub fn p2a() -> Self {
+        ScriptBuf(vec![Opcode::OP_1 as u8, 0x02, 0x4e, 0x73])
     }
 
     /// Build a standard P2TR (Taproot) script
@@ -905,5 +926,29 @@ mod tests {
         set.insert(s2);
         assert_eq!(set.len(), 2);
         assert!(set.contains(&s1));
+    }
+
+    #[test]
+    fn test_p2a_script() {
+        let script = ScriptBuf::p2a();
+        assert!(script.is_p2a());
+        assert!(script.is_witness_program());
+        assert!(!script.is_p2tr());
+        assert!(!script.is_op_return());
+        assert_eq!(script.len(), 4);
+        assert_eq!(script.as_bytes(), &[0x51, 0x02, 0x4e, 0x73]);
+    }
+
+    #[test]
+    fn test_is_p2a_false_for_other_scripts() {
+        assert!(!ScriptBuf::p2pkh(&[0; 20]).is_p2a());
+        assert!(!ScriptBuf::p2tr(&[0; 32]).is_p2a());
+        assert!(!ScriptBuf::p2wpkh(&[0; 20]).is_p2a());
+        // Wrong witness program data
+        let wrong = ScriptBuf::from_bytes(vec![0x51, 0x02, 0x00, 0x00]);
+        assert!(!wrong.is_p2a());
+        // Too long
+        let too_long = ScriptBuf::from_bytes(vec![0x51, 0x02, 0x4e, 0x73, 0x00]);
+        assert!(!too_long.is_p2a());
     }
 }
