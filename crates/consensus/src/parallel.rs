@@ -103,7 +103,9 @@ impl ParallelValidator {
         // Collect (tx_index, input_index, prev_output) for every non-coinbase
         // input. We resolve UTXO lookups on the main thread so that the worker
         // threads only need shared, immutable references.
-        let flags = ScriptFlags::all();
+        // Use consensus flags for block validation — policy flags (MINIMALDATA,
+        // SIGPUSHONLY, etc.) only apply to mempool relay, not historical blocks.
+        let flags = ScriptFlags::consensus();
 
         struct WorkItem {
             tx_idx: usize,

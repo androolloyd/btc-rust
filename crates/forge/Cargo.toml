@@ -12,3 +12,6 @@ hex = { workspace = true }
 thiserror = { workspace = true }
 sha2 = { workspace = true }
 secp256k1 = { workspace = true }
+
+[dev-dependencies]
+ripemd = { workspace = true }

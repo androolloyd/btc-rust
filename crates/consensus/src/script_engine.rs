@@ -142,6 +142,44 @@ impl ScriptFlags {
     pub fn none() -> Self {
         ScriptFlags::default()
     }
+
+    /// Consensus-only flags — what's required for valid blocks.
+    /// No policy flags (MINIMALDATA, SIGPUSHONLY, etc.).
+    /// Use this for block validation during IBD.
+    pub fn consensus() -> Self {
+        ScriptFlags {
+            verify_p2sh: true,
+            verify_witness: true,
+            verify_dersig: true,
+            verify_nulldummy: true,
+            verify_checklocktimeverify: true,
+            verify_checksequenceverify: true,
+            verify_taproot: true,
+            ..ScriptFlags::default()
+        }
+    }
+
+    /// Core-compliant — consensus + all policy flags that Bitcoin Core enforces.
+    /// Use this for mempool acceptance.
+    pub fn core_compliant() -> Self {
+        ScriptFlags {
+            verify_p2sh: true,
+            verify_witness: true,
+            verify_strictenc: true,
+            verify_dersig: true,
+            verify_low_s: true,
+            verify_nulldummy: true,
+            verify_cleanstack: true,
+            verify_checklocktimeverify: true,
+            verify_checksequenceverify: true,
+            verify_taproot: true,
+            verify_sigpushonly: true,
+            verify_minimaldata: true,
+            verify_nullfail: true,
+            verify_minimalif: true,
+            ..ScriptFlags::default()
+        }
+    }
 }
 
 impl<'a> ScriptEngine<'a> {
