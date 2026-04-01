@@ -2028,4 +2028,85 @@ mod tests {
         let hash_clean = sighash_legacy(&tx, 0, &script_code_clean, SighashType::ALL).unwrap();
         assert_eq!(hash, hash_clean, "sighash should strip OP_CODESEPARATOR before hashing");
     }
+
+    // ---- Coverage: sighash_anyprevout input out of range ----
+
+    #[test]
+    fn test_anyprevout_input_out_of_range() {
+        let tx = make_multi_io_tx();
+        let prevouts = make_multi_prevouts();
+        let result = sighash_anyprevout(&tx, 99, &prevouts, SIGHASH_ANYPREVOUT, None, None);
+        assert!(result.is_err());
+    }
+
+    // ---- Coverage: sighash_anyprevout prevout count mismatch ----
+
+    #[test]
+    fn test_anyprevout_prevout_count_mismatch() {
+        let tx = make_multi_io_tx();
+        let result = sighash_anyprevout(&tx, 0, &[], SIGHASH_ANYPREVOUT, None, None);
+        assert!(result.is_err());
+    }
+
+    // ---- Coverage: sighash_anyprevout invalid hash type ----
+
+    #[test]
+    fn test_anyprevout_invalid_hash_type() {
+        let tx = make_multi_io_tx();
+        let prevouts = make_multi_prevouts();
+        let result = sighash_anyprevout(&tx, 0, &prevouts, 0x01, None, None); // not 0x41 or 0x42
+        assert!(result.is_err());
+    }
+
+    // ---- Coverage: sighash_anyprevout with ANYPREVOUT (0x41) ----
+
+    #[test]
+    fn test_anyprevout_0x41() {
+        let tx = make_multi_io_tx();
+        let prevouts = make_multi_prevouts();
+        let result = sighash_anyprevout(&tx, 0, &prevouts, SIGHASH_ANYPREVOUT, None, None);
+        assert!(result.is_ok());
+        assert_ne!(result.unwrap(), [0u8; 32]);
+    }
+
+    // ---- Coverage: sighash_anyprevout with ANYPREVOUTANYSCRIPT (0x42) ----
+
+    #[test]
+    fn test_anyprevout_0x42() {
+        let tx = make_multi_io_tx();
+        let prevouts = make_multi_prevouts();
+        let result = sighash_anyprevout(&tx, 0, &prevouts, SIGHASH_ANYPREVOUTANYSCRIPT, None, None);
+        assert!(result.is_ok());
+        assert_ne!(result.unwrap(), [0u8; 32]);
+    }
+
+    // ---- Coverage: sighash_anyprevout with annex and leaf_hash ----
+
+    #[test]
+    fn test_anyprevout_annex_and_leaf() {
+        let tx = make_multi_io_tx();
+        let prevouts = make_multi_prevouts();
+        let annex = vec![0x50, 0x01, 0x02];
+        let leaf_hash = [0xaa; 32];
+        let result = sighash_anyprevout(
+            &tx, 0, &prevouts, SIGHASH_ANYPREVOUT,
+            Some(&annex), Some(&leaf_hash),
+        );
+        assert!(result.is_ok());
+    }
+
+    // ---- Coverage: sighash_anyprevoutanyscript with annex and leaf ----
+
+    #[test]
+    fn test_anyprevoutanyscript_annex_and_leaf() {
+        let tx = make_multi_io_tx();
+        let prevouts = make_multi_prevouts();
+        let annex = vec![0x50, 0x01];
+        let leaf_hash = [0xbb; 32];
+        let result = sighash_anyprevout(
+            &tx, 0, &prevouts, SIGHASH_ANYPREVOUTANYSCRIPT,
+            Some(&annex), Some(&leaf_hash),
+        );
+        assert!(result.is_ok());
+    }
 }

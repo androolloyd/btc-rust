@@ -1326,4 +1326,179 @@ mod tests {
         let n = decode_num(top).unwrap();
         assert_eq!(n, 0, "empty sig should leave counter at 0");
     }
+
+    // ---- Coverage: parse_schnorr_sig edge cases ----
+
+    #[test]
+    fn test_parse_schnorr_sig_default() {
+        let sig = [0u8; 64];
+        let (raw_sig, ht) = parse_schnorr_sig(&sig).unwrap();
+        assert_eq!(raw_sig.len(), 64);
+        assert_eq!(ht.0, 0x00); // default sighash
+    }
+
+    #[test]
+    fn test_parse_schnorr_sig_explicit_hashtype() {
+        let mut sig = vec![0u8; 64];
+        sig.push(0x01); // SIGHASH_ALL
+        let (raw_sig, ht) = parse_schnorr_sig(&sig).unwrap();
+        assert_eq!(raw_sig.len(), 64);
+        assert_eq!(ht.0, 0x01);
+    }
+
+    #[test]
+    fn test_parse_schnorr_sig_explicit_zero_invalid() {
+        let mut sig = vec![0u8; 64];
+        sig.push(0x00); // explicit 0x00 is invalid
+        let result = parse_schnorr_sig(&sig);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_schnorr_sig_bad_length() {
+        let sig = [0u8; 32]; // too short
+        let result = parse_schnorr_sig(&sig);
+        assert!(result.is_err());
+    }
+
+    // ---- Coverage: parse_control_block ----
+
+    #[test]
+    fn test_parse_control_block_too_short_cov() {
+        let result = parse_control_block(&[0u8; 10]);
+        assert!(matches!(result.unwrap_err(), TaprootError::ControlBlockTooShort));
+    }
+
+    #[test]
+    fn test_parse_control_block_invalid_length_cov() {
+        // 33 bytes (valid min) + 15 bytes (not a multiple of 32)
+        let data = vec![0u8; 48];
+        let result = parse_control_block(&data);
+        assert!(matches!(result.unwrap_err(), TaprootError::ControlBlockInvalidLength));
+    }
+
+    #[test]
+    fn test_parse_control_block_valid_no_path() {
+        // Just leaf_version | parity + 32-byte internal key, no merkle path
+        let mut data = vec![0xc0u8]; // leaf version 0xc0, parity 0
+        data.extend_from_slice(&[0xab; 32]); // internal key
+        let (leaf_version, internal_key, merkle_path) = parse_control_block(&data).unwrap();
+        assert_eq!(leaf_version, 0xc0);
+        assert_eq!(internal_key, [0xab; 32]);
+        assert!(merkle_path.is_empty());
+    }
+
+    #[test]
+    fn test_parse_control_block_valid_with_path() {
+        let mut data = vec![0xc1u8]; // leaf version 0xc0, parity 1
+        data.extend_from_slice(&[0xab; 32]); // internal key
+        data.extend_from_slice(&[0xcd; 32]); // one merkle path element
+        let (leaf_version, internal_key, merkle_path) = parse_control_block(&data).unwrap();
+        assert_eq!(leaf_version, 0xc0); // 0xc1 & 0xfe = 0xc0
+        assert_eq!(internal_key, [0xab; 32]);
+        assert_eq!(merkle_path.len(), 1);
+    }
+
+    // ---- Coverage: extract_annex ----
+
+    #[test]
+    fn test_extract_annex_present() {
+        let mut witness = Witness::new();
+        witness.push(vec![0x01]); // item 1
+        witness.push(vec![0x50, 0x01]); // annex (starts with 0x50)
+        let (annex, effective_len) = extractannex(&witness);
+        assert!(annex.is_some());
+        assert_eq!(effective_len, 1);
+    }
+
+    #[test]
+    fn test_extract_annex_not_present() {
+        let mut witness = Witness::new();
+        witness.push(vec![0x01]);
+        witness.push(vec![0x01]); // does not start with 0x50
+        let (annex, effective_len) = extractannex(&witness);
+        assert!(annex.is_none());
+        assert_eq!(effective_len, 2);
+    }
+
+    #[test]
+    fn test_extract_annex_single_item() {
+        let mut witness = Witness::new();
+        witness.push(vec![0x50, 0x01]);
+        let (annex, effective_len) = extractannex(&witness);
+        // Only one item, so annex logic requires 2+
+        assert!(annex.is_none());
+        assert_eq!(effective_len, 1);
+    }
+
+    // ---- Coverage: verify_taproot_input empty witness ----
+
+    #[test]
+    fn test_verify_taproot_input_empty_witness() {
+        use crate::sig_verify::Secp256k1Verifier;
+        let verifier = Secp256k1Verifier;
+        let witness = Witness::new();
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![],
+            outputs: vec![],
+            witness: vec![],
+            lock_time: 0,
+        };
+        let flags = ScriptFlags::none();
+        let result = verify_taproot_input(&[0u8; 32], &witness, &tx, 0, &[], &verifier, &flags);
+        assert!(matches!(result.unwrap_err(), TaprootError::EmptyWitness));
+    }
+
+    // ---- Coverage: verify_script_path with unknown leaf version (forward compat) ----
+
+    #[test]
+    fn test_verify_script_path_unknown_leaf_version() {
+        use crate::sig_verify::Secp256k1Verifier;
+        let verifier = Secp256k1Verifier;
+        let internal_key = test_internal_key(42);
+        let tapscript = vec![Opcode::OP_1 as u8]; // OP_TRUE
+
+        // Use a non-tapscript leaf version (0xc2 instead of 0xc0)
+        let leaf_hash = tap_leaf_hash(0xc2, &tapscript);
+        let merkle_root = leaf_hash;
+        let (output_key, parity) = compute_taprootoutput_key(&internal_key, Some(&merkle_root)).unwrap();
+
+        // Build control block with leaf version 0xc2
+        let mut control_block = vec![0xc2 | parity]; // leaf version with parity
+        control_block.extend_from_slice(&internal_key);
+
+        let mut witness = Witness::new();
+        // No script args needed for unknown leaf version
+        witness.push(tapscript.clone()); // tapscript
+        witness.push(control_block); // control block
+
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![btc_primitives::transaction::TxIn {
+                previous_output: btc_primitives::transaction::OutPoint::new(
+                    btc_primitives::hash::TxHash::from_bytes([0x11; 32]), 0,
+                ),
+                script_sig: ScriptBuf::new(),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![btc_primitives::transaction::TxOut {
+                value: btc_primitives::amount::Amount::from_sat(1000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+            witness: vec![],
+            lock_time: 0,
+        };
+
+        let prevouts = vec![btc_primitives::transaction::TxOut {
+            value: btc_primitives::amount::Amount::from_sat(1000),
+            script_pubkey: ScriptBuf::new(),
+        }];
+
+        let flags = ScriptFlags::none();
+
+        // Unknown leaf version succeeds (forward compatibility)
+        let result = verify_script_path(&output_key, &witness, &tx, 0, &prevouts, &verifier, &flags);
+        assert!(result.is_ok(), "unknown leaf version should succeed: {:?}", result.err());
+    }
 }

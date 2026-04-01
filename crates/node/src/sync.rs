@@ -2385,4 +2385,579 @@ mod tests {
         // 0.1 + 0.25 * 0.9 = 0.1 + 0.225 = 0.325
         assert!((p - 0.325).abs() < 1e-9, "expected 0.325, got {}", p);
     }
+
+    // -----------------------------------------------------------------------
+    // compute_block_start (extended)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_block_start_large_height() {
+        assert_eq!(compute_block_start(800_000, None), 800_001);
+    }
+
+    #[test]
+    fn test_compute_block_start_checkpoint_lower_than_chain() {
+        assert_eq!(compute_block_start(100, Some(50)), 101);
+    }
+
+    #[test]
+    fn test_compute_block_start_checkpoint_higher_than_chain() {
+        assert_eq!(compute_block_start(50, Some(100)), 101);
+    }
+
+    #[test]
+    fn test_compute_block_start_checkpoint_equal_to_chain() {
+        assert_eq!(compute_block_start(100, Some(100)), 101);
+    }
+
+    #[test]
+    fn test_compute_block_start_both_at_zero() {
+        assert_eq!(compute_block_start(0, Some(0)), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // is_header_sync_complete (extended)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_header_sync_complete_empty() {
+        assert!(is_header_sync_complete(0));
+    }
+
+    #[test]
+    fn test_is_header_sync_complete_partial() {
+        assert!(is_header_sync_complete(100));
+        assert!(is_header_sync_complete(1999));
+    }
+
+    #[test]
+    fn test_is_header_sync_complete_over_batch() {
+        assert!(!is_header_sync_complete(2001));
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_batch_end (extended)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_batch_end_within_range() {
+        assert_eq!(compute_batch_end(1, 128, 1000), 128);
+    }
+
+    #[test]
+    fn test_compute_batch_end_clamped_to_target() {
+        assert_eq!(compute_batch_end(990, 128, 1000), 1000);
+    }
+
+    #[test]
+    fn test_compute_batch_end_single_block() {
+        assert_eq!(compute_batch_end(500, 1, 1000), 500);
+    }
+
+    #[test]
+    fn test_compute_batch_end_at_target() {
+        assert_eq!(compute_batch_end(1000, 128, 1000), 1000);
+    }
+
+    #[test]
+    fn test_compute_batch_end_large_batch() {
+        assert_eq!(compute_batch_end(1, 10_000, 500), 500);
+    }
+
+    #[test]
+    fn test_compute_batch_end_default_batch_size() {
+        assert_eq!(compute_batch_end(1, BLOCK_DOWNLOAD_BATCH_SIZE, 800_000), 128);
+        assert_eq!(compute_batch_end(129, BLOCK_DOWNLOAD_BATCH_SIZE, 800_000), 256);
+    }
+
+    // -----------------------------------------------------------------------
+    // should_verify_scripts (pure wrapper, extended)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_should_verify_scripts_no_assume_valid() {
+        let params = ChainParams::regtest();
+        let hash = BlockHash::from_bytes([0xaa; 32]);
+        assert!(should_verify_scripts(&params, 100, &hash, None));
+        assert!(should_verify_scripts(&params, 0, &hash, None));
+    }
+
+    #[test]
+    fn test_should_verify_scripts_below_assume_valid() {
+        let mut params = ChainParams::mainnet();
+        params.assume_valid = Some(BlockHash::from_bytes([0xcc; 32]));
+        let some_hash = BlockHash::from_bytes([0xbb; 32]);
+        assert!(!should_verify_scripts(&params, 100, &some_hash, Some(500_000)));
+    }
+
+    #[test]
+    fn test_should_verify_scripts_above_assume_valid() {
+        let mut params = ChainParams::mainnet();
+        params.assume_valid = Some(BlockHash::from_bytes([0xcc; 32]));
+        let some_hash = BlockHash::from_bytes([0xbb; 32]);
+        assert!(should_verify_scripts(&params, 500_001, &some_hash, Some(500_000)));
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_undo_prune_cutoff (extended)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_undo_prune_cutoff_at_boundary() {
+        assert_eq!(compute_undo_prune_cutoff(101, 100), Some(1));
+    }
+
+    #[test]
+    fn test_compute_undo_prune_cutoff_well_past() {
+        assert_eq!(compute_undo_prune_cutoff(1000, 100), Some(900));
+    }
+
+    #[test]
+    fn test_compute_undo_prune_cutoff_zero_depth() {
+        assert_eq!(compute_undo_prune_cutoff(1, 0), Some(1));
+        assert_eq!(compute_undo_prune_cutoff(500, 0), Some(500));
+    }
+
+    // -----------------------------------------------------------------------
+    // should_flush_utxo / should_log_utxo_status (extended)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_should_flush_utxo_not_at_boundary() {
+        assert!(!should_flush_utxo(1));
+        assert!(!should_flush_utxo(499));
+        assert!(!should_flush_utxo(501));
+    }
+
+    #[test]
+    fn test_should_log_utxo_status_at_boundary() {
+        assert!(should_log_utxo_status(0));
+        assert!(should_log_utxo_status(1000));
+    }
+
+    #[test]
+    fn test_should_log_utxo_status_not_at_boundary() {
+        assert!(!should_log_utxo_status(1));
+        assert!(!should_log_utxo_status(250));
+        assert!(!should_log_utxo_status(999));
+    }
+
+    // -----------------------------------------------------------------------
+    // should_download_blocks (extended)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_should_download_blocks_peer_ahead() {
+        assert!(should_download_blocks(1000, 1));
+        assert!(should_download_blocks(1000, 1000));
+    }
+
+    #[test]
+    fn test_should_download_blocks_peer_behind() {
+        assert!(!should_download_blocks(100, 101));
+        assert!(!should_download_blocks(0, 1));
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_policy (extended)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_policy_core() {
+        assert!(validate_policy("core").is_ok());
+    }
+
+    #[test]
+    fn test_validate_policy_consensus() {
+        assert!(validate_policy("consensus").is_ok());
+    }
+
+    #[test]
+    fn test_validate_policy_all() {
+        assert!(validate_policy("all").is_ok());
+    }
+
+    #[test]
+    fn test_validate_policy_unknown_message() {
+        let result = validate_policy("potato");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("potato"));
+    }
+
+    #[test]
+    fn test_validate_policy_empty() {
+        assert!(validate_policy("").is_err());
+    }
+
+    #[test]
+    fn test_validate_policy_case_sensitive() {
+        assert!(validate_policy("Core").is_err());
+        assert!(validate_policy("CONSENSUS").is_err());
+        assert!(validate_policy("ALL").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_inv_items (extended)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_inv_items_mixed_with_error_type() {
+        let items = vec![
+            InvItem { inv_type: InvType::Tx, hash: btc_primitives::hash::Hash256::from_bytes([0x01; 32]) },
+            InvItem { inv_type: InvType::WitnessTx, hash: btc_primitives::hash::Hash256::from_bytes([0x02; 32]) },
+            InvItem { inv_type: InvType::Block, hash: btc_primitives::hash::Hash256::from_bytes([0x03; 32]) },
+            InvItem { inv_type: InvType::WitnessBlock, hash: btc_primitives::hash::Hash256::from_bytes([0x04; 32]) },
+            InvItem { inv_type: InvType::Error, hash: btc_primitives::hash::Hash256::from_bytes([0x05; 32]) },
+        ];
+        let (blocks, txs) = classify_inv_items(&items);
+        assert_eq!(blocks, 2);
+        assert_eq!(txs, 2);
+    }
+
+    #[test]
+    fn test_classify_inv_items_only_blocks() {
+        let items = vec![
+            InvItem { inv_type: InvType::Block, hash: btc_primitives::hash::Hash256::from_bytes([0x01; 32]) },
+            InvItem { inv_type: InvType::WitnessBlock, hash: btc_primitives::hash::Hash256::from_bytes([0x02; 32]) },
+        ];
+        let (blocks, txs) = classify_inv_items(&items);
+        assert_eq!(blocks, 2);
+        assert_eq!(txs, 0);
+    }
+
+    #[test]
+    fn test_classify_inv_items_only_txs() {
+        let items = vec![
+            InvItem { inv_type: InvType::Tx, hash: btc_primitives::hash::Hash256::from_bytes([0x01; 32]) },
+            InvItem { inv_type: InvType::WitnessTx, hash: btc_primitives::hash::Hash256::from_bytes([0x02; 32]) },
+        ];
+        let (blocks, txs) = classify_inv_items(&items);
+        assert_eq!(blocks, 0);
+        assert_eq!(txs, 2);
+    }
+
+    #[test]
+    fn test_classify_inv_items_only_error() {
+        let items = vec![
+            InvItem { inv_type: InvType::Error, hash: btc_primitives::hash::Hash256::from_bytes([0x01; 32]) },
+        ];
+        let (blocks, txs) = classify_inv_items(&items);
+        assert_eq!(blocks, 0);
+        assert_eq!(txs, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // determine_output_format (extended)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_determine_output_format_json_flag_priority() {
+        let f = determine_output_format(true, None);
+        assert_eq!(f, crate::output::OutputFormat::Json);
+    }
+
+    #[test]
+    fn test_determine_output_format_json_flag_overrides_text_opt() {
+        let f = determine_output_format(true, Some("text"));
+        assert_eq!(f, crate::output::OutputFormat::Json);
+    }
+
+    #[test]
+    fn test_determine_output_format_explicit_json_opt() {
+        let f = determine_output_format(false, Some("json"));
+        assert_eq!(f, crate::output::OutputFormat::Json);
+    }
+
+    #[test]
+    fn test_determine_output_format_explicit_text_opt() {
+        let f = determine_output_format(false, Some("text"));
+        assert_eq!(f, crate::output::OutputFormat::Text);
+    }
+
+    #[test]
+    fn test_determine_output_format_auto_detection() {
+        let f = determine_output_format(false, None);
+        assert_eq!(f, crate::output::OutputFormat::Json); // test env = not TTY
+    }
+
+    #[test]
+    fn test_determine_output_format_unknown_falls_to_auto() {
+        let f = determine_output_format(false, Some("xml"));
+        assert_eq!(f, crate::output::OutputFormat::auto());
+    }
+
+    // -----------------------------------------------------------------------
+    // next_state_after_headers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_next_state_after_headers_incomplete() {
+        let state = next_state_after_headers(2000, 50_000);
+        match state {
+            SyncState::DownloadingHeaders { progress, target } => {
+                assert_eq!(progress, 50_000);
+                assert_eq!(target, 50_000);
+            }
+            _ => panic!("expected DownloadingHeaders"),
+        }
+    }
+
+    #[test]
+    fn test_next_state_after_headers_complete() {
+        let state = next_state_after_headers(500, 50_000);
+        match state {
+            SyncState::DownloadingHeaders { progress, target } => {
+                assert_eq!(progress, 50_000);
+                assert_eq!(target, 50_000);
+            }
+            _ => panic!("expected DownloadingHeaders"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // next_state_downloading_blocks
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_next_state_downloading_blocks() {
+        let state = next_state_downloading_blocks(100, 1000);
+        assert_eq!(state, SyncState::DownloadingBlocks { progress: 100, target: 1000 });
+    }
+
+    #[test]
+    fn test_next_state_downloading_blocks_complete() {
+        let state = next_state_downloading_blocks(1000, 1000);
+        assert_eq!(state, SyncState::DownloadingBlocks { progress: 1000, target: 1000 });
+    }
+
+    // -----------------------------------------------------------------------
+    // estimate_sync_eta
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_estimate_sync_eta_midway() {
+        // 50% done in 100 seconds -> 100 seconds remaining
+        let eta = estimate_sync_eta(0.5, 100.0);
+        assert!(eta.is_some());
+        assert!((eta.unwrap() - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_estimate_sync_eta_quarter() {
+        // 25% done in 100 seconds -> 300 seconds remaining
+        let eta = estimate_sync_eta(0.25, 100.0);
+        assert!(eta.is_some());
+        assert!((eta.unwrap() - 300.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_estimate_sync_eta_zero_progress() {
+        assert!(estimate_sync_eta(0.0, 100.0).is_none());
+    }
+
+    #[test]
+    fn test_estimate_sync_eta_complete() {
+        assert!(estimate_sync_eta(1.0, 100.0).is_none());
+    }
+
+    #[test]
+    fn test_estimate_sync_eta_zero_elapsed() {
+        assert!(estimate_sync_eta(0.5, 0.0).is_none());
+    }
+
+    #[test]
+    fn test_estimate_sync_eta_negative_progress() {
+        assert!(estimate_sync_eta(-0.1, 100.0).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_sync_speed
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_sync_speed_normal() {
+        let speed = compute_sync_speed(1000, 10.0);
+        assert!(speed.is_some());
+        assert!((speed.unwrap() - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_compute_sync_speed_zero_elapsed() {
+        assert!(compute_sync_speed(1000, 0.0).is_none());
+    }
+
+    #[test]
+    fn test_compute_sync_speed_zero_blocks() {
+        let speed = compute_sync_speed(0, 10.0);
+        assert!(speed.is_some());
+        assert!((speed.unwrap() - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_compute_sync_speed_negative_elapsed() {
+        assert!(compute_sync_speed(100, -1.0).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // lookup_pending_block
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_lookup_pending_block_found() {
+        let mut pending = HashMap::new();
+        let hash = BlockHash::from_bytes([0x01; 32]);
+        pending.insert(hash, 100);
+        assert_eq!(lookup_pending_block(&pending, &hash), Some(100));
+    }
+
+    #[test]
+    fn test_lookup_pending_block_not_found() {
+        let pending: HashMap<BlockHash, u64> = HashMap::new();
+        let hash = BlockHash::from_bytes([0x01; 32]);
+        assert_eq!(lookup_pending_block(&pending, &hash), None);
+    }
+
+    #[test]
+    fn test_lookup_pending_block_wrong_hash() {
+        let mut pending = HashMap::new();
+        let hash1 = BlockHash::from_bytes([0x01; 32]);
+        let hash2 = BlockHash::from_bytes([0x02; 32]);
+        pending.insert(hash1, 100);
+        assert_eq!(lookup_pending_block(&pending, &hash2), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // detect_potential_reorg
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_detect_potential_reorg_same_tip() {
+        let hash = BlockHash::from_bytes([0x01; 32]);
+        let first_prev = BlockHash::from_bytes([0x02; 32]);
+        assert!(!detect_potential_reorg(&hash, &hash, &first_prev));
+    }
+
+    #[test]
+    fn test_detect_potential_reorg_linear_extension() {
+        let old = BlockHash::from_bytes([0x01; 32]);
+        let new = BlockHash::from_bytes([0x02; 32]);
+        // First new header's prev == old tip: linear extension
+        assert!(!detect_potential_reorg(&old, &new, &old));
+    }
+
+    #[test]
+    fn test_detect_potential_reorg_actual_reorg() {
+        let old = BlockHash::from_bytes([0x01; 32]);
+        let new = BlockHash::from_bytes([0x02; 32]);
+        let first_prev = BlockHash::from_bytes([0x03; 32]);
+        // First new header's prev != old tip: potential reorg
+        assert!(detect_potential_reorg(&old, &new, &first_prev));
+    }
+
+    // -----------------------------------------------------------------------
+    // Batch iteration simulation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_batch_iteration_covers_full_range() {
+        let from = 1u64;
+        let to = 500u64;
+        let batch_size = BLOCK_DOWNLOAD_BATCH_SIZE;
+        let mut height = from;
+        let mut batch_count = 0;
+        let mut last_batch_end = 0;
+
+        while height <= to {
+            let batch_end = compute_batch_end(height, batch_size, to);
+            assert!(batch_end >= height);
+            assert!(batch_end <= to);
+            last_batch_end = batch_end;
+            height = batch_end + 1;
+            batch_count += 1;
+        }
+
+        assert_eq!(last_batch_end, to);
+        assert_eq!(batch_count, 4);
+    }
+
+    #[test]
+    fn test_batch_iteration_single_block() {
+        let batch_end = compute_batch_end(100, BLOCK_DOWNLOAD_BATCH_SIZE, 100);
+        assert_eq!(batch_end, 100);
+    }
+
+    // -----------------------------------------------------------------------
+    // Full sync lifecycle simulation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sync_lifecycle_pure_simulation() {
+        let chain_height = 0u64;
+        let checkpoint_height: Option<u64> = None;
+        let peer_tip = 1000u64;
+
+        let block_start = compute_block_start(chain_height, checkpoint_height);
+        assert_eq!(block_start, 1);
+        assert!(should_download_blocks(peer_tip, block_start));
+
+        let mut height = block_start;
+        let mut blocks_downloaded = 0u64;
+        while height <= peer_tip {
+            let batch_end = compute_batch_end(height, BLOCK_DOWNLOAD_BATCH_SIZE, peer_tip);
+            blocks_downloaded += batch_end - height + 1;
+            height = batch_end + 1;
+        }
+        assert_eq!(blocks_downloaded, 1000);
+        assert_eq!(compute_progress(&SyncState::Synced), 1.0);
+    }
+
+    #[test]
+    fn test_sync_lifecycle_with_checkpoint_resume() {
+        let chain_height = 0u64;
+        let checkpoint_height = Some(500u64);
+        let peer_tip = 1000u64;
+
+        let block_start = compute_block_start(chain_height, checkpoint_height);
+        assert_eq!(block_start, 501);
+        assert!(should_download_blocks(peer_tip, block_start));
+        assert_eq!(peer_tip - block_start + 1, 500);
+    }
+
+    #[test]
+    fn test_sync_lifecycle_already_synced() {
+        let chain_height = 1000u64;
+        let peer_tip = 1000u64;
+
+        let block_start = compute_block_start(chain_height, None);
+        assert_eq!(block_start, 1001);
+        assert!(!should_download_blocks(peer_tip, block_start));
+    }
+
+    // -----------------------------------------------------------------------
+    // SyncState display (additional coverage)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sync_state_display_all_variants_formatted() {
+        assert_eq!(format!("{}", SyncState::Idle), "idle");
+        assert_eq!(format!("{}", SyncState::ConnectingPeers), "connecting_peers");
+        assert_eq!(format!("{}", SyncState::Synced), "synced");
+        assert_eq!(
+            format!("{}", SyncState::DownloadingHeaders { progress: 5, target: 10 }),
+            "downloading_headers (5/10)"
+        );
+        assert_eq!(
+            format!("{}", SyncState::DownloadingBlocks { progress: 3, target: 7 }),
+            "downloading_blocks (3/7)"
+        );
+    }
+
+    #[test]
+    fn test_sync_state_is_idle_or_synced_comprehensive() {
+        assert!(SyncState::Idle.is_idle_or_synced());
+        assert!(SyncState::Synced.is_idle_or_synced());
+        assert!(!SyncState::ConnectingPeers.is_idle_or_synced());
+        assert!(!SyncState::DownloadingHeaders { progress: 0, target: 0 }.is_idle_or_synced());
+        assert!(!SyncState::DownloadingBlocks { progress: 0, target: 0 }.is_idle_or_synced());
+    }
 }

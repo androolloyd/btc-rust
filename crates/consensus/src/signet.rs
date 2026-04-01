@@ -427,4 +427,24 @@ mod tests {
             other => panic!("expected ChallengeFailed, got: {:?}", other),
         }
     }
+
+    // ---- Coverage: solution too large (line 118-120) ----
+
+    #[test]
+    fn test_solution_too_large() {
+        let challenge = SignetChallenge::new(ScriptBuf::from_bytes(vec![0x51]));
+        // Create a solution larger than MAX_SIGNET_SOLUTION_SIZE
+        let huge_solution = vec![0x42; MAX_SIGNET_SOLUTION_SIZE + 1];
+        let block = make_signet_block(Some(huge_solution));
+
+        let result = validate_signet_block(&block, &challenge);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SignetError::SolutionTooLarge { size, max } => {
+                assert_eq!(max, MAX_SIGNET_SOLUTION_SIZE);
+                assert!(size > MAX_SIGNET_SOLUTION_SIZE);
+            }
+            other => panic!("expected SolutionTooLarge, got: {:?}", other),
+        }
+    }
 }

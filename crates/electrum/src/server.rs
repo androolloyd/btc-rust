@@ -185,6 +185,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_server_run_and_connect() {
+        // Get a random available port
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener); // Release the port
+
+        let handler = Arc::new(ElectrumHandler::new());
+        let server = ElectrumServer::new(port);
+
+        // Run the server in a background task (it runs forever so we'll abort it)
+        let server_task = tokio::spawn(async move {
+            let _ = server.run(handler).await;
+        });
+
+        // Give the server a moment to bind
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Connect as a client and send a request
+        let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
+        let (reader, mut writer) = client.split();
+
+        // Send server.ping
+        let req = r#"{"id":1,"method":"server.ping","params":[]}"#;
+        writer
+            .write_all(format!("{}\n", req).as_bytes())
+            .await
+            .unwrap();
+
+        // Read response
+        let mut lines = BufReader::new(reader).lines();
+        let resp_line = lines.next_line().await.unwrap().unwrap();
+        let resp: serde_json::Value = serde_json::from_str(&resp_line).unwrap();
+        assert_eq!(resp["id"], 1);
+
+        // Send empty line (should be skipped by server)
+        drop(writer);
+        drop(lines);
+
+        // Abort the server
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn test_server_run_port_in_use() {
+        // Bind a port first and keep it occupied
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let handler = Arc::new(ElectrumHandler::new());
+        let server = ElectrumServer::new(port);
+
+        // Use tokio::select! to add a timeout - the run method should return
+        // immediately with Ok(()) when the port is in use
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server.run(handler),
+        )
+        .await;
+
+        // It should complete quickly (not timeout) and return Ok(())
+        match result {
+            Ok(Ok(())) => {} // Port was in use, server returned gracefully
+            Ok(Err(e)) => panic!("unexpected IO error: {e}"),
+            Err(_) => {
+                // Timeout means the server actually bound (race condition)
+                // This is still a valid outcome if the port was released
+            }
+        }
+
+        drop(listener);
+    }
+
+    #[tokio::test]
     async fn test_server_handles_empty_lines() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();

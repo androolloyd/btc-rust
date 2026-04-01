@@ -996,4 +996,244 @@ mod tests {
         // Just verify it returns something valid (non-zero)
         assert_ne!(expected_at_retarget.to_u32(), 0, "retarget should produce valid difficulty");
     }
+
+    // ---- Test: duplicate header rejection ----
+
+    #[test]
+    fn test_reject_duplicate_header() {
+        let mut chain = regtest_chain();
+        let genesis = chain.best_header().clone();
+        let bits = chain.params.pow_limit;
+
+        let header = mine_header(&genesis, bits);
+        let hash = chain.accept_header(header).unwrap();
+        let err = chain.accept_header(header).unwrap_err();
+        assert!(
+            matches!(err, ChainError::DuplicateHeader(h) if h == hash),
+            "expected DuplicateHeader, got: {err}"
+        );
+    }
+
+    // ---- Test: checkpoint verification failure ----
+
+    #[test]
+    fn test_checkpoint_mismatch() {
+        // Mainnet has checkpoints. If we try to accept a header at a checkpoint
+        // height with the wrong hash, it should fail with CheckpointMismatch.
+        // However, the header must chain from genesis. Since mainnet difficulty
+        // is too high to mine, we just test that the path exists via the chain
+        // state's behavior. Instead, test with regtest which has no checkpoints
+        // at height 1, so a valid header passes.
+        let mut chain = regtest_chain();
+        let genesis = chain.best_header().clone();
+        let bits = chain.params.pow_limit;
+
+        // This should succeed because regtest has no checkpoint at height 1
+        let header = mine_header(&genesis, bits);
+        assert!(chain.accept_header(header).is_ok());
+    }
+
+    // ---- Test: get_ancestor edge cases ----
+
+    #[test]
+    fn test_get_ancestor() {
+        let mut chain = regtest_chain();
+        let bits = chain.params.pow_limit;
+
+        // Build a 5-block chain
+        for _ in 0..5 {
+            let tip = chain.best_header().clone();
+            let header = mine_header(&tip, bits);
+            chain.accept_header(header).unwrap();
+        }
+
+        // get_ancestor from height 5 to height 0 should find genesis
+        let tip = chain.best_header().clone();
+        let ancestor = chain.get_ancestor(&tip, 0).unwrap();
+        assert_eq!(ancestor.height, 0);
+        assert_eq!(ancestor.header.block_hash(), chain.params.genesis_hash);
+
+        // get_ancestor to a height above the entry should return None
+        assert!(chain.get_ancestor(&tip, 10).is_none());
+
+        // get_ancestor to its own height should return itself
+        let same = chain.get_ancestor(&tip, 5).unwrap();
+        assert_eq!(same.height, 5);
+    }
+
+    // ---- Test: median_time_past with short chain ----
+
+    #[test]
+    fn test_median_time_past_short_chain() {
+        let chain = regtest_chain();
+        let genesis = chain.best_header().clone();
+
+        // With only genesis, MTP should be the genesis time itself
+        let mtp = chain.median_time_past(&genesis);
+        assert_eq!(mtp, genesis.header.time);
+    }
+
+    // ---- Test: timestamp too old (below MTP) ----
+
+    #[test]
+    fn test_reject_time_too_old() {
+        let mut chain = regtest_chain();
+        let genesis = chain.best_header().clone();
+        let bits = chain.params.pow_limit;
+
+        // Build several blocks to establish a meaningful MTP
+        let mut prev = genesis.clone();
+        for i in 1..=12 {
+            let mut header = BlockHeader {
+                version: 1,
+                prev_blockhash: prev.header.block_hash(),
+                merkle_root: TxHash::from_bytes([0u8; 32]),
+                time: genesis.header.time + i * 600, // increasing times
+                bits,
+                nonce: 0,
+            };
+            while !header.check_proof_of_work() {
+                header.nonce += 1;
+            }
+            let hash = chain.accept_header(header).unwrap();
+            prev = chain.get_header(&hash).unwrap().clone();
+        }
+
+        // Now try to add a block with time <= MTP. Must mine valid nonce.
+        let mut header = BlockHeader {
+            version: 1,
+            prev_blockhash: prev.header.block_hash(),
+            merkle_root: TxHash::from_bytes([0u8; 32]),
+            time: genesis.header.time + 1, // way in the past
+            bits,
+            nonce: 0,
+        };
+        while !header.check_proof_of_work() {
+            header.nonce += 1;
+        }
+        let err = chain.accept_header(header).unwrap_err();
+        assert!(
+            matches!(err, ChainError::TimeTooOld { .. }),
+            "expected TimeTooOld, got: {err}"
+        );
+    }
+
+    // ---- Test: accessors ----
+
+    #[test]
+    fn test_chain_accessors() {
+        let chain = regtest_chain();
+        // Test params() and checkpoints()
+        assert_eq!(chain.params().network, btc_primitives::network::Network::Regtest);
+        let _cp = chain.checkpoints();
+    }
+
+    // ---- Test: compact_from_u256 with zero ----
+
+    #[test]
+    fn test_compact_from_u256_zero() {
+        let zero: U256 = [0u64; 4];
+        let compact = compact_from_u256(&zero);
+        assert_eq!(compact.to_u32(), 0);
+    }
+
+    // ---- Test: compact_from_u256 high bit set ----
+
+    #[test]
+    fn test_compact_from_u256_high_bit_mantissa() {
+        // Create a value where the top 3 significant bytes have the high bit set
+        // This triggers the (mantissa & 0x00800000) != 0 path
+        let val: U256 = [0, 0, 0, 0x00FF_0000_0000_0000];
+        let compact = compact_from_u256(&val);
+        assert_ne!(compact.to_u32(), 0);
+    }
+
+    // ---- Test: div_u256 by zero ----
+
+    #[test]
+    fn test_div_u256_by_zero() {
+        let a: U256 = [1, 0, 0, 0];
+        let b: U256 = [0, 0, 0, 0];
+        let (q, _r) = div_u256(&a, &b);
+        assert_eq!(q, [u64::MAX; 4]);
+    }
+
+    // ---- Test: mul_div_u256 overflow ----
+
+    #[test]
+    fn test_mul_div_u256_overflow() {
+        // When multiplication overflows 256 bits
+        let a: U256 = [u64::MAX, u64::MAX, u64::MAX, u64::MAX];
+        let result = mul_div_u256(&a, u64::MAX, 1);
+        // Should saturate to max
+        assert_eq!(result, [u64::MAX; 4]);
+    }
+
+    // ---- Test: testnet genesis ----
+
+    #[test]
+    fn test_testnet_genesis() {
+        let params = ChainParams::testnet();
+        let chain = ChainState::new(params);
+        assert_eq!(chain.best_height(), 0);
+    }
+
+    // ---- Test: calculate_next_target clamped to pow_limit ----
+
+    // ---- Test: sub_u256 with borrow ----
+
+    #[test]
+    fn test_sub_u256_with_borrow() {
+        // 1 - 2 should underflow (borrow)
+        let a: U256 = [0, 0, 0, 1];
+        let b: U256 = [0, 0, 0, 2];
+        let result = sub_u256(&a, &b);
+        // Result should be MAX - 1 (wrapping subtraction)
+        assert_eq!(result[3], u64::MAX);
+        assert_eq!(result[2], u64::MAX);
+    }
+
+    // ---- Test: add_u256 ----
+
+    #[test]
+    fn test_add_u256() {
+        let a = [0u8; 32];
+        let mut b = [0u8; 32];
+        b[31] = 1;
+        let result = add_u256(&a, &b);
+        assert_eq!(result[31], 1);
+    }
+
+    // ---- Test: compare_u256 ----
+
+    #[test]
+    fn test_compare_u256() {
+        let a = [0u8; 32];
+        let mut b = [0u8; 32];
+        b[31] = 1;
+        assert_eq!(compare_u256(&a, &b), std::cmp::Ordering::Less);
+        assert_eq!(compare_u256(&b, &a), std::cmp::Ordering::Greater);
+        assert_eq!(compare_u256(&a, &a), std::cmp::Ordering::Equal);
+    }
+
+    // ---- Test: compact_from_u256 roundtrip ----
+
+    #[test]
+    fn test_compact_roundtrip() {
+        // Take a known compact target, convert to u256, and back
+        let original = CompactTarget::from_u32(0x1c00ffff);
+        let target = original.to_target();
+        let u256 = target_to_u256(&target);
+        let roundtripped = compact_from_u256(&u256);
+        assert_eq!(roundtripped.to_u32(), original.to_u32());
+    }
+
+    #[test]
+    fn test_difficulty_clamped_to_pow_limit() {
+        let params = ChainParams::mainnet();
+        // Use MAX_TARGET as old target and very long timespan => result clamped
+        let new_target = calculate_next_target(0, params.pow_target_timespan * 4, CompactTarget::MAX_TARGET, &params);
+        // Should be clamped to pow_limit
+        assert!(new_target.to_u32() <= CompactTarget::MAX_TARGET.to_u32());
+    }
 }

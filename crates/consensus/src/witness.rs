@@ -2929,4 +2929,81 @@ mod tests {
         let result = verify_input(&tx, 0, &prev_output, &verifier, &flags);
         assert!(result.is_ok(), "P2SH with verify_p2sh=false should run as legacy: {:?}", result.err());
     }
+
+    // ---- Coverage: verify_input with witness v0 and empty scriptSig ----
+
+    #[test]
+    fn test_verify_input_p2wpkh_non_empty_scriptsig_fails() {
+        use crate::sig_verify::Secp256k1Verifier;
+        let verifier = Secp256k1Verifier;
+        let mut flags = ScriptFlags::none();
+        flags.verify_witness = true;
+
+        // P2WPKH output (OP_0 <20-byte hash>)
+        let pubkey_hash = [0xab; 20];
+        let mut spk = vec![0x00, 0x14]; // OP_0 PUSH(20)
+        spk.extend_from_slice(&pubkey_hash);
+
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0xba; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![0x01, 0x00]), // non-empty!
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(1000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76]),
+            }],
+            witness: vec![Witness::from_items(vec![vec![0x30; 72], vec![0x02; 33]])],
+            lock_time: 0,
+        };
+
+        let prev_output = TxOut {
+            value: Amount::from_sat(2000),
+            script_pubkey: ScriptBuf::from_bytes(spk),
+        };
+
+        // Should fail because scriptSig must be empty for native segwit
+        let result = verify_input(&tx, 0, &prev_output, &verifier, &flags);
+        assert!(result.is_err());
+    }
+
+    // ---- Coverage: unknown witness version (v2+) succeeds (forward compat) ----
+
+    #[test]
+    fn test_verify_input_unknown_witness_version() {
+        use crate::sig_verify::Secp256k1Verifier;
+        let verifier = Secp256k1Verifier;
+        let mut flags = ScriptFlags::none();
+        flags.verify_witness = true;
+
+        // Witness v2 output (OP_2 <20-byte program>) - unknown version succeeds
+        let mut spk = vec![0x52, 0x14]; // OP_2 PUSH(20)
+        spk.extend_from_slice(&[0xab; 20]);
+
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0xba; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(1000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76]),
+            }],
+            witness: vec![Witness::new()],
+            lock_time: 0,
+        };
+
+        let prev_output = TxOut {
+            value: Amount::from_sat(2000),
+            script_pubkey: ScriptBuf::from_bytes(spk),
+        };
+
+        // Unknown witness versions succeed for forward compatibility
+        let result = verify_input(&tx, 0, &prev_output, &verifier, &flags);
+        assert!(result.is_ok(), "unknown witness version should succeed");
+    }
 }

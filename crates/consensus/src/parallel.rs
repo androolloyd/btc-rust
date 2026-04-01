@@ -551,4 +551,42 @@ mod tests {
         assert_eq!(slices[0], &[1]);
         assert_eq!(slices[1], &[2]);
     }
+
+    // ---- Coverage: distribute with zero workers ----
+
+    #[test]
+    fn test_distribute_zero_workers() {
+        let items = vec![1, 2, 3];
+        let slices = distribute(&items, 0);
+        assert_eq!(slices.len(), 1);
+        assert_eq!(slices[0], &[1, 2, 3]);
+    }
+
+    // ---- Coverage: distribute with empty items ----
+
+    #[test]
+    fn test_distribute_empty() {
+        let items: Vec<i32> = vec![];
+        let slices = distribute(&items, 4);
+        assert_eq!(slices.len(), 1);
+        assert!(slices[0].is_empty());
+    }
+
+    // ---- Coverage: ParallelValidator default ----
+
+    #[test]
+    fn test_parallel_validator_default() {
+        let validator = ParallelValidator::default();
+        // num_threads 0 means auto-detect, effective_threads should be > 0
+        assert!(validator.effective_threads() > 0);
+    }
+
+    // ---- Coverage: ParallelConfig default ----
+
+    #[test]
+    fn test_parallel_config_default() {
+        let config = ParallelConfig::default();
+        // 0 means auto-detect
+        assert_eq!(config.num_threads, 0);
+    }
 }

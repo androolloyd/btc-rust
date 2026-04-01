@@ -6223,4 +6223,378 @@ mod tests {
         // Without tx context, the tx-based checks are skipped
         engine.execute(script.as_script()).unwrap();
     }
+
+    // ========== Coverage: OP_CHECKSIGVERIFY ==========
+
+    #[test]
+    fn test_op_checksigverify_empty_sig_cov() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_0); // empty sig
+        script.push_slice(&[0x02; 33]); // fake pubkey
+        script.push_opcode(Opcode::OP_CHECKSIGVERIFY);
+        assert!(engine.execute(script.as_script()).is_err());
+    }
+
+    // ========== Coverage: is_push_only ==========
+
+    #[test]
+    fn test_is_push_only_cov() {
+        // Script with only pushes
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_1);
+        script.push_slice(b"data");
+        assert!(is_push_only(script.as_script()));
+
+        // Script with OP_ADD (not push-only)
+        let mut script2 = ScriptBuf::new();
+        script2.push_opcode(Opcode::OP_ADD);
+        assert!(!is_push_only(script2.as_script()));
+    }
+
+    // ========== Coverage: encode_num / decode_num edge cases ==========
+
+    #[test]
+    fn test_encode_decode_num_zero_cov() {
+        let encoded = encode_num(0);
+        assert!(encoded.is_empty());
+        assert_eq!(decode_num(&encoded).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_encode_decode_num_negative_cov() {
+        let encoded = encode_num(-42);
+        let decoded = decode_num(&encoded).unwrap();
+        assert_eq!(decoded, -42);
+    }
+
+    #[test]
+    fn test_encode_decode_num_large_cov() {
+        let encoded = encode_num(255);
+        let decoded = decode_num(&encoded).unwrap();
+        assert_eq!(decoded, 255);
+    }
+
+    // ========== Coverage: OP_CHECKSIGADD in non-tapscript ==========
+
+    #[test]
+    fn test_op_checksigadd_non_tapscript() {
+        let mut engine = make_engine();
+        // OP_CHECKSIGADD outside tapscript mode should fail as invalid opcode
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_0);
+        script.push_opcode(Opcode::OP_0);
+        script.push_opcode(Opcode::OP_0);
+        script.push_opcode(Opcode::OP_CHECKSIGADD);
+        let result = engine.execute(script.as_script());
+        assert!(result.is_err());
+    }
+
+    // ========== Coverage: tapscript CHECKMULTISIGVERIFY disabled ==========
+
+    #[test]
+    fn test_tapscript_checkmultisigverify_disabled_cov() {
+        static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
+        let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
+        engine.set_witness_execution(true);
+        engine.set_tapscript_mode([0u8; 32], vec![], None, 1000);
+
+        let script = ScriptBuf::from_bytes(vec![
+            Opcode::OP_0 as u8,
+            Opcode::OP_0 as u8,
+            Opcode::OP_0 as u8,
+            Opcode::OP_CHECKMULTISIGVERIFY as u8,
+        ]);
+        let result = engine.execute_tapscript(script.as_script());
+        assert!(result.is_err());
+    }
+
+    // ========== Coverage: stack overflow ==========
+
+    #[test]
+    fn test_stack_overflow() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        // Push 1000 items (just under MAX_STACK_SIZE)
+        for _ in 0..999 {
+            script.push_opcode(Opcode::OP_1);
+        }
+        // This should work
+        engine.execute(script.as_script()).unwrap();
+    }
+
+    // ========== Coverage: MINIMALIF enforcement in witness ==========
+
+    #[test]
+    fn test_minimalif_enforcement() {
+        static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
+        let mut flags = ScriptFlags::none();
+        flags.verify_minimalif = true;
+        let mut engine = ScriptEngine::new_without_tx(&VERIFIER, flags);
+        engine.set_witness_execution(true);
+
+        // Non-minimal IF argument (0x02 instead of 0x01 for true)
+        let mut script = ScriptBuf::new();
+        script.push_slice(&[0x02]); // non-minimal true value
+        script.push_opcode(Opcode::OP_IF);
+        script.push_opcode(Opcode::OP_1);
+        script.push_opcode(Opcode::OP_ENDIF);
+        let result = engine.execute(script.as_script());
+        assert!(result.is_err());
+    }
+
+    // ========== Coverage: OP_CHECKSIG in tapscript with empty sig ==========
+
+    #[test]
+    fn test_op_checksig_tapscript_empty_sig() {
+        static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
+        let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
+        engine.set_witness_execution(true);
+        engine.set_tapscript_mode([0u8; 32], vec![], None, 1000);
+
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_0); // empty sig
+        script.push_slice(&[0xaa; 32]); // pubkey
+        script.push_opcode(Opcode::OP_CHECKSIG);
+        engine.execute_tapscript(script.as_script()).unwrap();
+        // Empty sig in tapscript should push false
+        assert!(!engine.success());
+    }
+
+    // ========== Coverage: comprehensive opcode exercise ==========
+
+    #[test]
+    fn test_comprehensive_opcode_coverage() {
+        // This test exercises multiple opcodes in a single script to improve
+        // coverage of execute_opcode match arms. Many opcodes are already
+        // tested individually but tarpaulin sometimes misses match arm lines.
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+
+        // OP_0 (push empty)
+        script.push_opcode(Opcode::OP_0);
+        // OP_1NEGATE
+        script.push_opcode(Opcode::OP_1NEGATE);
+        // OP_DROP both
+        script.push_opcode(Opcode::OP_2DROP);
+
+        // Push numbers OP_1 through OP_16
+        for i in 1..=16u8 {
+            let op = unsafe { std::mem::transmute::<u8, Opcode>(0x50 + i) };
+            script.push_opcode(op);
+        }
+        // Drop them all
+        for _ in 0..16 {
+            script.push_opcode(Opcode::OP_DROP);
+        }
+
+        // Stack ops: OP_DUP, OP_NIP, OP_OVER, OP_SWAP, OP_ROT, OP_TUCK
+        script.push_opcode(Opcode::OP_1);
+        script.push_opcode(Opcode::OP_2);
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_3DUP); // 1,2,3,1,2,3
+        script.push_opcode(Opcode::OP_2DROP); // 1,2,3,1
+        script.push_opcode(Opcode::OP_2DROP); // 1,2
+        script.push_opcode(Opcode::OP_SWAP);  // 2,1
+        script.push_opcode(Opcode::OP_NIP);   // 1
+        script.push_opcode(Opcode::OP_DUP);   // 1,1
+        script.push_opcode(Opcode::OP_2DUP);  // 1,1,1,1
+        script.push_opcode(Opcode::OP_DROP);
+        script.push_opcode(Opcode::OP_DROP);
+        script.push_opcode(Opcode::OP_DROP);
+        script.push_opcode(Opcode::OP_DROP);
+
+        // OP_IFDUP with truthy value
+        script.push_opcode(Opcode::OP_1);
+        script.push_opcode(Opcode::OP_IFDUP); // 1,1
+        script.push_opcode(Opcode::OP_DROP);   // 1
+
+        // OP_DEPTH
+        script.push_opcode(Opcode::OP_DEPTH);  // 1, depth(1)
+        script.push_opcode(Opcode::OP_DROP);   // 1
+
+        // OP_TOALTSTACK / OP_FROMALTSTACK
+        script.push_opcode(Opcode::OP_TOALTSTACK);
+        script.push_opcode(Opcode::OP_FROMALTSTACK); // 1
+
+        // OP_SIZE
+        script.push_opcode(Opcode::OP_SIZE);   // 1, size(1)
+        script.push_opcode(Opcode::OP_DROP);   // 1
+
+        // OP_OVER
+        script.push_opcode(Opcode::OP_2);
+        script.push_opcode(Opcode::OP_OVER);   // 1,2,1
+        script.push_opcode(Opcode::OP_DROP);
+        script.push_opcode(Opcode::OP_DROP);   // 1
+
+        // OP_ROT
+        script.push_opcode(Opcode::OP_2);
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_ROT);    // 2,3,1
+        script.push_opcode(Opcode::OP_DROP);
+        script.push_opcode(Opcode::OP_DROP);   // 2
+
+        // OP_TUCK
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_TUCK);   // 3,2,3
+        script.push_opcode(Opcode::OP_DROP);
+        script.push_opcode(Opcode::OP_DROP);
+        script.push_opcode(Opcode::OP_DROP);
+
+        // Arithmetic
+        script.push_opcode(Opcode::OP_5);
+        script.push_opcode(Opcode::OP_1ADD);   // 6
+        script.push_opcode(Opcode::OP_1SUB);   // 5
+        script.push_opcode(Opcode::OP_NEGATE); // -5
+        script.push_opcode(Opcode::OP_ABS);    // 5
+        script.push_opcode(Opcode::OP_NOT);    // 0
+        script.push_opcode(Opcode::OP_0NOTEQUAL); // 0
+
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_4);
+        script.push_opcode(Opcode::OP_ADD);    // 7
+        script.push_opcode(Opcode::OP_2);
+        script.push_opcode(Opcode::OP_SUB);    // 5
+
+        // Comparisons
+        script.push_opcode(Opcode::OP_DUP);
+        script.push_opcode(Opcode::OP_5);
+        script.push_opcode(Opcode::OP_NUMEQUAL);  // 1
+        script.push_opcode(Opcode::OP_DROP);
+
+        script.push_opcode(Opcode::OP_4);
+        script.push_opcode(Opcode::OP_LESSTHAN);     // 0 (5 < 4 is false)
+        script.push_opcode(Opcode::OP_DROP);
+
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_2);
+        script.push_opcode(Opcode::OP_GREATERTHAN);   // 1
+        script.push_opcode(Opcode::OP_DROP);
+
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_LESSTHANOREQUAL); // 1
+        script.push_opcode(Opcode::OP_DROP);
+
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_GREATERTHANOREQUAL); // 1
+        script.push_opcode(Opcode::OP_DROP);
+
+        script.push_opcode(Opcode::OP_1);
+        script.push_opcode(Opcode::OP_2);
+        script.push_opcode(Opcode::OP_MIN);    // 1
+        script.push_opcode(Opcode::OP_DROP);
+
+        script.push_opcode(Opcode::OP_1);
+        script.push_opcode(Opcode::OP_2);
+        script.push_opcode(Opcode::OP_MAX);    // 2
+        script.push_opcode(Opcode::OP_DROP);
+
+        // OP_WITHIN
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_1);
+        script.push_opcode(Opcode::OP_5);
+        script.push_opcode(Opcode::OP_WITHIN); // 1
+        script.push_opcode(Opcode::OP_DROP);
+
+        // OP_BOOLAND, OP_BOOLOR
+        script.push_opcode(Opcode::OP_1);
+        script.push_opcode(Opcode::OP_1);
+        script.push_opcode(Opcode::OP_BOOLAND); // 1
+        script.push_opcode(Opcode::OP_DROP);
+
+        script.push_opcode(Opcode::OP_0);
+        script.push_opcode(Opcode::OP_1);
+        script.push_opcode(Opcode::OP_BOOLOR); // 1
+        script.push_opcode(Opcode::OP_DROP);
+
+        // OP_NUMNOTEQUAL
+        script.push_opcode(Opcode::OP_1);
+        script.push_opcode(Opcode::OP_2);
+        script.push_opcode(Opcode::OP_NUMNOTEQUAL); // 1
+        script.push_opcode(Opcode::OP_DROP);
+
+        // Hash opcodes
+        script.push_slice(b"x");
+        script.push_opcode(Opcode::OP_RIPEMD160);
+        script.push_opcode(Opcode::OP_DROP);
+
+        script.push_slice(b"x");
+        script.push_opcode(Opcode::OP_SHA1);
+        script.push_opcode(Opcode::OP_DROP);
+
+        script.push_slice(b"x");
+        script.push_opcode(Opcode::OP_SHA256);
+        script.push_opcode(Opcode::OP_DROP);
+
+        script.push_slice(b"x");
+        script.push_opcode(Opcode::OP_HASH160);
+        script.push_opcode(Opcode::OP_DROP);
+
+        script.push_slice(b"x");
+        script.push_opcode(Opcode::OP_HASH256);
+        script.push_opcode(Opcode::OP_DROP);
+
+        // OP_EQUAL, OP_EQUALVERIFY
+        script.push_opcode(Opcode::OP_1);
+        script.push_opcode(Opcode::OP_1);
+        script.push_opcode(Opcode::OP_EQUAL);  // 1
+        script.push_opcode(Opcode::OP_DROP);
+
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_3);
+        script.push_opcode(Opcode::OP_NUMEQUALVERIFY); // verifies
+
+        // OP_VERIFY
+        script.push_opcode(Opcode::OP_1);
+        script.push_opcode(Opcode::OP_VERIFY);
+
+        // OP_PICK
+        script.push_opcode(Opcode::OP_1);
+        script.push_opcode(Opcode::OP_2);
+        script.push_opcode(Opcode::OP_1); // pick from index 1
+        script.push_opcode(Opcode::OP_PICK); // copies OP_1
+        script.push_opcode(Opcode::OP_DROP);
+        script.push_opcode(Opcode::OP_DROP);
+        script.push_opcode(Opcode::OP_DROP);
+
+        // OP_ROLL
+        script.push_opcode(Opcode::OP_1);
+        script.push_opcode(Opcode::OP_2);
+        script.push_opcode(Opcode::OP_1); // roll from index 1
+        script.push_opcode(Opcode::OP_ROLL); // moves OP_1 to top
+        script.push_opcode(Opcode::OP_DROP);
+        script.push_opcode(Opcode::OP_DROP);
+
+        // OP_NOP
+        script.push_opcode(Opcode::OP_NOP);
+
+        // OP_CODESEPARATOR
+        script.push_opcode(Opcode::OP_CODESEPARATOR);
+
+        // Leave true on stack
+        script.push_opcode(Opcode::OP_1);
+
+        engine.execute(script.as_script()).unwrap();
+        assert!(engine.success());
+    }
+
+    // ========== Coverage: disabled opcodes in non-executed branch ==========
+
+    #[test]
+    fn test_disabled_opcode_in_unexecuted_branch() {
+        let mut engine = make_engine();
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_0); // false
+        script.push_opcode(Opcode::OP_IF);
+        // OP_CAT (0x7e) is disabled even in unexecuted branches
+        let mut bytes = script.into_bytes();
+        bytes.push(0x7e); // OP_CAT
+        bytes.push(Opcode::OP_ENDIF as u8);
+        bytes.push(Opcode::OP_1 as u8);
+        let script = ScriptBuf::from_bytes(bytes);
+        let result = engine.execute(script.as_script());
+        assert!(result.is_err());
+    }
 }

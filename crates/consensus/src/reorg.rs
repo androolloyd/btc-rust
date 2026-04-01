@@ -773,4 +773,66 @@ mod tests {
             other => panic!("expected MissingUndoData, got: {other}"),
         }
     }
+
+    // ---- Coverage: max_undo_depth accessor ----
+
+    #[test]
+    fn test_max_undo_depth() {
+        let mgr = ReorgManager::new(42);
+        assert_eq!(mgr.max_undo_depth(), 42);
+    }
+
+    // ---- Coverage: find_fork_point with unknown tip ----
+
+    #[test]
+    fn test_find_fork_point_unknown_tip() {
+        let chain = regtest_chain();
+        let unknown = BlockHash::from_bytes([0xff; 32]);
+        let genesis = ChainParams::regtest().genesis_hash;
+        assert!(find_fork_point(&chain, &unknown, &genesis).is_none());
+    }
+
+    // ---- Coverage: find_fork_point with asymmetric heights ----
+
+    #[test]
+    fn test_find_fork_point_old_tip_taller() {
+        let mut chain = regtest_chain();
+        let mut utxo_set = InMemoryUtxoSet::new();
+
+        // Build main chain: genesis -> B1 -> B2 -> B3 -> B4
+        let (main_hashes, _, _) = build_chain(&mut chain, &mut utxo_set, 4);
+
+        // Fork from B1 (height 1): B1 -> F2
+        let fork_entry = chain.get_header(&main_hashes[0]).unwrap().clone();
+        let (fork_hashes, _) = build_fork(&mut chain, &fork_entry, 1, 0xAA);
+
+        // Old tip at height 4, new tip at height 2 => old is taller
+        let (fork_hash, fork_height) =
+            find_fork_point(&chain, &main_hashes[3], &fork_hashes[0])
+                .expect("should find fork point");
+
+        assert_eq!(fork_hash, main_hashes[0]);
+        assert_eq!(fork_height, 1);
+    }
+
+    #[test]
+    fn test_find_fork_point_new_tip_taller() {
+        let mut chain = regtest_chain();
+        let mut utxo_set = InMemoryUtxoSet::new();
+
+        // Build main chain: genesis -> B1 -> B2
+        let (main_hashes, _, _) = build_chain(&mut chain, &mut utxo_set, 2);
+
+        // Fork from B1: B1 -> F2 -> F3 -> F4 -> F5
+        let fork_entry = chain.get_header(&main_hashes[0]).unwrap().clone();
+        let (fork_hashes, _) = build_fork(&mut chain, &fork_entry, 4, 0xBB);
+
+        // Old tip at height 2, new tip at height 5 => new is taller
+        let (fork_hash, fork_height) =
+            find_fork_point(&chain, &main_hashes[1], fork_hashes.last().unwrap())
+                .expect("should find fork point");
+
+        assert_eq!(fork_hash, main_hashes[0]);
+        assert_eq!(fork_height, 1);
+    }
 }

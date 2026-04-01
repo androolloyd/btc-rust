@@ -350,4 +350,125 @@ mod tests {
         };
         assert!((c.fee_rate_sats_per_wu() - 10.0).abs() < 0.001);
     }
+
+    // ---- Coverage: zero weight fee rate ----
+
+    #[test]
+    fn test_candidate_fee_rate_zero_weight() {
+        let c = CandidateTx {
+            txid: TxHash::ZERO,
+            tx: Transaction {
+                version: 1,
+                inputs: vec![],
+                outputs: vec![],
+                witness: vec![],
+                lock_time: 0,
+            },
+            fee: Amount::from_sat(10_000),
+            weight: 0,
+        };
+        assert_eq!(c.fee_rate_sats_per_wu(), 0.0);
+    }
+
+    // ---- Coverage: build_coinbase height=0 ----
+
+    #[test]
+    fn test_build_coinbase_height_zero() {
+        let output_script = ScriptBuf::from_bytes(vec![0x76, 0xa9]);
+        let cb = build_coinbase(0, b"btc-rust", output_script, Amount::from_sat(5_000_000_000));
+        assert!(cb.is_coinbase());
+        let sig = cb.inputs[0].script_sig.as_bytes();
+        assert_eq!(sig[0], 0x00); // OP_0 for height 0
+    }
+
+    // ---- Coverage: estimate_tx_weight ----
+
+    #[test]
+    fn test_estimate_tx_weight_legacy() {
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0x11; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![0x01]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(1000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+        let weight = estimate_tx_weight(&tx);
+        assert!(weight > 0);
+    }
+
+    // ---- Coverage: estimate_tx_weight for segwit ----
+
+    #[test]
+    fn test_estimate_tx_weight_segwit() {
+        use btc_primitives::transaction::Witness;
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0x11; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(1000),
+                script_pubkey: ScriptBuf::from_bytes({
+                    let mut v = vec![0x00, 0x14];
+                    v.extend_from_slice(&[0xab; 20]);
+                    v
+                }),
+            }],
+            witness: vec![Witness::from_items(vec![vec![0x30; 72], vec![0x02; 33]])],
+            lock_time: 0,
+        };
+        let weight = estimate_tx_weight(&tx);
+        assert!(weight > 0);
+    }
+
+    // ---- Coverage: build_template with oversized tx (skip) ----
+
+    #[test]
+    fn test_build_template_skips_oversized_tx() {
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0x11; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![0x01]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(1000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let mut candidates = vec![
+            CandidateTx {
+                txid: tx.txid(),
+                tx: tx.clone(),
+                fee: Amount::from_sat(10_000),
+                weight: 3_999_000, // exceeds available_weight (4M - 4K = 3,996,000)
+            },
+        ];
+
+        let template = build_block_template(
+            BlockHash::ZERO,
+            100,
+            1700000000,
+            CompactTarget::MAX_TARGET,
+            b"test",
+            ScriptBuf::from_bytes(vec![0x76]),
+            &mut candidates,
+        );
+
+        // Transaction should be skipped because it exceeds available weight
+        assert_eq!(template.transactions.len(), 0);
+    }
 }

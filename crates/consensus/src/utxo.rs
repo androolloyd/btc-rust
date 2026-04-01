@@ -1330,4 +1330,135 @@ mod tests {
         let result = connect_block_with_params(&block, 0, &utxo_set, &params);
         assert!(result.is_ok(), "coinbase should be exempt from BIP68");
     }
+
+    // ---- Coverage: apply_update and enforce_limit ----
+
+    #[test]
+    fn test_utxo_set_apply_and_limit() {
+        let mut utxo_set = InMemoryUtxoSet::new();
+
+        // Add some UTXOs
+        for i in 0u8..10 {
+            utxo_set.insert(
+                OutPoint::new(TxHash::from_bytes([i; 32]), 0),
+                UtxoEntry {
+                    txout: TxOut {
+                        value: Amount::from_sat(1000),
+                        script_pubkey: ScriptBuf::from_bytes(vec![0x76]),
+                    },
+                    height: 1,
+                    is_coinbase: false,
+                },
+            );
+        }
+        assert_eq!(utxo_set.len(), 10);
+        assert!(!utxo_set.is_empty());
+
+        // Test iter
+        assert_eq!(utxo_set.iter().count(), 10);
+
+        // Remove one
+        let removed = utxo_set.remove(&OutPoint::new(TxHash::from_bytes([0u8; 32]), 0));
+        assert!(removed.is_some());
+        assert_eq!(utxo_set.len(), 9);
+
+        // enforce_limit shouldn't do anything with only 9 entries
+        utxo_set.enforce_limit();
+        assert_eq!(utxo_set.len(), 9);
+    }
+
+    // ---- Coverage: apply_update forward ----
+
+    #[test]
+    fn test_apply_update() {
+        let mut utxo_set = InMemoryUtxoSet::new();
+        let op1 = OutPoint::new(TxHash::from_bytes([0xaa; 32]), 0);
+        let entry1 = UtxoEntry {
+            txout: TxOut {
+                value: Amount::from_sat(1000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76]),
+            },
+            height: 1,
+            is_coinbase: false,
+        };
+
+        // Insert first
+        utxo_set.insert(op1, entry1.clone());
+        assert_eq!(utxo_set.len(), 1);
+
+        // Create an update that spends op1 and creates op2
+        let op2 = OutPoint::new(TxHash::from_bytes([0xbb; 32]), 0);
+        let entry2 = UtxoEntry {
+            txout: TxOut {
+                value: Amount::from_sat(500),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76]),
+            },
+            height: 2,
+            is_coinbase: false,
+        };
+
+        let update = UtxoSetUpdate {
+            spent: vec![(op1, entry1)],
+            created: vec![(op2, entry2)],
+        };
+
+        utxo_set.apply_update(&update);
+        assert!(utxo_set.get_utxo(&op1).is_none());
+        assert!(utxo_set.get_utxo(&op2).is_some());
+    }
+
+    // ---- Coverage: coinbase maturity check via connect_block ----
+
+    #[test]
+    fn test_coinbase_maturity_failure() {
+        let mut utxo_set = InMemoryUtxoSet::new();
+
+        // Insert a coinbase UTXO at height 1
+        let cb_outpoint = OutPoint::new(TxHash::from_bytes([0xcc; 32]), 0);
+        utxo_set.insert(cb_outpoint, UtxoEntry {
+            txout: TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76, 0xa9]),
+            },
+            height: 1,
+            is_coinbase: true,
+        });
+
+        let subsidy = crate::validation::block_subsidy(50);
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::COINBASE,
+                script_sig: ScriptBuf::from_bytes(vec![0x04, 0x32]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: subsidy + Amount::from_sat(1_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76, 0xa9]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let spend = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: cb_outpoint,
+                script_sig: ScriptBuf::from_bytes(vec![0x01]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(4_999_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let block = make_block(vec![coinbase, spend]);
+
+        // Try to spend at height 50 (less than COINBASE_MATURITY=100)
+        let result = connect_block(&block, 50, &utxo_set);
+        assert!(result.is_err());
+    }
 }

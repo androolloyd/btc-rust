@@ -1114,4 +1114,180 @@ mod tests {
             "should match when at least one script is in the block"
         );
     }
+
+    // ---- Coverage: GcsBuilder with_params ----
+
+    #[test]
+    fn test_gcs_builder_with_params() {
+        let key = [0u8; 16];
+        let mut builder = GcsBuilder::with_params(key, 19, 784931);
+        assert!(builder.is_empty());
+        assert_eq!(builder.len(), 0);
+        builder.add_item(b"item1");
+        assert!(!builder.is_empty());
+        assert_eq!(builder.len(), 1);
+        let data = builder.build();
+        assert!(!data.is_empty());
+    }
+
+    // ---- Coverage: gcs_match_any edge cases ----
+
+    #[test]
+    fn test_gcs_match_any_empty_cases() {
+        let key = [0u8; 16];
+        // n == 0
+        assert!(!gcs_match_any(&key, 0, BASIC_FILTER_M, BASIC_FILTER_P, &[1, 2], &[b"item".as_slice()]));
+        // empty query
+        assert!(!gcs_match_any(&key, 1, BASIC_FILTER_M, BASIC_FILTER_P, &[1, 2], &[]));
+        // empty filter data
+        assert!(!gcs_match_any(&key, 1, BASIC_FILTER_M, BASIC_FILTER_P, &[], &[b"item".as_slice()]));
+    }
+
+    // ---- Coverage: gcs_match_any query not in filter ----
+
+    #[test]
+    fn test_gcs_match_any_no_match() {
+        let key = [0u8; 16];
+        let mut builder = GcsBuilder::with_params(key, BASIC_FILTER_P, BASIC_FILTER_M);
+        builder.add_item(b"item1");
+        builder.add_item(b"item2");
+        let filter_data = builder.build();
+        let n = 2u64;
+
+        // Query for something not in the filter
+        let result = gcs_match_any(&key, n, BASIC_FILTER_M, BASIC_FILTER_P, &filter_data, &[b"not_present".as_slice()]);
+        assert!(!result);
+    }
+
+    // ---- Coverage: gcs_match_any match found ----
+
+    #[test]
+    fn test_gcs_match_any_match() {
+        let key = [0u8; 16];
+        let items = [b"hello".as_slice(), b"world".as_slice(), b"test".as_slice()];
+        let mut builder = GcsBuilder::with_params(key, BASIC_FILTER_P, BASIC_FILTER_M);
+        for item in &items {
+            builder.add_item(item);
+        }
+        let filter_data = builder.build();
+
+        // Query for items that ARE in the filter
+        let result = gcs_match_any(&key, 3, BASIC_FILTER_M, BASIC_FILTER_P, &filter_data, &[b"hello".as_slice()]);
+        assert!(result);
+    }
+
+    // ---- Coverage: BasicFilter::match_any with empty filter ----
+
+    #[test]
+    fn test_basic_filter_match_empty() {
+        let filter = BasicFilter {
+            filter_type: 0x00,
+            block_hash: BlockHash::ZERO,
+            filter_data: vec![],
+            n: 0,
+            filter_header: [0u8; 32],
+        };
+        assert!(!filter.match_any(&[b"test".as_slice()]));
+        assert!(!filter.match_any(&[]));
+    }
+
+    // ---- Coverage: BasicFilter::to_bytes / from_bytes roundtrip ----
+
+    #[test]
+    fn test_basic_filter_serialization() {
+        let block_hash = BlockHash::from_bytes([0xab; 32]);
+        let mut builder = GcsBuilder::new(&block_hash);
+        builder.add_item(b"script1");
+        builder.add_item(b"script2");
+        let filter_data = builder.build();
+
+        let filter = BasicFilter {
+            filter_type: 0x00,
+            block_hash,
+            filter_data,
+            n: 2,
+            filter_header: [0u8; 32],
+        };
+
+        let bytes = filter.to_bytes();
+        let prev_header = [0u8; 32];
+        let restored = BasicFilter::from_bytes(block_hash, &prev_header, &bytes).unwrap();
+        assert_eq!(restored.n, 2);
+        assert_eq!(restored.filter_type, 0x00);
+    }
+
+    // ---- Coverage: BitReader at end of data ----
+
+    #[test]
+    fn test_bit_reader_end_of_data() {
+        let mut reader = BitReader::new(&[]);
+        assert!(reader.read_bit().is_none());
+        assert!(reader.read_bits(8).is_none());
+    }
+
+    // ---- Coverage: golomb_decode at end of data ----
+
+    #[test]
+    fn test_golomb_decode_end_of_data() {
+        let mut reader = BitReader::new(&[]);
+        assert!(golomb_decode(&mut reader, BASIC_FILTER_P).is_none());
+    }
+
+    // ---- Coverage: filter header chain ----
+
+    #[test]
+    fn test_compute_filter_header() {
+        let filter_hash = [0xaa; 32];
+        let prev_header = [0xbb; 32];
+        let header = compute_filter_header(&filter_hash, &prev_header);
+        assert_ne!(header, [0u8; 32]);
+
+        // Same inputs => same output
+        let header2 = compute_filter_header(&filter_hash, &prev_header);
+        assert_eq!(header, header2);
+
+        // Different inputs => different output
+        let header3 = compute_filter_header(&[0xcc; 32], &prev_header);
+        assert_ne!(header, header3);
+    }
+
+    // ---- Coverage: build_basic_filter with OP_RETURN outputs ----
+
+    #[test]
+    fn test_build_basic_filter_op_return_excluded() {
+        let op_return_script = ScriptBuf::from_bytes(vec![0x6a, 0x04, 0xde, 0xad, 0xbe, 0xef]); // OP_RETURN
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::COINBASE,
+                script_sig: ScriptBuf::from_bytes(vec![0x04, 0x01]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![
+                TxOut {
+                    value: Amount::from_sat(5_000_000_000),
+                    script_pubkey: op_return_script,
+                },
+            ],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_blockhash: BlockHash::ZERO,
+                merkle_root: TxHash::ZERO,
+                time: 0,
+                bits: CompactTarget::MAX_TARGET,
+                nonce: 0,
+            },
+            transactions: vec![coinbase],
+        };
+
+        let prev_header = [0u8; 32];
+        let filter = build_basic_filter(&block, &[], &prev_header);
+        // OP_RETURN outputs should be excluded, so n should be 0
+        assert_eq!(filter.n, 0, "OP_RETURN outputs should be excluded from the filter");
+    }
 }

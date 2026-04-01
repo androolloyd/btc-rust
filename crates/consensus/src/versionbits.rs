@@ -848,4 +848,23 @@ mod tests {
         let state = manager.update_state("nonexistent", 0, 0, &[]);
         assert_eq!(state, DeploymentState::Defined);
     }
+
+    // ---- Coverage: deployments() and get_deployment() ----
+
+    #[test]
+    fn test_deployments_accessors() {
+        let d1 = Deployment {
+            name: "test_deploy",
+            bit: 1,
+            start_time: 1_000_000,
+            timeout: 2_000_000,
+            min_activation_height: 0,
+            threshold: 1,
+            period: 1,
+        };
+        let manager = VersionBitsManager::with_deployments(vec![d1]);
+        assert_eq!(manager.deployments().len(), 1);
+        assert!(manager.get_deployment("test_deploy").is_some());
+        assert!(manager.get_deployment("nonexistent").is_none());
+    }
 }

@@ -1133,4 +1133,502 @@ mod tests {
             other => panic!("expected Bip34ScriptSigTooShort, got: {other}"),
         }
     }
+
+    // ---- Coverage: validate_block no transactions ----
+
+    // Helper to mine a valid block header (for regtest difficulty)
+    fn mine_header_for_test(
+        prev_hash: BlockHash,
+        merkle_root: TxHash,
+        time: u32,
+    ) -> BlockHeader {
+        let bits = CompactTarget::from_u32(0x207fffff); // regtest
+        let mut header = BlockHeader {
+            version: 1,
+            prev_blockhash: prev_hash,
+            merkle_root,
+            time,
+            bits,
+            nonce: 0,
+        };
+        while !header.check_proof_of_work() {
+            header.nonce += 1;
+        }
+        header
+    }
+
+    #[test]
+    fn test_validate_block_no_transactions() {
+        let header = mine_header_for_test(BlockHash::ZERO, TxHash::ZERO, 1231006505);
+        let block = Block {
+            header,
+            transactions: vec![],
+        };
+        let result = BlockValidator::validate_block(&block);
+        assert!(matches!(result.unwrap_err(), ValidationError::NoTransactions));
+    }
+
+    // ---- Coverage: validate_block no coinbase ----
+
+    #[test]
+    fn test_validate_block_no_coinbase() {
+        use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint};
+        let non_coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0xaa; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![0x01]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(1000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let txids = vec![non_coinbase.txid().to_bytes()];
+        let merkle = btc_primitives::block::merkle_root(&txids);
+        let header = mine_header_for_test(BlockHash::ZERO, TxHash::from_bytes(merkle), 1231006505);
+
+        let block = Block {
+            header,
+            transactions: vec![non_coinbase],
+        };
+        let result = BlockValidator::validate_block(&block);
+        assert!(matches!(result.unwrap_err(), ValidationError::NoCoinbase));
+    }
+
+    // ---- Coverage: validate_block multiple coinbase ----
+
+    #[test]
+    fn test_validate_block_multiple_coinbase() {
+        use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint};
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::COINBASE,
+                script_sig: ScriptBuf::from_bytes(vec![0x04, 0x01]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+        let coinbase2 = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::COINBASE,
+                script_sig: ScriptBuf::from_bytes(vec![0x04, 0x02]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let txids = vec![coinbase.txid().to_bytes(), coinbase2.txid().to_bytes()];
+        let merkle = btc_primitives::block::merkle_root(&txids);
+        let header = mine_header_for_test(BlockHash::ZERO, TxHash::from_bytes(merkle), 1231006505);
+
+        let block = Block {
+            header,
+            transactions: vec![coinbase, coinbase2],
+        };
+        let result = BlockValidator::validate_block(&block);
+        assert!(matches!(result.unwrap_err(), ValidationError::MultipleCoinbase));
+    }
+
+    // ---- Coverage: validate_block bad merkle root ----
+
+    #[test]
+    fn test_validate_block_bad_merkle_root() {
+        use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint};
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::COINBASE,
+                script_sig: ScriptBuf::from_bytes(vec![0x04, 0x01]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let header = mine_header_for_test(BlockHash::ZERO, TxHash::from_bytes([0xaa; 32]), 1231006505);
+        let block = Block {
+            header,
+            transactions: vec![coinbase],
+        };
+        let result = BlockValidator::validate_block(&block);
+        assert!(matches!(result.unwrap_err(), ValidationError::InvalidMerkleRoot));
+    }
+
+    // ---- Coverage: encode/decode_bip34_height zero ----
+
+    #[test]
+    fn test_bip34_height_zero() {
+        let encoded = encode_bip34_height(0);
+        assert_eq!(encoded, vec![0x00]);
+
+        let decoded = decode_bip34_height(&encoded);
+        assert_eq!(decoded, Some(0));
+    }
+
+    // ---- Coverage: encode/decode_bip34_height various ----
+
+    #[test]
+    fn test_bip34_height_various() {
+        for height in [1u64, 127, 128, 255, 256, 65535, 100_000, 500_000] {
+            let encoded = encode_bip34_height(height);
+            let decoded = decode_bip34_height(&encoded);
+            assert_eq!(decoded, Some(height), "roundtrip failed for height {height}");
+        }
+    }
+
+    // ---- Coverage: decode_bip34_height edge cases ----
+
+    #[test]
+    fn test_bip34_height_decode_edge_cases() {
+        // Empty
+        assert_eq!(decode_bip34_height(&[]), None);
+        // Too long push length
+        assert_eq!(decode_bip34_height(&[5, 0, 0, 0, 0, 0]), None);
+        // Push length > remaining data
+        assert_eq!(decode_bip34_height(&[3, 0]), None);
+    }
+
+    // ---- Coverage: validate_bip34_coinbase below bip34 height ----
+
+    #[test]
+    fn test_bip34_below_activation() {
+        use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint};
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::COINBASE,
+                script_sig: ScriptBuf::from_bytes(vec![0xff]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_blockhash: BlockHash::ZERO,
+                merkle_root: TxHash::ZERO,
+                time: 0,
+                bits: CompactTarget::MAX_TARGET,
+                nonce: 0,
+            },
+            transactions: vec![coinbase],
+        };
+
+        // Below bip34_height => always OK
+        assert!(validate_bip34_coinbase(&block, 100, 227931).is_ok());
+    }
+
+    // ---- Coverage: validate_bip34_coinbase height mismatch ----
+
+    #[test]
+    fn test_bip34_height_mismatch() {
+        use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint};
+        // Encode height 50 in coinbase but validate at height 60
+        // Both 50 and 60 produce 1-byte height encoding (same length prefix)
+        let encoded_50 = encode_bip34_height(50);
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::COINBASE,
+                script_sig: ScriptBuf::from_bytes(encoded_50),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_blockhash: BlockHash::ZERO,
+                merkle_root: TxHash::ZERO,
+                time: 0,
+                bits: CompactTarget::MAX_TARGET,
+                nonce: 0,
+            },
+            transactions: vec![coinbase],
+        };
+
+        let result = validate_bip34_coinbase(&block, 60, 1);
+        assert!(matches!(result.unwrap_err(), ValidationError::Bip34HeightMismatch { .. }));
+    }
+
+    // ---- Coverage: from_network ----
+
+    #[test]
+    fn test_chain_params_from_network() {
+        use btc_primitives::network::Network;
+        let p = ChainParams::from_network(Network::Testnet);
+        assert_eq!(p.network, Network::Testnet);
+        let p = ChainParams::from_network(Network::Signet);
+        assert_eq!(p.network, Network::Signet);
+        let p = ChainParams::from_network(Network::Regtest);
+        assert_eq!(p.network, Network::Regtest);
+        let p = ChainParams::from_network(Network::Mainnet);
+        assert_eq!(p.network, Network::Mainnet);
+    }
+
+    // ---- Coverage: should_verify_scripts ----
+
+    #[test]
+    fn test_should_verify_scripts_av_set_no_match() {
+        let params = ChainParams::mainnet();
+        let non_av_hash = BlockHash::ZERO;
+        // assume_valid is set, no height known, hash doesn't match => verify
+        assert!(params.should_verify_scripts(100, &non_av_hash, None));
+    }
+
+    // ---- Coverage: signet params ----
+
+    #[test]
+    fn test_signet_params() {
+        let params = ChainParams::signet();
+        assert_eq!(params.network, btc_primitives::network::Network::Signet);
+        assert!(params.signet_challenge.is_some());
+        assert!(params.assume_valid.is_some());
+    }
+
+    // ---- Coverage: witness commitment verification ----
+
+    #[test]
+    fn test_verify_witness_commitment_no_witness() {
+        use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint};
+        // Block where no non-coinbase tx has witness => should pass
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::COINBASE,
+                script_sig: ScriptBuf::from_bytes(vec![0x04, 0x01]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let non_segwit_tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0xaa; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![0x01]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(1000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_blockhash: BlockHash::ZERO,
+                merkle_root: TxHash::ZERO,
+                time: 0,
+                bits: CompactTarget::MAX_TARGET,
+                nonce: 0,
+            },
+            transactions: vec![coinbase, non_segwit_tx],
+        };
+
+        assert!(BlockValidator::verify_witness_commitment(&block).is_ok());
+    }
+
+    // ---- Coverage: verify_witness_commitment missing commitment ----
+
+    #[test]
+    fn test_verify_witness_commitment_missing() {
+        use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint, Witness};
+        // Block with segwit tx but coinbase has no witness commitment output
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::COINBASE,
+                script_sig: ScriptBuf::from_bytes(vec![0x04, 0x01]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76, 0xa9]), // no commitment
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let segwit_tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0xaa; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(1000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76]),
+            }],
+            witness: vec![Witness::from_items(vec![vec![0x30; 72], vec![0x02; 33]])],
+            lock_time: 0,
+        };
+
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_blockhash: BlockHash::ZERO,
+                merkle_root: TxHash::ZERO,
+                time: 0,
+                bits: CompactTarget::MAX_TARGET,
+                nonce: 0,
+            },
+            transactions: vec![coinbase, segwit_tx],
+        };
+
+        let result = BlockValidator::verify_witness_commitment(&block);
+        assert!(matches!(result.unwrap_err(), ValidationError::MissingWitnessCommitment));
+    }
+
+    // ---- Coverage: verify_witness_commitment mismatch ----
+
+    #[test]
+    fn test_verify_witness_commitment_mismatch() {
+        use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint, Witness};
+        // Build coinbase with a fake witness commitment
+        let mut commitment_script = vec![0x6a, 0x24]; // OP_RETURN PUSH(36)
+        commitment_script.extend_from_slice(&[0xaa, 0x21, 0xa9, 0xed]); // commitment prefix
+        commitment_script.extend_from_slice(&[0xff; 32]); // wrong commitment hash
+
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::COINBASE,
+                script_sig: ScriptBuf::from_bytes(vec![0x04, 0x01]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                script_pubkey: ScriptBuf::from_bytes(commitment_script),
+            }],
+            witness: vec![Witness::from_items(vec![vec![0u8; 32]])],
+            lock_time: 0,
+        };
+
+        let segwit_tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0xaa; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(1000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76]),
+            }],
+            witness: vec![Witness::from_items(vec![vec![0x30; 72], vec![0x02; 33]])],
+            lock_time: 0,
+        };
+
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_blockhash: BlockHash::ZERO,
+                merkle_root: TxHash::ZERO,
+                time: 0,
+                bits: CompactTarget::MAX_TARGET,
+                nonce: 0,
+            },
+            transactions: vec![coinbase, segwit_tx],
+        };
+
+        let result = BlockValidator::verify_witness_commitment(&block);
+        assert!(matches!(result.unwrap_err(), ValidationError::WitnessCommitmentMismatch));
+    }
+
+    // ---- Coverage: block weight too large ----
+
+    #[test]
+    fn test_validate_block_too_large() {
+        use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint};
+
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::COINBASE,
+                script_sig: ScriptBuf::from_bytes(vec![0x04, 0x01]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                // Create a very large output script to exceed block weight
+                script_pubkey: ScriptBuf::from_bytes(vec![0x00; 1_000_001]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let txids = vec![coinbase.txid().to_bytes()];
+        let merkle = btc_primitives::block::merkle_root(&txids);
+        let header = mine_header_for_test(BlockHash::ZERO, TxHash::from_bytes(merkle), 1231006505);
+
+        let block = Block {
+            header,
+            transactions: vec![coinbase],
+        };
+
+        let result = BlockValidator::validate_block(&block);
+        assert!(matches!(result.unwrap_err(), ValidationError::BlockTooLarge { .. }));
+    }
+
+    // ---- Coverage: validate_bip34_coinbase with no transactions ----
+
+    #[test]
+    fn test_bip34_no_coinbase_tx() {
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_blockhash: BlockHash::ZERO,
+                merkle_root: TxHash::ZERO,
+                time: 0,
+                bits: CompactTarget::MAX_TARGET,
+                nonce: 0,
+            },
+            transactions: vec![],
+        };
+        // validate_bip34_coinbase with no transactions returns Ok
+        assert!(validate_bip34_coinbase(&block, 300_000, 227931).is_ok());
+    }
 }

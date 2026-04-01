@@ -61,4 +61,26 @@ mod tests {
         // Verify the trait is object-safe
         let _verifier: Box<dyn SignatureVerifier> = Box::new(Secp256k1Verifier);
     }
+
+    // ---- Coverage: verify_schnorr invalid lengths ----
+
+    #[test]
+    fn test_schnorr_invalid_sig_length() {
+        let verifier = Secp256k1Verifier;
+        let msg = [0xab; 32];
+        let bad_sig = [0u8; 32]; // too short
+        let pubkey = [0u8; 32];
+        let result = verifier.verify_schnorr(&msg, &bad_sig, &pubkey);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_schnorr_invalid_pubkey_length() {
+        let verifier = Secp256k1Verifier;
+        let msg = [0xab; 32];
+        let sig = [0u8; 64];
+        let bad_pubkey = [0u8; 16]; // too short
+        let result = verifier.verify_schnorr(&msg, &sig, &bad_pubkey);
+        assert!(result.is_err());
+    }
 }
