@@ -84,6 +84,37 @@ enum Commands {
         /// Custom OP_RETURN data carrier size limit in bytes
         #[arg(long)]
         datacarrier_size: Option<usize>,
+
+        /// Path to an AssumeUTXO snapshot file. When provided, the node loads the
+        /// serialized UTXO set and starts syncing from the snapshot height.
+        #[arg(long)]
+        assumeutxo: Option<String>,
+
+        /// Disable full RBF (revert to BIP125 opt-in RBF behavior).
+        /// By default, full RBF is enabled (Bitcoin Core v29+ behavior).
+        #[arg(long)]
+        no_full_rbf: bool,
+
+        /// Maximum OP_RETURN data size in bytes (default: 100000).
+        /// Bitcoin Core v30+ raised this from 80 to 100,000 bytes.
+        #[arg(long)]
+        op_return_limit: Option<usize>,
+
+        /// ZMQ notification endpoint for hashblock topic (e.g., tcp://127.0.0.1:28332)
+        #[arg(long)]
+        zmq_pub_hashblock: Option<String>,
+
+        /// ZMQ notification endpoint for hashtx topic
+        #[arg(long)]
+        zmq_pub_hashtx: Option<String>,
+
+        /// ZMQ notification endpoint for rawblock topic
+        #[arg(long)]
+        zmq_pub_rawblock: Option<String>,
+
+        /// ZMQ notification endpoint for rawtx topic
+        #[arg(long)]
+        zmq_pub_rawtx: Option<String>,
     },
 
     /// Show current node status
@@ -195,6 +226,13 @@ async fn main() -> eyre::Result<()> {
             no_nullfail,
             dust_limit,
             datacarrier_size,
+            assumeutxo,
+            no_full_rbf,
+            op_return_limit,
+            zmq_pub_hashblock,
+            zmq_pub_hashtx,
+            zmq_pub_rawblock,
+            zmq_pub_rawtx,
         }) => {
             cmd_run(
                 config,
@@ -204,11 +242,34 @@ async fn main() -> eyre::Result<()> {
                 no_nullfail,
                 dust_limit,
                 datacarrier_size,
+                assumeutxo,
+                no_full_rbf,
+                op_return_limit,
+                zmq_pub_hashblock,
+                zmq_pub_hashtx,
+                zmq_pub_rawblock,
+                zmq_pub_rawtx,
             )
             .await
         }
         None => {
-            cmd_run(config, format, cli.interactive, "core", false, None, None).await
+            cmd_run(
+                config,
+                format,
+                cli.interactive,
+                "core",
+                false,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
         }
         Some(Commands::Status) => cmd_status(config, format),
         Some(Commands::Sync) => cmd_sync(config, format),
@@ -236,6 +297,13 @@ async fn cmd_run(
     no_nullfail: bool,
     dust_limit: Option<u64>,
     datacarrier_size: Option<usize>,
+    assumeutxo: Option<String>,
+    no_full_rbf: bool,
+    op_return_limit: Option<usize>,
+    zmq_pub_hashblock: Option<String>,
+    zmq_pub_hashtx: Option<String>,
+    zmq_pub_rawblock: Option<String>,
+    zmq_pub_rawtx: Option<String>,
 ) -> eyre::Result<()> {
     // Validate policy preset
     match policy {
@@ -243,6 +311,24 @@ async fn cmd_run(
         other => {
             output::emit_error(format, 2, &format!("unknown policy preset '{}': expected 'core', 'consensus', or 'all'", other));
         }
+    }
+
+    let full_rbf = !no_full_rbf;
+    let effective_op_return_limit = op_return_limit.unwrap_or(btc_mempool::policy::MAX_OP_RETURN_SIZE);
+
+    // Collect ZMQ topics from CLI flags
+    let mut zmq_topics: Vec<String> = Vec::new();
+    if zmq_pub_hashblock.is_some() {
+        zmq_topics.push("hashblock".to_string());
+    }
+    if zmq_pub_hashtx.is_some() {
+        zmq_topics.push("hashtx".to_string());
+    }
+    if zmq_pub_rawblock.is_some() {
+        zmq_topics.push("rawblock".to_string());
+    }
+    if zmq_pub_rawtx.is_some() {
+        zmq_topics.push("rawtx".to_string());
     }
 
     if interactive {
@@ -262,6 +348,11 @@ async fn cmd_run(
         if let Some(ds) = datacarrier_size {
             eprintln!("  OP_RETURN data limit: {} bytes", ds);
         }
+        eprintln!("  Full RBF: {}", if full_rbf { "enabled" } else { "disabled" });
+        eprintln!("  OP_RETURN limit: {} bytes", effective_op_return_limit);
+        if !zmq_topics.is_empty() {
+            eprintln!("  ZMQ topics: {}", zmq_topics.join(", "));
+        }
         eprintln!();
     }
 
@@ -276,8 +367,57 @@ async fn cmd_run(
             "no_nullfail": no_nullfail,
             "dust_limit": dust_limit,
             "datacarrier_size": datacarrier_size,
+            "full_rbf": full_rbf,
+            "op_return_limit": effective_op_return_limit,
+            "zmq_topics": zmq_topics,
         }),
     );
+
+    // Load AssumeUTXO snapshot if provided
+    if let Some(ref snapshot_path) = assumeutxo {
+        let path = std::path::Path::new(snapshot_path);
+        if !path.exists() {
+            output::emit_error(format, 1, &format!("assumeutxo snapshot file not found: {}", snapshot_path));
+            return Ok(());
+        }
+
+        output::emit_progress(
+            "snapshot_loading",
+            &serde_json::json!({
+                "path": snapshot_path,
+            }),
+        );
+
+        let db_path = config.datadir.join("utxo.redb");
+        match btc_storage::redb_backend::RedbDatabase::new(&db_path) {
+            Ok(db) => {
+                if let Err(e) = db.init_tables() {
+                    output::emit_error(format, 5, &format!("failed to init database tables: {}", e));
+                    return Ok(());
+                }
+                match btc_storage::snapshot::load_utxo_snapshot(path, &db) {
+                    Ok(metadata) => {
+                        output::emit_progress(
+                            "snapshot_loaded",
+                            &serde_json::json!({
+                                "height": metadata.height,
+                                "hash": format!("{}", metadata.block_hash),
+                                "entries": metadata.entry_count,
+                            }),
+                        );
+                    }
+                    Err(e) => {
+                        output::emit_error(format, 5, &format!("failed to load UTXO snapshot: {}", e));
+                        return Ok(());
+                    }
+                }
+            }
+            Err(e) => {
+                output::emit_error(format, 5, &format!("failed to open database: {}", e));
+                return Ok(());
+            }
+        }
+    }
 
     let db = DatabaseHandle {
         path: config.datadir.clone(),

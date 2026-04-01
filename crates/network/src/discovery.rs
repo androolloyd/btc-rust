@@ -42,6 +42,7 @@ pub fn dns_seeds(network: Network) -> &'static [&'static str] {
     match network {
         Network::Mainnet => MAINNET_DNS_SEEDS,
         Network::Testnet => TESTNET_DNS_SEEDS,
+        Network::Testnet4 => TESTNET_DNS_SEEDS,
         Network::Signet => SIGNET_DNS_SEEDS,
         Network::Regtest => &[], // regtest has no DNS seeds
     }

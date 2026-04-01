@@ -531,6 +531,206 @@ async fn handle_subscriber(
 }
 
 // ---------------------------------------------------------------------------
+// NodeNotification — internal event type for the notification hub
+// ---------------------------------------------------------------------------
+
+/// Events that can be emitted by the node and dispatched to subscribers.
+///
+/// This is the internal representation used by [`NotificationHub`]. It covers
+/// both block-level events (from the sync manager) and transaction-level
+/// events (from the mempool).
+#[derive(Debug, Clone)]
+pub enum NodeNotification {
+    /// A new block has been connected to the chain.
+    BlockConnected {
+        /// Block hash (32 bytes).
+        hash: btc_primitives::BlockHash,
+        /// Block height.
+        height: u64,
+        /// Full serialized block data (for `rawblock` subscribers).
+        raw_block: Vec<u8>,
+    },
+    /// A block has been disconnected (reorg).
+    BlockDisconnected {
+        /// Block hash (32 bytes).
+        hash: btc_primitives::BlockHash,
+        /// Block height.
+        height: u64,
+    },
+    /// A new transaction has been accepted into the mempool.
+    TxAccepted {
+        /// Transaction ID (32 bytes).
+        txid: btc_primitives::TxHash,
+        /// Full serialized transaction data (for `rawtx` subscribers).
+        raw_tx: Vec<u8>,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// NotificationHub — internal broadcast-channel based event dispatcher
+// ---------------------------------------------------------------------------
+
+/// A tokio broadcast-channel based notification hub for dispatching block and
+/// transaction events to internal subscribers.
+///
+/// This is the core event dispatch infrastructure. The actual ZMQ TCP socket
+/// binding is handled by [`ZmqPublisher`] which can consume events from this
+/// hub.  Other internal components (RPC long-polling, webhook dispatchers,
+/// etc.) can also subscribe.
+pub struct NotificationHub {
+    /// Broadcast sender for node notifications.
+    sender: broadcast::Sender<NodeNotification>,
+    /// Per-topic sequence counters for ZMQ-compatible output.
+    counters: SequenceCounters,
+    /// Which topics are enabled.
+    topics: HashSet<String>,
+}
+
+impl NotificationHub {
+    /// Create a new notification hub.
+    ///
+    /// `capacity` controls the broadcast channel buffer size.
+    pub fn new(capacity: usize) -> Self {
+        let topics = ALL_TOPICS.iter().map(|s| (*s).to_string()).collect();
+        let counters = SequenceCounters::new(&topics);
+        let (sender, _) = broadcast::channel(capacity);
+        Self {
+            sender,
+            counters,
+            topics,
+        }
+    }
+
+    /// Create a hub with specific topics enabled.
+    pub fn with_topics(capacity: usize, topics: HashSet<String>) -> Self {
+        let counters = SequenceCounters::new(&topics);
+        let (sender, _) = broadcast::channel(capacity);
+        Self {
+            sender,
+            counters,
+            topics,
+        }
+    }
+
+    /// Subscribe to notifications. Returns a broadcast receiver.
+    pub fn subscribe(&self) -> broadcast::Receiver<NodeNotification> {
+        self.sender.subscribe()
+    }
+
+    /// Get the number of active subscribers.
+    pub fn subscriber_count(&self) -> usize {
+        self.sender.receiver_count()
+    }
+
+    /// Notify that a new block has been connected.
+    pub fn notify_block_connected(
+        &self,
+        hash: btc_primitives::BlockHash,
+        height: u64,
+        raw_block: Vec<u8>,
+    ) {
+        let notification = NodeNotification::BlockConnected {
+            hash,
+            height,
+            raw_block,
+        };
+        // Ignore send errors (no subscribers).
+        let _ = self.sender.send(notification);
+    }
+
+    /// Notify that a block has been disconnected.
+    pub fn notify_block_disconnected(
+        &self,
+        hash: btc_primitives::BlockHash,
+        height: u64,
+    ) {
+        let notification = NodeNotification::BlockDisconnected { hash, height };
+        let _ = self.sender.send(notification);
+    }
+
+    /// Notify that a transaction has been accepted into the mempool.
+    pub fn notify_tx_accepted(
+        &self,
+        txid: btc_primitives::TxHash,
+        raw_tx: Vec<u8>,
+    ) {
+        let notification = NodeNotification::TxAccepted { txid, raw_tx };
+        let _ = self.sender.send(notification);
+    }
+
+    /// Convert a [`NodeNotification`] into ZMQ-compatible messages.
+    ///
+    /// This mirrors `ZmqPublisher::notification_to_messages` but operates
+    /// on our internal notification type rather than ExEx notifications.
+    pub fn to_zmq_messages(&self, notification: &NodeNotification) -> Vec<ZmqMessage> {
+        let mut messages = Vec::new();
+
+        match notification {
+            NodeNotification::BlockConnected {
+                hash,
+                raw_block,
+                ..
+            } => {
+                if self.topics.contains(TOPIC_HASHBLOCK) {
+                    messages.push(ZmqMessage {
+                        topic: TOPIC_HASHBLOCK.to_string(),
+                        body: hash.as_bytes().to_vec(),
+                        sequence: self.counters.next(TOPIC_HASHBLOCK),
+                    });
+                }
+                if self.topics.contains(TOPIC_RAWBLOCK) {
+                    messages.push(ZmqMessage {
+                        topic: TOPIC_RAWBLOCK.to_string(),
+                        body: raw_block.clone(),
+                        sequence: self.counters.next(TOPIC_RAWBLOCK),
+                    });
+                }
+                if self.topics.contains(TOPIC_SEQUENCE) {
+                    let mut body = Vec::with_capacity(33);
+                    body.extend_from_slice(hash.as_bytes());
+                    body.push(b'C');
+                    messages.push(ZmqMessage {
+                        topic: TOPIC_SEQUENCE.to_string(),
+                        body,
+                        sequence: self.counters.next(TOPIC_SEQUENCE),
+                    });
+                }
+            }
+            NodeNotification::BlockDisconnected { hash, .. } => {
+                if self.topics.contains(TOPIC_SEQUENCE) {
+                    let mut body = Vec::with_capacity(33);
+                    body.extend_from_slice(hash.as_bytes());
+                    body.push(b'D');
+                    messages.push(ZmqMessage {
+                        topic: TOPIC_SEQUENCE.to_string(),
+                        body,
+                        sequence: self.counters.next(TOPIC_SEQUENCE),
+                    });
+                }
+            }
+            NodeNotification::TxAccepted { txid, raw_tx } => {
+                if self.topics.contains(TOPIC_HASHTX) {
+                    messages.push(ZmqMessage {
+                        topic: TOPIC_HASHTX.to_string(),
+                        body: txid.as_bytes().to_vec(),
+                        sequence: self.counters.next(TOPIC_HASHTX),
+                    });
+                }
+                if self.topics.contains(TOPIC_RAWTX) {
+                    messages.push(ZmqMessage {
+                        topic: TOPIC_RAWTX.to_string(),
+                        body: raw_tx.clone(),
+                        sequence: self.counters.next(TOPIC_RAWTX),
+                    });
+                }
+            }
+        }
+
+        messages
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1205,5 +1405,238 @@ mod tests {
         // The hashtx sequence numbers should be 0 and 1
         assert_eq!(hashtx_msgs[0].sequence, 0);
         assert_eq!(hashtx_msgs[1].sequence, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // NotificationHub tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_notification_hub_creation() {
+        let hub = NotificationHub::new(128);
+        assert_eq!(hub.subscriber_count(), 0);
+    }
+
+    #[test]
+    fn test_notification_hub_subscribe() {
+        let hub = NotificationHub::new(128);
+        let _rx1 = hub.subscribe();
+        assert_eq!(hub.subscriber_count(), 1);
+        let _rx2 = hub.subscribe();
+        assert_eq!(hub.subscriber_count(), 2);
+    }
+
+    #[test]
+    fn test_notification_hub_block_connected() {
+        let hub = NotificationHub::new(128);
+        let mut rx = hub.subscribe();
+
+        let hash = BlockHash::from_bytes([0xab; 32]);
+        let raw_block = vec![0x01, 0x02, 0x03];
+        hub.notify_block_connected(hash, 42, raw_block.clone());
+
+        let notification = rx.try_recv().unwrap();
+        match notification {
+            NodeNotification::BlockConnected {
+                hash: h,
+                height,
+                raw_block: rb,
+            } => {
+                assert_eq!(h, hash);
+                assert_eq!(height, 42);
+                assert_eq!(rb, raw_block);
+            }
+            _ => panic!("expected BlockConnected"),
+        }
+    }
+
+    #[test]
+    fn test_notification_hub_block_disconnected() {
+        let hub = NotificationHub::new(128);
+        let mut rx = hub.subscribe();
+
+        let hash = BlockHash::from_bytes([0xcd; 32]);
+        hub.notify_block_disconnected(hash, 100);
+
+        let notification = rx.try_recv().unwrap();
+        match notification {
+            NodeNotification::BlockDisconnected {
+                hash: h,
+                height,
+            } => {
+                assert_eq!(h, hash);
+                assert_eq!(height, 100);
+            }
+            _ => panic!("expected BlockDisconnected"),
+        }
+    }
+
+    #[test]
+    fn test_notification_hub_tx_accepted() {
+        let hub = NotificationHub::new(128);
+        let mut rx = hub.subscribe();
+
+        let txid = TxHash::from_bytes([0xef; 32]);
+        let raw_tx = vec![0x04, 0x05, 0x06];
+        hub.notify_tx_accepted(txid, raw_tx.clone());
+
+        let notification = rx.try_recv().unwrap();
+        match notification {
+            NodeNotification::TxAccepted {
+                txid: t,
+                raw_tx: rt,
+            } => {
+                assert_eq!(t, txid);
+                assert_eq!(rt, raw_tx);
+            }
+            _ => panic!("expected TxAccepted"),
+        }
+    }
+
+    #[test]
+    fn test_notification_hub_multiple_subscribers() {
+        let hub = NotificationHub::new(128);
+        let mut rx1 = hub.subscribe();
+        let mut rx2 = hub.subscribe();
+
+        let hash = BlockHash::from_bytes([0xab; 32]);
+        hub.notify_block_connected(hash, 1, vec![0x01]);
+
+        // Both subscribers should receive the notification
+        assert!(rx1.try_recv().is_ok());
+        assert!(rx2.try_recv().is_ok());
+    }
+
+    #[test]
+    fn test_notification_hub_no_subscribers_no_panic() {
+        let hub = NotificationHub::new(128);
+        // Should not panic even with no subscribers
+        let hash = BlockHash::from_bytes([0xab; 32]);
+        hub.notify_block_connected(hash, 1, vec![0x01]);
+        hub.notify_block_disconnected(hash, 1);
+        hub.notify_tx_accepted(TxHash::from_bytes([0xef; 32]), vec![0x02]);
+    }
+
+    #[test]
+    fn test_notification_hub_to_zmq_messages_block_connected() {
+        let hub = NotificationHub::new(128);
+
+        let hash = BlockHash::from_bytes([0xab; 32]);
+        let raw_block = vec![0x01, 0x02, 0x03];
+        let notification = NodeNotification::BlockConnected {
+            hash,
+            height: 42,
+            raw_block: raw_block.clone(),
+        };
+
+        let messages = hub.to_zmq_messages(&notification);
+
+        // Should produce: hashblock, rawblock, sequence
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].topic, TOPIC_HASHBLOCK);
+        assert_eq!(messages[0].body, hash.as_bytes().to_vec());
+        assert_eq!(messages[1].topic, TOPIC_RAWBLOCK);
+        assert_eq!(messages[1].body, raw_block);
+        assert_eq!(messages[2].topic, TOPIC_SEQUENCE);
+        assert_eq!(*messages[2].body.last().unwrap(), b'C');
+    }
+
+    #[test]
+    fn test_notification_hub_to_zmq_messages_block_disconnected() {
+        let hub = NotificationHub::new(128);
+
+        let hash = BlockHash::from_bytes([0xab; 32]);
+        let notification = NodeNotification::BlockDisconnected {
+            hash,
+            height: 42,
+        };
+
+        let messages = hub.to_zmq_messages(&notification);
+
+        // Should produce: sequence with 'D'
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].topic, TOPIC_SEQUENCE);
+        assert_eq!(*messages[0].body.last().unwrap(), b'D');
+    }
+
+    #[test]
+    fn test_notification_hub_to_zmq_messages_tx_accepted() {
+        let hub = NotificationHub::new(128);
+
+        let txid = TxHash::from_bytes([0xef; 32]);
+        let raw_tx = vec![0x04, 0x05];
+        let notification = NodeNotification::TxAccepted {
+            txid,
+            raw_tx: raw_tx.clone(),
+        };
+
+        let messages = hub.to_zmq_messages(&notification);
+
+        // Should produce: hashtx, rawtx
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].topic, TOPIC_HASHTX);
+        assert_eq!(messages[0].body, txid.as_bytes().to_vec());
+        assert_eq!(messages[1].topic, TOPIC_RAWTX);
+        assert_eq!(messages[1].body, raw_tx);
+    }
+
+    #[test]
+    fn test_notification_hub_with_filtered_topics() {
+        let topics: HashSet<String> = [TOPIC_HASHBLOCK.to_string()].into_iter().collect();
+        let hub = NotificationHub::with_topics(128, topics);
+
+        let hash = BlockHash::from_bytes([0xab; 32]);
+        let notification = NodeNotification::BlockConnected {
+            hash,
+            height: 42,
+            raw_block: vec![0x01],
+        };
+
+        let messages = hub.to_zmq_messages(&notification);
+
+        // Only hashblock should be produced (not rawblock or sequence)
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].topic, TOPIC_HASHBLOCK);
+    }
+
+    #[test]
+    fn test_notification_hub_zmq_sequence_numbers_increment() {
+        let hub = NotificationHub::new(128);
+
+        let hash = BlockHash::from_bytes([0xab; 32]);
+        let notification = NodeNotification::BlockConnected {
+            hash,
+            height: 1,
+            raw_block: vec![0x01],
+        };
+
+        let messages1 = hub.to_zmq_messages(&notification);
+        let messages2 = hub.to_zmq_messages(&notification);
+
+        // hashblock sequence should increment: 0, then 1
+        let hb1 = messages1.iter().find(|m| m.topic == TOPIC_HASHBLOCK).unwrap();
+        let hb2 = messages2.iter().find(|m| m.topic == TOPIC_HASHBLOCK).unwrap();
+        assert_eq!(hb1.sequence, 0);
+        assert_eq!(hb2.sequence, 1);
+    }
+
+    #[test]
+    fn test_notification_hub_tx_then_block() {
+        let hub = NotificationHub::new(128);
+        let mut rx = hub.subscribe();
+
+        // Tx accepted
+        let txid = TxHash::from_bytes([0xef; 32]);
+        hub.notify_tx_accepted(txid, vec![0x01]);
+
+        // Block connected
+        let hash = BlockHash::from_bytes([0xab; 32]);
+        hub.notify_block_connected(hash, 1, vec![0x02]);
+
+        // Should receive tx first, then block
+        let n1 = rx.try_recv().unwrap();
+        assert!(matches!(n1, NodeNotification::TxAccepted { .. }));
+        let n2 = rx.try_recv().unwrap();
+        assert!(matches!(n2, NodeNotification::BlockConnected { .. }));
     }
 }

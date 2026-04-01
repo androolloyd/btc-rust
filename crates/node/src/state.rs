@@ -45,6 +45,9 @@ impl NodeState {
             Network::Regtest => {
                 "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206".to_string()
             }
+            Network::Testnet4 => {
+                "00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043".to_string()
+            }
         };
 
         Self {
@@ -83,6 +86,7 @@ impl NodeState {
         match self.network {
             Network::Mainnet => "main".to_string(),
             Network::Testnet => "test".to_string(),
+            Network::Testnet4 => "testnet4".to_string(),
             Network::Signet => "signet".to_string(),
             Network::Regtest => "regtest".to_string(),
         }
