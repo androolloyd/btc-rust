@@ -593,7 +593,7 @@ fn test_debugger_history() {
 
 #[test]
 fn test_script_analysis_with_branches() {
-    use crate::weight::{analyze_script, estimate_witness_weight};
+    use crate::weight::analyze_script;
 
     // IF/ELSE/ENDIF script
     let script = ForgeScript::new()
@@ -984,4 +984,609 @@ fn test_forge_error_display() {
     assert!(format!("{}", e2).contains("missing"));
     let e3 = ForgeError::InvalidArgument("bad arg".into());
     assert!(format!("{}", e3).contains("bad arg"));
+}
+
+// ---------------------------------------------------------------------------
+// Debugger -- large push data coverage (lines 78-83, 87)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_debugger_large_pushdata_76_to_255_bytes() {
+    // A push of 76-255 bytes uses OP_PUSHDATA1 (2 + len bytes overhead)
+    let data = vec![0x42u8; 100];
+    let mut script = ScriptBuf::new();
+    script.push_slice(&data);
+    script.push_opcode(Opcode::OP_DROP);
+
+    let mut debugger = ScriptDebugger::new(script.as_script());
+    let trace = debugger.run();
+    assert!(trace.len() >= 2);
+    // First step pushes 100 bytes onto stack
+    assert_eq!(trace[0].stack.len(), 1);
+    assert_eq!(trace[0].stack[0].len(), 100);
+}
+
+#[test]
+fn test_debugger_large_pushdata_over_255_bytes() {
+    // A push of 256+ bytes uses OP_PUSHDATA2 (3 + len bytes overhead)
+    let data = vec![0x42u8; 300];
+    let mut script = ScriptBuf::new();
+    script.push_slice(&data);
+    script.push_opcode(Opcode::OP_DROP);
+
+    let mut debugger = ScriptDebugger::new(script.as_script());
+    let trace = debugger.run();
+    assert!(trace.len() >= 2);
+    assert_eq!(trace[0].stack.len(), 1);
+    assert_eq!(trace[0].stack[0].len(), 300);
+}
+
+#[test]
+fn test_debugger_invalid_script_breaks() {
+    // A script with an invalid instruction should stop at Err(_) => break
+    // OP_PUSHDATA1 (0x4c) followed by a length byte claiming 0xff bytes,
+    // but the script is too short. This should cause a parse error.
+    let bytes = vec![0x4c, 0xff]; // PUSHDATA1 requesting 255 bytes, but none follow
+    let script = ScriptBuf::from_bytes(bytes);
+
+    let mut debugger = ScriptDebugger::new(script.as_script());
+    let trace = debugger.run();
+    // The parse error means no instructions are successfully decoded
+    assert!(trace.is_empty());
+}
+
+#[test]
+fn test_debugger_print_trace_empty_stack_items() {
+    // Ensure print_trace handles empty stack items (the "[]" branch)
+    let script = ForgeScript::new()
+        .op(Opcode::OP_0)  // pushes empty bytes onto stack
+        .op(Opcode::OP_DROP)
+        .build();
+
+    let mut debugger = ScriptDebugger::new(script.as_script());
+    debugger.run();
+    // Should not panic; the empty stack item should be printed as "[]"
+    debugger.print_trace();
+}
+
+// ---------------------------------------------------------------------------
+// TxBuilder -- sign_input coverage (lines 97-102)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_tx_builder_sign_input() {
+    let mut env = ScriptEnv::new();
+    let _ = env.new_named_account("signer");
+    let utxo = env.fund_p2pkh(0, Amount::from_sat(100_000));
+    env.advance_blocks(100); // mature coinbase
+
+    let keypair = &env.account(0).keypair;
+    let prev_output = utxo.txout.clone();
+
+    let tx = TxBuilder::new()
+        .add_input(&utxo)
+        .add_output(
+            ForgeScript::p2pkh(&[0xbb; 20]).build(),
+            Amount::from_sat(40_000),
+        )
+        .sign_input(0, keypair, &prev_output)
+        .build();
+
+    assert_eq!(tx.inputs.len(), 1);
+    // After signing, the script_sig should be non-empty
+    assert!(!tx.inputs[0].script_sig.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Weight -- varint_size edge cases (lines 217-222)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_estimate_witness_weight_large_items() {
+    use crate::weight::estimate_witness_weight;
+
+    // An item of 253 bytes triggers the 3-byte varint path for item length
+    let big_item = vec![0x42u8; 253];
+    let w = estimate_witness_weight(&[big_item]);
+    // 1 (count varint, count=1 < 0xfd) + 3 (item len varint, 253 = 0xfd) + 253 = 257
+    assert_eq!(w, 257);
+}
+
+#[test]
+fn test_estimate_witness_weight_many_items() {
+    use crate::weight::estimate_witness_weight;
+
+    // Create 253 items to trigger 3-byte varint for witness count
+    let items: Vec<Vec<u8>> = (0..253).map(|_| vec![0x01]).collect();
+    let w = estimate_witness_weight(&items);
+    // 3 (count varint for 253) + 253 * (1 (item len) + 1 (item byte)) = 3 + 506 = 509
+    assert_eq!(w, 509);
+}
+
+// ---------------------------------------------------------------------------
+// Weight -- invalid script error branch (line 177)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_script_analysis_malformed_script() {
+    // Script with an invalid instruction: OP_PUSHDATA1 + length but no data
+    let bytes = vec![0x4c, 0x10]; // PUSHDATA1 requesting 16 bytes, but none follow
+    let script = ScriptBuf::from_bytes(bytes);
+    let analysis = analyze_script(script.as_script());
+    // The script parsing will hit Err(_) => break
+    // No ops should be counted
+    assert_eq!(analysis.op_count, 0);
+    assert_eq!(analysis.size_bytes, 2);
+}
+
+// ---------------------------------------------------------------------------
+// Weight -- data push > 1 byte doesn't set last_n_keys
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_script_analysis_data_push_multiby_no_n() {
+    // Push 2 bytes: should NOT set last_n_keys
+    let mut script = ScriptBuf::new();
+    script.push_slice(&[3u8, 0u8]); // 2-byte push
+    script.push_opcode(Opcode::OP_CHECKMULTISIG);
+    let analysis = analyze_script(script.as_script());
+    // last_n_keys should be 0 since data.len() != 1, so sigop_count = 20
+    assert_eq!(analysis.sigop_count, 20);
+}
+
+// ---------------------------------------------------------------------------
+// Miniscript parser edge cases
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_policy_parse_thresh_missing_close_in_sub() {
+    use crate::miniscript::Policy;
+    // thresh sub-policy followed by invalid character (not comma or close)
+    let result = Policy::parse("thresh(2,pk(aa);pk(bb))");
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_policy_parse_thresh_empty_subs() {
+    use crate::miniscript::Policy;
+    // thresh with k but no sub-policies - should fail
+    // "thresh(1)" has no comma after k
+    let result = Policy::parse("thresh(1)");
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_policy_parse_after_invalid_number() {
+    use crate::miniscript::Policy;
+    let result = Policy::parse("after(not_a_number)");
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_policy_parse_and_missing_close_paren() {
+    use crate::miniscript::Policy;
+    let result = Policy::parse("and(pk(aa),pk(bb)");
+    assert!(result.is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Miniscript -- MiniscriptError Display variants
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_miniscript_error_display() {
+    use crate::miniscript::MiniscriptError;
+    let e1 = MiniscriptError::UnexpectedEof;
+    assert!(format!("{}", e1).contains("unexpected end"));
+
+    let e2 = MiniscriptError::Expected("(".into(), "foo".into());
+    assert!(format!("{}", e2).contains("expected"));
+
+    let e3 = MiniscriptError::InvalidHex("bad hex".into());
+    assert!(format!("{}", e3).contains("invalid hex"));
+
+    let e4 = MiniscriptError::InvalidNumber("nan".into());
+    assert!(format!("{}", e4).contains("invalid number"));
+
+    let e5 = MiniscriptError::UnknownPolicy("foo".into());
+    assert!(format!("{}", e5).contains("unknown policy"));
+
+    let e6 = MiniscriptError::InvalidThreshold;
+    assert!(format!("{}", e6).contains("thresh"));
+
+    let e7 = MiniscriptError::EmptyThresh;
+    assert!(format!("{}", e7).contains("thresh"));
+
+    let e8 = MiniscriptError::TrailingInput("extra".into());
+    assert!(format!("{}", e8).contains("trailing"));
+}
+
+// ---------------------------------------------------------------------------
+// Miniscript -- encode_script_num edge cases for push_script_number
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_miniscript_compile_after_zero() {
+    use crate::miniscript::Miniscript;
+    // After(0) should push 0 via push_script_number (hits the n==0 branch)
+    let ms = Miniscript::After(0);
+    let script = ms.compile();
+    assert!(!script.is_empty());
+    // Should start with OP_0
+    assert_eq!(script.as_bytes()[0], Opcode::OP_0 as u8);
+}
+
+#[test]
+fn test_miniscript_compile_after_small_values() {
+    use crate::miniscript::Miniscript;
+    // After(1) should use OP_1
+    let ms = Miniscript::After(1);
+    let script = ms.compile();
+    assert_eq!(script.as_bytes()[0], Opcode::OP_1 as u8);
+
+    // After(16) should use OP_16
+    let ms16 = Miniscript::After(16);
+    let script16 = ms16.compile();
+    assert_eq!(script16.as_bytes()[0], Opcode::OP_16 as u8);
+}
+
+// ---------------------------------------------------------------------------
+// Miniscript -- read_until_close with nested parens
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_policy_parse_deeply_nested_parens() {
+    use crate::miniscript::Policy;
+    // This tests read_until_close with multiple levels of nesting
+    let result = Policy::parse("and(and(pk(aa),pk(bb)),and(pk(cc),pk(dd)))");
+    assert!(result.is_ok());
+    let p = result.unwrap();
+    if let Policy::And(left, right) = &p {
+        assert!(matches!(**left, Policy::And(_, _)));
+        assert!(matches!(**right, Policy::And(_, _)));
+    } else {
+        panic!("Expected And");
+    }
+}
+
+#[test]
+fn test_policy_parse_read_until_close_unclosed() {
+    use crate::miniscript::Policy;
+    // Missing closing paren at the end -- should trigger read_until_close error
+    let result = Policy::parse("pk(aabb");
+    assert!(result.is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Weight -- NOTIF coverage and remaining branch ops
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_script_analysis_notif() {
+    let script = ForgeScript::new()
+        .op(Opcode::OP_NOTIF)
+        .push_num(1)
+        .op(Opcode::OP_ENDIF)
+        .build();
+    let analysis = analyze_script(script.as_script());
+    assert!(!analysis.branches.is_empty());
+}
+
+#[test]
+fn test_script_analysis_else_without_prior_ops() {
+    // IF immediately followed by ELSE (current_branch_ops for ELSE is just [OP_IF])
+    let script = ForgeScript::new()
+        .op(Opcode::OP_IF)
+        .op(Opcode::OP_ELSE)
+        .push_num(1)
+        .op(Opcode::OP_ENDIF)
+        .build();
+    let analysis = analyze_script(script.as_script());
+    assert!(!analysis.branches.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Weight -- remaining arithmetic/comparison stack ops
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_script_analysis_comparison_ops() {
+    let script = ForgeScript::new()
+        .push_num(1)
+        .push_num(2)
+        .op(Opcode::OP_LESSTHAN)
+        .push_num(3)
+        .push_num(4)
+        .op(Opcode::OP_GREATERTHAN)
+        .op(Opcode::OP_BOOLOR)
+        .push_num(5)
+        .push_num(6)
+        .op(Opcode::OP_MIN)
+        .op(Opcode::OP_BOOLAND)
+        .push_num(7)
+        .push_num(8)
+        .op(Opcode::OP_MAX)
+        .op(Opcode::OP_NUMEQUAL)
+        .push_num(9)
+        .push_num(10)
+        .op(Opcode::OP_SUB)
+        .op(Opcode::OP_DROP)
+        .build();
+    let analysis = analyze_script(script.as_script());
+    assert!(analysis.op_count > 0);
+    assert!(analysis.max_stack_depth > 0);
+}
+
+// ---------------------------------------------------------------------------
+// Script builder -- push_num edge cases for encode_script_num
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_forge_script_push_num_negative_needing_sign_extension() {
+    // -128 has abs = 0x80, whose high bit is set, so it needs an extra 0x80 byte
+    let s = ForgeScript::new().push_num(-128).build();
+    assert!(!s.is_empty());
+
+    // -255 has abs = 0xFF, high bit set, needs sign extension
+    let s2 = ForgeScript::new().push_num(-255).build();
+    assert!(!s2.is_empty());
+}
+
+#[test]
+fn test_forge_script_push_num_large_negative() {
+    // -1000 exercises the "set sign bit on last byte" path
+    let s = ForgeScript::new().push_num(-1000).build();
+    assert!(!s.is_empty());
+
+    // Verify the encoded value is correct by checking script is valid
+    let env = ScriptEnv::new();
+    // Push -1000 then negate to get 1000, which should equal push_num(1000)
+    let script = ForgeScript::new()
+        .push_num(-1000)
+        .op(Opcode::OP_NEGATE)
+        .push_num(1000)
+        .op(Opcode::OP_EQUAL)
+        .build();
+    let result = env.execute_script(script.as_script()).unwrap();
+    assert!(result.success);
+}
+
+// ---------------------------------------------------------------------------
+// Miniscript -- Verify wrapper witness size
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_miniscript_verify_wrapper_compile_and_safety() {
+    use crate::miniscript::Miniscript;
+    // Verify(Sha256(...)) should not be safe (no key)
+    let ms = Miniscript::Verify(Box::new(Miniscript::Sha256(vec![0x42; 32])));
+    assert!(!ms.is_safe());
+    let script = ms.compile();
+    assert!(!script.is_empty());
+}
+
+#[test]
+fn test_miniscript_nonzero_wrapper_unsafe() {
+    use crate::miniscript::Miniscript;
+    // NonZero(After(100)) should not be safe (no key)
+    let ms = Miniscript::NonZero(Box::new(Miniscript::After(100)));
+    assert!(!ms.is_safe());
+}
+
+// ---------------------------------------------------------------------------
+// Miniscript -- OrI witness size with asymmetric branches
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_miniscript_ori_witness_size_asymmetric() {
+    use crate::miniscript::Miniscript;
+    // One branch is PkH (108 bytes) and the other is Pk (74 bytes)
+    let ms = Miniscript::OrI(
+        Box::new(Miniscript::PkH(vec![0xaa; 20])),
+        Box::new(Miniscript::Pk(vec![0xbb; 33])),
+    );
+    // 1 selector + max(108, 74) = 109
+    assert_eq!(ms.max_satisfaction_witness_size(), 109);
+}
+
+// ---------------------------------------------------------------------------
+// Miniscript -- AndB with non-key branches
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_miniscript_andb_no_keys_unsafe() {
+    use crate::miniscript::Miniscript;
+    let ms = Miniscript::AndB(
+        Box::new(Miniscript::Sha256(vec![0x42; 32])),
+        Box::new(Miniscript::After(100)),
+    );
+    assert!(!ms.is_safe());
+}
+
+// ---------------------------------------------------------------------------
+// Miniscript -- AndV witness size
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_miniscript_andv_witness_size_mixed() {
+    use crate::miniscript::Miniscript;
+    // AndV(Pk, Sha256): 74 + 33 = 107
+    let ms = Miniscript::AndV(
+        Box::new(Miniscript::Pk(vec![0xaa; 33])),
+        Box::new(Miniscript::Sha256(vec![0x42; 32])),
+    );
+    assert_eq!(ms.max_satisfaction_witness_size(), 107);
+}
+
+// ---------------------------------------------------------------------------
+// Policy -- thresh with non-key subs (general path)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_policy_compile_thresh_general_three_subs() {
+    use crate::miniscript::Policy;
+    // General thresh with mixed sub-policies (not all keys)
+    let p = Policy::Thresh(
+        2,
+        vec![
+            Policy::Key("aa".to_string()),
+            Policy::After(10),
+            Policy::Key("bb".to_string()),
+        ],
+    );
+    let script = p.compile();
+    assert!(!script.is_empty());
+    // Should contain OP_ADD and OP_EQUAL (not OP_CHECKMULTISIG)
+    let bytes = script.as_bytes();
+    assert!(bytes.contains(&(Opcode::OP_ADD as u8)));
+    assert!(bytes.contains(&(Opcode::OP_EQUAL as u8)));
+}
+
+// ---------------------------------------------------------------------------
+// Miniscript -- Multi witness size with k=1
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_miniscript_multi_witness_size_k1() {
+    use crate::miniscript::Miniscript;
+    let ms = Miniscript::Multi(1, vec![vec![0xaa; 33]]);
+    // 1 (OP_0 dummy) + 1 * (1+73) = 1 + 74 = 75
+    assert_eq!(ms.max_satisfaction_witness_size(), 75);
+}
+
+// ---------------------------------------------------------------------------
+// Miniscript -- script_size for various types
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_miniscript_script_size_various() {
+    use crate::miniscript::Miniscript;
+
+    // PkH
+    let ms = Miniscript::PkH(vec![0xab; 20]);
+    assert_eq!(ms.script_size(), ms.compile().len());
+
+    // Hash256
+    let ms2 = Miniscript::Hash256(vec![0x42; 32]);
+    assert_eq!(ms2.script_size(), ms2.compile().len());
+
+    // After
+    let ms3 = Miniscript::After(500);
+    assert_eq!(ms3.script_size(), ms3.compile().len());
+
+    // Older
+    let ms4 = Miniscript::Older(144);
+    assert_eq!(ms4.script_size(), ms4.compile().len());
+
+    // AndB
+    let ms5 = Miniscript::AndB(
+        Box::new(Miniscript::Pk(vec![0xaa; 33])),
+        Box::new(Miniscript::Pk(vec![0xbb; 33])),
+    );
+    assert_eq!(ms5.script_size(), ms5.compile().len());
+
+    // Thresh
+    let ms6 = Miniscript::Thresh(
+        1,
+        vec![Miniscript::Pk(vec![0xaa; 33]), Miniscript::Pk(vec![0xbb; 33])],
+    );
+    assert_eq!(ms6.script_size(), ms6.compile().len());
+
+    // Verify
+    let ms7 = Miniscript::Verify(Box::new(Miniscript::Pk(vec![0xaa; 33])));
+    assert_eq!(ms7.script_size(), ms7.compile().len());
+
+    // NonZero
+    let ms8 = Miniscript::NonZero(Box::new(Miniscript::Pk(vec![0xaa; 33])));
+    assert_eq!(ms8.script_size(), ms8.compile().len());
+}
+
+// ---------------------------------------------------------------------------
+// Weight -- varint_size for large item sizes (lines 219-220)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_estimate_witness_weight_very_large_item() {
+    use crate::weight::estimate_witness_weight;
+    // An item of 65536 bytes triggers the 5-byte varint path for item length
+    // (n > 0xffff)
+    let big_item = vec![0x00u8; 65536];
+    let w = estimate_witness_weight(&[big_item]);
+    // 1 (count varint, count=1 < 0xfd) + 5 (item len varint, 65536 > 0xffff) + 65536 = 65542
+    assert_eq!(w, 65542);
+}
+
+// ---------------------------------------------------------------------------
+// Miniscript parser -- read_until_comma with close paren at depth 0
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_policy_parse_thresh_close_paren_before_comma() {
+    use crate::miniscript::Policy;
+    // "thresh(1)" -- first arg is "1" followed by ')' not ','
+    // This should hit the read_until_comma error path for ')' at depth 0
+    let result = Policy::parse("thresh(1)");
+    assert!(result.is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Miniscript parser -- read_until_comma reaching end of input
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_policy_parse_thresh_no_comma_no_close() {
+    use crate::miniscript::Policy;
+    // Truncated input: "thresh(1" -- no comma or close paren
+    let result = Policy::parse("thresh(1");
+    assert!(result.is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Miniscript parser -- thresh sub followed by invalid separator
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_policy_parse_thresh_sub_invalid_sep() {
+    use crate::miniscript::Policy;
+    // "thresh(1,pk(aa)!)" -- '!' is not comma or close paren after sub
+    let result = Policy::parse("thresh(1,pk(aa)!)");
+    assert!(result.is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Miniscript -- read_until_close with nested depth decrements
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_policy_parse_sha256_with_nested_parens_in_hash() {
+    use crate::miniscript::Policy;
+    // A sha256 hash cannot contain parens, but read_until_close handles depth
+    // Let's test a read_until_close where depth goes up then down
+    // The 'pk' argument is simple but 'sha256' goes through read_until_close
+    let valid_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let result = Policy::parse(&format!("sha256({})", valid_hash));
+    assert!(result.is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// Debugger -- large pushdata over 65535 bytes
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_debugger_very_large_pushdata() {
+    // OP_PUSHDATA4 (0x4e) + 4-byte little-endian length
+    // We'll create a script that pushes 70000 bytes using PUSHDATA4 format
+    // Script format: 0x4e LL LL LL LL <data>
+    let data_len: u32 = 70_000;
+    let mut bytes = Vec::new();
+    bytes.push(0x4e); // OP_PUSHDATA4
+    bytes.extend_from_slice(&data_len.to_le_bytes());
+    bytes.extend(std::iter::repeat(0x42).take(data_len as usize));
+    bytes.push(Opcode::OP_DROP as u8);
+
+    let script = ScriptBuf::from_bytes(bytes);
+    let mut debugger = ScriptDebugger::new(script.as_script());
+    let trace = debugger.run();
+    // Should have parsed the pushdata instruction (pos += 5 + len) and the OP_DROP
+    assert!(trace.len() >= 1);
 }
