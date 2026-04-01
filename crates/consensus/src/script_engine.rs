@@ -50,6 +50,18 @@ pub enum ScriptError {
     Encode(#[from] btc_primitives::encode::EncodeError),
     #[error("sig verify error: {0}")]
     SigVerify(String),
+    #[error("sig pushonly: scriptSig contains non-push opcode")]
+    SigPushOnly,
+    #[error("cleanstack: stack must have exactly one element after execution")]
+    CleanStack,
+    #[error("null fail: non-empty signature must succeed")]
+    NullFail,
+    #[error("minimal data: non-minimal push encoding")]
+    MinimalData,
+    #[error("minimal if: OP_IF/NOTIF argument must be empty or 0x01")]
+    MinimalIf,
+    #[error("discourage upgradable NOPs")]
+    DiscourageUpgradableNops,
 }
 
 const MAX_STACK_SIZE: usize = 1000;
@@ -93,6 +105,13 @@ pub struct ScriptFlags {
     pub verify_checklocktimeverify: bool,
     pub verify_checksequenceverify: bool,
     pub verify_taproot: bool,
+    pub verify_sigpushonly: bool,
+    pub verify_minimaldata: bool,
+    pub verify_nullfail: bool,
+    pub verify_minimalif: bool,
+    pub verify_discourage_upgradable_nops: bool,
+    pub verify_discourage_upgradable_witness_program: bool,
+    pub verify_const_scriptcode: bool,
 }
 
 impl ScriptFlags {
@@ -108,6 +127,13 @@ impl ScriptFlags {
             verify_checklocktimeverify: true,
             verify_checksequenceverify: true,
             verify_taproot: true,
+            verify_sigpushonly: true,
+            verify_minimaldata: true,
+            verify_nullfail: true,
+            verify_minimalif: true,
+            verify_discourage_upgradable_nops: true,
+            verify_discourage_upgradable_witness_program: true,
+            verify_const_scriptcode: true,
         }
     }
 
@@ -199,27 +225,39 @@ impl<'a> ScriptEngine<'a> {
             match &instruction {
                 Instruction::PushBytes(data) => {
                     let len = data.len();
-                    if len == 0 {
-                        // OP_0
+                    // Determine the opcode byte used for this push (for MINIMALDATA checking)
+                    let push_opcode_byte = if len == 0 {
                         byte_pos += 1;
+                        Opcode::OP_0 as u8
                     } else if len <= 75 {
+                        let ob = script_bytes[_instr_start];
                         byte_pos += 1 + len;
+                        ob
                     } else if len <= 0xff {
+                        let ob = script_bytes[_instr_start];
                         byte_pos += 2 + len; // OP_PUSHDATA1 + 1 byte len
+                        ob
                     } else if len <= 0xffff {
+                        let ob = script_bytes[_instr_start];
                         byte_pos += 3 + len; // OP_PUSHDATA2 + 2 byte len
+                        ob
                     } else {
+                        let ob = script_bytes[_instr_start];
                         byte_pos += 5 + len; // OP_PUSHDATA4 + 4 byte len
-                    }
-
-                    if len == 0 {
-                        // OP_0 is handled as Op(OP_0) by the iterator, not PushBytes
-                        // (but just in case)
-                    }
+                        ob
+                    };
 
                     if data.len() > MAX_PUSH_SIZE {
                         return Err(ScriptError::PushSizeLimit);
                     }
+
+                    // MINIMALDATA: reject non-minimal push encodings
+                    if self.flags.verify_minimaldata && executing(&exec_stack) {
+                        if !is_minimal_push(data, push_opcode_byte) {
+                            return Err(ScriptError::MinimalData);
+                        }
+                    }
+
                     if executing(&exec_stack) {
                         self.push(data.to_vec())?;
                     }
@@ -236,12 +274,26 @@ impl<'a> ScriptEngine<'a> {
                         }
                     }
 
+                    // These opcodes are ALWAYS illegal, even in unexecuted branches
+                    match op {
+                        Opcode::OP_VERIF | Opcode::OP_VERNOTIF => {
+                            return Err(ScriptError::DisabledOpcode(op));
+                        }
+                        _ => {}
+                    }
+
                     // Handle flow control even when not executing
                     match op {
                         Opcode::OP_IF | Opcode::OP_NOTIF => {
                             let mut val = false;
                             if executing(&exec_stack) {
                                 let top = self.pop()?;
+                                // MINIMALIF: argument must be empty or exactly 0x01
+                                if self.flags.verify_minimalif {
+                                    if !top.is_empty() && top != [0x01] {
+                                        return Err(ScriptError::MinimalIf);
+                                    }
+                                }
                                 val = !is_false(&top);
                                 if op == Opcode::OP_NOTIF {
                                     val = !val;
@@ -268,7 +320,17 @@ impl<'a> ScriptEngine<'a> {
                         _ => {}
                     }
 
+                    // Disabled opcodes are also illegal in unexecuted branches
                     if !executing(&exec_stack) {
+                        match op {
+                            Opcode::OP_CAT | Opcode::OP_SUBSTR | Opcode::OP_LEFT | Opcode::OP_RIGHT |
+                            Opcode::OP_INVERT | Opcode::OP_AND | Opcode::OP_OR | Opcode::OP_XOR |
+                            Opcode::OP_2MUL | Opcode::OP_2DIV | Opcode::OP_MUL | Opcode::OP_DIV |
+                            Opcode::OP_MOD | Opcode::OP_LSHIFT | Opcode::OP_RSHIFT => {
+                                return Err(ScriptError::DisabledOpcode(op));
+                            }
+                            _ => {}
+                        }
                         continue;
                     }
 
@@ -351,6 +413,20 @@ impl<'a> ScriptEngine<'a> {
 
     pub fn stack(&self) -> &[Vec<u8>] {
         &self.stack
+    }
+
+    /// Check the CLEANSTACK rule: after script execution succeeds, the stack
+    /// must have exactly 1 element. Call this after execute() and success() return OK.
+    pub fn check_cleanstack(&self) -> Result<(), ScriptError> {
+        if self.flags.verify_cleanstack && self.stack.len() != 1 {
+            return Err(ScriptError::CleanStack);
+        }
+        Ok(())
+    }
+
+    /// Return the flags being used by this engine.
+    pub fn flags(&self) -> &ScriptFlags {
+        &self.flags
     }
 
     fn push(&mut self, data: Vec<u8>) -> Result<(), ScriptError> {
@@ -607,6 +683,10 @@ impl<'a> ScriptEngine<'a> {
                 let pubkey = self.pop()?;
                 let sig = self.pop()?;
                 let result = self.verify_signature(&sig, &pubkey)?;
+                // NULLFAIL: non-empty signature that fails must error
+                if !result && !sig.is_empty() && self.flags.verify_nullfail {
+                    return Err(ScriptError::NullFail);
+                }
                 self.push(if result { encode_num(1) } else { encode_num(0) })?;
             }
             Opcode::OP_CHECKSIGVERIFY => {
@@ -614,6 +694,10 @@ impl<'a> ScriptEngine<'a> {
                 let sig = self.pop()?;
                 let result = self.verify_signature(&sig, &pubkey)?;
                 if !result {
+                    // NULLFAIL: non-empty signature that fails must give NULLFAIL error
+                    if !sig.is_empty() && self.flags.verify_nullfail {
+                        return Err(ScriptError::NullFail);
+                    }
                     return Err(ScriptError::CheckSigFailed);
                 }
             }
@@ -653,7 +737,7 @@ impl<'a> ScriptEngine<'a> {
                 } else {
                     let sequence = decode_num(self.top()?)?;
                     if sequence < 0 {
-                        // negative = NOP behavior
+                        return Err(ScriptError::NegativeLocktime);
                     } else {
                         let sequence = sequence as u32;
                         if sequence & (1 << 31) != 0 {
@@ -698,9 +782,13 @@ impl<'a> ScriptEngine<'a> {
                             taproot_internal_key: None,
                         };
                         plugin.execute(&mut ctx)?;
+                    } else if self.flags.verify_discourage_upgradable_nops {
+                        return Err(ScriptError::DiscourageUpgradableNops);
                     }
+                } else if self.flags.verify_discourage_upgradable_nops {
+                    return Err(ScriptError::DiscourageUpgradableNops);
                 }
-                // If no plugin registered, silently succeed (NOP behavior)
+                // If no plugin registered and flag not set, silently succeed (NOP behavior)
             }
 
             // Disabled opcodes — if a plugin overrides one (e.g. OP_CAT in
@@ -858,6 +946,15 @@ impl<'a> ScriptEngine<'a> {
                     }
                 }
 
+                // NULLFAIL: if verification failed, check if any sig was non-empty
+                if !success && self.flags.verify_nullfail {
+                    for sig in &sigs {
+                        if !sig.is_empty() {
+                            return Err(ScriptError::NullFail);
+                        }
+                    }
+                }
+
                 if op == Opcode::OP_CHECKMULTISIG {
                     self.push(if success { encode_num(1) } else { encode_num(0) })?;
                 } else {
@@ -943,6 +1040,65 @@ pub fn decode_num(data: &[u8]) -> Result<i64, ScriptError> {
     }
 
     Ok(result)
+}
+
+/// Check if a script contains only push operations (no opcodes > OP_16 except push data ops).
+/// Used for SIGPUSHONLY enforcement.
+pub fn is_push_only(script: &Script) -> bool {
+    for instruction in script.instructions() {
+        match instruction {
+            Ok(Instruction::PushBytes(_)) => {} // push data is OK
+            Ok(Instruction::Op(op)) => {
+                // OP_0 (0x00) through OP_16 (0x60) are push-value opcodes
+                // OP_1NEGATE (0x4f) is also a push-value opcode
+                // OP_RESERVED (0x50) is NOT a push opcode
+                let b = op as u8;
+                if b > Opcode::OP_16 as u8 {
+                    return false;
+                }
+                // OP_RESERVED (0x50) is between OP_1NEGATE and OP_1 — it is NOT push-only
+                if op == Opcode::OP_RESERVED {
+                    return false;
+                }
+            }
+            Err(_) => return false, // parse error
+        }
+    }
+    true
+}
+
+/// Check if a push encoding is minimal (MINIMALDATA enforcement).
+/// Returns true if the encoding is minimal, false otherwise.
+fn is_minimal_push(data: &[u8], opcode_byte: u8) -> bool {
+    let len = data.len();
+    if len == 0 {
+        // Should have used OP_0
+        return opcode_byte == Opcode::OP_0 as u8;
+    }
+    if len == 1 {
+        let val = data[0];
+        if val >= 1 && val <= 16 {
+            // Should have used OP_1 through OP_16
+            return opcode_byte == (Opcode::OP_1 as u8 + val - 1);
+        }
+        if val == 0x81 {
+            // Should have used OP_1NEGATE
+            return opcode_byte == Opcode::OP_1NEGATE as u8;
+        }
+    }
+    if len <= 75 {
+        // Should have used a direct push (opcode = length)
+        return opcode_byte == len as u8;
+    }
+    if len <= 255 {
+        // Should have used OP_PUSHDATA1
+        return opcode_byte == Opcode::OP_PUSHDATA1 as u8;
+    }
+    if len <= 65535 {
+        // Should have used OP_PUSHDATA2
+        return opcode_byte == Opcode::OP_PUSHDATA2 as u8;
+    }
+    true
 }
 
 /// Check if a stack element represents false (empty or all zeros, or negative zero)

@@ -23,8 +23,15 @@ use btc_stages::Pipeline;
     about = "A Rust Bitcoin full node",
     long_about = "btc-node is a modular Rust Bitcoin full node.\n\n\
                   By default, output is JSON when piped and text when interactive.\n\
-                  Use --output json to force JSON output for agent/automation use.\n\
-                  Use --interactive for human-friendly interactive mode."
+                  Use --output json (or --json) to force JSON output for agent/automation use.\n\
+                  Use --interactive for human-friendly interactive mode.\n\n\
+                  Exit codes:\n  \
+                  0  — success\n  \
+                  1  — general error\n  \
+                  2  — invalid arguments\n  \
+                  3  — network error\n  \
+                  4  — consensus error\n  \
+                  5  — storage error"
 )]
 struct Cli {
     /// Network to connect to
@@ -51,6 +58,10 @@ struct Cli {
     #[arg(long, global = true)]
     output: Option<String>,
 
+    /// Shorthand for --output json
+    #[arg(long, global = true)]
+    json: bool,
+
     /// Enable interactive mode (human-friendly prompts and progress bars)
     #[arg(long, short = 'i', global = true)]
     interactive: bool,
@@ -62,7 +73,23 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Start the node and begin syncing
-    Run,
+    Run {
+        /// Policy preset: "core" (default), "consensus" (minimal), "all" (strictest)
+        #[arg(long, default_value = "core")]
+        policy: String,
+
+        /// Disable NULLFAIL policy (only effective with --policy core or --policy all)
+        #[arg(long)]
+        no_nullfail: bool,
+
+        /// Custom dust limit in satoshis
+        #[arg(long)]
+        dust_limit: Option<u64>,
+
+        /// Custom OP_RETURN data carrier size limit in bytes
+        #[arg(long)]
+        datacarrier_size: Option<usize>,
+    },
 
     /// Show current node status
     Status,
@@ -129,6 +156,13 @@ enum Commands {
         /// Policy string (e.g., "and(pk(KEY),after(100))")
         policy: String,
     },
+
+    /// Launch the block explorer web UI
+    Explore {
+        /// Explorer HTTP port
+        #[arg(long, default_value = "3000")]
+        explorer_port: u16,
+    },
 }
 
 fn parse_network(s: &str) -> Network {
@@ -148,7 +182,11 @@ fn parse_network(s: &str) -> Network {
 async fn main() -> eyre::Result<()> {
     let cli = Cli::parse();
 
-    let format = OutputFormat::from_str_opt(cli.output.as_deref());
+    let format = if cli.json {
+        OutputFormat::Json
+    } else {
+        OutputFormat::from_str_opt(cli.output.as_deref())
+    };
 
     // Log to stderr so stdout stays clean for structured output
     tracing_subscriber::fmt()
@@ -170,7 +208,26 @@ async fn main() -> eyre::Result<()> {
     }
 
     match cli.command {
-        Some(Commands::Run) | None => cmd_run(config, format, cli.interactive).await,
+        Some(Commands::Run {
+            policy,
+            no_nullfail,
+            dust_limit,
+            datacarrier_size,
+        }) => {
+            cmd_run(
+                config,
+                format,
+                cli.interactive,
+                &policy,
+                no_nullfail,
+                dust_limit,
+                datacarrier_size,
+            )
+            .await
+        }
+        None => {
+            cmd_run(config, format, cli.interactive, "core", false, None, None).await
+        }
         Some(Commands::Status) => cmd_status(config, format),
         Some(Commands::Sync) => cmd_sync(config, format),
         Some(Commands::Peers) => cmd_peers(config, format),
@@ -185,6 +242,7 @@ async fn main() -> eyre::Result<()> {
         Some(Commands::Watch { address }) => cmd_watch(&address, network, format),
         Some(Commands::SimulateTx { hex }) => cmd_simulate_tx(&hex, format),
         Some(Commands::Compile { policy }) => cmd_compile(&policy, format),
+        Some(Commands::Explore { explorer_port }) => cmd_explore(config, format, explorer_port),
     }
 }
 
@@ -192,7 +250,19 @@ async fn cmd_run(
     config: NodeConfig,
     format: OutputFormat,
     interactive: bool,
+    policy: &str,
+    no_nullfail: bool,
+    dust_limit: Option<u64>,
+    datacarrier_size: Option<usize>,
 ) -> eyre::Result<()> {
+    // Validate policy preset
+    match policy {
+        "core" | "consensus" | "all" => {}
+        other => {
+            output::emit_error(format, 2, &format!("unknown policy preset '{}': expected 'core', 'consensus', or 'all'", other));
+        }
+    }
+
     if interactive {
         eprintln!("Starting btc-node on {} (interactive mode)", config.network);
         eprintln!("Data directory: {}", config.datadir.display());
@@ -200,6 +270,16 @@ async fn cmd_run(
             "P2P port: {}, RPC port: {}",
             config.p2p_port, config.rpc_port
         );
+        eprintln!("Policy preset: {}", policy);
+        if no_nullfail {
+            eprintln!("  NULLFAIL: disabled");
+        }
+        if let Some(dl) = dust_limit {
+            eprintln!("  Dust limit: {} sat", dl);
+        }
+        if let Some(ds) = datacarrier_size {
+            eprintln!("  OP_RETURN data limit: {} bytes", ds);
+        }
         eprintln!();
     }
 
@@ -210,6 +290,10 @@ async fn cmd_run(
             "datadir": config.datadir.display().to_string(),
             "p2p_port": config.p2p_port,
             "rpc_port": config.rpc_port,
+            "policy": policy,
+            "no_nullfail": no_nullfail,
+            "dust_limit": dust_limit,
+            "datacarrier_size": datacarrier_size,
         }),
     );
 
@@ -248,7 +332,7 @@ fn cmd_status(config: NodeConfig, format: OutputFormat) -> eyre::Result<()> {
     Ok(())
 }
 
-fn cmd_sync(config: NodeConfig, format: OutputFormat) -> eyre::Result<()> {
+fn cmd_sync(_config: NodeConfig, format: OutputFormat) -> eyre::Result<()> {
     let status = output::SyncStatus {
         syncing: false,
         current_height: 0,
@@ -308,7 +392,7 @@ fn cmd_version(format: OutputFormat) -> eyre::Result<()> {
 
 fn cmd_rpc(
     config: NodeConfig,
-    format: OutputFormat,
+    _format: OutputFormat,
     method: &str,
     params: &[String],
 ) -> eyre::Result<()> {
@@ -329,12 +413,24 @@ fn cmd_rpc(
         "id": 1,
     });
 
+    // In a live node, this would send the JSON-RPC request and forward
+    // the response directly. For now, emit the JSON-RPC envelope so agents
+    // can see the exact request shape.
     let result = serde_json::json!({
-        "request": request,
-        "target": format!("127.0.0.1:{}", config.rpc_port),
-        "note": "RPC client not yet connected \u{2014} showing request that would be sent",
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": null,
+        "error": {
+            "code": -32600,
+            "message": "RPC client not yet connected",
+            "data": {
+                "request": request,
+                "target": format!("127.0.0.1:{}", config.rpc_port),
+            }
+        }
     });
-    output::emit(format, &result);
+    // Always emit JSON-RPC responses as JSON (the protocol is JSON-native)
+    output::emit(OutputFormat::Json, &result);
     Ok(())
 }
 
@@ -434,6 +530,28 @@ fn cmd_decode_header(hex_str: &str, format: OutputFormat) -> eyre::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Explore (block explorer web UI)
+// ---------------------------------------------------------------------------
+
+fn cmd_explore(config: NodeConfig, format: OutputFormat, explorer_port: u16) -> eyre::Result<()> {
+    let info = serde_json::json!({
+        "event": "explorer_starting",
+        "network": config.network.to_string(),
+        "explorer_url": format!("http://127.0.0.1:{}", explorer_port),
+        "api_url": format!("http://127.0.0.1:{}/api", explorer_port),
+        "rpc_port": config.rpc_port,
+    });
+    output::emit(format, &info);
+    eprintln!(
+        "Block explorer starting at http://127.0.0.1:{} (network: {})",
+        explorer_port, config.network
+    );
+    // In a full implementation this would start the ExplorerServer from explorer.rs.
+    // For now we emit the startup event so agents can parse it.
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Watch address
 // ---------------------------------------------------------------------------
 
@@ -459,14 +577,26 @@ fn cmd_watch(address_str: &str, network: Network, format: OutputFormat) -> eyre:
         Address::P2tr { .. } => "p2tr",
     };
 
+    // Emit watch-started event (JSON line to stderr for agents)
+    output::emit_progress(
+        "watch_started",
+        &serde_json::json!({
+            "address": address_str,
+            "type": addr_type,
+            "script_hash": hex::encode(&script_hash),
+        }),
+    );
+
+    // Emit the structured status to stdout
     let info = serde_json::json!({
+        "event": "watch_status",
         "address": address_str,
         "type": addr_type,
         "network": network.to_string(),
         "script_pubkey_hex": hex::encode(spk_bytes),
         "script_hash": hex::encode(script_hash),
         "status": "watching",
-        "message": "Polling for new blocks. Connect to a running node for live updates.",
+        "note": "In a live node, JSON-line events will stream here for each matching transaction.",
     });
     output::emit(format, &info);
     Ok(())

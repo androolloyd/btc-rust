@@ -4,11 +4,13 @@
 //! Bitcoin Core's expected outcomes from its official test vectors.  Any
 //! divergence is a consensus bug.
 
-use btc_consensus::script_engine::{encode_num, ScriptEngine, ScriptFlags};
+use btc_consensus::script_engine::{encode_num, is_push_only, ScriptEngine, ScriptFlags};
 use btc_consensus::sig_verify::Secp256k1Verifier;
+use btc_primitives::amount::Amount;
 use btc_primitives::encode::Decodable;
+use btc_primitives::hash::TxHash;
 use btc_primitives::script::{Opcode, ScriptBuf};
-use btc_primitives::transaction::Transaction;
+use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut, Witness};
 
 // ---------------------------------------------------------------------------
 // Script text parser – mirrors Bitcoin Core's `script_tests.json` format
@@ -371,10 +373,15 @@ fn parse_flags(s: &str) -> ScriptFlags {
             "CHECKSEQUENCEVERIFY" => flags.verify_checksequenceverify = true,
             "WITNESS" => flags.verify_witness = true,
             "TAPROOT" => flags.verify_taproot = true,
+            "SIGPUSHONLY" => flags.verify_sigpushonly = true,
+            "MINIMALDATA" => flags.verify_minimaldata = true,
+            "DISCOURAGE_UPGRADABLE_NOPS" => flags.verify_discourage_upgradable_nops = true,
+            "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM" => flags.verify_discourage_upgradable_witness_program = true,
+            "MINIMALIF" => flags.verify_minimalif = true,
+            "NULLFAIL" => flags.verify_nullfail = true,
+            "CONST_SCRIPTCODE" => flags.verify_const_scriptcode = true,
             // Flags our engine does not yet model — accepted but not wired
-            "SIGPUSHONLY" | "MINIMALDATA" | "DISCOURAGE_UPGRADABLE_NOPS"
-            | "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM" | "MINIMALIF" | "NULLFAIL"
-            | "WITNESS_PUBKEYTYPE" | "CONST_SCRIPTCODE" | "NONE" | "" => {}
+            "WITNESS_PUBKEYTYPE" | "NONE" | "" => {}
             other => {
                 eprintln!("  [warn] unknown flag: {other}");
             }
@@ -390,9 +397,7 @@ fn has_unimplemented_flag(flag_str: &str) -> bool {
     for flag in flag_str.split(',') {
         match flag.trim() {
             // These flags require validation logic we have not wired yet.
-            "SIGPUSHONLY" | "MINIMALDATA" | "DISCOURAGE_UPGRADABLE_NOPS"
-            | "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM" | "MINIMALIF" | "NULLFAIL"
-            | "WITNESS_PUBKEYTYPE" | "CONST_SCRIPTCODE" => return true,
+            "WITNESS_PUBKEYTYPE" => return true,
             _ => {}
         }
     }
@@ -409,13 +414,34 @@ fn expected_success(result_str: &str) -> bool {
     result_str == "OK"
 }
 
-/// Classify our engine's outcome into a single boolean: did it succeed?
-fn engine_succeeded(
-    sig_exec_result: &Result<(), btc_consensus::script_engine::ScriptError>,
-    pubkey_exec_result: &Result<(), btc_consensus::script_engine::ScriptError>,
-    engine_success_flag: bool,
-) -> bool {
-    sig_exec_result.is_ok() && pubkey_exec_result.is_ok() && engine_success_flag
+// ---------------------------------------------------------------------------
+// Mock transaction builder
+// ---------------------------------------------------------------------------
+
+/// Build a minimal mock transaction for CHECKSIG support in script_tests.json.
+///
+/// Bitcoin Core's test vectors assume a transaction context exists even when
+/// none is provided in the vector itself. The sighash is computed over:
+///   - version = 1
+///   - one input spending a dummy outpoint with the given scriptSig
+///   - one output with the given amount
+///   - locktime = 0
+///   - sequence = 0xffffffff
+fn build_mock_tx(script_sig: &ScriptBuf, amount_sat: i64) -> Transaction {
+    Transaction {
+        version: 1,
+        inputs: vec![TxIn {
+            previous_output: OutPoint::new(TxHash::ZERO, 0xffffffff),
+            script_sig: script_sig.clone(),
+            sequence: 0xffffffff,
+        }],
+        outputs: vec![TxOut {
+            value: Amount::from_sat(amount_sat),
+            script_pubkey: ScriptBuf::new(),
+        }],
+        witness: vec![],
+        lock_time: 0,
+    }
 }
 
 // ========================== TEST 1: script_tests.json ======================
@@ -507,41 +533,86 @@ fn differential_script_tests() {
 
         let expected_ok = expected_success(expected_str);
 
+        // ---- Build a mock transaction for CHECKSIG support ---------------
+        // Bitcoin Core's script_tests.json assumes a transaction context exists.
+        // We build a minimal spending transaction so that sighash computation works.
+        let mock_tx = build_mock_tx(&script_sig, _amount_sat);
+
         // ---- Execute: scriptSig then scriptPubKey -------------------------
-        let mut engine = ScriptEngine::new_without_tx(&verifier, flags);
+        let mut engine = ScriptEngine::new(
+            &verifier,
+            flags,
+            Some(&mock_tx),
+            0,
+            _amount_sat,
+        );
 
-        let sig_result = engine.execute(script_sig.as_script());
-        let sig_ok = sig_result.is_ok();
-        let sig_err_msg = match &sig_result {
-            Err(e) => Some(format!("scriptSig error: {e}")),
-            Ok(_) => None,
-        };
-
-        let pub_result = if sig_ok {
-            engine.execute(script_pubkey.as_script())
+        // SIGPUSHONLY check: scriptSig must contain only push operations
+        let sigpushonly_fail = if flags.verify_sigpushonly {
+            !is_push_only(script_sig.as_script())
         } else {
-            // Carry forward the failure; pubkey not executed
-            Err(sig_result.unwrap_err())
-        };
-        let pub_ok = pub_result.is_ok();
-        let pub_err_msg = match &pub_result {
-            Err(e) => Some(format!("scriptPubKey error: {e}")),
-            Ok(_) => None,
+            false
         };
 
-        let our_ok = sig_ok && pub_ok && engine.success();
+        let our_ok = if sigpushonly_fail {
+            false
+        } else {
+            let sig_result = engine.execute(script_sig.as_script());
+            let sig_ok = sig_result.is_ok();
+
+            let pub_result = if sig_ok {
+                engine.execute(script_pubkey.as_script())
+            } else {
+                Err(sig_result.unwrap_err())
+            };
+            let pub_ok = pub_result.is_ok();
+
+            if sig_ok && pub_ok && engine.success() {
+                // CLEANSTACK check: after execution, stack must have exactly 1 element
+                engine.check_cleanstack().is_ok()
+            } else {
+                false
+            }
+        };
+
+        // Compute error detail for divergence reporting
+        let err_detail = if sigpushonly_fail {
+            "SIGPUSHONLY failed".to_string()
+        } else {
+            // Re-execute to get the error message for reporting
+            let mut engine2 = ScriptEngine::new(
+                &verifier,
+                flags,
+                Some(&mock_tx),
+                0,
+                _amount_sat,
+            );
+            let sig_result = engine2.execute(script_sig.as_script());
+            match sig_result {
+                Err(e) => format!("scriptSig error: {e}"),
+                Ok(_) => {
+                    let pub_result = engine2.execute(script_pubkey.as_script());
+                    match pub_result {
+                        Err(e) => format!("scriptPubKey error: {e}"),
+                        Ok(_) => {
+                            if !engine2.success() {
+                                format!("stack top = false")
+                            } else {
+                                match engine2.check_cleanstack() {
+                                    Err(e) => format!("cleanstack: {e}"),
+                                    Ok(_) => format!("stack top = {}", engine2.success()),
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
 
         if our_ok == expected_ok {
             passed += 1;
         } else {
             failed += 1;
-            let err_detail = if let Some(ref m) = sig_err_msg {
-                m.clone()
-            } else if let Some(ref m) = pub_err_msg {
-                m.clone()
-            } else {
-                format!("stack top = {}", engine.success())
-            };
             let desc = format!(
                 "  [#{idx}] DIVERGENCE: expected={expected_str} got_ok={our_ok} | \
                  sig=\"{script_sig_str}\" pub=\"{script_pubkey_str}\" flags={flag_str} \
@@ -697,7 +768,7 @@ fn differential_tx_invalid() {
     let mut tested = 0u32;
     let mut passed = 0u32;
     let mut failed = 0u32;
-    let mut skipped = 0u32;
+    let skipped = 0u32;
     let mut divergences: Vec<String> = Vec::new();
 
     for (idx, vector) in vectors.as_array().unwrap().iter().enumerate() {
@@ -787,7 +858,6 @@ fn differential_tx_invalid() {
             "  NOTE: {failed} divergence(s) remain — see details above."
         );
     }
-    let _ = skipped;
 }
 
 // ---------------------------------------------------------------------------

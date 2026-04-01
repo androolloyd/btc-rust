@@ -73,17 +73,24 @@ pub fn emit_progress(event: &str, data: &serde_json::Value) {
     eprintln!("{}", serde_json::to_string(&msg).unwrap());
 }
 
-/// Emit an error and exit
+/// Emit an error and exit.
+///
+/// Error output always goes to stderr so that stdout remains clean for piping.
+/// When JSON format is active, a structured JSON error is also written to stdout
+/// so that agents can parse it.
 pub fn emit_error(format: OutputFormat, code: i32, message: &str) -> ! {
     match format {
         OutputFormat::Json => {
+            // Structured error on stdout for machine consumption
             let err = serde_json::json!({
                 "error": {
                     "code": code,
                     "message": message,
                 }
             });
-            println!("{}", serde_json::to_string(&err).unwrap());
+            let _ = writeln!(io::stdout(), "{}", serde_json::to_string(&err).unwrap());
+            // Also log to stderr for humans watching the terminal
+            eprintln!("error: {}", message);
         }
         OutputFormat::Text => {
             eprintln!("error: {}", message);

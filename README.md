@@ -216,6 +216,86 @@ fn test_full_flow() {
 }
 ```
 
+## Policy Configuration
+
+btc-rust lets you tune your node's validation policy without forking:
+
+### Presets
+
+```bash
+# Match Bitcoin Core exactly (default)
+btc-node run --policy core
+
+# Consensus rules only — accept anything technically valid
+btc-node run --policy consensus
+
+# Maximum strictness
+btc-node run --policy all
+```
+
+### Individual flags
+
+```bash
+# Core-compliant but disable specific policies
+btc-node run --policy core --no-nullfail
+
+# Custom dust limit (satoshis)
+btc-node run --dust-limit 330
+
+# Custom OP_RETURN data limit (bytes)
+btc-node run --datacarrier-size 100000
+```
+
+### Policy presets detail
+
+| Flag | `consensus` | `core` | `all` |
+|------|:-----------:|:------:|:-----:|
+| P2SH | ✓ | ✓ | ✓ |
+| WITNESS | ✓ | ✓ | ✓ |
+| TAPROOT | ✓ | ✓ | ✓ |
+| CLTV/CSV | ✓ | ✓ | ✓ |
+| DERSIG | ✓ | ✓ | ✓ |
+| NULLDUMMY | ✓ | ✓ | ✓ |
+| SIGPUSHONLY | | ✓ | ✓ |
+| CLEANSTACK | | ✓ | ✓ |
+| NULLFAIL | | ✓ | ✓ |
+| MINIMALDATA | | ✓ | ✓ |
+| MINIMALIF | | | ✓ |
+| DISCOURAGE_UPGRADABLE_NOPS | | | ✓ |
+
+## Agent Integration
+
+btc-rust is designed to be operated by AI agents and automation:
+
+```bash
+# All commands support JSON output
+btc-node status --output json
+btc-node decode-tx <hex> --output json
+
+# Shorthand
+btc-node status --json
+
+# Progress events on stderr (JSON lines)
+btc-node run --output json 2>progress.jsonl
+
+# Pipe-friendly: data on stdout, logs on stderr
+btc-node decode-tx <hex> --json | jq '.txid'
+
+# Exit codes are meaningful
+btc-node decode-tx <invalid> --json; echo "exit: $?"
+```
+
+### Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Success |
+| 1 | General error |
+| 2 | Invalid arguments |
+| 3 | Network error |
+| 4 | Consensus error |
+| 5 | Storage error |
+
 ## Architecture
 
 11 crates in a Cargo workspace, each independently importable:
@@ -362,15 +442,30 @@ btc-node config       Show configuration
 btc-node init         Initialize data directory
 btc-node version      Show version info
 btc-node rpc METHOD   Send RPC command
+btc-node decode-tx    Decode raw transaction hex
+btc-node decode-script  Decode raw script hex
+btc-node decode-header  Decode raw block header hex
+btc-node watch ADDR   Watch address for transactions
+btc-node simulate-tx  Simulate transaction (dry run)
+btc-node compile      Compile miniscript policy to script
+btc-node explore      Launch block explorer web UI
+btc-node playground   Interactive script playground (no JSON mode)
 
 Flags:
   --network signet|testnet|mainnet|regtest
   --datadir PATH
   --output json|text     (auto-detects: JSON when piped)
+  --json                 (shorthand for --output json)
   --interactive          (human-friendly mode)
   --rpc-port PORT
   --port PORT
   --log-level LEVEL
+
+Run flags:
+  --policy core|consensus|all  (validation policy preset)
+  --no-nullfail               (disable NULLFAIL policy)
+  --dust-limit SATS           (custom dust limit)
+  --datacarrier-size BYTES    (custom OP_RETURN data limit)
 ```
 
 ## Testing
