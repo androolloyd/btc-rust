@@ -1699,4 +1699,1050 @@ mod tests {
         assert_eq!(registry.get(0xb7).unwrap().name(), "OP_TXHASH");
         assert_eq!(registry.get(0xb8).unwrap().name(), "OP_CHECKCONTRACTVERIFY");
     }
+
+    // -----------------------------------------------------------------------
+    // OpcodeRegistry: get returns None for unregistered opcode
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_registry_get_returns_none_for_unregistered() {
+        let registry = OpcodeRegistry::new();
+        assert!(registry.get(0xaa).is_none());
+        assert!(registry.get(0xb3).is_none());
+        assert!(!registry.has(0xaa));
+    }
+
+    #[test]
+    fn test_registry_default_is_empty() {
+        let registry = OpcodeRegistry::default();
+        assert!(!registry.has(0xb3));
+        assert!(registry.get(0xb3).is_none());
+    }
+
+    #[test]
+    fn test_registry_overwrite_plugin() {
+        let mut registry = OpcodeRegistry::new();
+        registry.register(Box::new(OpCheckTemplateVerify));
+        assert_eq!(registry.get(0xb3).unwrap().name(), "OP_CHECKTEMPLATEVERIFY");
+
+        // Register a different plugin at the same opcode byte
+        struct FakeCTV;
+        impl OpcodePlugin for FakeCTV {
+            fn opcode(&self) -> u8 { 0xb3 }
+            fn name(&self) -> &str { "FAKE_CTV" }
+            fn context(&self) -> OpcodeContext { OpcodeContext::Always }
+            fn execute(&self, _ctx: &mut OpcodeExecContext) -> Result<(), ScriptError> { Ok(()) }
+        }
+        registry.register(Box::new(FakeCTV));
+        assert_eq!(registry.get(0xb3).unwrap().name(), "FAKE_CTV");
+    }
+
+    // -----------------------------------------------------------------------
+    // OpcodeContext variants coverage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_opcode_context_variants() {
+        // NopUpgrade
+        let ctx = OpcodeContext::NopUpgrade;
+        assert_eq!(ctx, OpcodeContext::NopUpgrade);
+
+        // TapscriptOnly
+        let ctx2 = OpcodeContext::TapscriptOnly;
+        assert_eq!(ctx2, OpcodeContext::TapscriptOnly);
+        assert_ne!(ctx, ctx2);
+
+        // NetworkOnly
+        let ctx3 = OpcodeContext::NetworkOnly(vec![Network::Mainnet]);
+        assert_eq!(ctx3.clone(), OpcodeContext::NetworkOnly(vec![Network::Mainnet]));
+        assert_ne!(ctx3, OpcodeContext::NetworkOnly(vec![Network::Testnet]));
+
+        // Always
+        let ctx4 = OpcodeContext::Always;
+        assert_eq!(ctx4, OpcodeContext::Always);
+
+        // Debug formatting
+        let _ = format!("{:?}", ctx);
+        let _ = format!("{:?}", ctx2);
+        let _ = format!("{:?}", ctx3);
+        let _ = format!("{:?}", ctx4);
+    }
+
+    // -----------------------------------------------------------------------
+    // CTV: empty stack
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ctv_empty_stack_fails() {
+        let tx = make_ctv_test_tx();
+        let flags = ScriptFlags::none();
+        let mut stack: Vec<Vec<u8>> = Vec::new();
+        let mut altstack: Vec<Vec<u8>> = Vec::new();
+
+        let ctv = OpCheckTemplateVerify;
+        let mut ctx = OpcodeExecContext {
+            stack: &mut stack,
+            altstack: &mut altstack,
+            tx: Some(&tx),
+            input_index: 0,
+            input_amount: 0,
+            flags: &flags,
+            taproot_internal_key: None,
+        };
+
+        let result = ctv.execute(&mut ctx);
+        assert!(matches!(result, Err(ScriptError::StackUnderflow)));
+    }
+
+    // -----------------------------------------------------------------------
+    // OP_CAT: stack underflow with empty stack and with one element
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_opcat_empty_stack_underflow() {
+        let cat = OpCat;
+        let flags = ScriptFlags::none();
+        let mut stack: Vec<Vec<u8>> = Vec::new();
+        let mut altstack: Vec<Vec<u8>> = Vec::new();
+
+        let mut ctx = OpcodeExecContext {
+            stack: &mut stack,
+            altstack: &mut altstack,
+            tx: None,
+            input_index: 0,
+            input_amount: 0,
+            flags: &flags,
+            taproot_internal_key: None,
+        };
+
+        let result = cat.execute(&mut ctx);
+        assert!(matches!(result, Err(ScriptError::StackUnderflow)));
+    }
+
+    #[test]
+    fn test_opcat_one_element_underflow() {
+        let cat = OpCat;
+        let flags = ScriptFlags::none();
+        let mut stack: Vec<Vec<u8>> = vec![b"only".to_vec()];
+        let mut altstack: Vec<Vec<u8>> = Vec::new();
+
+        let mut ctx = OpcodeExecContext {
+            stack: &mut stack,
+            altstack: &mut altstack,
+            tx: None,
+            input_index: 0,
+            input_amount: 0,
+            flags: &flags,
+            taproot_internal_key: None,
+        };
+
+        let result = cat.execute(&mut ctx);
+        assert!(matches!(result, Err(ScriptError::StackUnderflow)));
+    }
+
+    #[test]
+    fn test_opcat_exactly_520_bytes_succeeds() {
+        let cat = OpCat;
+        let flags = ScriptFlags::none();
+        let mut stack: Vec<Vec<u8>> = vec![vec![0x41; 260], vec![0x42; 260]];
+        let mut altstack: Vec<Vec<u8>> = Vec::new();
+
+        let mut ctx = OpcodeExecContext {
+            stack: &mut stack,
+            altstack: &mut altstack,
+            tx: None,
+            input_index: 0,
+            input_amount: 0,
+            flags: &flags,
+            taproot_internal_key: None,
+        };
+
+        cat.execute(&mut ctx).unwrap();
+        assert_eq!(ctx.stack.len(), 1);
+        assert_eq!(ctx.stack[0].len(), 520);
+    }
+
+    #[test]
+    fn test_opcat_empty_elements() {
+        let cat = OpCat;
+        let flags = ScriptFlags::none();
+        let mut stack: Vec<Vec<u8>> = vec![vec![], vec![]];
+        let mut altstack: Vec<Vec<u8>> = Vec::new();
+
+        let mut ctx = OpcodeExecContext {
+            stack: &mut stack,
+            altstack: &mut altstack,
+            tx: None,
+            input_index: 0,
+            input_amount: 0,
+            flags: &flags,
+            taproot_internal_key: None,
+        };
+
+        cat.execute(&mut ctx).unwrap();
+        assert_eq!(ctx.stack.len(), 1);
+        assert_eq!(ctx.stack[0].len(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // CHECKSIGFROMSTACK: wrong pubkey length pushes false
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_checksigfromstack_wrong_pubkey_length() {
+        let flags = ScriptFlags::none();
+        let mut stack: Vec<Vec<u8>> = Vec::new();
+        let mut altstack: Vec<Vec<u8>> = Vec::new();
+
+        // Push sig (64 bytes), msg, pubkey with wrong length (33 bytes instead of 32)
+        stack.push(vec![0x00; 64]); // sig
+        stack.push(b"some message".to_vec()); // msg
+        stack.push(vec![0x02; 33]); // pubkey - wrong length
+
+        let csfs = OpCheckSigFromStack;
+        let mut ctx = OpcodeExecContext {
+            stack: &mut stack,
+            altstack: &mut altstack,
+            tx: None,
+            input_index: 0,
+            input_amount: 0,
+            flags: &flags,
+            taproot_internal_key: None,
+        };
+
+        csfs.execute(&mut ctx).unwrap();
+        // Should push false due to invalid pubkey length
+        assert_eq!(ctx.stack.len(), 1);
+        assert!(ctx.stack[0].is_empty());
+    }
+
+    #[test]
+    fn test_checksigfromstack_empty_pubkey() {
+        let flags = ScriptFlags::none();
+        let mut stack: Vec<Vec<u8>> = Vec::new();
+        let mut altstack: Vec<Vec<u8>> = Vec::new();
+
+        stack.push(vec![0x00; 64]); // sig
+        stack.push(b"msg".to_vec()); // msg
+        stack.push(vec![]); // empty pubkey
+
+        let csfs = OpCheckSigFromStack;
+        let mut ctx = OpcodeExecContext {
+            stack: &mut stack,
+            altstack: &mut altstack,
+            tx: None,
+            input_index: 0,
+            input_amount: 0,
+            flags: &flags,
+            taproot_internal_key: None,
+        };
+
+        csfs.execute(&mut ctx).unwrap();
+        assert_eq!(ctx.stack.len(), 1);
+        assert!(ctx.stack[0].is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // CHECKSIGFROMSTACK: stack underflow with 0 and 2 elements
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_checksigfromstack_empty_stack_underflow() {
+        let flags = ScriptFlags::none();
+        let mut stack: Vec<Vec<u8>> = Vec::new();
+        let mut altstack: Vec<Vec<u8>> = Vec::new();
+
+        let csfs = OpCheckSigFromStack;
+        let mut ctx = OpcodeExecContext {
+            stack: &mut stack,
+            altstack: &mut altstack,
+            tx: None,
+            input_index: 0,
+            input_amount: 0,
+            flags: &flags,
+            taproot_internal_key: None,
+        };
+
+        let result = csfs.execute(&mut ctx);
+        assert!(matches!(result, Err(ScriptError::StackUnderflow)));
+    }
+
+    #[test]
+    fn test_checksigfromstack_two_elements_underflow() {
+        let flags = ScriptFlags::none();
+        let mut stack: Vec<Vec<u8>> = vec![b"sig".to_vec(), b"pubkey".to_vec()];
+        let mut altstack: Vec<Vec<u8>> = Vec::new();
+
+        let csfs = OpCheckSigFromStack;
+        let mut ctx = OpcodeExecContext {
+            stack: &mut stack,
+            altstack: &mut altstack,
+            tx: None,
+            input_index: 0,
+            input_amount: 0,
+            flags: &flags,
+            taproot_internal_key: None,
+        };
+
+        let result = csfs.execute(&mut ctx);
+        assert!(matches!(result, Err(ScriptError::StackUnderflow)));
+    }
+
+    // -----------------------------------------------------------------------
+    // ANYPREVOUT execute path coverage
+    // -----------------------------------------------------------------------
+
+    fn make_anyprevout_test_tx() -> Transaction {
+        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
+        use btc_primitives::hash::TxHash;
+        use btc_primitives::amount::Amount;
+
+        Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0xaa; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(1_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76, 0xa9]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        }
+    }
+
+    #[test]
+    fn test_anyprevout_empty_stack_underflow() {
+        let flags = ScriptFlags::none();
+        let mut stack: Vec<Vec<u8>> = Vec::new();
+        let mut altstack: Vec<Vec<u8>> = Vec::new();
+
+        let op = OpCheckSigAnyprevout;
+        let mut ctx = OpcodeExecContext {
+            stack: &mut stack,
+            altstack: &mut altstack,
+            tx: None,
+            input_index: 0,
+            input_amount: 0,
+            flags: &flags,
+            taproot_internal_key: None,
+        };
+
+        let result = op.execute(&mut ctx);
+        assert!(matches!(result, Err(ScriptError::StackUnderflow)));
+    }
+
+    #[test]
+    fn test_anyprevout_one_element_underflow() {
+        let flags = ScriptFlags::none();
+        let mut stack: Vec<Vec<u8>> = vec![vec![0x02; 32]]; // only pubkey
+        let mut altstack: Vec<Vec<u8>> = Vec::new();
+
+        let op = OpCheckSigAnyprevout;
+        let mut ctx = OpcodeExecContext {
+            stack: &mut stack,
+            altstack: &mut altstack,
+            tx: None,
+            input_index: 0,
+            input_amount: 0,
+            flags: &flags,
+            taproot_internal_key: None,
+        };
+
+        let result = op.execute(&mut ctx);
+        assert!(matches!(result, Err(ScriptError::StackUnderflow)));
+    }
+
+    #[test]
+    fn test_anyprevout_wrong_pubkey_length() {
+        let flags = ScriptFlags::none();
+        let mut stack: Vec<Vec<u8>> = Vec::new();
+        let mut altstack: Vec<Vec<u8>> = Vec::new();
+
+        // Push sig (65 bytes), pubkey with wrong length
+        let mut sig = vec![0x00; 64];
+        sig.push(0x41); // SIGHASH_ANYPREVOUT
+        stack.push(sig);
+        stack.push(vec![0x02; 33]); // 33-byte pubkey - wrong
+
+        let op = OpCheckSigAnyprevout;
+        let mut ctx = OpcodeExecContext {
+            stack: &mut stack,
+            altstack: &mut altstack,
+            tx: None,
+            input_index: 0,
+            input_amount: 0,
+            flags: &flags,
+            taproot_internal_key: None,
+        };
+
+        op.execute(&mut ctx).unwrap();
+        assert_eq!(ctx.stack.len(), 1);
+        assert!(ctx.stack[0].is_empty()); // pushed false
+    }
+
+    #[test]
+    fn test_anyprevout_wrong_sig_length() {
+        let flags = ScriptFlags::none();
+        let mut stack: Vec<Vec<u8>> = Vec::new();
+        let mut altstack: Vec<Vec<u8>> = Vec::new();
+
+        // Push sig with wrong length (64 bytes instead of 65)
+        stack.push(vec![0x00; 64]);
+        stack.push(vec![0x02; 32]); // valid pubkey size
+
+        let op = OpCheckSigAnyprevout;
+        let mut ctx = OpcodeExecContext {
+            stack: &mut stack,
+            altstack: &mut altstack,
+            tx: None,
+            input_index: 0,
+            input_amount: 0,
+            flags: &flags,
+            taproot_internal_key: None,
+        };
+
+        op.execute(&mut ctx).unwrap();
+        assert_eq!(ctx.stack.len(), 1);
+        assert!(ctx.stack[0].is_empty()); // pushed false
+    }
+
+    #[test]
+    fn test_anyprevout_invalid_hash_type() {
+        let flags = ScriptFlags::none();
+        let mut stack: Vec<Vec<u8>> = Vec::new();
+        let mut altstack: Vec<Vec<u8>> = Vec::new();
+
+        // Push sig with invalid hash type byte (not 0x41 or 0x42)
+        let mut sig = vec![0x00; 64];
+        sig.push(0x01); // SIGHASH_ALL - not ANYPREVOUT
+        stack.push(sig);
+        stack.push(vec![0x02; 32]); // valid pubkey size
+
+        let op = OpCheckSigAnyprevout;
+        let mut ctx = OpcodeExecContext {
+            stack: &mut stack,
+            altstack: &mut altstack,
+            tx: None,
+            input_index: 0,
+            input_amount: 0,
+            flags: &flags,
+            taproot_internal_key: None,
+        };
+
+        op.execute(&mut ctx).unwrap();
+        assert_eq!(ctx.stack.len(), 1);
+        assert!(ctx.stack[0].is_empty()); // pushed false
+    }
+
+    #[test]
+    fn test_anyprevout_no_tx_context_fails() {
+        let flags = ScriptFlags::none();
+        let mut stack: Vec<Vec<u8>> = Vec::new();
+        let mut altstack: Vec<Vec<u8>> = Vec::new();
+
+        // Valid sig length with ANYPREVOUT hash type
+        let mut sig = vec![0x00; 64];
+        sig.push(0x41); // SIGHASH_ANYPREVOUT
+        stack.push(sig);
+        stack.push(vec![0x02; 32]); // valid pubkey
+
+        let op = OpCheckSigAnyprevout;
+        let mut ctx = OpcodeExecContext {
+            stack: &mut stack,
+            altstack: &mut altstack,
+            tx: None, // no tx context
+            input_index: 0,
+            input_amount: 0,
+            flags: &flags,
+            taproot_internal_key: None,
+        };
+
+        let result = op.execute(&mut ctx);
+        assert!(matches!(result, Err(ScriptError::VerifyFailed)));
+    }
+
+    #[test]
+    fn test_anyprevout_invalid_sig_verify_pushes_false() {
+        let tx = make_anyprevout_test_tx();
+        let flags = ScriptFlags::none();
+        let mut stack: Vec<Vec<u8>> = Vec::new();
+        let mut altstack: Vec<Vec<u8>> = Vec::new();
+
+        // Generate a valid pubkey so key parsing succeeds
+        let secp = secp256k1::Secp256k1::new();
+        let (_secret_key, public_key) = secp.generate_keypair(&mut secp256k1::rand::thread_rng());
+        let (xonly_pubkey, _parity) = public_key.x_only_public_key();
+
+        // Push an invalid 65-byte sig (all zeros + ANYPREVOUT hash type)
+        // The sig will parse as a Schnorr sig but fail verification
+        let mut sig = vec![0x01; 64];
+        sig.push(0x41); // SIGHASH_ANYPREVOUT
+        stack.push(sig);
+        stack.push(xonly_pubkey.serialize().to_vec());
+
+        let op = OpCheckSigAnyprevout;
+        let mut ctx = OpcodeExecContext {
+            stack: &mut stack,
+            altstack: &mut altstack,
+            tx: Some(&tx),
+            input_index: 0,
+            input_amount: 50_000,
+            flags: &flags,
+            taproot_internal_key: None,
+        };
+
+        op.execute(&mut ctx).unwrap();
+        assert_eq!(ctx.stack.len(), 1);
+        assert!(ctx.stack[0].is_empty()); // pushed false - sig verification failed
+    }
+
+    #[test]
+    fn test_anyprevout_with_anyprevoutanyscript_hash_type() {
+        let tx = make_anyprevout_test_tx();
+        let flags = ScriptFlags::none();
+        let mut stack: Vec<Vec<u8>> = Vec::new();
+        let mut altstack: Vec<Vec<u8>> = Vec::new();
+
+        // Generate a valid pubkey
+        let secp = secp256k1::Secp256k1::new();
+        let (_secret_key, public_key) = secp.generate_keypair(&mut secp256k1::rand::thread_rng());
+        let (xonly_pubkey, _parity) = public_key.x_only_public_key();
+
+        // Push invalid sig with ANYPREVOUTANYSCRIPT hash type
+        let mut sig = vec![0x01; 64];
+        sig.push(0x42); // SIGHASH_ANYPREVOUTANYSCRIPT
+        stack.push(sig);
+        stack.push(xonly_pubkey.serialize().to_vec());
+
+        let op = OpCheckSigAnyprevout;
+        let mut ctx = OpcodeExecContext {
+            stack: &mut stack,
+            altstack: &mut altstack,
+            tx: Some(&tx),
+            input_index: 0,
+            input_amount: 50_000,
+            flags: &flags,
+            taproot_internal_key: None,
+        };
+
+        op.execute(&mut ctx).unwrap();
+        assert_eq!(ctx.stack.len(), 1);
+        // Sig is bogus, so it should push false
+        assert!(ctx.stack[0].is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // TXHASH: stack underflow and selector wrong size
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_txhash_empty_stack_underflow() {
+        let flags = ScriptFlags::none();
+        let mut stack: Vec<Vec<u8>> = Vec::new();
+        let mut altstack: Vec<Vec<u8>> = Vec::new();
+
+        let txhash = OpTxHash;
+        let mut ctx = OpcodeExecContext {
+            stack: &mut stack,
+            altstack: &mut altstack,
+            tx: None,
+            input_index: 0,
+            input_amount: 0,
+            flags: &flags,
+            taproot_internal_key: None,
+        };
+
+        let result = txhash.execute(&mut ctx);
+        assert!(matches!(result, Err(ScriptError::StackUnderflow)));
+    }
+
+    #[test]
+    fn test_txhash_selector_wrong_size() {
+        let tx = make_ctv_test_tx();
+        let flags = ScriptFlags::none();
+        let mut stack: Vec<Vec<u8>> = Vec::new();
+        let mut altstack: Vec<Vec<u8>> = Vec::new();
+
+        // Push a 2-byte selector (wrong size, should be 1 byte)
+        stack.push(vec![0x00, 0x01]);
+
+        let txhash = OpTxHash;
+        let mut ctx = OpcodeExecContext {
+            stack: &mut stack,
+            altstack: &mut altstack,
+            tx: Some(&tx),
+            input_index: 0,
+            input_amount: 0,
+            flags: &flags,
+            taproot_internal_key: None,
+        };
+
+        let result = txhash.execute(&mut ctx);
+        assert!(matches!(result, Err(ScriptError::VerifyFailed)));
+    }
+
+    #[test]
+    fn test_txhash_empty_selector_wrong_size() {
+        let tx = make_ctv_test_tx();
+        let flags = ScriptFlags::none();
+        let mut stack: Vec<Vec<u8>> = Vec::new();
+        let mut altstack: Vec<Vec<u8>> = Vec::new();
+
+        // Push an empty selector (wrong size)
+        stack.push(vec![]);
+
+        let txhash = OpTxHash;
+        let mut ctx = OpcodeExecContext {
+            stack: &mut stack,
+            altstack: &mut altstack,
+            tx: Some(&tx),
+            input_index: 0,
+            input_amount: 0,
+            flags: &flags,
+            taproot_internal_key: None,
+        };
+
+        let result = txhash.execute(&mut ctx);
+        assert!(matches!(result, Err(ScriptError::VerifyFailed)));
+    }
+
+    #[test]
+    fn test_txhash_each_selector_individually() {
+        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
+        use btc_primitives::hash::TxHash;
+        use btc_primitives::amount::Amount;
+
+        let tx = Transaction {
+            version: 3,
+            inputs: vec![
+                TxIn {
+                    previous_output: OutPoint::new(TxHash::from_bytes([0xaa; 32]), 0),
+                    script_sig: ScriptBuf::from_bytes(vec![]),
+                    sequence: 0xfffffffe,
+                },
+                TxIn {
+                    previous_output: OutPoint::new(TxHash::from_bytes([0xbb; 32]), 1),
+                    script_sig: ScriptBuf::from_bytes(vec![]),
+                    sequence: 0xffffffff,
+                },
+            ],
+            outputs: vec![
+                TxOut {
+                    value: Amount::from_sat(1_000_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x76, 0xa9]),
+                },
+                TxOut {
+                    value: Amount::from_sat(2_000_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x20]),
+                },
+            ],
+            witness: Vec::new(),
+            lock_time: 123456,
+        };
+
+        let txhash = OpTxHash;
+        let flags = ScriptFlags::none();
+
+        // Selector 0x00: all fields
+        {
+            let mut stack: Vec<Vec<u8>> = vec![vec![0x00]];
+            let mut altstack: Vec<Vec<u8>> = Vec::new();
+            let mut ctx = OpcodeExecContext {
+                stack: &mut stack, altstack: &mut altstack,
+                tx: Some(&tx), input_index: 0, input_amount: 0,
+                flags: &flags, taproot_internal_key: None,
+            };
+            txhash.execute(&mut ctx).unwrap();
+            assert_eq!(ctx.stack[0].len(), 32);
+
+            // Verify determinism: expected = SHA256(version || locktime || inputs_count || outputs_count)
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&tx.version.to_le_bytes());
+            buf.extend_from_slice(&tx.lock_time.to_le_bytes());
+            buf.extend_from_slice(&(tx.inputs.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&(tx.outputs.len() as u32).to_le_bytes());
+            assert_eq!(ctx.stack[0], sha256(&buf).to_vec());
+        }
+
+        // Selector 0x01: version
+        {
+            let mut stack: Vec<Vec<u8>> = vec![vec![0x01]];
+            let mut altstack: Vec<Vec<u8>> = Vec::new();
+            let mut ctx = OpcodeExecContext {
+                stack: &mut stack, altstack: &mut altstack,
+                tx: Some(&tx), input_index: 0, input_amount: 0,
+                flags: &flags, taproot_internal_key: None,
+            };
+            txhash.execute(&mut ctx).unwrap();
+            assert_eq!(ctx.stack[0], sha256(&tx.version.to_le_bytes()).to_vec());
+        }
+
+        // Selector 0x02: locktime
+        {
+            let mut stack: Vec<Vec<u8>> = vec![vec![0x02]];
+            let mut altstack: Vec<Vec<u8>> = Vec::new();
+            let mut ctx = OpcodeExecContext {
+                stack: &mut stack, altstack: &mut altstack,
+                tx: Some(&tx), input_index: 0, input_amount: 0,
+                flags: &flags, taproot_internal_key: None,
+            };
+            txhash.execute(&mut ctx).unwrap();
+            assert_eq!(ctx.stack[0], sha256(&tx.lock_time.to_le_bytes()).to_vec());
+        }
+
+        // Selector 0x03: inputs hash
+        {
+            let mut stack: Vec<Vec<u8>> = vec![vec![0x03]];
+            let mut altstack: Vec<Vec<u8>> = Vec::new();
+            let mut ctx = OpcodeExecContext {
+                stack: &mut stack, altstack: &mut altstack,
+                tx: Some(&tx), input_index: 0, input_amount: 0,
+                flags: &flags, taproot_internal_key: None,
+            };
+            txhash.execute(&mut ctx).unwrap();
+            assert_eq!(ctx.stack[0].len(), 32);
+        }
+
+        // Selector 0x04: outputs hash
+        {
+            let mut stack: Vec<Vec<u8>> = vec![vec![0x04]];
+            let mut altstack: Vec<Vec<u8>> = Vec::new();
+            let mut ctx = OpcodeExecContext {
+                stack: &mut stack, altstack: &mut altstack,
+                tx: Some(&tx), input_index: 0, input_amount: 0,
+                flags: &flags, taproot_internal_key: None,
+            };
+            txhash.execute(&mut ctx).unwrap();
+            assert_eq!(ctx.stack[0].len(), 32);
+        }
+
+        // Selector 0x05: sequences hash
+        {
+            let mut stack: Vec<Vec<u8>> = vec![vec![0x05]];
+            let mut altstack: Vec<Vec<u8>> = Vec::new();
+            let mut ctx = OpcodeExecContext {
+                stack: &mut stack, altstack: &mut altstack,
+                tx: Some(&tx), input_index: 0, input_amount: 0,
+                flags: &flags, taproot_internal_key: None,
+            };
+            txhash.execute(&mut ctx).unwrap();
+            // Verify: SHA256(sequence[0] || sequence[1])
+            let mut buf = Vec::new();
+            for input in &tx.inputs {
+                buf.extend_from_slice(&input.sequence.to_le_bytes());
+            }
+            assert_eq!(ctx.stack[0], sha256(&buf).to_vec());
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // CHECKCONTRACTVERIFY: wrong-size fields
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_checkcontractverify_wrong_expected_hash_size() {
+        let flags = ScriptFlags::none();
+        let mut stack: Vec<Vec<u8>> = Vec::new();
+        let mut altstack: Vec<Vec<u8>> = Vec::new();
+
+        stack.push(vec![0x01]); // flags
+        stack.push([0xab; 32].to_vec()); // internal_key
+        stack.push([0xcd; 32].to_vec()); // taptree_hash
+        stack.push(vec![0xff; 20]); // wrong size expected_hash (20 instead of 32)
+
+        let op = OpCheckContractVerify;
+        let mut ctx = OpcodeExecContext {
+            stack: &mut stack,
+            altstack: &mut altstack,
+            tx: None,
+            input_index: 0,
+            input_amount: 0,
+            flags: &flags,
+            taproot_internal_key: None,
+        };
+
+        let result = op.execute(&mut ctx);
+        assert!(matches!(result, Err(ScriptError::VerifyFailed)));
+    }
+
+    #[test]
+    fn test_checkcontractverify_wrong_taptree_hash_size() {
+        let flags = ScriptFlags::none();
+        let mut stack: Vec<Vec<u8>> = Vec::new();
+        let mut altstack: Vec<Vec<u8>> = Vec::new();
+
+        stack.push(vec![0x01]); // flags
+        stack.push([0xab; 32].to_vec()); // internal_key
+        stack.push(vec![0xcd; 20]); // taptree_hash - wrong size
+        stack.push([0xff; 32].to_vec()); // expected_hash
+
+        let op = OpCheckContractVerify;
+        let mut ctx = OpcodeExecContext {
+            stack: &mut stack,
+            altstack: &mut altstack,
+            tx: None,
+            input_index: 0,
+            input_amount: 0,
+            flags: &flags,
+            taproot_internal_key: None,
+        };
+
+        let result = op.execute(&mut ctx);
+        assert!(matches!(result, Err(ScriptError::VerifyFailed)));
+    }
+
+    #[test]
+    fn test_checkcontractverify_wrong_internal_key_size() {
+        let flags = ScriptFlags::none();
+        let mut stack: Vec<Vec<u8>> = Vec::new();
+        let mut altstack: Vec<Vec<u8>> = Vec::new();
+
+        stack.push(vec![0x01]); // flags
+        stack.push(vec![0xab; 20]); // internal_key - wrong size
+        stack.push([0xcd; 32].to_vec()); // taptree_hash
+        stack.push([0xff; 32].to_vec()); // expected_hash
+
+        let op = OpCheckContractVerify;
+        let mut ctx = OpcodeExecContext {
+            stack: &mut stack,
+            altstack: &mut altstack,
+            tx: None,
+            input_index: 0,
+            input_amount: 0,
+            flags: &flags,
+            taproot_internal_key: None,
+        };
+
+        let result = op.execute(&mut ctx);
+        assert!(matches!(result, Err(ScriptError::VerifyFailed)));
+    }
+
+    #[test]
+    fn test_checkcontractverify_empty_flags() {
+        let flags = ScriptFlags::none();
+        let mut stack: Vec<Vec<u8>> = Vec::new();
+        let mut altstack: Vec<Vec<u8>> = Vec::new();
+
+        stack.push(vec![]); // empty flags
+        stack.push([0xab; 32].to_vec()); // internal_key
+        stack.push([0xcd; 32].to_vec()); // taptree_hash
+        stack.push([0xff; 32].to_vec()); // expected_hash
+
+        let op = OpCheckContractVerify;
+        let mut ctx = OpcodeExecContext {
+            stack: &mut stack,
+            altstack: &mut altstack,
+            tx: None,
+            input_index: 0,
+            input_amount: 0,
+            flags: &flags,
+            taproot_internal_key: None,
+        };
+
+        let result = op.execute(&mut ctx);
+        assert!(matches!(result, Err(ScriptError::VerifyFailed)));
+    }
+
+    #[test]
+    fn test_checkcontractverify_one_element_underflow() {
+        let flags = ScriptFlags::none();
+        let mut stack: Vec<Vec<u8>> = vec![vec![0x01]];
+        let mut altstack: Vec<Vec<u8>> = Vec::new();
+
+        let op = OpCheckContractVerify;
+        let mut ctx = OpcodeExecContext {
+            stack: &mut stack,
+            altstack: &mut altstack,
+            tx: None,
+            input_index: 0,
+            input_amount: 0,
+            flags: &flags,
+            taproot_internal_key: None,
+        };
+
+        let result = op.execute(&mut ctx);
+        assert!(matches!(result, Err(ScriptError::StackUnderflow)));
+    }
+
+    #[test]
+    fn test_checkcontractverify_three_elements_underflow() {
+        let flags = ScriptFlags::none();
+        let mut stack: Vec<Vec<u8>> = vec![
+            vec![0x01],
+            [0xab; 32].to_vec(),
+            [0xcd; 32].to_vec(),
+        ];
+        let mut altstack: Vec<Vec<u8>> = Vec::new();
+
+        let op = OpCheckContractVerify;
+        let mut ctx = OpcodeExecContext {
+            stack: &mut stack,
+            altstack: &mut altstack,
+            tx: None,
+            input_index: 0,
+            input_amount: 0,
+            flags: &flags,
+            taproot_internal_key: None,
+        };
+
+        // 3 elements: pops expected_hash, taptree_hash, internal_key, then fails on flags
+        let result = op.execute(&mut ctx);
+        assert!(matches!(result, Err(ScriptError::StackUnderflow)));
+    }
+
+    // -----------------------------------------------------------------------
+    // OpcodeExecContext: verify all fields accessible
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_opcode_exec_context_fields() {
+        let flags = ScriptFlags::none();
+        let mut stack: Vec<Vec<u8>> = vec![b"test".to_vec()];
+        let mut altstack: Vec<Vec<u8>> = vec![b"alt".to_vec()];
+        let tx = make_ctv_test_tx();
+        let internal_key = [0xab; 32];
+
+        let ctx = OpcodeExecContext {
+            stack: &mut stack,
+            altstack: &mut altstack,
+            tx: Some(&tx),
+            input_index: 3,
+            input_amount: 100_000,
+            flags: &flags,
+            taproot_internal_key: Some(internal_key),
+        };
+
+        // Verify all fields are accessible
+        assert_eq!(ctx.stack.len(), 1);
+        assert_eq!(ctx.altstack.len(), 1);
+        assert!(ctx.tx.is_some());
+        assert_eq!(ctx.input_index, 3);
+        assert_eq!(ctx.input_amount, 100_000);
+        assert_eq!(ctx.taproot_internal_key, Some(internal_key));
+        // flags is accessible (just check it doesn't panic)
+        let _ = ctx.flags;
+    }
+
+    // -----------------------------------------------------------------------
+    // default_check_template_verify_hash: edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ctv_hash_with_multiple_inputs_and_outputs() {
+        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
+        use btc_primitives::hash::TxHash;
+        use btc_primitives::amount::Amount;
+
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![
+                TxIn {
+                    previous_output: OutPoint::new(TxHash::from_bytes([0xaa; 32]), 0),
+                    script_sig: ScriptBuf::from_bytes(vec![]),
+                    sequence: 0xffffffff,
+                },
+                TxIn {
+                    previous_output: OutPoint::new(TxHash::from_bytes([0xbb; 32]), 1),
+                    script_sig: ScriptBuf::from_bytes(vec![]),
+                    sequence: 0xfffffffe,
+                },
+                TxIn {
+                    previous_output: OutPoint::new(TxHash::from_bytes([0xcc; 32]), 2),
+                    script_sig: ScriptBuf::from_bytes(vec![]),
+                    sequence: 0xfffffffd,
+                },
+            ],
+            outputs: vec![
+                TxOut {
+                    value: Amount::from_sat(100_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x76, 0xa9]),
+                },
+                TxOut {
+                    value: Amount::from_sat(200_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x20]),
+                },
+            ],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        // Each input index should produce a different hash
+        let h0 = default_check_template_verify_hash(&tx, 0);
+        let h1 = default_check_template_verify_hash(&tx, 1);
+        let h2 = default_check_template_verify_hash(&tx, 2);
+        assert_ne!(h0, h1);
+        assert_ne!(h0, h2);
+        assert_ne!(h1, h2);
+        // All should be 32 bytes and non-zero
+        assert_ne!(h0, [0u8; 32]);
+        assert_ne!(h1, [0u8; 32]);
+        assert_ne!(h2, [0u8; 32]);
+    }
+
+    // -----------------------------------------------------------------------
+    // ANYPREVOUT: multi-input tx for prevouts building
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_anyprevout_with_multi_input_tx() {
+        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
+        use btc_primitives::hash::TxHash;
+        use btc_primitives::amount::Amount;
+
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![
+                TxIn {
+                    previous_output: OutPoint::new(TxHash::from_bytes([0xaa; 32]), 0),
+                    script_sig: ScriptBuf::from_bytes(vec![]),
+                    sequence: 0xffffffff,
+                },
+                TxIn {
+                    previous_output: OutPoint::new(TxHash::from_bytes([0xbb; 32]), 1),
+                    script_sig: ScriptBuf::from_bytes(vec![]),
+                    sequence: 0xffffffff,
+                },
+            ],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(1_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76, 0xa9]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let flags = ScriptFlags::none();
+        let mut stack: Vec<Vec<u8>> = Vec::new();
+        let mut altstack: Vec<Vec<u8>> = Vec::new();
+
+        // Generate a valid pubkey
+        let secp = secp256k1::Secp256k1::new();
+        let (_secret_key, public_key) = secp.generate_keypair(&mut secp256k1::rand::thread_rng());
+        let (xonly_pubkey, _parity) = public_key.x_only_public_key();
+
+        // Push invalid sig with ANYPREVOUT hash type, input_index=1
+        let mut sig = vec![0x01; 64];
+        sig.push(0x41); // SIGHASH_ANYPREVOUT
+        stack.push(sig);
+        stack.push(xonly_pubkey.serialize().to_vec());
+
+        let op = OpCheckSigAnyprevout;
+        let mut ctx = OpcodeExecContext {
+            stack: &mut stack,
+            altstack: &mut altstack,
+            tx: Some(&tx),
+            input_index: 1, // second input
+            input_amount: 50_000,
+            flags: &flags,
+            taproot_internal_key: None,
+        };
+
+        op.execute(&mut ctx).unwrap();
+        assert_eq!(ctx.stack.len(), 1);
+        // Sig is bogus, should push false but the code path through prevouts building is exercised
+        assert!(ctx.stack[0].is_empty());
+    }
 }

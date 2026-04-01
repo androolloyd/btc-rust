@@ -1,14 +1,39 @@
 use btc_primitives::amount::Amount;
 use btc_primitives::block::Block;
+use btc_primitives::hash::TxHash;
 use btc_primitives::transaction::{OutPoint, TxOut};
 use std::collections::HashMap;
 use thiserror::Error;
 
-use crate::validation::block_subsidy;
+use crate::validation::{block_subsidy, ChainParams, validate_bip34_coinbase};
 
 /// Coinbase maturity: outputs of a coinbase tx cannot be spent until
 /// 100 blocks after the block containing the coinbase.
 pub const COINBASE_MATURITY: u64 = 100;
+
+// ---------------------------------------------------------------------------
+// BIP68 constants
+// ---------------------------------------------------------------------------
+
+/// BIP68: If this flag is set in the sequence number, the relative lock-time
+/// is disabled for that input.
+pub const SEQUENCE_LOCKTIME_DISABLE_FLAG: u32 = 1 << 31;
+
+/// BIP68: If this flag is set (and disable flag is not), the relative
+/// lock-time is measured in 512-second units rather than blocks.
+pub const SEQUENCE_LOCKTIME_TYPE_FLAG: u32 = 1 << 22;
+
+/// BIP68: Mask for the relative lock-time value (lower 16 bits).
+pub const SEQUENCE_LOCKTIME_MASK: u32 = 0x0000ffff;
+
+// ---------------------------------------------------------------------------
+// BIP30 exempt blocks (mainnet)
+// ---------------------------------------------------------------------------
+
+/// Mainnet blocks 91842 and 91880 contain duplicate coinbase txids that
+/// overwrote earlier unspent outputs. These two blocks are exempt from the
+/// BIP30 duplicate-txid check.
+const BIP30_EXEMPT_HEIGHTS: [u64; 2] = [91842, 91880];
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -33,6 +58,19 @@ pub enum UtxoError {
 
     #[error("invalid transaction: {0}")]
     InvalidTransaction(String),
+
+    #[error("BIP30: duplicate unspent txid {0}")]
+    Bip30DuplicateTxid(TxHash),
+
+    #[error("BIP34: {0}")]
+    Bip34(#[from] crate::validation::ValidationError),
+
+    #[error("BIP68: relative lock-time not satisfied for input spending {outpoint:?} (need {required_depth} blocks, have {actual_depth})")]
+    Bip68RelativeLockTime {
+        outpoint: OutPoint,
+        required_depth: u64,
+        actual_depth: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -187,6 +225,122 @@ pub fn connect_block(
     }
 
     Ok(UtxoSetUpdate { spent, created })
+}
+
+/// Apply a block to the UTXO set with full BIP30/BIP34/BIP68 validation.
+///
+/// This wraps `connect_block` with additional consensus checks that require
+/// knowledge of the chain parameters:
+///
+/// - **BIP30**: Before inserting new UTXOs, verify that no existing unspent
+///   UTXO shares a txid with any transaction in this block. Exception:
+///   mainnet blocks 91842 and 91880 are exempt. After BIP34 activation
+///   (height >= bip34_height), coinbase txids are guaranteed unique by the
+///   height-in-coinbase rule, so this check is implicitly satisfied.
+///
+/// - **BIP34**: The coinbase scriptSig must begin with a push of the block
+///   height, encoded as a minimal CScriptNum. Enforced at heights >=
+///   `params.bip34_height`.
+///
+/// - **BIP68**: For non-coinbase transactions with version >= 2, each input
+///   whose sequence number does NOT have bit 31 set is subject to a
+///   relative lock-time constraint. Height-based relative lock-times (bit 22
+///   not set) are fully enforced. Time-based relative lock-times (bit 22
+///   set) require median-time-past access and are currently not enforced
+///   (TODO).
+pub fn connect_block_with_params(
+    block: &Block,
+    height: u64,
+    utxo_view: &dyn UtxoSet,
+    params: &ChainParams,
+) -> Result<UtxoSetUpdate, UtxoError> {
+    // --- BIP34: height in coinbase ---
+    validate_bip34_coinbase(block, height, params.bip34_height)?;
+
+    // --- BIP30: duplicate txid check ---
+    // After BIP34 activation, coinbase txids include the height so they are
+    // unique; we can skip the (expensive) scan in that case. The two
+    // historical exception blocks are also skipped.
+    let bip30_active = height < params.bip34_height
+        && !BIP30_EXEMPT_HEIGHTS.contains(&height);
+
+    if bip30_active {
+        for tx in &block.transactions {
+            let txid = tx.txid();
+            // Check whether any output of this txid is still unspent.
+            for vout in 0..tx.outputs.len() {
+                let outpoint = OutPoint::new(txid, vout as u32);
+                if utxo_view.contains(&outpoint) {
+                    return Err(UtxoError::Bip30DuplicateTxid(txid));
+                }
+            }
+        }
+    }
+
+    // --- Run the base connect_block (UTXO spend/create, maturity, etc.) ---
+    let update = connect_block(block, height, utxo_view)?;
+
+    // --- BIP68: relative lock-time ---
+    // We need access to the spent entries that connect_block just recorded,
+    // so we check BIP68 after the base validation.
+    for tx in &block.transactions {
+        if tx.is_coinbase() {
+            continue;
+        }
+        // BIP68 only applies to transactions with version >= 2.
+        if tx.version < 2 {
+            continue;
+        }
+
+        for input in &tx.inputs {
+            let seq = input.sequence;
+
+            // If the disable flag is set, skip this input.
+            if seq & SEQUENCE_LOCKTIME_DISABLE_FLAG != 0 {
+                continue;
+            }
+
+            let masked = (seq & SEQUENCE_LOCKTIME_MASK) as u64;
+
+            if seq & SEQUENCE_LOCKTIME_TYPE_FLAG != 0 {
+                // Time-based relative lock-time (512-second granularity).
+                // Requires median-time-past of the block at the UTXO
+                // creation height, which we don't currently have access to.
+                // TODO: implement time-based BIP68 once MTP is available.
+                continue;
+            }
+
+            // Height-based relative lock-time: the input's UTXO must be
+            // at least `masked` blocks old.
+            //
+            // Find the entry height from the spent list (connect_block
+            // already validated that the UTXO exists).
+            let outpoint = &input.previous_output;
+            let entry_height = update
+                .spent
+                .iter()
+                .find(|(op, _)| op == outpoint)
+                .map(|(_, e)| e.height)
+                .unwrap_or(0);
+
+            // Per BIP68, the relative lock-time is satisfied when:
+            //   (spending_height - utxo_height) >= required_depth
+            // where required_depth = masked value from the sequence.
+            // Note: the "+1" is because block N spending a UTXO created in
+            // block N has depth 0 (same block), and a sequence value of 1
+            // means "at least 1 block apart".
+            let actual_depth = height.saturating_sub(entry_height);
+            if actual_depth < masked {
+                return Err(UtxoError::Bip68RelativeLockTime {
+                    outpoint: *outpoint,
+                    required_depth: masked,
+                    actual_depth,
+                });
+            }
+        }
+    }
+
+    Ok(update)
 }
 
 /// Reverse the effect of `connect_block` — used during chain reorganisations.
@@ -750,5 +904,430 @@ mod tests {
             }
             other => panic!("expected InvalidTransaction, got: {other}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // BIP30 tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_bip30_rejects_duplicate_txid() {
+        // Create a UTXO set with an existing unspent output that shares a
+        // txid with a transaction in the new block.
+        let mut utxo_set = InMemoryUtxoSet::new();
+
+        // Put a coinbase at height 0 whose txid will collide.
+        let coinbase_0 = make_coinbase_tx(crate::validation::block_subsidy(0));
+        let txid_0 = coinbase_0.txid();
+        utxo_set.insert(
+            OutPoint::new(txid_0, 0),
+            UtxoEntry {
+                txout: coinbase_0.outputs[0].clone(),
+                height: 0,
+                is_coinbase: true,
+            },
+        );
+
+        // Now create a block at height 1 with the SAME coinbase tx (same
+        // outputs/inputs means same txid). This should be rejected by BIP30
+        // because the UTXO from height 0 is still unspent.
+        let duplicate_coinbase = make_coinbase_tx(crate::validation::block_subsidy(1));
+        // Verify the txids actually match (they should, since make_coinbase_tx
+        // produces deterministic tx structure).
+        assert_eq!(
+            duplicate_coinbase.txid(),
+            txid_0,
+            "test setup: coinbase txids must match for BIP30 test"
+        );
+
+        let block = make_block(vec![duplicate_coinbase]);
+
+        // Use ChainParams with bip34_height far in the future so BIP30 is
+        // active.
+        let mut params = ChainParams::mainnet();
+        params.bip34_height = 1_000_000; // disable BIP34 for this test
+
+        let result = connect_block_with_params(&block, 1, &utxo_set, &params);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            UtxoError::Bip30DuplicateTxid(txid) => {
+                assert_eq!(txid, txid_0);
+            }
+            other => panic!("expected Bip30DuplicateTxid, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_bip30_allows_after_utxo_spent() {
+        // If all outputs of the old txid have been spent, the same txid can
+        // appear again (this is what happens in the exempt blocks).
+        let utxo_set = InMemoryUtxoSet::new(); // empty -- no unspent UTXOs
+
+        let coinbase = make_coinbase_tx(crate::validation::block_subsidy(0));
+        let block = make_block(vec![coinbase]);
+
+        let mut params = ChainParams::mainnet();
+        params.bip34_height = 1_000_000;
+
+        // No collision since the UTXO set is empty.
+        let result = connect_block_with_params(&block, 0, &utxo_set, &params);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_bip30_exempt_blocks() {
+        // Blocks 91842 and 91880 are exempt from BIP30.
+        let mut utxo_set = InMemoryUtxoSet::new();
+
+        let coinbase = make_coinbase_tx(crate::validation::block_subsidy(91842));
+        let txid = coinbase.txid();
+        utxo_set.insert(
+            OutPoint::new(txid, 0),
+            UtxoEntry {
+                txout: coinbase.outputs[0].clone(),
+                height: 0,
+                is_coinbase: true,
+            },
+        );
+
+        let duplicate_coinbase = make_coinbase_tx(crate::validation::block_subsidy(91842));
+        let block = make_block(vec![duplicate_coinbase]);
+
+        let mut params = ChainParams::mainnet();
+        params.bip34_height = 1_000_000;
+
+        // Should succeed at exempt height 91842.
+        let result = connect_block_with_params(&block, 91842, &utxo_set, &params);
+        assert!(result.is_ok(), "BIP30 exempt block 91842 should be accepted");
+    }
+
+    #[test]
+    fn test_bip30_skipped_after_bip34() {
+        // After BIP34 activation, BIP30 check is skipped because coinbase
+        // txids are guaranteed unique by the height-in-coinbase rule.
+        let mut utxo_set = InMemoryUtxoSet::new();
+
+        let coinbase = make_coinbase_tx(crate::validation::block_subsidy(0));
+        let txid = coinbase.txid();
+        utxo_set.insert(
+            OutPoint::new(txid, 0),
+            UtxoEntry {
+                txout: coinbase.outputs[0].clone(),
+                height: 0,
+                is_coinbase: true,
+            },
+        );
+
+        // Build a coinbase with valid BIP34 height encoding at height 227931.
+        let height = 227931u64;
+        let height_push = crate::validation::encode_bip34_height(height);
+        let mut script_sig = height_push;
+        script_sig.push(0x00); // extra data
+
+        let bip34_coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::COINBASE,
+                script_sig: ScriptBuf::from_bytes(script_sig),
+                sequence: TxIn::SEQUENCE_FINAL,
+            }],
+            outputs: vec![TxOut {
+                value: crate::validation::block_subsidy(height),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76, 0xa9]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let block = make_block(vec![bip34_coinbase]);
+        let params = ChainParams::mainnet();
+
+        // At height >= bip34_height, BIP30 scan is skipped. Even though
+        // the old txid has unspent outputs, the new coinbase has a different
+        // txid (it includes the height), so this is fine.
+        let result = connect_block_with_params(&block, height, &utxo_set, &params);
+        assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // BIP68 tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a v2 spend tx with a specific sequence number.
+    fn make_v2_spend_tx(
+        inputs: Vec<(OutPoint, u32)>,
+        output_values: Vec<Amount>,
+    ) -> Transaction {
+        let tx_inputs = inputs
+            .into_iter()
+            .map(|(op, seq)| TxIn {
+                previous_output: op,
+                script_sig: ScriptBuf::from_bytes(vec![]),
+                sequence: seq,
+            })
+            .collect();
+
+        let tx_outputs = output_values
+            .into_iter()
+            .map(|v| TxOut {
+                value: v,
+                script_pubkey: ScriptBuf::from_bytes(vec![0x00, 0x14]),
+            })
+            .collect();
+
+        Transaction {
+            version: 2,
+            inputs: tx_inputs,
+            outputs: tx_outputs,
+            witness: Vec::new(),
+            lock_time: 0,
+        }
+    }
+
+    #[test]
+    fn test_bip68_height_lock_satisfied() {
+        // UTXO created at height 100; spend at height 110 with sequence
+        // requiring 10 blocks.
+        let mut utxo_set = InMemoryUtxoSet::new();
+        let prev_txid = TxHash::from_bytes([0xaa; 32]);
+        let prev_outpoint = OutPoint::new(prev_txid, 0);
+        utxo_set.insert(
+            prev_outpoint,
+            UtxoEntry {
+                txout: TxOut {
+                    value: Amount::from_sat(10_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x00]),
+                },
+                height: 100,
+                is_coinbase: false,
+            },
+        );
+
+        let spend_height = 110u64;
+        let subsidy = crate::validation::block_subsidy(spend_height);
+        let coinbase = make_coinbase_tx(subsidy);
+
+        // Sequence: height-based lock requiring 10 blocks (no flags set).
+        let sequence = 10u32;
+        let spend = make_v2_spend_tx(
+            vec![(prev_outpoint, sequence)],
+            vec![Amount::from_sat(8_000)],
+        );
+
+        let block = make_block(vec![coinbase, spend]);
+
+        let mut params = ChainParams::mainnet();
+        params.bip34_height = 1_000_000; // disable BIP34 for simplicity
+
+        let result = connect_block_with_params(&block, spend_height, &utxo_set, &params);
+        assert!(result.is_ok(), "BIP68: lock should be satisfied (depth=10, required=10)");
+    }
+
+    #[test]
+    fn test_bip68_height_lock_not_satisfied() {
+        // UTXO created at height 100; spend at height 105 with sequence
+        // requiring 10 blocks -- should fail.
+        let mut utxo_set = InMemoryUtxoSet::new();
+        let prev_txid = TxHash::from_bytes([0xbb; 32]);
+        let prev_outpoint = OutPoint::new(prev_txid, 0);
+        utxo_set.insert(
+            prev_outpoint,
+            UtxoEntry {
+                txout: TxOut {
+                    value: Amount::from_sat(10_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x00]),
+                },
+                height: 100,
+                is_coinbase: false,
+            },
+        );
+
+        let spend_height = 105u64;
+        let subsidy = crate::validation::block_subsidy(spend_height);
+        let coinbase = make_coinbase_tx(subsidy);
+
+        let sequence = 10u32; // require 10 blocks
+        let spend = make_v2_spend_tx(
+            vec![(prev_outpoint, sequence)],
+            vec![Amount::from_sat(8_000)],
+        );
+
+        let block = make_block(vec![coinbase, spend]);
+
+        let mut params = ChainParams::mainnet();
+        params.bip34_height = 1_000_000;
+
+        let result = connect_block_with_params(&block, spend_height, &utxo_set, &params);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            UtxoError::Bip68RelativeLockTime {
+                outpoint,
+                required_depth,
+                actual_depth,
+            } => {
+                assert_eq!(outpoint, prev_outpoint);
+                assert_eq!(required_depth, 10);
+                assert_eq!(actual_depth, 5);
+            }
+            other => panic!("expected Bip68RelativeLockTime, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_bip68_disabled_flag() {
+        // When bit 31 is set, BIP68 is disabled for that input.
+        let mut utxo_set = InMemoryUtxoSet::new();
+        let prev_txid = TxHash::from_bytes([0xcc; 32]);
+        let prev_outpoint = OutPoint::new(prev_txid, 0);
+        utxo_set.insert(
+            prev_outpoint,
+            UtxoEntry {
+                txout: TxOut {
+                    value: Amount::from_sat(10_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x00]),
+                },
+                height: 100,
+                is_coinbase: false,
+            },
+        );
+
+        let spend_height = 101u64;
+        let subsidy = crate::validation::block_subsidy(spend_height);
+        let coinbase = make_coinbase_tx(subsidy);
+
+        // Sequence with disable flag set: should bypass BIP68 even though
+        // the masked value (9999) would otherwise fail.
+        let sequence = SEQUENCE_LOCKTIME_DISABLE_FLAG | 9999;
+        let spend = make_v2_spend_tx(
+            vec![(prev_outpoint, sequence)],
+            vec![Amount::from_sat(8_000)],
+        );
+
+        let block = make_block(vec![coinbase, spend]);
+
+        let mut params = ChainParams::mainnet();
+        params.bip34_height = 1_000_000;
+
+        let result = connect_block_with_params(&block, spend_height, &utxo_set, &params);
+        assert!(result.is_ok(), "BIP68 should be disabled when bit 31 is set");
+    }
+
+    #[test]
+    fn test_bip68_v1_tx_not_enforced() {
+        // BIP68 only applies to transactions with version >= 2.
+        let mut utxo_set = InMemoryUtxoSet::new();
+        let prev_txid = TxHash::from_bytes([0xdd; 32]);
+        let prev_outpoint = OutPoint::new(prev_txid, 0);
+        utxo_set.insert(
+            prev_outpoint,
+            UtxoEntry {
+                txout: TxOut {
+                    value: Amount::from_sat(10_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x00]),
+                },
+                height: 100,
+                is_coinbase: false,
+            },
+        );
+
+        let spend_height = 101u64;
+        let subsidy = crate::validation::block_subsidy(spend_height);
+        let coinbase = make_coinbase_tx(subsidy);
+
+        // Version 1 transaction with a restrictive sequence -- should NOT
+        // trigger BIP68.
+        let spend = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: prev_outpoint,
+                script_sig: ScriptBuf::from_bytes(vec![]),
+                sequence: 1000, // would require 1000 blocks if v2
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(8_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x00, 0x14]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let block = make_block(vec![coinbase, spend]);
+
+        let mut params = ChainParams::mainnet();
+        params.bip34_height = 1_000_000;
+
+        let result = connect_block_with_params(&block, spend_height, &utxo_set, &params);
+        assert!(result.is_ok(), "BIP68 should not apply to v1 transactions");
+    }
+
+    #[test]
+    fn test_bip68_time_based_lock_skipped() {
+        // Time-based relative lock-time (bit 22 set) should be skipped
+        // (not enforced) for now, with a TODO for MTP support.
+        let mut utxo_set = InMemoryUtxoSet::new();
+        let prev_txid = TxHash::from_bytes([0xee; 32]);
+        let prev_outpoint = OutPoint::new(prev_txid, 0);
+        utxo_set.insert(
+            prev_outpoint,
+            UtxoEntry {
+                txout: TxOut {
+                    value: Amount::from_sat(10_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x00]),
+                },
+                height: 100,
+                is_coinbase: false,
+            },
+        );
+
+        let spend_height = 101u64;
+        let subsidy = crate::validation::block_subsidy(spend_height);
+        let coinbase = make_coinbase_tx(subsidy);
+
+        // Time-based lock: bit 22 set, value = 1000 (512-second units).
+        let sequence = SEQUENCE_LOCKTIME_TYPE_FLAG | 1000;
+        let spend = make_v2_spend_tx(
+            vec![(prev_outpoint, sequence)],
+            vec![Amount::from_sat(8_000)],
+        );
+
+        let block = make_block(vec![coinbase, spend]);
+
+        let mut params = ChainParams::mainnet();
+        params.bip34_height = 1_000_000;
+
+        // Should pass because time-based locks are not yet enforced.
+        let result = connect_block_with_params(&block, spend_height, &utxo_set, &params);
+        assert!(result.is_ok(), "time-based BIP68 should be skipped (not enforced yet)");
+    }
+
+    #[test]
+    fn test_bip68_coinbase_exempt() {
+        // Coinbase transactions are exempt from BIP68.
+        let utxo_set = InMemoryUtxoSet::new();
+        let subsidy = crate::validation::block_subsidy(0);
+
+        // Coinbase with a sequence that would fail BIP68 if it were checked.
+        let coinbase = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::COINBASE,
+                script_sig: ScriptBuf::from_bytes(vec![0x04, 0x00]),
+                sequence: 100, // would fail BIP68 if checked
+            }],
+            outputs: vec![TxOut {
+                value: subsidy,
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76, 0xa9]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let block = make_block(vec![coinbase]);
+
+        let mut params = ChainParams::mainnet();
+        params.bip34_height = 1_000_000;
+
+        let result = connect_block_with_params(&block, 0, &utxo_set, &params);
+        assert!(result.is_ok(), "coinbase should be exempt from BIP68");
     }
 }

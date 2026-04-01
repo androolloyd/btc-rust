@@ -1,5 +1,5 @@
 use btc_primitives::block::{Block, BlockHeader};
-use btc_primitives::hash::BlockHash;
+use btc_primitives::hash::{BlockHash, TxHash, sha256d};
 use btc_primitives::compact::CompactTarget;
 use btc_primitives::script::ScriptBuf;
 use btc_primitives::amount::Amount;
@@ -23,12 +23,20 @@ pub enum ValidationError {
     MultipleCoinbase,
     #[error("coinbase reward too high: got {got}, max {max}")]
     CoinbaseRewardTooHigh { got: Amount, max: Amount },
-    #[error("block too large: {size} bytes > {max} bytes")]
+    #[error("block too large: {size} weight units > {max} weight units")]
     BlockTooLarge { size: usize, max: usize },
     #[error("block version too low")]
     BadVersion,
     #[error("duplicate transaction")]
     DuplicateTransaction,
+    #[error("BIP34 violation: coinbase does not encode block height {expected_height}")]
+    Bip34HeightMismatch { expected_height: u64 },
+    #[error("BIP34 violation: coinbase scriptSig too short to encode height")]
+    Bip34ScriptSigTooShort,
+    #[error("BIP141: witness commitment mismatch in coinbase")]
+    WitnessCommitmentMismatch,
+    #[error("BIP141: block has witness data but no witness commitment in coinbase")]
+    MissingWitnessCommitment,
 }
 
 /// Maximum block size (1MB legacy limit, 4MW weight limit)
@@ -82,21 +90,13 @@ impl BlockValidator {
             return Err(ValidationError::InvalidMerkleRoot);
         }
 
-        // Block size validation depends on whether segwit is active:
-        // - Pre-segwit (before activation height): max 1,000,000 bytes (non-witness serialization)
-        // - Post-segwit (BIP141): max 4,000,000 weight units
-        //
-        // For validation without height context, we use the post-segwit limit
-        // (4MW) on the full serialized size as a safe upper bound, since
-        // serialized_size <= weight always holds.
-        //
-        // TODO: accept block height parameter and apply the correct limit:
-        //   if height < segwit_height { check non-witness size <= 1MB }
-        //   else { check weight <= 4MW }
-        let encoded = btc_primitives::encode::encode(block);
-        if encoded.len() > MAX_BLOCK_WEIGHT {
+        // BIP141 block weight check: weight = sum of (base_size * 3 + total_size)
+        // for each transaction, plus header/varint overhead at 4x.
+        // Maximum allowed weight is 4,000,000 weight units.
+        let weight = block.weight();
+        if weight > MAX_BLOCK_WEIGHT {
             return Err(ValidationError::BlockTooLarge {
-                size: encoded.len(),
+                size: weight,
                 max: MAX_BLOCK_WEIGHT,
             });
         }
@@ -111,6 +111,195 @@ impl BlockValidator {
 
         Ok(())
     }
+
+    /// Verify the BIP141 witness commitment in the coinbase.
+    ///
+    /// If any non-coinbase transaction in the block has witness data,
+    /// the coinbase must contain a witness commitment output matching:
+    ///   OP_RETURN 0xaa21a9ed <32-byte commitment>
+    /// where commitment = SHA256d(witness_merkle_root || witness_nonce)
+    /// and witness_nonce is the coinbase's witness (typically 32 zero bytes).
+    ///
+    /// Call this after segwit activation height.
+    pub fn verify_witness_commitment(block: &Block) -> Result<(), ValidationError> {
+        // Check if any non-coinbase tx has witness data
+        let has_witness = block.transactions.iter().skip(1).any(|tx| tx.is_segwit());
+        if !has_witness {
+            return Ok(());
+        }
+
+        let coinbase = &block.transactions[0];
+
+        // Find the witness commitment output (scan from last to first, use the
+        // last matching output per Bitcoin Core's behavior).
+        let commitment_prefix: [u8; 4] = [0xaa, 0x21, 0xa9, 0xed];
+        let mut commitment_hash: Option<[u8; 32]> = None;
+
+        for output in coinbase.outputs.iter().rev() {
+            let script = output.script_pubkey.as_bytes();
+            // OP_RETURN (0x6a) + push(36) (0x24) + 4-byte prefix + 32-byte hash
+            if script.len() >= 38
+                && script[0] == 0x6a
+                && script[1] == 0x24
+                && script[2..6] == commitment_prefix
+            {
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&script[6..38]);
+                commitment_hash = Some(hash);
+                break;
+            }
+        }
+
+        let expected_commitment = match commitment_hash {
+            Some(h) => h,
+            None => return Err(ValidationError::MissingWitnessCommitment),
+        };
+
+        // Get the witness nonce from the coinbase witness.
+        // BIP141: coinbase must have exactly one witness item of 32 bytes.
+        let witness_nonce = if !coinbase.witness.is_empty()
+            && !coinbase.witness[0].is_empty()
+            && coinbase.witness[0].get(0).map_or(false, |item| item.len() == 32)
+        {
+            let mut nonce = [0u8; 32];
+            nonce.copy_from_slice(coinbase.witness[0].get(0).unwrap());
+            nonce
+        } else {
+            // Default nonce is 32 zero bytes
+            [0u8; 32]
+        };
+
+        // Compute the witness merkle root.
+        // The witness merkle tree is computed from wtxids, with the coinbase
+        // wtxid replaced by 0x00...00 (32 zero bytes).
+        let wtxids: Vec<TxHash> = block.transactions.iter().enumerate().map(|(i, tx)| {
+            if i == 0 {
+                TxHash::ZERO // coinbase wtxid is always zero in the witness merkle tree
+            } else {
+                tx.wtxid()
+            }
+        }).collect();
+
+        let wtxid_bytes: Vec<[u8; 32]> = wtxids.iter().map(|h| h.to_bytes()).collect();
+        let witness_root_bytes = btc_primitives::block::merkle_root(&wtxid_bytes);
+
+        // commitment = SHA256d(witness_root || witness_nonce)
+        let mut preimage = Vec::with_capacity(64);
+        preimage.extend_from_slice(&witness_root_bytes);
+        preimage.extend_from_slice(&witness_nonce);
+        let computed_commitment = sha256d(&preimage);
+
+        if computed_commitment != expected_commitment {
+            return Err(ValidationError::WitnessCommitmentMismatch);
+        }
+
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BIP34 — Height in coinbase
+// ---------------------------------------------------------------------------
+
+/// Encode a block height as a CScriptNum push, matching Bitcoin Core's
+/// serialization (minimal little-endian encoding with a length prefix).
+///
+/// Returns the expected prefix bytes that the coinbase scriptSig must start
+/// with.
+pub fn encode_bip34_height(height: u64) -> Vec<u8> {
+    if height == 0 {
+        // OP_0 — push empty byte vector (CScriptNum for 0)
+        return vec![0x00];
+    }
+
+    // Encode the height as a minimal little-endian signed integer
+    // (CScriptNum encoding).
+    let mut h = height;
+    let mut data = Vec::new();
+    while h > 0 {
+        data.push((h & 0xff) as u8);
+        h >>= 8;
+    }
+    // If the most significant byte has its high bit set, we need an
+    // extra 0x00 byte so the value is not interpreted as negative.
+    if data.last().map_or(false, |&b| b & 0x80 != 0) {
+        data.push(0x00);
+    }
+
+    let mut result = Vec::with_capacity(1 + data.len());
+    result.push(data.len() as u8); // push-length opcode
+    result.extend_from_slice(&data);
+    result
+}
+
+/// Decode the block height from a coinbase scriptSig per BIP34.
+///
+/// Returns `None` if the scriptSig is too short or the push-length byte
+/// indicates more data than is available.
+pub fn decode_bip34_height(script_sig: &[u8]) -> Option<u64> {
+    if script_sig.is_empty() {
+        return None;
+    }
+
+    let push_len = script_sig[0] as usize;
+
+    // OP_0 encodes height 0
+    if push_len == 0 {
+        return Some(0);
+    }
+
+    // push_len must be a direct push (1..=4 bytes for any realistic height)
+    if push_len > 4 || script_sig.len() < 1 + push_len {
+        return None;
+    }
+
+    let data = &script_sig[1..1 + push_len];
+    let mut height: u64 = 0;
+    for (i, &byte) in data.iter().enumerate() {
+        height |= (byte as u64) << (8 * i);
+    }
+
+    Some(height)
+}
+
+/// Validate BIP34: the coinbase scriptSig must begin with a push of the
+/// block height, encoded as a minimal CScriptNum.
+///
+/// Only enforced at heights >= `bip34_height`.
+pub fn validate_bip34_coinbase(
+    block: &Block,
+    height: u64,
+    bip34_height: u64,
+) -> Result<(), ValidationError> {
+    if height < bip34_height {
+        return Ok(());
+    }
+
+    if block.transactions.is_empty() || !block.transactions[0].is_coinbase() {
+        // This would be caught by other validation; don't duplicate the error.
+        return Ok(());
+    }
+
+    let coinbase_tx = &block.transactions[0];
+    let script_sig = coinbase_tx.inputs[0].script_sig.as_bytes();
+
+    if script_sig.is_empty() {
+        return Err(ValidationError::Bip34ScriptSigTooShort);
+    }
+
+    let expected_prefix = encode_bip34_height(height);
+
+    if script_sig.len() < expected_prefix.len() {
+        return Err(ValidationError::Bip34ScriptSigTooShort);
+    }
+
+    if &script_sig[..expected_prefix.len()] != expected_prefix.as_slice() {
+        return Err(ValidationError::Bip34HeightMismatch {
+            expected_height: height,
+        });
+    }
+
+    Ok(())
 }
 
 /// Chain parameters — network-specific consensus rules
@@ -526,5 +715,422 @@ mod tests {
         let result = BlockValidator::validate_block(&block);
         assert!(result.is_err());
         // It should either fail PoW or block size; both are valid rejections
+    }
+
+    #[test]
+    fn test_witness_commitment_verification() {
+        use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint, Witness};
+        use btc_primitives::hash::TxHash;
+        use btc_primitives::script::ScriptBuf;
+        use btc_primitives::block::{Block, BlockHeader, merkle_root};
+        use btc_primitives::compact::CompactTarget;
+
+        // Build a segwit transaction (has witness data)
+        let segwit_tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0x01; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(49_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x00, 0x14, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb]),
+            }],
+            witness: vec![Witness::from_items(vec![vec![0x30; 72], vec![0x02; 33]])],
+            lock_time: 0,
+        };
+
+        // Compute the witness merkle root
+        let wtxids: Vec<[u8; 32]> = vec![
+            [0u8; 32], // coinbase wtxid is zero
+            segwit_tx.wtxid().to_bytes(),
+        ];
+        let witness_root = merkle_root(&wtxids);
+
+        // Compute the commitment: SHA256d(witness_root || nonce)
+        let witness_nonce = [0u8; 32];
+        let mut preimage = Vec::with_capacity(64);
+        preimage.extend_from_slice(&witness_root);
+        preimage.extend_from_slice(&witness_nonce);
+        let commitment = btc_primitives::hash::sha256d(&preimage);
+
+        // Build the commitment script: OP_RETURN <prefix + commitment>
+        let mut commitment_data = vec![0xaa, 0x21, 0xa9, 0xed];
+        commitment_data.extend_from_slice(&commitment);
+        let mut commitment_script = ScriptBuf::new();
+        commitment_script.push_opcode(btc_primitives::script::Opcode::OP_RETURN);
+        commitment_script.push_slice(&commitment_data);
+
+        // Build the coinbase with witness commitment
+        let coinbase = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::COINBASE,
+                script_sig: ScriptBuf::from_bytes(vec![0x03, 0x01, 0x00, 0x00]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![
+                TxOut {
+                    value: Amount::from_sat(5_000_000_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x76, 0xa9]),
+                },
+                TxOut {
+                    value: Amount::ZERO,
+                    script_pubkey: commitment_script,
+                },
+            ],
+            witness: vec![Witness::from_items(vec![vec![0u8; 32]])],
+            lock_time: 0,
+        };
+
+        let block = Block {
+            header: BlockHeader {
+                version: 0x20000000,
+                prev_blockhash: BlockHash::ZERO,
+                merkle_root: TxHash::ZERO,
+                time: 0,
+                bits: CompactTarget::MAX_TARGET,
+                nonce: 0,
+            },
+            transactions: vec![coinbase, segwit_tx],
+        };
+
+        // Valid commitment should pass
+        let result = BlockValidator::verify_witness_commitment(&block);
+        assert!(result.is_ok(), "valid witness commitment should pass: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_witness_commitment_missing() {
+        use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint, Witness};
+        use btc_primitives::hash::TxHash;
+        use btc_primitives::script::ScriptBuf;
+        use btc_primitives::block::{Block, BlockHeader};
+        use btc_primitives::compact::CompactTarget;
+
+        // Segwit tx but NO witness commitment in coinbase
+        let segwit_tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0x01; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(49_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x00, 0x14]),
+            }],
+            witness: vec![Witness::from_items(vec![vec![0x30; 72]])],
+            lock_time: 0,
+        };
+
+        let coinbase = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::COINBASE,
+                script_sig: ScriptBuf::from_bytes(vec![0x03, 0x01, 0x00, 0x00]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76, 0xa9]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let block = Block {
+            header: BlockHeader {
+                version: 0x20000000,
+                prev_blockhash: BlockHash::ZERO,
+                merkle_root: TxHash::ZERO,
+                time: 0,
+                bits: CompactTarget::MAX_TARGET,
+                nonce: 0,
+            },
+            transactions: vec![coinbase, segwit_tx],
+        };
+
+        let result = BlockValidator::verify_witness_commitment(&block);
+        assert!(matches!(result, Err(ValidationError::MissingWitnessCommitment)));
+    }
+
+    #[test]
+    fn test_no_witness_commitment_needed_for_legacy_blocks() {
+        use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint};
+        use btc_primitives::hash::TxHash;
+        use btc_primitives::script::ScriptBuf;
+        use btc_primitives::block::{Block, BlockHeader};
+        use btc_primitives::compact::CompactTarget;
+
+        // Block with only legacy txs (no witness data) — no commitment needed
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::COINBASE,
+                script_sig: ScriptBuf::from_bytes(vec![0x03, 0x01, 0x00, 0x00]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76, 0xa9]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_blockhash: BlockHash::ZERO,
+                merkle_root: TxHash::ZERO,
+                time: 0,
+                bits: CompactTarget::MAX_TARGET,
+                nonce: 0,
+            },
+            transactions: vec![coinbase],
+        };
+
+        let result = BlockValidator::verify_witness_commitment(&block);
+        assert!(result.is_ok(), "legacy-only block needs no witness commitment");
+    }
+
+    // -----------------------------------------------------------------------
+    // BIP34 tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_encode_bip34_height_zero() {
+        // Height 0 => OP_0
+        let encoded = encode_bip34_height(0);
+        assert_eq!(encoded, vec![0x00]);
+    }
+
+    #[test]
+    fn test_encode_bip34_height_1() {
+        // Height 1 => [0x01, 0x01]
+        let encoded = encode_bip34_height(1);
+        assert_eq!(encoded, vec![0x01, 0x01]);
+    }
+
+    #[test]
+    fn test_encode_bip34_height_16() {
+        // Height 16 => [0x01, 0x10]
+        let encoded = encode_bip34_height(16);
+        assert_eq!(encoded, vec![0x01, 0x10]);
+    }
+
+    #[test]
+    fn test_encode_bip34_height_127() {
+        // Height 127 => [0x01, 0x7f]
+        let encoded = encode_bip34_height(127);
+        assert_eq!(encoded, vec![0x01, 0x7f]);
+    }
+
+    #[test]
+    fn test_encode_bip34_height_128() {
+        // Height 128 => [0x02, 0x80, 0x00] because 0x80 has high bit set
+        let encoded = encode_bip34_height(128);
+        assert_eq!(encoded, vec![0x02, 0x80, 0x00]);
+    }
+
+    #[test]
+    fn test_encode_bip34_height_255() {
+        // Height 255 => [0x02, 0xff, 0x00]
+        let encoded = encode_bip34_height(255);
+        assert_eq!(encoded, vec![0x02, 0xff, 0x00]);
+    }
+
+    #[test]
+    fn test_encode_bip34_height_256() {
+        // Height 256 => [0x02, 0x00, 0x01]
+        let encoded = encode_bip34_height(256);
+        assert_eq!(encoded, vec![0x02, 0x00, 0x01]);
+    }
+
+    #[test]
+    fn test_encode_bip34_height_227931() {
+        // BIP34 activation height on mainnet: 227931 = 0x037A5B
+        // Little-endian: [0x5B, 0x7A, 0x03] => push 3 bytes
+        let encoded = encode_bip34_height(227931);
+        assert_eq!(encoded, vec![0x03, 0x5b, 0x7a, 0x03]);
+    }
+
+    #[test]
+    fn test_encode_bip34_height_500000() {
+        // 500000 = 0x07A120, LE = [0x20, 0xA1, 0x07]
+        let encoded = encode_bip34_height(500000);
+        assert_eq!(encoded, vec![0x03, 0x20, 0xa1, 0x07]);
+    }
+
+    #[test]
+    fn test_decode_bip34_height_roundtrip() {
+        for height in [0u64, 1, 16, 127, 128, 255, 256, 1000, 227931, 500000, 800000] {
+            let encoded = encode_bip34_height(height);
+            let decoded = decode_bip34_height(&encoded);
+            assert_eq!(decoded, Some(height), "roundtrip failed for height {height}");
+        }
+    }
+
+    #[test]
+    fn test_validate_bip34_below_activation() {
+        use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint};
+
+        // Below BIP34 activation height, any coinbase scriptSig is fine.
+        let coinbase_tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::COINBASE,
+                script_sig: ScriptBuf::from_bytes(vec![0xff, 0xff]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76, 0xa9]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_blockhash: BlockHash::ZERO,
+                merkle_root: btc_primitives::hash::TxHash::ZERO,
+                time: 0,
+                bits: CompactTarget::MAX_TARGET,
+                nonce: 0,
+            },
+            transactions: vec![coinbase_tx],
+        };
+
+        // Height 100 is below mainnet BIP34 height 227931
+        assert!(validate_bip34_coinbase(&block, 100, 227931).is_ok());
+    }
+
+    #[test]
+    fn test_validate_bip34_valid_height() {
+        use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint};
+
+        let height = 227931u64;
+        let height_push = encode_bip34_height(height);
+        // scriptSig = height push + some extra data (like miners add)
+        let mut script_sig_bytes = height_push;
+        script_sig_bytes.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+
+        let coinbase_tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::COINBASE,
+                script_sig: ScriptBuf::from_bytes(script_sig_bytes),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76, 0xa9]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_blockhash: BlockHash::ZERO,
+                merkle_root: btc_primitives::hash::TxHash::ZERO,
+                time: 0,
+                bits: CompactTarget::MAX_TARGET,
+                nonce: 0,
+            },
+            transactions: vec![coinbase_tx],
+        };
+
+        assert!(validate_bip34_coinbase(&block, height, 227931).is_ok());
+    }
+
+    #[test]
+    fn test_validate_bip34_wrong_height() {
+        use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint};
+
+        let actual_height = 227931u64;
+        // Encode a different height in the coinbase
+        let wrong_height_push = encode_bip34_height(100);
+
+        let coinbase_tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::COINBASE,
+                script_sig: ScriptBuf::from_bytes(wrong_height_push),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76, 0xa9]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_blockhash: BlockHash::ZERO,
+                merkle_root: btc_primitives::hash::TxHash::ZERO,
+                time: 0,
+                bits: CompactTarget::MAX_TARGET,
+                nonce: 0,
+            },
+            transactions: vec![coinbase_tx],
+        };
+
+        let result = validate_bip34_coinbase(&block, actual_height, 227931);
+        assert!(result.is_err(), "wrong height should be rejected");
+        // The push encoding of height 100 is shorter than height 227931,
+        // so it triggers ScriptSigTooShort before HeightMismatch.
+        match result.unwrap_err() {
+            ValidationError::Bip34HeightMismatch { .. }
+            | ValidationError::Bip34ScriptSigTooShort => {}
+            other => panic!("expected BIP34 error, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_validate_bip34_empty_scriptsig() {
+        use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint};
+
+        let coinbase_tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::COINBASE,
+                script_sig: ScriptBuf::from_bytes(vec![]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76, 0xa9]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_blockhash: BlockHash::ZERO,
+                merkle_root: btc_primitives::hash::TxHash::ZERO,
+                time: 0,
+                bits: CompactTarget::MAX_TARGET,
+                nonce: 0,
+            },
+            transactions: vec![coinbase_tx],
+        };
+
+        let result = validate_bip34_coinbase(&block, 227931, 227931);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ValidationError::Bip34ScriptSigTooShort => {}
+            other => panic!("expected Bip34ScriptSigTooShort, got: {other}"),
+        }
     }
 }
