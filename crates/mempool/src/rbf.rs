@@ -45,6 +45,12 @@ pub enum RbfError {
 pub struct RbfPolicy {
     /// Whether RBF replacement is enabled at all.
     pub enabled: bool,
+    /// Whether full RBF is enabled (any tx can be replaced regardless of
+    /// BIP125 signaling). When `true`, the sequence-number opt-in check is
+    /// skipped. Bitcoin Core v29+ defaults this to `true`.
+    /// Use `--no-full-rbf` CLI flag to set this to `false` for the old
+    /// BIP125 opt-in behavior.
+    pub full_rbf: bool,
     /// Minimum fee increase (in satoshis) the replacement must pay on top
     /// of the combined fee of all replaced transactions.
     pub min_fee_increment: Amount,
@@ -57,6 +63,7 @@ impl Default for RbfPolicy {
     fn default() -> Self {
         Self {
             enabled: true,
+            full_rbf: true,
             min_fee_increment: Amount::from_sat(1_000),
             max_replacements: 100,
         }
@@ -99,10 +106,12 @@ pub fn can_replace(
         return Err(RbfError::Disabled);
     }
 
-    // -- 1. All replaced txs must signal RBF ----------------------------------
-    for (txid, entry) in conflicts {
-        if !signals_rbf(&entry.tx) {
-            return Err(RbfError::NotSignaling(txid.to_hex()));
+    // -- 1. All replaced txs must signal RBF (unless full_rbf is on) ----------
+    if !policy.full_rbf {
+        for (txid, entry) in conflicts {
+            if !signals_rbf(&entry.tx) {
+                return Err(RbfError::NotSignaling(txid.to_hex()));
+            }
         }
     }
 
@@ -312,20 +321,84 @@ mod tests {
     // ---- can_replace: not signaling -----------------------------------------
 
     #[test]
-    fn test_replaced_tx_not_signaling() {
+    fn test_replaced_tx_not_signaling_with_opt_in_rbf() {
         // Old tx does NOT signal RBF (sequence = 0xffffffff)
+        // With full_rbf disabled, this should be rejected
         let old_tx = make_tx(0x01, 0xffffffff, 50_000);
         let old_entry = make_entry(old_tx.clone(), Amount::from_sat(2_000));
         let old_txid = old_tx.txid();
 
         let new_tx = make_tx(0x01, 0x00000001, 48_000);
         let conflicts = vec![(old_txid, &old_entry)];
-        let policy = RbfPolicy::default();
+        let policy = RbfPolicy {
+            full_rbf: false,
+            ..RbfPolicy::default()
+        };
 
         assert!(matches!(
             can_replace(&new_tx, Amount::from_sat(5_000), &conflicts, &policy),
             Err(RbfError::NotSignaling(_)),
         ));
+    }
+
+    #[test]
+    fn test_full_rbf_allows_non_signaling_replacement() {
+        // Old tx does NOT signal RBF (sequence = 0xffffffff)
+        // With full_rbf enabled (default), replacement should be accepted
+        let old_tx = make_tx(0x01, 0xffffffff, 50_000);
+        let old_entry = make_entry(old_tx.clone(), Amount::from_sat(2_000));
+        let old_txid = old_tx.txid();
+
+        let new_tx = make_tx(0x01, 0x00000001, 48_000);
+        let new_fee = Amount::from_sat(5_000);
+        let conflicts = vec![(old_txid, &old_entry)];
+        let policy = RbfPolicy::default(); // full_rbf = true
+
+        assert!(policy.full_rbf);
+        assert!(can_replace(&new_tx, new_fee, &conflicts, &policy).is_ok());
+    }
+
+    #[test]
+    fn test_full_rbf_default_is_true() {
+        let policy = RbfPolicy::default();
+        assert!(policy.full_rbf);
+    }
+
+    #[test]
+    fn test_full_rbf_disabled_requires_signaling() {
+        // With full_rbf = false, non-signaling tx cannot be replaced
+        let old_tx = make_tx(0x01, 0xfffffffe, 50_000); // does NOT signal
+        let old_entry = make_entry(old_tx.clone(), Amount::from_sat(2_000));
+        let old_txid = old_tx.txid();
+
+        let new_tx = make_tx(0x01, 0x00000001, 48_000);
+        let conflicts = vec![(old_txid, &old_entry)];
+        let policy = RbfPolicy {
+            full_rbf: false,
+            ..RbfPolicy::default()
+        };
+
+        assert!(matches!(
+            can_replace(&new_tx, Amount::from_sat(5_000), &conflicts, &policy),
+            Err(RbfError::NotSignaling(_)),
+        ));
+    }
+
+    #[test]
+    fn test_full_rbf_disabled_allows_signaling_replacement() {
+        // With full_rbf = false, signaling tx CAN be replaced
+        let old_tx = make_tx(0x01, 0x00000001, 50_000); // signals RBF
+        let old_entry = make_entry(old_tx.clone(), Amount::from_sat(2_000));
+        let old_txid = old_tx.txid();
+
+        let new_tx = make_tx(0x01, 0x00000002, 48_000);
+        let conflicts = vec![(old_txid, &old_entry)];
+        let policy = RbfPolicy {
+            full_rbf: false,
+            ..RbfPolicy::default()
+        };
+
+        assert!(can_replace(&new_tx, Amount::from_sat(5_000), &conflicts, &policy).is_ok());
     }
 
     // ---- can_replace: insufficient fee --------------------------------------
@@ -537,6 +610,7 @@ mod tests {
     fn test_default_rbf_policy() {
         let policy = RbfPolicy::default();
         assert!(policy.enabled);
+        assert!(policy.full_rbf);
         assert_eq!(policy.min_fee_increment.as_sat(), 1_000);
         assert_eq!(policy.max_replacements, 100);
     }
@@ -762,11 +836,13 @@ mod tests {
     fn test_rbf_policy_clone() {
         let policy = RbfPolicy {
             enabled: false,
+            full_rbf: false,
             min_fee_increment: Amount::from_sat(5_000),
             max_replacements: 50,
         };
         let cloned = policy.clone();
         assert_eq!(cloned.enabled, false);
+        assert_eq!(cloned.full_rbf, false);
         assert_eq!(cloned.min_fee_increment.as_sat(), 5_000);
         assert_eq!(cloned.max_replacements, 50);
     }

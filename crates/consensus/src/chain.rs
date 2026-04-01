@@ -488,6 +488,17 @@ pub fn genesis_header(params: &ChainParams) -> BlockHeader {
             bits: CompactTarget::from_u32(0x1e0377ae),
             nonce: 52613770,
         },
+        btc_primitives::network::Network::Testnet4 => BlockHeader {
+            version: 1,
+            prev_blockhash: BlockHash::ZERO,
+            merkle_root: TxHash::from_hex(
+                "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b",
+            )
+            .unwrap(),
+            time: 1714777860,
+            bits: CompactTarget::from_u32(0x1d00ffff),
+            nonce: 393743547,
+        },
     }
 }
 

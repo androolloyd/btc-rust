@@ -1,6 +1,13 @@
 use btc_primitives::{Amount, Transaction, Encodable};
 use thiserror::Error;
 
+/// Default maximum OP_RETURN data size in bytes.
+///
+/// Bitcoin Core v30 raised this from 80 to 100,000 bytes and allows multiple
+/// OP_RETURN outputs per transaction. This is a relay *policy* limit, not a
+/// consensus rule (consensus never had a limit).
+pub const MAX_OP_RETURN_SIZE: usize = 100_000;
+
 /// Errors returned when a transaction violates mempool acceptance policy.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum PolicyError {
@@ -22,6 +29,9 @@ pub enum PolicyError {
 
     #[error("descendant count {count} exceeds maximum {max}")]
     TooManyDescendants { count: usize, max: usize },
+
+    #[error("OP_RETURN output {index} has {size} bytes of data, exceeding limit of {max} bytes")]
+    OpReturnTooLarge { index: usize, size: usize, max: usize },
 }
 
 /// Configurable limits for transaction acceptance into the mempool.
@@ -37,6 +47,12 @@ pub struct TxValidationPolicy {
     pub max_descendant_count: usize,
     /// Dust limit in satoshis -- outputs below this are rejected (default: 546).
     pub dust_limit: Amount,
+    /// Maximum size in bytes for OP_RETURN output data (default: 100,000).
+    ///
+    /// Bitcoin Core v30 raised this from 80 to 100,000 bytes. This is a relay
+    /// policy limit, not a consensus rule. Use `--op-return-limit <bytes>` to
+    /// configure.
+    pub max_op_return_size: usize,
 }
 
 impl Default for TxValidationPolicy {
@@ -47,6 +63,7 @@ impl Default for TxValidationPolicy {
             max_ancestor_count: 25,
             max_descendant_count: 25,
             dust_limit: Amount::from_sat(546),
+            max_op_return_size: MAX_OP_RETURN_SIZE,
         }
     }
 }
@@ -83,8 +100,23 @@ pub fn validate_tx_policy(
     }
 
     // Check for dust outputs (skip OP_RETURN outputs which are provably unspendable)
+    // and validate OP_RETURN data size against the policy limit.
+    // Note: multiple OP_RETURN outputs are allowed (Bitcoin Core v30+).
     for (index, output) in tx.outputs.iter().enumerate() {
         if output.script_pubkey.is_op_return() {
+            // OP_RETURN data is everything after the OP_RETURN opcode byte
+            let data_len = if output.script_pubkey.len() > 1 {
+                output.script_pubkey.len() - 1
+            } else {
+                0
+            };
+            if data_len > policy.max_op_return_size {
+                return Err(PolicyError::OpReturnTooLarge {
+                    index,
+                    size: data_len,
+                    max: policy.max_op_return_size,
+                });
+            }
             continue;
         }
         if output.value.as_sat() < policy.dust_limit.as_sat() {
@@ -274,6 +306,7 @@ mod tests {
         assert_eq!(policy.max_ancestor_count, 25);
         assert_eq!(policy.max_descendant_count, 25);
         assert_eq!(policy.dust_limit.as_sat(), 546);
+        assert_eq!(policy.max_op_return_size, 100_000);
     }
 
     #[test]
@@ -491,6 +524,7 @@ mod tests {
             max_ancestor_count: 10,
             max_descendant_count: 10,
             dust_limit: Amount::from_sat(200),
+            max_op_return_size: 500,
         };
         let cloned = policy.clone();
         assert_eq!(cloned.max_tx_size, 50_000);
@@ -498,6 +532,7 @@ mod tests {
         assert_eq!(cloned.max_ancestor_count, 10);
         assert_eq!(cloned.max_descendant_count, 10);
         assert_eq!(cloned.dust_limit.as_sat(), 200);
+        assert_eq!(cloned.max_op_return_size, 500);
     }
 
     #[test]
@@ -528,6 +563,244 @@ mod tests {
         let tx = make_tx(&[0], 25);
         // Zero fee with zero min should pass
         let result = validate_tx_policy(&tx, Amount::from_sat(0), 0, 0, &policy);
+        assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------
+    // OP_RETURN policy tests (Bitcoin Core v30+)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_default_max_op_return_size() {
+        let policy = TxValidationPolicy::default();
+        assert_eq!(policy.max_op_return_size, 100_000);
+    }
+
+    #[test]
+    fn test_max_op_return_constant() {
+        assert_eq!(super::MAX_OP_RETURN_SIZE, 100_000);
+    }
+
+    #[test]
+    fn test_op_return_within_default_limit() {
+        // OP_RETURN with 80 bytes of data (old limit) should pass
+        let mut script_bytes = vec![0x6a]; // OP_RETURN
+        script_bytes.extend_from_slice(&vec![0xab; 80]);
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0xaa; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![0x00; 10]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![
+                TxOut {
+                    value: Amount::from_sat(50_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x76; 25]),
+                },
+                TxOut {
+                    value: Amount::from_sat(0),
+                    script_pubkey: ScriptBuf::from_bytes(script_bytes),
+                },
+            ],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+        let policy = TxValidationPolicy::default();
+        let result = validate_tx_policy(&tx, Amount::from_sat(5_000), 0, 0, &policy);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_op_return_large_data_within_new_limit() {
+        // OP_RETURN with ~50KB of data should pass under the new 100KB limit
+        let mut script_bytes = vec![0x6a]; // OP_RETURN
+        script_bytes.extend_from_slice(&vec![0xab; 50_000]);
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0xaa; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![0x00; 10]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(0),
+                script_pubkey: ScriptBuf::from_bytes(script_bytes),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+        let policy = TxValidationPolicy {
+            dust_limit: Amount::from_sat(0),
+            ..Default::default()
+        };
+        let result = validate_tx_policy(&tx, Amount::from_sat(5_000), 0, 0, &policy);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_op_return_exceeds_custom_limit() {
+        // Set a custom limit of 80 bytes, then exceed it
+        let mut script_bytes = vec![0x6a]; // OP_RETURN
+        script_bytes.extend_from_slice(&vec![0xab; 100]); // 100 bytes data > 80 limit
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0xaa; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![0x00; 10]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(0),
+                script_pubkey: ScriptBuf::from_bytes(script_bytes),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+        let policy = TxValidationPolicy {
+            max_op_return_size: 80,
+            dust_limit: Amount::from_sat(0),
+            ..Default::default()
+        };
+        let result = validate_tx_policy(&tx, Amount::from_sat(5_000), 0, 0, &policy);
+        assert!(matches!(
+            result,
+            Err(PolicyError::OpReturnTooLarge { index: 0, size: 100, max: 80 })
+        ));
+    }
+
+    #[test]
+    fn test_multiple_op_return_outputs_allowed() {
+        // Multiple OP_RETURN outputs should be accepted (Bitcoin Core v30+)
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0xaa; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![0x00; 10]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![
+                TxOut {
+                    value: Amount::from_sat(50_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x76; 25]),
+                },
+                TxOut {
+                    value: Amount::from_sat(0),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x6a, 0x04, 0xde, 0xad]),
+                },
+                TxOut {
+                    value: Amount::from_sat(0),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x6a, 0x04, 0xbe, 0xef]),
+                },
+                TxOut {
+                    value: Amount::from_sat(0),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x6a, 0x02, 0xca, 0xfe]),
+                },
+            ],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+        let policy = TxValidationPolicy::default();
+        let result = validate_tx_policy(&tx, Amount::from_sat(5_000), 0, 0, &policy);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_op_return_exactly_at_limit() {
+        // OP_RETURN data exactly at the limit should pass
+        let mut script_bytes = vec![0x6a]; // OP_RETURN
+        script_bytes.extend_from_slice(&vec![0xab; 80]); // exactly 80 bytes data
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0xaa; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![0x00; 10]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(0),
+                script_pubkey: ScriptBuf::from_bytes(script_bytes),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+        let policy = TxValidationPolicy {
+            max_op_return_size: 80,
+            dust_limit: Amount::from_sat(0),
+            ..Default::default()
+        };
+        let result = validate_tx_policy(&tx, Amount::from_sat(5_000), 0, 0, &policy);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_op_return_one_over_limit() {
+        let mut script_bytes = vec![0x6a]; // OP_RETURN
+        script_bytes.extend_from_slice(&vec![0xab; 81]); // 81 bytes data > 80 limit
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0xaa; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![0x00; 10]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(0),
+                script_pubkey: ScriptBuf::from_bytes(script_bytes),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+        let policy = TxValidationPolicy {
+            max_op_return_size: 80,
+            dust_limit: Amount::from_sat(0),
+            ..Default::default()
+        };
+        let result = validate_tx_policy(&tx, Amount::from_sat(5_000), 0, 0, &policy);
+        assert!(matches!(
+            result,
+            Err(PolicyError::OpReturnTooLarge { index: 0, size: 81, max: 80 })
+        ));
+    }
+
+    #[test]
+    fn test_op_return_error_display() {
+        let err = PolicyError::OpReturnTooLarge {
+            index: 1,
+            size: 200,
+            max: 100,
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("200"));
+        assert!(msg.contains("100"));
+        assert!(msg.contains("OP_RETURN"));
+    }
+
+    #[test]
+    fn test_bare_op_return_no_data() {
+        // A bare OP_RETURN with no data should always pass
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0xaa; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![0x00; 10]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![
+                TxOut {
+                    value: Amount::from_sat(50_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x76; 25]),
+                },
+                TxOut {
+                    value: Amount::from_sat(0),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x6a]), // bare OP_RETURN
+                },
+            ],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+        let policy = TxValidationPolicy::default();
+        let result = validate_tx_policy(&tx, Amount::from_sat(5_000), 0, 0, &policy);
         assert!(result.is_ok());
     }
 }
