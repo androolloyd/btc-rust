@@ -329,7 +329,7 @@ mod tests {
     use super::*;
     use crate::ExExManager;
     use btc_primitives::amount::Amount;
-    use btc_primitives::hash::TxHash;
+    use btc_primitives::hash::{BlockHash, TxHash};
     use btc_primitives::network::Network;
     use btc_primitives::script::ScriptBuf;
     use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut, Witness};
@@ -524,5 +524,432 @@ mod tests {
     fn test_ordinals_exex_default() {
         let exex = OrdinalsExEx::default();
         assert_eq!(exex.inscription_count, 0);
+    }
+
+    // -------------------------------------------------------------------
+    // find_envelope_start edge cases
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_find_envelope_start_empty() {
+        assert!(find_envelope_start(&[]).is_none());
+    }
+
+    #[test]
+    fn test_find_envelope_start_single_byte() {
+        assert!(find_envelope_start(&[0x00]).is_none());
+    }
+
+    #[test]
+    fn test_find_envelope_start_no_match() {
+        assert!(find_envelope_start(&[0x01, 0x02, 0x03]).is_none());
+    }
+
+    #[test]
+    fn test_find_envelope_start_at_offset() {
+        // OP_FALSE OP_IF at position 3
+        let data = [0x01, 0x02, 0x03, OP_FALSE, OP_IF, 0x04];
+        let pos = find_envelope_start(&data).unwrap();
+        assert_eq!(pos, 3);
+    }
+
+    // -------------------------------------------------------------------
+    // read_push edge cases for ordinals
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_read_push_op_0_ordinals() {
+        let data = [0x00];
+        let (bytes, new_pos) = read_push(&data, 0).unwrap();
+        assert!(bytes.is_empty());
+        assert_eq!(new_pos, 1);
+    }
+
+    #[test]
+    fn test_read_push_small_push_ordinals() {
+        let data = [0x02, 0xAA, 0xBB];
+        let (bytes, new_pos) = read_push(&data, 0).unwrap();
+        assert_eq!(bytes, &[0xAA, 0xBB]);
+        assert_eq!(new_pos, 3);
+    }
+
+    #[test]
+    fn test_read_push_small_push_truncated_ordinals() {
+        let data = [0x05, 0xAA, 0xBB]; // says 5 bytes, only 2 available
+        assert!(read_push(&data, 0).is_none());
+    }
+
+    #[test]
+    fn test_read_push_pushdata1_ordinals() {
+        let mut data = vec![Opcode::OP_PUSHDATA1 as u8, 0x03]; // length=3
+        data.extend_from_slice(&[0x01, 0x02, 0x03]);
+        let (bytes, new_pos) = read_push(&data, 0).unwrap();
+        assert_eq!(bytes, &[0x01, 0x02, 0x03]);
+        assert_eq!(new_pos, 5);
+    }
+
+    #[test]
+    fn test_read_push_pushdata1_truncated_length_ordinals() {
+        let data = [Opcode::OP_PUSHDATA1 as u8];
+        assert!(read_push(&data, 0).is_none());
+    }
+
+    #[test]
+    fn test_read_push_pushdata1_truncated_data_ordinals() {
+        let data = [Opcode::OP_PUSHDATA1 as u8, 0x05, 0x01, 0x02];
+        assert!(read_push(&data, 0).is_none());
+    }
+
+    #[test]
+    fn test_read_push_pushdata2_ordinals() {
+        let mut data = vec![Opcode::OP_PUSHDATA2 as u8];
+        data.extend_from_slice(&4u16.to_le_bytes());
+        data.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        let (bytes, new_pos) = read_push(&data, 0).unwrap();
+        assert_eq!(bytes, &[0xAA, 0xBB, 0xCC, 0xDD]);
+        assert_eq!(new_pos, 7);
+    }
+
+    #[test]
+    fn test_read_push_pushdata2_truncated_length_ordinals() {
+        let data = [Opcode::OP_PUSHDATA2 as u8, 0x01]; // only 1 byte of 2-byte length
+        assert!(read_push(&data, 0).is_none());
+    }
+
+    #[test]
+    fn test_read_push_pushdata2_truncated_data_ordinals() {
+        let mut data = vec![Opcode::OP_PUSHDATA2 as u8];
+        data.extend_from_slice(&10u16.to_le_bytes()); // length=10
+        data.extend_from_slice(&[0x01, 0x02]); // only 2 bytes
+        assert!(read_push(&data, 0).is_none());
+    }
+
+    #[test]
+    fn test_read_push_unknown_opcode_ordinals() {
+        let data = [0x6a]; // OP_RETURN, not a push op
+        assert!(read_push(&data, 0).is_none());
+    }
+
+    #[test]
+    fn test_read_push_past_end_ordinals() {
+        let data = [0x01, 0x02];
+        assert!(read_push(&data, 10).is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // parse_envelope edge cases
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_envelope_too_short() {
+        // Less than 5 bytes
+        let data = [OP_FALSE, OP_IF, 0x03, 0x6f];
+        let result = parse_envelope(&data, TxHash::from_bytes([0; 32]), 0);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_envelope_with_unknown_tag() {
+        // Build an envelope with an unknown tag (e.g. 0x52 = OP_2)
+        let mut data = Vec::new();
+        data.push(OP_FALSE);
+        data.push(OP_IF);
+        data.push(3u8); // push 3
+        data.extend_from_slice(b"ord");
+        // Unknown tag: OP_2 (0x52)
+        data.push(Opcode::OP_2 as u8);
+        // Push some skip data
+        data.push(2u8); // push 2 bytes
+        data.extend_from_slice(&[0xAA, 0xBB]);
+        // Content type
+        data.push(Opcode::OP_1 as u8);
+        data.push(10u8);
+        data.extend_from_slice(b"text/plain");
+        // Body
+        data.push(OP_FALSE);
+        data.push(4u8);
+        data.extend_from_slice(b"test");
+        data.push(OP_ENDIF);
+
+        let result =
+            parse_envelope(&data, TxHash::from_bytes([0x11; 32]), 0).unwrap();
+        assert_eq!(result.content_type, "text/plain");
+        assert_eq!(result.content_body, b"test");
+    }
+
+    #[test]
+    fn test_parse_envelope_unknown_tag_no_push_data() {
+        // Unknown tag followed by invalid push data -> should break
+        let mut data = Vec::new();
+        data.push(OP_FALSE);
+        data.push(OP_IF);
+        data.push(3u8);
+        data.extend_from_slice(b"ord");
+        // Unknown tag
+        data.push(Opcode::OP_2 as u8);
+        // Invalid push data (OP_RETURN is not a valid push)
+        data.push(0x6a);
+
+        let result =
+            parse_envelope(&data, TxHash::from_bytes([0x22; 32]), 0);
+        // Should still return Some with defaults (empty content_type, empty body)
+        assert!(result.is_some());
+        let insc = result.unwrap();
+        assert_eq!(insc.content_type, "");
+        assert!(insc.content_body.is_empty());
+    }
+
+    #[test]
+    fn test_parse_envelope_no_content_type() {
+        // Envelope with body but no OP_1 content-type tag
+        let mut data = Vec::new();
+        data.push(OP_FALSE);
+        data.push(OP_IF);
+        data.push(3u8);
+        data.extend_from_slice(b"ord");
+        // Body directly
+        data.push(OP_FALSE);
+        data.push(5u8);
+        data.extend_from_slice(b"hello");
+        data.push(OP_ENDIF);
+
+        let result =
+            parse_envelope(&data, TxHash::from_bytes([0x33; 32]), 0).unwrap();
+        assert_eq!(result.content_type, ""); // default empty
+        assert_eq!(result.content_body, b"hello");
+    }
+
+    #[test]
+    fn test_parse_envelope_multiple_body_chunks() {
+        // Envelope with two body chunks
+        let mut data = Vec::new();
+        data.push(OP_FALSE);
+        data.push(OP_IF);
+        data.push(3u8);
+        data.extend_from_slice(b"ord");
+        data.push(Opcode::OP_1 as u8);
+        data.push(10u8);
+        data.extend_from_slice(b"text/plain");
+        // First body chunk
+        data.push(OP_FALSE);
+        data.push(5u8);
+        data.extend_from_slice(b"Hello");
+        // Second body chunk
+        data.push(OP_FALSE);
+        data.push(6u8);
+        data.extend_from_slice(b" World");
+        data.push(OP_ENDIF);
+
+        let result =
+            parse_envelope(&data, TxHash::from_bytes([0x44; 32]), 0).unwrap();
+        assert_eq!(result.content_type, "text/plain");
+        assert_eq!(result.content_body, b"Hello World");
+    }
+
+    // -------------------------------------------------------------------
+    // parse_inscription_from_witness_item edge cases
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_inscription_from_witness_item_too_short() {
+        let data = [0x00]; // single byte, too short
+        let result = parse_inscription_from_witness_item(
+            &data,
+            TxHash::from_bytes([0; 32]),
+            0,
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_inscription_from_witness_item_no_envelope() {
+        // Data without OP_FALSE OP_IF
+        let data = [0x01, 0x02, 0x03, 0x04, 0x05];
+        let result = parse_inscription_from_witness_item(
+            &data,
+            TxHash::from_bytes([0; 32]),
+            0,
+        );
+        assert!(result.is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // OrdinalsExEx: BlockReverted and ChainReorged branches
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_ordinals_exex_block_reverted() {
+        let manager = ExExManager::new(Network::Regtest);
+        let ctx = manager.subscribe();
+
+        manager.notify(ExExNotification::BlockReverted {
+            height: 10,
+            hash: BlockHash::from_bytes([0xcc; 32]),
+        });
+
+        drop(manager);
+        let result = OrdinalsExEx::new().start(ctx).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_ordinals_exex_chain_reorged() {
+        let manager = ExExManager::new(Network::Regtest);
+        let ctx = manager.subscribe();
+
+        manager.notify(ExExNotification::ChainReorged {
+            old_tip: BlockHash::from_bytes([0x01; 32]),
+            new_tip: BlockHash::from_bytes([0x02; 32]),
+            fork_height: 5,
+            reverted: vec![BlockHash::from_bytes([0x01; 32])],
+            committed: vec![(6, BlockHash::from_bytes([0x02; 32]))],
+        });
+
+        drop(manager);
+        let result = OrdinalsExEx::new().start(ctx).await;
+        assert!(result.is_ok());
+    }
+
+    // -------------------------------------------------------------------
+    // OrdinalsExEx: processes block with inscriptions and counts them
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_ordinals_exex_processes_inscriptions_and_counts() {
+        use btc_consensus::utxo::UtxoSetUpdate;
+        use btc_primitives::block::{Block, BlockHeader};
+        use btc_primitives::compact::CompactTarget;
+        use btc_primitives::hash::BlockHash;
+
+        let manager = ExExManager::new(Network::Regtest);
+        let ctx = manager.subscribe();
+
+        let tx1 = make_inscription_tx("text/plain", b"Hello", 0xF1);
+        let tx2 = make_inscription_tx("image/png", &[0x89, 0x50], 0xF2);
+
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_blockhash: BlockHash::ZERO,
+                merkle_root: TxHash::ZERO,
+                time: 1231006505,
+                bits: CompactTarget::MAX_TARGET,
+                nonce: 0,
+            },
+            transactions: vec![tx1, tx2],
+        };
+        let hash = block.block_hash();
+
+        let utxo_changes = UtxoSetUpdate {
+            created: vec![],
+            spent: vec![],
+        };
+
+        manager.notify(ExExNotification::BlockCommitted {
+            height: 1,
+            hash,
+            block,
+            utxo_changes,
+        });
+
+        drop(manager);
+        let result = OrdinalsExEx::new().start(ctx).await;
+        assert!(result.is_ok());
+    }
+
+    // -------------------------------------------------------------------
+    // InscriptionData struct tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_inscription_data_equality() {
+        let d1 = InscriptionData {
+            content_type: "text/plain".into(),
+            content_body: b"hello".to_vec(),
+            txid: TxHash::from_bytes([0x01; 32]),
+            inscription_id: "abc123i0".into(),
+        };
+        let d2 = d1.clone();
+        assert_eq!(d1, d2);
+    }
+
+    // -------------------------------------------------------------------
+    // Large body with OP_PUSHDATA1 in witness item
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_inscription_with_pushdata1_body() {
+        let body = vec![0xAB; 100]; // >75 bytes triggers OP_PUSHDATA1 in helper
+        let tx = make_inscription_tx("application/octet-stream", &body, 0xF3);
+        let inscriptions = scan_transaction_for_inscriptions(&tx);
+        assert_eq!(inscriptions.len(), 1);
+        assert_eq!(inscriptions[0].content_type, "application/octet-stream");
+        assert_eq!(inscriptions[0].content_body, body);
+    }
+
+    // -------------------------------------------------------------------
+    // Scan transaction with multiple inputs and witnesses
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_scan_multiple_inputs_no_inscriptions() {
+        let w1 = Witness::from_items(vec![vec![0x01; 64]]);
+        let w2 = Witness::from_items(vec![vec![0x02; 33]]);
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![
+                TxIn {
+                    previous_output: OutPoint::new(TxHash::from_bytes([0xA1; 32]), 0),
+                    script_sig: ScriptBuf::from_bytes(vec![]),
+                    sequence: TxIn::SEQUENCE_FINAL,
+                },
+                TxIn {
+                    previous_output: OutPoint::new(TxHash::from_bytes([0xA2; 32]), 0),
+                    script_sig: ScriptBuf::from_bytes(vec![]),
+                    sequence: TxIn::SEQUENCE_FINAL,
+                },
+            ],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(10_000),
+                script_pubkey: ScriptBuf::p2tr(&[0xaa; 32]),
+            }],
+            witness: vec![w1, w2],
+            lock_time: 0,
+        };
+
+        let inscriptions = scan_transaction_for_inscriptions(&tx);
+        assert!(inscriptions.is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // Envelope at non-zero offset in witness item
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_inscription_envelope_at_offset() {
+        // Prefix some random bytes before the envelope
+        let mut data = vec![0x01, 0x02, 0x03, 0x04, 0x05];
+        // Then add the envelope
+        data.push(OP_FALSE);
+        data.push(OP_IF);
+        data.push(3u8);
+        data.extend_from_slice(b"ord");
+        data.push(Opcode::OP_1 as u8);
+        data.push(10u8);
+        data.extend_from_slice(b"text/plain");
+        data.push(OP_FALSE);
+        data.push(4u8);
+        data.extend_from_slice(b"test");
+        data.push(OP_ENDIF);
+
+        let result = parse_inscription_from_witness_item(
+            &data,
+            TxHash::from_bytes([0x55; 32]),
+            0,
+        );
+        assert!(result.is_some());
+        let insc = result.unwrap();
+        assert_eq!(insc.content_type, "text/plain");
+        assert_eq!(insc.content_body, b"test");
     }
 }

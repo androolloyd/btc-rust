@@ -586,7 +586,7 @@ mod tests {
     use super::*;
     use crate::ExExManager;
     use btc_primitives::amount::Amount;
-    use btc_primitives::hash::TxHash;
+    use btc_primitives::hash::{BlockHash, TxHash};
     use btc_primitives::network::Network;
     use btc_primitives::script::ScriptBuf;
     use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
@@ -1313,7 +1313,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_runes_exex_processes_etch_mint_transfer() {
-        use btc_consensus::utxo::{UtxoEntry, UtxoSetUpdate};
+        use btc_consensus::utxo::UtxoSetUpdate;
         use btc_primitives::block::{Block, BlockHeader};
         use btc_primitives::compact::CompactTarget;
         use btc_primitives::hash::BlockHash;
