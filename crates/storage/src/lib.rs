@@ -5,6 +5,7 @@ pub mod redb_backend;
 pub mod qmdb_backend;
 pub mod pruning;
 pub mod utxo_store;
+pub mod leveldb_backend;
 
 pub use traits::{Database, DbTx, DbTxMut};
 pub use provider::BlockchainProvider;
