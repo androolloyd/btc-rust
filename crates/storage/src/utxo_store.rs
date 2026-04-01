@@ -636,4 +636,350 @@ mod tests {
         assert_eq!(utxo_set.get_utxo(&op2).unwrap().txout.value.as_sat(), 20_000);
         assert_eq!(utxo_set.get_utxo(&op3).unwrap().txout.value.as_sat(), 30_000);
     }
+
+    // -----------------------------------------------------------------------
+    // apply_update_cached + flush_cache roundtrip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_apply_update_cached_then_flush() {
+        let (db, _dir) = temp_db();
+        let mut utxo_set = PersistentUtxoSet::new(Arc::clone(&db));
+
+        let op1 = make_outpoint(0x60, 0);
+        let entry1 = make_entry(10_000, 1, false);
+        let op2 = make_outpoint(0x61, 0);
+        let entry2 = make_entry(20_000, 2, true);
+
+        // Cache-only insert.
+        let update = UtxoSetUpdate {
+            spent: vec![],
+            created: vec![(op1, entry1.clone()), (op2, entry2.clone())],
+        };
+        utxo_set.apply_update_cached(&update);
+        assert_eq!(utxo_set.cache_len(), 2);
+
+        // Before flush, data should NOT be in a fresh instance's DB.
+        {
+            let fresh = PersistentUtxoSet::new(Arc::clone(&db));
+            assert!(fresh.get_utxo(&op1).is_none());
+            assert!(fresh.get_utxo(&op2).is_none());
+        }
+
+        // Flush to DB.
+        utxo_set.flush_cache().unwrap();
+        assert_eq!(utxo_set.cache_len(), 0);
+
+        // After flush, a fresh instance should find them.
+        {
+            let fresh = PersistentUtxoSet::new(Arc::clone(&db));
+            let got1 = fresh.get_utxo(&op1).expect("should be in DB after flush");
+            assert_eq!(got1.txout.value.as_sat(), 10_000);
+            assert_eq!(got1.height, 1);
+            assert!(!got1.is_coinbase);
+
+            let got2 = fresh.get_utxo(&op2).expect("should be in DB after flush");
+            assert_eq!(got2.txout.value.as_sat(), 20_000);
+            assert_eq!(got2.height, 2);
+            assert!(got2.is_coinbase);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_update_cached: spend removes from cache, adds to pending_deletes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_apply_update_cached_spend() {
+        let (db, _dir) = temp_db();
+        let mut utxo_set = PersistentUtxoSet::new(Arc::clone(&db));
+
+        let op = make_outpoint(0x62, 0);
+        let entry = make_entry(5_000, 10, false);
+
+        // First persist via apply_update so the UTXO is in DB.
+        utxo_set
+            .apply_update(&UtxoSetUpdate {
+                spent: vec![],
+                created: vec![(op, entry.clone())],
+            })
+            .unwrap();
+        assert!(utxo_set.contains(&op));
+
+        // Now spend via cached path — this removes from cache and adds
+        // to pending_deletes, but the UTXO is still in the DB.
+        utxo_set.apply_update_cached(&UtxoSetUpdate {
+            spent: vec![(op, entry.clone())],
+            created: vec![],
+        });
+
+        // The cache no longer has it, but get_utxo falls through to DB
+        // and re-loads it. This is expected behavior — the cached spend
+        // only takes full effect after flush.
+        // Verify a fresh instance still sees it in DB.
+        {
+            let fresh = PersistentUtxoSet::new(Arc::clone(&db));
+            assert!(fresh.get_utxo(&op).is_some());
+        }
+
+        // After flush, it should be gone from DB too.
+        utxo_set.flush_cache().unwrap();
+        {
+            let fresh = PersistentUtxoSet::new(Arc::clone(&db));
+            assert!(fresh.get_utxo(&op).is_none());
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // pending_deletes: UTXOs created and spent in same cached batch never
+    // get persisted, so flush should skip deleting them from DB
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_pending_deletes_created_and_spent_in_same_batch() {
+        let (db, _dir) = temp_db();
+        let mut utxo_set = PersistentUtxoSet::new(Arc::clone(&db));
+
+        let op = make_outpoint(0x63, 0);
+        let entry = make_entry(7_777, 5, false);
+
+        // Create in cache.
+        utxo_set.apply_update_cached(&UtxoSetUpdate {
+            spent: vec![],
+            created: vec![(op, entry.clone())],
+        });
+        assert!(utxo_set.contains(&op));
+
+        // Spend in cache (same instance, never flushed).
+        utxo_set.apply_update_cached(&UtxoSetUpdate {
+            spent: vec![(op, entry.clone())],
+            created: vec![],
+        });
+        assert!(!utxo_set.contains(&op));
+
+        // Flush should succeed — the UTXO was never in DB, so no delete needed.
+        utxo_set.flush_cache().unwrap();
+
+        // Confirm it's truly gone.
+        {
+            let fresh = PersistentUtxoSet::new(Arc::clone(&db));
+            assert!(fresh.get_utxo(&op).is_none());
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // flush_cache on empty cache is a no-op
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_flush_empty_cache() {
+        let (db, _dir) = temp_db();
+        let mut utxo_set = PersistentUtxoSet::new(Arc::clone(&db));
+
+        // Empty cache + no pending deletes → should return Ok(()) immediately.
+        utxo_set.flush_cache().unwrap();
+        assert_eq!(utxo_set.cache_len(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Cache eviction with apply_update_cached
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cache_eviction_with_cached_update() {
+        let (db, _dir) = temp_db();
+        let mut utxo_set = PersistentUtxoSet::with_cache_limit(Arc::clone(&db), 3);
+
+        // Insert 5 UTXOs through cached path — cache should be capped at 3.
+        let entries: Vec<(OutPoint, UtxoEntry)> = (0u8..5)
+            .map(|i| (make_outpoint(0x70 + i, 0), make_entry(i as u64 * 100, i as u64, false)))
+            .collect();
+
+        utxo_set.apply_update_cached(&UtxoSetUpdate {
+            spent: vec![],
+            created: entries.clone(),
+        });
+
+        assert!(utxo_set.cache_len() <= 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // with_cache_limit constructor
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_with_cache_limit_constructor() {
+        let (db, _dir) = temp_db();
+        let utxo_set = PersistentUtxoSet::with_cache_limit(Arc::clone(&db), 42);
+        assert_eq!(utxo_set.cache_len(), 0);
+        assert_eq!(utxo_set.cache_size_limit, 42);
+    }
+
+    // -----------------------------------------------------------------------
+    // Metadata encoding: non-coinbase with is_coinbase=false
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_metadata_not_coinbase() {
+        let (db, _dir) = temp_db();
+        let op = make_outpoint(0x80, 0);
+        let entry = make_entry(100, 999, false);
+
+        {
+            let mut utxo_set = PersistentUtxoSet::new(Arc::clone(&db));
+            utxo_set
+                .apply_update(&UtxoSetUpdate {
+                    spent: vec![],
+                    created: vec![(op, entry.clone())],
+                })
+                .unwrap();
+        }
+
+        // Fresh instance must recover is_coinbase=false correctly.
+        {
+            let utxo_set = PersistentUtxoSet::new(Arc::clone(&db));
+            let got = utxo_set.get_utxo(&op).unwrap();
+            assert!(!got.is_coinbase);
+            assert_eq!(got.height, 999);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // cache_len reflects actual count
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cache_len_tracks_correctly() {
+        let (db, _dir) = temp_db();
+        let mut utxo_set = PersistentUtxoSet::new(Arc::clone(&db));
+
+        assert_eq!(utxo_set.cache_len(), 0);
+
+        let op1 = make_outpoint(0x90, 0);
+        let op2 = make_outpoint(0x91, 0);
+        let e1 = make_entry(1, 1, false);
+        let e2 = make_entry(2, 2, false);
+
+        utxo_set.apply_update_cached(&UtxoSetUpdate {
+            spent: vec![],
+            created: vec![(op1, e1.clone()), (op2, e2.clone())],
+        });
+        assert_eq!(utxo_set.cache_len(), 2);
+
+        utxo_set.apply_update_cached(&UtxoSetUpdate {
+            spent: vec![(op1, e1)],
+            created: vec![],
+        });
+        assert_eq!(utxo_set.cache_len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // flush_cache with only pending_deletes (no created entries in cache)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_flush_cache_pending_deletes_only() {
+        let (db, _dir) = temp_db();
+        let mut utxo_set = PersistentUtxoSet::new(Arc::clone(&db));
+
+        let op = make_outpoint(0xa0, 0);
+        let entry = make_entry(12_345, 77, false);
+
+        // Persist to DB first.
+        utxo_set
+            .apply_update(&UtxoSetUpdate {
+                spent: vec![],
+                created: vec![(op, entry.clone())],
+            })
+            .unwrap();
+
+        // Clear cache manually by flushing.
+        utxo_set.flush_cache().unwrap();
+        assert_eq!(utxo_set.cache_len(), 0);
+
+        // Now spend via cached — cache empty, but pending_deletes non-empty.
+        utxo_set.apply_update_cached(&UtxoSetUpdate {
+            spent: vec![(op, entry)],
+            created: vec![],
+        });
+        assert_eq!(utxo_set.cache_len(), 0);
+        assert!(!utxo_set.pending_deletes.is_empty());
+
+        // Flush should process the deletes.
+        utxo_set.flush_cache().unwrap();
+        assert!(utxo_set.pending_deletes.is_empty());
+
+        // Verify the UTXO is gone from DB.
+        {
+            let fresh = PersistentUtxoSet::new(Arc::clone(&db));
+            assert!(fresh.get_utxo(&op).is_none());
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // get_utxo cache hit returns same reference on second call
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_get_utxo_cache_hit() {
+        let (db, _dir) = temp_db();
+        let mut utxo_set = PersistentUtxoSet::new(Arc::clone(&db));
+
+        let op = make_outpoint(0xb0, 0);
+        let entry = make_entry(999, 1, false);
+
+        utxo_set
+            .apply_update(&UtxoSetUpdate {
+                spent: vec![],
+                created: vec![(op, entry)],
+            })
+            .unwrap();
+
+        // First call — cache hit (inserted during apply_update).
+        let got1 = utxo_set.get_utxo(&op).unwrap();
+        assert_eq!(got1.txout.value.as_sat(), 999);
+
+        // Second call — still a cache hit, same data.
+        let got2 = utxo_set.get_utxo(&op).unwrap();
+        assert_eq!(got2.txout.value.as_sat(), 999);
+    }
+
+    // -----------------------------------------------------------------------
+    // get_utxo with metadata edge case: empty script_pubkey in meta
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_get_utxo_meta_empty_script_defaults() {
+        let (db, _dir) = temp_db();
+
+        let op = make_outpoint(0xc0, 0);
+
+        // Directly write a UTXO without metadata to test the fallback
+        // in get_utxo_meta where the script_pubkey bytes might not have
+        // the expected content. We write the TxOut directly, plus metadata
+        // with an empty script to verify is_coinbase defaults to false.
+        {
+            use crate::traits::DbTxMut;
+            let tx = db.tx_mut().unwrap();
+            let txout = TxOut {
+                value: Amount::from_sat(100),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76]),
+            };
+            tx.put_utxo(&op, &txout).unwrap();
+
+            // Write metadata with empty script_pubkey (is_coinbase defaults false).
+            let meta_op = OutPoint::new(op.txid, op.vout | 0x8000_0000);
+            let meta_txout = TxOut {
+                value: Amount::from_sat(50),
+                script_pubkey: ScriptBuf::from_bytes(vec![]),
+            };
+            tx.put_utxo(&meta_op, &meta_txout).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let utxo_set = PersistentUtxoSet::new(Arc::clone(&db));
+        let got = utxo_set.get_utxo(&op).unwrap();
+        assert_eq!(got.height, 50);
+        assert!(!got.is_coinbase); // empty script => false
+    }
 }

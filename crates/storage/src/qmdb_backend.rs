@@ -526,4 +526,386 @@ mod tests {
         assert_eq!(tx.get_block_hash_by_height(42).unwrap(), Some(hash));
         assert_eq!(tx.get_block_hash_by_height(43).unwrap(), None);
     }
+
+    // -----------------------------------------------------------------------
+    // Transaction roundtrip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_qmdb_transaction_roundtrip() {
+        let (_dir, db) = temp_db();
+        let transaction = btc_primitives::transaction::Transaction {
+            version: 1,
+            inputs: vec![btc_primitives::transaction::TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0x00; 32]), 0xffffffff),
+                script_sig: ScriptBuf::from_bytes(vec![0x04, 0xff]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![btc_primitives::transaction::TxOut {
+                value: Amount::from_sat(5_000_000),
+                script_pubkey: ScriptBuf::p2pkh(&[0xaa; 20]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+        let txid = transaction.txid();
+
+        let tx = db.tx_mut().unwrap();
+        tx.put_transaction(&txid, &transaction).unwrap();
+        tx.commit().unwrap();
+
+        let tx = db.tx().unwrap();
+        let retrieved = tx.get_transaction(&txid).unwrap();
+        assert_eq!(retrieved, Some(transaction));
+    }
+
+    // -----------------------------------------------------------------------
+    // Transaction missing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_qmdb_transaction_missing() {
+        let (_dir, db) = temp_db();
+        let tx = db.tx().unwrap();
+        let result = tx
+            .get_transaction(&TxHash::from_bytes([0xff; 32]))
+            .unwrap();
+        assert_eq!(result, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // UTXO missing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_qmdb_utxo_missing() {
+        let (_dir, db) = temp_db();
+        let tx = db.tx().unwrap();
+        let outpoint = OutPoint::new(TxHash::from_bytes([0xff; 32]), 0);
+        assert_eq!(tx.get_utxo(&outpoint).unwrap(), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Empty commit is a no-op
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_qmdb_empty_commit() {
+        let (_dir, db) = temp_db();
+        let tx = db.tx_mut().unwrap();
+        // Commit with no buffered operations should succeed.
+        tx.commit().unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // outpoint_key encoding
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_outpoint_key_format() {
+        let outpoint = OutPoint::new(TxHash::from_bytes([0xab; 32]), 42);
+        let key = outpoint_key(&outpoint);
+        assert!(key.starts_with(NS_UTXO));
+        assert_eq!(&key[NS_UTXO.len()..NS_UTXO.len() + 32], &[0xab; 32]);
+        assert_eq!(
+            &key[NS_UTXO.len() + 32..],
+            &42u32.to_le_bytes()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // make_key helper
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_make_key() {
+        let key = make_key(b"ns:", b"suffix");
+        assert_eq!(key, b"ns:suffix");
+    }
+
+    // -----------------------------------------------------------------------
+    // height_key encoding
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_height_key_format() {
+        let key = height_key(100);
+        assert!(key.starts_with(NS_BLOCK_HEIGHT));
+        let height_bytes = &key[NS_BLOCK_HEIGHT.len()..];
+        assert_eq!(height_bytes, &100u64.to_be_bytes());
+    }
+
+    // -----------------------------------------------------------------------
+    // Read via QmdbTxMut (DbTx impl on write tx)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_qmdb_read_through_write_tx() {
+        let (_dir, db) = temp_db();
+        let header = sample_header();
+        let hash = header.block_hash();
+
+        let tx = db.tx_mut().unwrap();
+        tx.put_block_header(&hash, &header).unwrap();
+
+        // Read from the write buffer before commit.
+        let read = tx.get_block_header(&hash).unwrap();
+        assert_eq!(read, Some(header));
+
+        // Missing key in write buffer.
+        let missing = tx
+            .get_block_header(&BlockHash::from_bytes([0xee; 32]))
+            .unwrap();
+        assert_eq!(missing, None);
+
+        tx.commit().unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // QmdbTxMut read_value: local buffer overrides committed state
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_qmdb_write_tx_reads_latest_buffer() {
+        let (_dir, db) = temp_db();
+
+        // First commit a UTXO.
+        let outpoint = OutPoint::new(TxHash::from_bytes([0x10; 32]), 0);
+        let txout1 = btc_primitives::transaction::TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        };
+        {
+            let tx = db.tx_mut().unwrap();
+            tx.put_utxo(&outpoint, &txout1).unwrap();
+            tx.commit().unwrap();
+        }
+
+        // Now in a new write tx, overwrite it.
+        let txout2 = btc_primitives::transaction::TxOut {
+            value: Amount::from_sat(2_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x52]),
+        };
+        {
+            let tx = db.tx_mut().unwrap();
+            tx.put_utxo(&outpoint, &txout2).unwrap();
+
+            // Read should return the buffered (new) value.
+            let got = tx.get_utxo(&outpoint).unwrap().unwrap();
+            assert_eq!(got.value.as_sat(), 2_000);
+
+            tx.commit().unwrap();
+        }
+
+        // Verify the committed value.
+        let tx = db.tx().unwrap();
+        let got = tx.get_utxo(&outpoint).unwrap().unwrap();
+        assert_eq!(got.value.as_sat(), 2_000);
+    }
+
+    // -----------------------------------------------------------------------
+    // QmdbTxMut: delete in buffer returns None on subsequent read
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_qmdb_write_tx_delete_then_read() {
+        let (_dir, db) = temp_db();
+
+        let outpoint = OutPoint::new(TxHash::from_bytes([0x20; 32]), 0);
+        let txout = btc_primitives::transaction::TxOut {
+            value: Amount::from_sat(500),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x76]),
+        };
+
+        // Commit it first.
+        {
+            let tx = db.tx_mut().unwrap();
+            tx.put_utxo(&outpoint, &txout).unwrap();
+            tx.commit().unwrap();
+        }
+
+        // Delete in a write tx and read back.
+        {
+            let tx = db.tx_mut().unwrap();
+            tx.delete_utxo(&outpoint).unwrap();
+
+            // Should see None (OP_DELETE in buffer).
+            let got = tx.get_utxo(&outpoint).unwrap();
+            assert_eq!(got, None);
+
+            tx.commit().unwrap();
+        }
+
+        // Verify really gone.
+        let tx = db.tx().unwrap();
+        assert_eq!(tx.get_utxo(&outpoint).unwrap(), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // QmdbTxMut: best block via write tx
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_qmdb_write_tx_best_block() {
+        let (_dir, db) = temp_db();
+        let hash = BlockHash::from_bytes([0xaa; 32]);
+
+        let tx = db.tx_mut().unwrap();
+
+        // Defaults.
+        assert_eq!(tx.get_best_block_height().unwrap(), 0);
+        assert_eq!(tx.get_best_block_hash().unwrap(), BlockHash::ZERO);
+
+        tx.set_best_block(999, &hash).unwrap();
+
+        // Read from buffer.
+        assert_eq!(tx.get_best_block_height().unwrap(), 999);
+        assert_eq!(tx.get_best_block_hash().unwrap(), hash);
+
+        tx.commit().unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // QmdbTxMut: height index via write tx
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_qmdb_write_tx_height_index() {
+        let (_dir, db) = temp_db();
+        let hash = BlockHash::from_bytes([0xbb; 32]);
+
+        let tx = db.tx_mut().unwrap();
+        tx.put_block_hash_by_height(7, &hash).unwrap();
+
+        assert_eq!(tx.get_block_hash_by_height(7).unwrap(), Some(hash));
+        assert_eq!(tx.get_block_hash_by_height(8).unwrap(), None);
+
+        tx.commit().unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // QmdbTxMut: transaction via write tx
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_qmdb_write_tx_transaction() {
+        let (_dir, db) = temp_db();
+        let transaction = btc_primitives::transaction::Transaction {
+            version: 1,
+            inputs: vec![btc_primitives::transaction::TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0x00; 32]), 0xffffffff),
+                script_sig: ScriptBuf::from_bytes(vec![0x04]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![btc_primitives::transaction::TxOut {
+                value: Amount::from_sat(100),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+        let txid = transaction.txid();
+
+        let tx = db.tx_mut().unwrap();
+        tx.put_transaction(&txid, &transaction).unwrap();
+
+        // Read from buffer.
+        let got = tx.get_transaction(&txid).unwrap();
+        assert_eq!(got, Some(transaction));
+
+        // Missing.
+        let missing = tx
+            .get_transaction(&TxHash::from_bytes([0xff; 32]))
+            .unwrap();
+        assert_eq!(missing, None);
+
+        tx.commit().unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // init_dir idempotency: opening same path twice doesn't panic
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_qmdb_init_dir_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // First open: write some data.
+        {
+            let db = QmdbDatabase::new(dir.path()).unwrap();
+            let hash = BlockHash::from_bytes([0xaa; 32]);
+            let tx = db.tx_mut().unwrap();
+            tx.set_best_block(42, &hash).unwrap();
+            tx.commit().unwrap();
+        }
+
+        // Second open on same path should not panic or error.
+        // QMDB's init_dir is idempotent — it skips if data already exists.
+        let db2 = QmdbDatabase::new(dir.path());
+        assert!(db2.is_ok(), "re-opening QMDB on same path should succeed");
+    }
+
+    // -----------------------------------------------------------------------
+    // Multiple commits increment height
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_qmdb_multiple_commits() {
+        let (_dir, db) = temp_db();
+
+        // Commit 1: write header.
+        let header1 = sample_header();
+        let hash1 = header1.block_hash();
+        {
+            let tx = db.tx_mut().unwrap();
+            tx.put_block_header(&hash1, &header1).unwrap();
+            tx.commit().unwrap();
+        }
+
+        // Commit 2: write best block.
+        {
+            let tx = db.tx_mut().unwrap();
+            tx.set_best_block(1, &hash1).unwrap();
+            tx.commit().unwrap();
+        }
+
+        // Both should be readable.
+        let tx = db.tx().unwrap();
+        assert_eq!(tx.get_block_header(&hash1).unwrap(), Some(header1));
+        assert_eq!(tx.get_best_block_height().unwrap(), 1);
+        assert_eq!(tx.get_best_block_hash().unwrap(), hash1);
+    }
+
+    // -----------------------------------------------------------------------
+    // buffer_upsert: OP_WRITE when key already exists in DB
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_qmdb_upsert_write_existing_key() {
+        let (_dir, db) = temp_db();
+        let outpoint = OutPoint::new(TxHash::from_bytes([0x30; 32]), 0);
+        let txout1 = btc_primitives::transaction::TxOut {
+            value: Amount::from_sat(100),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        };
+        let txout2 = btc_primitives::transaction::TxOut {
+            value: Amount::from_sat(200),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x52]),
+        };
+
+        // First commit: OP_CREATE.
+        let tx = db.tx_mut().unwrap();
+        tx.put_utxo(&outpoint, &txout1).unwrap();
+        tx.commit().unwrap();
+
+        // Second commit: should use OP_WRITE since key exists in DB.
+        let tx = db.tx_mut().unwrap();
+        tx.put_utxo(&outpoint, &txout2).unwrap();
+        tx.commit().unwrap();
+
+        // Verify the final value.
+        let tx = db.tx().unwrap();
+        let got = tx.get_utxo(&outpoint).unwrap().unwrap();
+        assert_eq!(got.value.as_sat(), 200);
+    }
 }

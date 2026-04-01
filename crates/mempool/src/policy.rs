@@ -261,4 +261,273 @@ mod tests {
         let result = validate_tx_policy(&tx, Amount::from_sat(200), 0, 0, &policy);
         assert!(result.is_ok());
     }
+
+    // -----------------------------------------------------------------
+    // Additional coverage tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_default_policy_values() {
+        let policy = TxValidationPolicy::default();
+        assert_eq!(policy.max_tx_size, 100_000);
+        assert_eq!(policy.min_relay_fee.as_sat(), 1_000);
+        assert_eq!(policy.max_ancestor_count, 25);
+        assert_eq!(policy.max_descendant_count, 25);
+        assert_eq!(policy.dust_limit.as_sat(), 546);
+    }
+
+    #[test]
+    fn test_policy_boundary_tx_size_exactly_at_max() {
+        // TX exactly at max size should pass
+        let policy = TxValidationPolicy {
+            max_tx_size: 100,
+            min_relay_fee: Amount::from_sat(0),
+            dust_limit: Amount::from_sat(0),
+            ..Default::default()
+        };
+        // We need a small tx
+        let tx = make_tx(&[50_000], 5);
+        let size = tx.encoded_size();
+
+        let custom_policy = TxValidationPolicy {
+            max_tx_size: size,
+            min_relay_fee: Amount::from_sat(0),
+            dust_limit: Amount::from_sat(0),
+            ..Default::default()
+        };
+        let result = validate_tx_policy(&tx, Amount::from_sat(0), 0, 0, &custom_policy);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_policy_boundary_tx_size_one_over() {
+        let tx = make_tx(&[50_000], 5);
+        let size = tx.encoded_size();
+
+        let policy = TxValidationPolicy {
+            max_tx_size: size - 1,
+            min_relay_fee: Amount::from_sat(0),
+            dust_limit: Amount::from_sat(0),
+            ..Default::default()
+        };
+        let result = validate_tx_policy(&tx, Amount::from_sat(0), 0, 0, &policy);
+        assert!(matches!(result, Err(PolicyError::TxTooLarge { .. })));
+    }
+
+    #[test]
+    fn test_policy_boundary_fee_exactly_at_min() {
+        let tx = make_tx(&[50_000], 25);
+        let policy = TxValidationPolicy::default();
+        // fee == min_relay_fee (1000) should be rejected (needs to be >=)
+        // Wait, check the condition: fee.as_sat() < min_relay_fee.as_sat()
+        // So equal should pass
+        let result = validate_tx_policy(&tx, Amount::from_sat(1_000), 0, 0, &policy);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_policy_boundary_fee_one_below_min() {
+        let tx = make_tx(&[50_000], 25);
+        let policy = TxValidationPolicy::default();
+        let result = validate_tx_policy(&tx, Amount::from_sat(999), 0, 0, &policy);
+        assert!(matches!(result, Err(PolicyError::InsufficientFee { .. })));
+    }
+
+    #[test]
+    fn test_policy_dust_exactly_at_limit() {
+        let tx = make_tx(&[546], 25);
+        let policy = TxValidationPolicy::default();
+        let result = validate_tx_policy(&tx, Amount::from_sat(5_000), 0, 0, &policy);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_policy_dust_one_below_limit() {
+        let tx = make_tx(&[545], 25);
+        let policy = TxValidationPolicy::default();
+        let result = validate_tx_policy(&tx, Amount::from_sat(5_000), 0, 0, &policy);
+        assert!(matches!(result, Err(PolicyError::DustOutput { .. })));
+    }
+
+    #[test]
+    fn test_policy_ancestor_exactly_at_max() {
+        let tx = make_tx(&[50_000], 25);
+        let policy = TxValidationPolicy::default();
+        let result = validate_tx_policy(&tx, Amount::from_sat(5_000), 25, 0, &policy);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_policy_ancestor_one_over_max() {
+        let tx = make_tx(&[50_000], 25);
+        let policy = TxValidationPolicy::default();
+        let result = validate_tx_policy(&tx, Amount::from_sat(5_000), 26, 0, &policy);
+        assert!(matches!(result, Err(PolicyError::TooManyAncestors { .. })));
+    }
+
+    #[test]
+    fn test_policy_descendant_exactly_at_max() {
+        let tx = make_tx(&[50_000], 25);
+        let policy = TxValidationPolicy::default();
+        let result = validate_tx_policy(&tx, Amount::from_sat(5_000), 0, 25, &policy);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_policy_descendant_one_over_max() {
+        let tx = make_tx(&[50_000], 25);
+        let policy = TxValidationPolicy::default();
+        let result = validate_tx_policy(&tx, Amount::from_sat(5_000), 0, 26, &policy);
+        assert!(matches!(
+            result,
+            Err(PolicyError::TooManyDescendants { .. })
+        ));
+    }
+
+    #[test]
+    fn test_policy_multiple_outputs_first_dust() {
+        let tx = make_tx(&[100, 50_000], 25); // First output is dust
+        let policy = TxValidationPolicy::default();
+        let result = validate_tx_policy(&tx, Amount::from_sat(5_000), 0, 0, &policy);
+        assert!(matches!(result, Err(PolicyError::DustOutput { index: 0, .. })));
+    }
+
+    #[test]
+    fn test_policy_multiple_outputs_second_dust() {
+        let tx = make_tx(&[50_000, 100], 25); // Second output is dust
+        let policy = TxValidationPolicy::default();
+        let result = validate_tx_policy(&tx, Amount::from_sat(5_000), 0, 0, &policy);
+        assert!(matches!(result, Err(PolicyError::DustOutput { index: 1, .. })));
+    }
+
+    #[test]
+    fn test_policy_multiple_valid_outputs() {
+        let tx = make_tx(&[50_000, 60_000, 70_000], 25);
+        let policy = TxValidationPolicy::default();
+        let result = validate_tx_policy(&tx, Amount::from_sat(5_000), 0, 0, &policy);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_policy_error_display_tx_too_large() {
+        let err = PolicyError::TxTooLarge {
+            size: 200_000,
+            max: 100_000,
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("200000"));
+        assert!(msg.contains("100000"));
+    }
+
+    #[test]
+    fn test_policy_error_display_insufficient_fee() {
+        let err = PolicyError::InsufficientFee {
+            fee: 500,
+            min_fee: 1000,
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("500"));
+        assert!(msg.contains("1000"));
+    }
+
+    #[test]
+    fn test_policy_error_display_dust_output() {
+        let err = PolicyError::DustOutput {
+            index: 2,
+            value: 100,
+            dust_limit: 546,
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("100"));
+        assert!(msg.contains("546"));
+    }
+
+    #[test]
+    fn test_policy_error_display_ancestors() {
+        let err = PolicyError::TooManyAncestors {
+            count: 30,
+            max: 25,
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("30"));
+        assert!(msg.contains("25"));
+    }
+
+    #[test]
+    fn test_policy_error_display_descendants() {
+        let err = PolicyError::TooManyDescendants {
+            count: 30,
+            max: 25,
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("30"));
+        assert!(msg.contains("25"));
+    }
+
+    #[test]
+    fn test_policy_error_equality() {
+        let e1 = PolicyError::InsufficientFee {
+            fee: 100,
+            min_fee: 1000,
+        };
+        let e2 = PolicyError::InsufficientFee {
+            fee: 100,
+            min_fee: 1000,
+        };
+        assert_eq!(e1, e2);
+
+        let e3 = PolicyError::InsufficientFee {
+            fee: 200,
+            min_fee: 1000,
+        };
+        assert_ne!(e1, e3);
+    }
+
+    #[test]
+    fn test_policy_clone() {
+        let policy = TxValidationPolicy {
+            max_tx_size: 50_000,
+            min_relay_fee: Amount::from_sat(500),
+            max_ancestor_count: 10,
+            max_descendant_count: 10,
+            dust_limit: Amount::from_sat(200),
+        };
+        let cloned = policy.clone();
+        assert_eq!(cloned.max_tx_size, 50_000);
+        assert_eq!(cloned.min_relay_fee.as_sat(), 500);
+        assert_eq!(cloned.max_ancestor_count, 10);
+        assert_eq!(cloned.max_descendant_count, 10);
+        assert_eq!(cloned.dust_limit.as_sat(), 200);
+    }
+
+    #[test]
+    fn test_policy_debug() {
+        let policy = TxValidationPolicy::default();
+        let debug = format!("{:?}", policy);
+        assert!(debug.contains("TxValidationPolicy"));
+    }
+
+    #[test]
+    fn test_policy_error_debug() {
+        let err = PolicyError::DustOutput {
+            index: 0,
+            value: 100,
+            dust_limit: 546,
+        };
+        let debug = format!("{:?}", err);
+        assert!(debug.contains("DustOutput"));
+    }
+
+    #[test]
+    fn test_zero_fee_policy() {
+        let policy = TxValidationPolicy {
+            min_relay_fee: Amount::from_sat(0),
+            dust_limit: Amount::from_sat(0),
+            ..Default::default()
+        };
+        let tx = make_tx(&[0], 25);
+        // Zero fee with zero min should pass
+        let result = validate_tx_policy(&tx, Amount::from_sat(0), 0, 0, &policy);
+        assert!(result.is_ok());
+    }
 }

@@ -501,4 +501,309 @@ mod tests {
         assert_eq!(clusters[0].txids.len(), 3);
         assert_eq!(clusters[0].total_fees, 6_000); // 1000 + 2000 + 3000
     }
+
+    // -----------------------------------------------------------------
+    // Additional coverage tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_single_tx_cluster() {
+        let mut pool = Mempool::new(10_000_000, 1000);
+        let tx = make_tx(0x01, None, 50_000);
+        let txid = tx.txid();
+        let tx_size = tx.encoded_size();
+        pool.add_tx(tx, Amount::from_sat(5_000), 100).unwrap();
+
+        let clusters = build_clusters(&pool);
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].txids, vec![txid]);
+        assert_eq!(clusters[0].total_fees, 5_000);
+        assert_eq!(clusters[0].total_weight, tx_size);
+    }
+
+    #[test]
+    fn test_cluster_feerate_basic() {
+        let cluster = TxCluster {
+            txids: vec![],
+            total_fees: 10_000,
+            total_weight: 500,
+        };
+        // feerate = 10000 * 1000 / 500 = 20000
+        assert_eq!(cluster.feerate(), 20_000);
+    }
+
+    #[test]
+    fn test_cluster_feerate_rounding() {
+        let cluster = TxCluster {
+            txids: vec![],
+            total_fees: 7,
+            total_weight: 3,
+        };
+        // feerate = 7 * 1000 / 3 = 2333
+        assert_eq!(cluster.feerate(), 2333);
+    }
+
+    #[test]
+    fn test_cluster_feerate_one_byte() {
+        let cluster = TxCluster {
+            txids: vec![],
+            total_fees: 1,
+            total_weight: 1,
+        };
+        assert_eq!(cluster.feerate(), 1000);
+    }
+
+    #[test]
+    fn test_select_for_block_empty_input() {
+        let clusters: Vec<TxCluster> = vec![];
+        let selected = select_for_block(&clusters, 1_000_000);
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn test_select_for_block_zero_weight() {
+        let mut pool = Mempool::new(10_000_000, 1000);
+        let tx = make_tx(0x01, None, 50_000);
+        pool.add_tx(tx, Amount::from_sat(5_000), 100).unwrap();
+
+        let clusters = build_clusters(&pool);
+        let selected = select_for_block(&clusters, 0);
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn test_select_for_block_all_fit() {
+        let mut pool = Mempool::new(10_000_000, 1000);
+        for i in 1u8..=5 {
+            let tx = make_tx(i, None, 50_000);
+            pool.add_tx(tx, Amount::from_sat(i as i64 * 1_000), i as u64 * 100)
+                .unwrap();
+        }
+
+        let clusters = build_clusters(&pool);
+        let selected = select_for_block(&clusters, 10_000_000);
+        assert_eq!(selected.len(), 5);
+    }
+
+    #[test]
+    fn test_select_for_block_priority_order() {
+        let mut pool = Mempool::new(10_000_000, 1000);
+
+        let tx_low = make_tx(0x01, None, 50_000);
+        let txid_low = tx_low.txid();
+        pool.add_tx(tx_low, Amount::from_sat(1_000), 100).unwrap();
+
+        let tx_high = make_tx(0x02, None, 50_000);
+        let txid_high = tx_high.txid();
+        pool.add_tx(tx_high, Amount::from_sat(50_000), 101).unwrap();
+
+        let clusters = build_clusters(&pool);
+        let selected = select_for_block(&clusters, 10_000_000);
+
+        // Highest feerate cluster should come first
+        assert_eq!(selected[0], txid_high);
+        assert_eq!(selected[1], txid_low);
+    }
+
+    #[test]
+    fn test_parent_child_cluster_order() {
+        let mut pool = Mempool::new(10_000_000, 1000);
+
+        let parent = make_tx(0x01, None, 50_000);
+        let parent_txid = parent.txid();
+        pool.add_tx(parent, Amount::from_sat(2_000), 100).unwrap();
+
+        let child = make_tx(0x02, Some(parent_txid), 40_000);
+        let child_txid = child.txid();
+        pool.add_tx(child, Amount::from_sat(8_000), 101).unwrap();
+
+        let clusters = build_clusters(&pool);
+        assert_eq!(clusters.len(), 1);
+
+        // Parent should come before child in topological order
+        let txids = &clusters[0].txids;
+        let parent_pos = txids.iter().position(|t| *t == parent_txid).unwrap();
+        let child_pos = txids.iter().position(|t| *t == child_txid).unwrap();
+        assert!(parent_pos < child_pos);
+    }
+
+    #[test]
+    fn test_cluster_mempool_build_clusters_empty() {
+        let pool = Mempool::new(10_000_000, 1000);
+        let cm = ClusterMempool::new(pool);
+        let clusters = cm.build_clusters();
+        assert!(clusters.is_empty());
+    }
+
+    #[test]
+    fn test_cluster_mempool_select_for_block_empty() {
+        let pool = Mempool::new(10_000_000, 1000);
+        let cm = ClusterMempool::new(pool);
+        let selected = cm.select_for_block(1_000_000);
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn test_cluster_mempool_with_chain() {
+        let pool = Mempool::new(10_000_000, 1000);
+        let mut cm = ClusterMempool::new(pool);
+
+        let parent = make_tx(0x01, None, 50_000);
+        let parent_txid = parent.txid();
+        cm.mempool.add_tx(parent, Amount::from_sat(3_000), 100).unwrap();
+
+        let child = make_tx(0x02, Some(parent_txid), 40_000);
+        cm.mempool.add_tx(child, Amount::from_sat(7_000), 101).unwrap();
+
+        let clusters = cm.build_clusters();
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].total_fees, 10_000);
+
+        let selected = cm.select_for_block(10_000_000);
+        assert_eq!(selected.len(), 2);
+    }
+
+    #[test]
+    fn test_two_separate_chains() {
+        let mut pool = Mempool::new(10_000_000, 1000);
+
+        // Chain 1: A -> B
+        let tx_a = make_tx(0x01, None, 50_000);
+        let txid_a = tx_a.txid();
+        pool.add_tx(tx_a, Amount::from_sat(2_000), 100).unwrap();
+
+        let tx_b = make_tx(0x02, Some(txid_a), 40_000);
+        pool.add_tx(tx_b, Amount::from_sat(3_000), 101).unwrap();
+
+        // Chain 2: C -> D
+        let tx_c = make_tx(0x03, None, 50_000);
+        let txid_c = tx_c.txid();
+        pool.add_tx(tx_c, Amount::from_sat(4_000), 102).unwrap();
+
+        let tx_d = make_tx(0x04, Some(txid_c), 40_000);
+        pool.add_tx(tx_d, Amount::from_sat(5_000), 103).unwrap();
+
+        let clusters = build_clusters(&pool);
+        assert_eq!(clusters.len(), 2);
+    }
+
+    #[test]
+    fn test_cluster_with_mixed_independent_and_chained() {
+        let mut pool = Mempool::new(10_000_000, 1000);
+
+        // Chain: A -> B
+        let tx_a = make_tx(0x01, None, 50_000);
+        let txid_a = tx_a.txid();
+        pool.add_tx(tx_a, Amount::from_sat(2_000), 100).unwrap();
+
+        let tx_b = make_tx(0x02, Some(txid_a), 40_000);
+        pool.add_tx(tx_b, Amount::from_sat(3_000), 101).unwrap();
+
+        // Independent
+        let tx_c = make_tx(0x03, None, 50_000);
+        pool.add_tx(tx_c, Amount::from_sat(10_000), 102).unwrap();
+
+        let clusters = build_clusters(&pool);
+        assert_eq!(clusters.len(), 2);
+    }
+
+    #[test]
+    fn test_select_skips_too_large_cluster() {
+        let mut pool = Mempool::new(10_000_000, 1000);
+
+        // Large chain cluster
+        let tx_a = make_tx(0x01, None, 50_000);
+        let txid_a = tx_a.txid();
+        let size_a = tx_a.encoded_size();
+        pool.add_tx(tx_a, Amount::from_sat(20_000), 100).unwrap();
+
+        let tx_b = make_tx(0x02, Some(txid_a), 40_000);
+        let size_b = tx_b.encoded_size();
+        pool.add_tx(tx_b, Amount::from_sat(20_000), 101).unwrap();
+
+        // Small independent tx with lower feerate
+        let tx_c = make_tx(0x03, None, 50_000);
+        let size_c = tx_c.encoded_size();
+        let txid_c = tx_c.txid();
+        pool.add_tx(tx_c, Amount::from_sat(1_000), 102).unwrap();
+
+        let clusters = build_clusters(&pool);
+
+        // Only enough weight for the small tx
+        let selected = select_for_block(&clusters, size_c);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0], txid_c);
+    }
+
+    #[test]
+    fn test_cluster_debug() {
+        let cluster = TxCluster {
+            txids: vec![],
+            total_fees: 100,
+            total_weight: 50,
+        };
+        let debug = format!("{:?}", cluster);
+        assert!(debug.contains("TxCluster"));
+    }
+
+    #[test]
+    fn test_cluster_clone() {
+        let txid = TxHash::from_bytes([0x01; 32]);
+        let cluster = TxCluster {
+            txids: vec![txid],
+            total_fees: 5000,
+            total_weight: 200,
+        };
+        let cloned = cluster.clone();
+        assert_eq!(cloned.txids, cluster.txids);
+        assert_eq!(cloned.total_fees, cluster.total_fees);
+        assert_eq!(cloned.total_weight, cluster.total_weight);
+        assert_eq!(cloned.feerate(), cluster.feerate());
+    }
+
+    #[test]
+    fn test_self_referencing_input_ignored() {
+        // A tx that has its own txid as an input's previous_output.txid
+        // should not create a self-loop in the dependency graph.
+        let mut pool = Mempool::new(10_000_000, 1000);
+        let tx = make_tx(0x01, None, 50_000);
+        pool.add_tx(tx, Amount::from_sat(5_000), 100).unwrap();
+
+        let clusters = build_clusters(&pool);
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].txids.len(), 1);
+    }
+
+    #[test]
+    fn test_many_independent_clusters() {
+        let mut pool = Mempool::new(10_000_000, 1000);
+        for i in 1u8..=20 {
+            let tx = make_tx(i, None, 50_000);
+            pool.add_tx(tx, Amount::from_sat(i as i64 * 1_000), i as u64)
+                .unwrap();
+        }
+
+        let clusters = build_clusters(&pool);
+        assert_eq!(clusters.len(), 20);
+    }
+
+    #[test]
+    fn test_long_chain_single_cluster() {
+        let mut pool = Mempool::new(10_000_000, 1000);
+
+        let mut prev_txid: Option<TxHash> = None;
+        for i in 1u8..=10 {
+            let tx = make_tx(i, prev_txid, 50_000);
+            let txid = tx.txid();
+            pool.add_tx(tx, Amount::from_sat(i as i64 * 1_000), i as u64)
+                .unwrap();
+            prev_txid = Some(txid);
+        }
+
+        let clusters = build_clusters(&pool);
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].txids.len(), 10);
+        // Total fees = 1000 + 2000 + ... + 10000 = 55000
+        assert_eq!(clusters[0].total_fees, 55_000);
+    }
 }

@@ -1156,4 +1156,712 @@ mod tests {
             assert_eq!(hash.as_str().unwrap().len(), 64);
         }
     }
+
+    // -----------------------------------------------------------------
+    // Additional coverage tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_default_trait() {
+        let handler = RpcHandler::default();
+        let req = make_request(METHOD_GETBLOCKCOUNT, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        assert_eq!(resp.result.unwrap(), serde_json::json!(0));
+    }
+
+    #[test]
+    fn test_getblockhash_no_params() {
+        let handler = RpcHandler::new();
+        let req = make_request(METHOD_GETBLOCKHASH, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        // No height param => null
+        assert_eq!(resp.result.unwrap(), serde_json::json!(null));
+    }
+
+    #[test]
+    fn test_getblockhash_null_param() {
+        let handler = RpcHandler::new();
+        let req = make_request(METHOD_GETBLOCKHASH, serde_json::json!([null]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        assert_eq!(resp.result.unwrap(), serde_json::json!(null));
+    }
+
+    #[test]
+    fn test_getblockheader_no_param() {
+        let handler = RpcHandler::new();
+        let req = make_request(METHOD_GETBLOCKHEADER, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        let result = resp.result.unwrap();
+        // hash should be empty string (default)
+        assert_eq!(result["hash"], "");
+    }
+
+    #[test]
+    fn test_estimatefee_no_param() {
+        let handler = RpcHandler::new();
+        let req = make_request(METHOD_ESTIMATEFEE, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        let fee = resp.result.unwrap().as_f64().unwrap();
+        assert!(fee > 0.0);
+    }
+
+    #[test]
+    fn test_estimatefee_null_param() {
+        let handler = RpcHandler::new();
+        let req = make_request(METHOD_ESTIMATEFEE, serde_json::json!([null]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        let fee = resp.result.unwrap().as_f64().unwrap();
+        assert_eq!(fee, 0.00001);
+    }
+
+    #[test]
+    fn test_getnetworkhashps_with_params() {
+        let handler = RpcHandler::new();
+        let req = make_request(METHOD_GETNETWORKHASHPS, serde_json::json!([240, 100]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        let hashps = resp.result.unwrap().as_f64().unwrap();
+        assert!(hashps > 0.0);
+    }
+
+    #[test]
+    fn test_getnetworkhashps_no_params() {
+        let handler = RpcHandler::new();
+        let req = make_request(METHOD_GETNETWORKHASHPS, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        let hashps = resp.result.unwrap().as_f64().unwrap();
+        assert!(hashps > 0.0);
+    }
+
+    #[test]
+    fn test_submitblock_no_param() {
+        let handler = RpcHandler::new();
+        let req = make_request(METHOD_SUBMITBLOCK, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        let msg = resp.result.unwrap();
+        assert!(msg.as_str().unwrap().contains("invalid parameter"));
+    }
+
+    #[test]
+    fn test_submitblock_null_param() {
+        let handler = RpcHandler::new();
+        let req = make_request(METHOD_SUBMITBLOCK, serde_json::json!([null]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        let msg = resp.result.unwrap();
+        assert!(msg.as_str().unwrap().contains("invalid parameter"));
+    }
+
+    #[test]
+    fn test_prioritisetransaction_no_params() {
+        let handler = RpcHandler::new();
+        let req = make_request(METHOD_PRIORITISETRANSACTION, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        assert_eq!(resp.result.unwrap(), serde_json::json!(false));
+    }
+
+    #[test]
+    fn test_prioritisetransaction_no_fee_delta() {
+        let handler = RpcHandler::new();
+        let txid = "aaaa000000000000000000000000000000000000000000000000000000000001";
+        let req = make_request(
+            METHOD_PRIORITISETRANSACTION,
+            serde_json::json!([txid]),
+        );
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        assert_eq!(resp.result.unwrap(), serde_json::json!(false));
+    }
+
+    #[test]
+    fn test_prioritisetransaction_two_param_form() {
+        // When only 2 params: txid and fee_delta (no dummy in between)
+        let handler = RpcHandler::new();
+        let txid = "bbbb000000000000000000000000000000000000000000000000000000000002";
+        let req = make_request(
+            METHOD_PRIORITISETRANSACTION,
+            serde_json::json!([txid, 7000]),
+        );
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        assert_eq!(resp.result.unwrap(), serde_json::json!(true));
+        assert_eq!(handler.get_priority_delta(txid), Some(7000));
+    }
+
+    #[test]
+    fn test_get_priority_delta_nonexistent() {
+        let handler = RpcHandler::new();
+        assert_eq!(handler.get_priority_delta("doesnotexist"), None);
+    }
+
+    #[test]
+    fn test_generatetoaddress_no_nblocks() {
+        let handler = RpcHandler::new_with_state(
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(RwLock::new("00".repeat(32))),
+            "regtest".to_string(),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        );
+        let req = make_request(METHOD_GENERATETOADDRESS, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        assert_eq!(resp.result.unwrap(), serde_json::json!(null));
+    }
+
+    #[test]
+    fn test_generatetoaddress_no_address() {
+        let handler = RpcHandler::new_with_state(
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(RwLock::new("00".repeat(32))),
+            "regtest".to_string(),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        );
+        let req = make_request(METHOD_GENERATETOADDRESS, serde_json::json!([5]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        assert_eq!(resp.result.unwrap(), serde_json::json!(null));
+    }
+
+    #[test]
+    fn test_generatetoaddress_zero_blocks() {
+        let handler = RpcHandler::new_with_state(
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(RwLock::new("00".repeat(32))),
+            "regtest".to_string(),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        );
+        let req = make_request(
+            METHOD_GENERATETOADDRESS,
+            serde_json::json!([0, "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"]),
+        );
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        let result = resp.result.unwrap();
+        assert_eq!(result.as_array().unwrap().len(), 0);
+    }
+
+    // -- Mining helper function tests --
+
+    #[test]
+    fn test_block_subsidy_sats_genesis() {
+        assert_eq!(block_subsidy_sats(0), 50 * 100_000_000);
+    }
+
+    #[test]
+    fn test_block_subsidy_sats_first_halving() {
+        assert_eq!(block_subsidy_sats(210_000), 25 * 100_000_000);
+    }
+
+    #[test]
+    fn test_block_subsidy_sats_second_halving() {
+        assert_eq!(block_subsidy_sats(420_000), 1_250_000_000);
+    }
+
+    #[test]
+    fn test_block_subsidy_sats_after_64_halvings() {
+        assert_eq!(block_subsidy_sats(210_000 * 64), 0);
+    }
+
+    #[test]
+    fn test_block_subsidy_sats_far_future() {
+        assert_eq!(block_subsidy_sats(210_000 * 100), 0);
+    }
+
+    #[test]
+    fn test_compact_bits_to_difficulty_standard() {
+        let diff = compact_bits_to_difficulty(0x1d00ffff);
+        assert!((diff - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_compact_bits_to_difficulty_zero_mantissa() {
+        assert_eq!(compact_bits_to_difficulty(0x1d000000), 0.0);
+    }
+
+    #[test]
+    fn test_compact_bits_to_difficulty_higher() {
+        let diff = compact_bits_to_difficulty(0x1b0404cb);
+        assert!(diff > 1.0);
+    }
+
+    #[test]
+    fn test_compact_bits_to_target_hex_standard() {
+        let target = compact_bits_to_target_hex(0x1d00ffff);
+        assert_eq!(target.len(), 64);
+        // Should contain non-zero bytes
+        assert!(target.contains(|c: char| c != '0'));
+    }
+
+    #[test]
+    fn test_compact_bits_to_target_hex_zero_mantissa() {
+        let target = compact_bits_to_target_hex(0x1d000000);
+        // Zero mantissa -> all zeros
+        assert_eq!(target, "00".repeat(32));
+    }
+
+    #[test]
+    fn test_compact_bits_to_target_hex_negative_sign() {
+        // Bit 0x00800000 is set -- negative sign bit, should produce all zeros
+        let target = compact_bits_to_target_hex(0x1d800000);
+        assert_eq!(target, "00".repeat(32));
+    }
+
+    #[test]
+    fn test_compact_bits_to_target_hex_zero_exponent() {
+        // Exponent 0 should produce all zeros
+        let target = compact_bits_to_target_hex(0x00ffff00);
+        assert_eq!(target, "00".repeat(32));
+    }
+
+    #[test]
+    fn test_compact_bits_to_target_hex_exponent_1() {
+        let target = compact_bits_to_target_hex(0x01010000);
+        assert_eq!(target.len(), 64);
+    }
+
+    #[test]
+    fn test_compact_bits_to_target_hex_exponent_2() {
+        let target = compact_bits_to_target_hex(0x02010100);
+        assert_eq!(target.len(), 64);
+    }
+
+    #[test]
+    fn test_compact_bits_to_target_hex_exponent_3() {
+        let target = compact_bits_to_target_hex(0x03010101);
+        assert_eq!(target.len(), 64);
+    }
+
+    #[test]
+    fn test_compact_bits_to_target_hex_exponent_4() {
+        // Exponent 4 -> start at 32 - 4 = 28
+        let target = compact_bits_to_target_hex(0x04010203);
+        assert_eq!(target.len(), 64);
+        // Bytes at positions 28, 29, 30 should contain the mantissa
+        let bytes = hex::decode(&target).unwrap();
+        assert_eq!(bytes[28], 0x01);
+        assert_eq!(bytes[29], 0x02);
+        assert_eq!(bytes[30], 0x03);
+    }
+
+    #[test]
+    fn test_compact_bits_to_target_hex_large_exponent() {
+        // Exponent > 32 -> start saturates to 0
+        let target = compact_bits_to_target_hex(0x21010203);
+        assert_eq!(target.len(), 64);
+    }
+
+    #[test]
+    fn test_register_custom_method() {
+        let mut handler = RpcHandler::new();
+        handler.register("custom_method", |_params| {
+            serde_json::json!("custom result")
+        });
+        let req = make_request("custom_method", serde_json::json!([]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        assert_eq!(resp.result.unwrap(), serde_json::json!("custom result"));
+    }
+
+    #[test]
+    fn test_handle_raw_with_string_id() {
+        let handler = RpcHandler::new();
+        let raw = r#"{"jsonrpc":"2.0","method":"getblockcount","params":[],"id":"my-id"}"#;
+        let resp_str = handler.handle_raw(raw);
+        let resp: RpcResponse = serde_json::from_str(&resp_str).unwrap();
+        assert_eq!(resp.id, Value::String("my-id".to_string()));
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn test_handle_raw_empty_object() {
+        let handler = RpcHandler::new();
+        let raw = r#"{}"#;
+        let resp_str = handler.handle_raw(raw);
+        let resp: RpcResponse = serde_json::from_str(&resp_str).unwrap();
+        // Missing required "method" field should cause parse error
+        assert!(resp.error.is_some());
+        assert_eq!(resp.error.as_ref().unwrap().code, PARSE_ERROR);
+    }
+
+    #[test]
+    fn test_getblockchaininfo_zero_height_progress() {
+        let handler = RpcHandler::new();
+        let req = make_request(METHOD_GETBLOCKCHAININFO, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        let result = resp.result.unwrap();
+        // At height 0, progress should be 0.0 and initialblockdownload = true
+        assert_eq!(result["verificationprogress"], 0.0);
+        assert_eq!(result["initialblockdownload"], true);
+    }
+
+    #[test]
+    fn test_getblockchaininfo_nonzero_height_progress() {
+        let handler = RpcHandler::new();
+        handler.update_chain_state(1, "aabb");
+        let req = make_request(METHOD_GETBLOCKCHAININFO, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["verificationprogress"], 1.0);
+        assert_eq!(result["initialblockdownload"], false);
+    }
+
+    #[test]
+    fn test_getpeerinfo_with_multiple_peers() {
+        let handler = RpcHandler::new();
+        handler.update_peer_count(5);
+        let req = make_request(METHOD_GETPEERINFO, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        let arr = resp.result.unwrap();
+        let peers = arr.as_array().unwrap();
+        assert_eq!(peers.len(), 5);
+        // Validate fields of first peer
+        assert_eq!(peers[0]["id"], 0);
+        assert_eq!(peers[0]["inbound"], false);
+        assert_eq!(peers[0]["version"], 70016);
+        assert!(peers[0]["addr"].as_str().unwrap().contains("127.0.0.1"));
+    }
+
+    #[test]
+    fn test_getmempoolinfo_all_fields() {
+        let handler = RpcHandler::new();
+        handler.update_mempool_stats(42, 123456);
+        let req = make_request(METHOD_GETMEMPOOLINFO, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["loaded"], true);
+        assert_eq!(result["size"], 42);
+        assert_eq!(result["bytes"], 123456);
+        assert_eq!(result["usage"], 123456);
+        assert_eq!(result["maxmempool"], 300000000_u64);
+        assert!(result["mempoolminfee"].as_f64().unwrap() > 0.0);
+        assert!(result["minrelaytxfee"].as_f64().unwrap() > 0.0);
+        assert_eq!(result["unbroadcastcount"], 0);
+    }
+
+    #[test]
+    fn test_stop_sets_shutdown_flag() {
+        let handler = RpcHandler::new();
+        assert!(!handler.should_shutdown());
+        let req = make_request(METHOD_STOP, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        assert_eq!(
+            resp.result.unwrap(),
+            serde_json::json!("Bitcoin server stopping")
+        );
+        assert!(handler.should_shutdown());
+    }
+
+    #[test]
+    fn test_getblocktemplate_coinbase_value() {
+        let handler = RpcHandler::new();
+        // At height 0, next block is height 1 -> 50 BTC subsidy
+        let req = make_request(METHOD_GETBLOCKTEMPLATE, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["coinbasevalue"], 50 * 100_000_000u64);
+        assert_eq!(result["height"], 1);
+    }
+
+    #[test]
+    fn test_getblocktemplate_after_halving() {
+        let handler = RpcHandler::new();
+        handler.update_chain_state(209_999, "aabb");
+        let req = make_request(METHOD_GETBLOCKTEMPLATE, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        let result = resp.result.unwrap();
+        // Next block is 210000 (first halving) -> 25 BTC subsidy
+        assert_eq!(result["coinbasevalue"], 25 * 100_000_000u64);
+    }
+
+    #[test]
+    fn test_getmininginfo_all_fields() {
+        let handler = RpcHandler::new();
+        let req = make_request(METHOD_GETMININGINFO, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["blocks"], 0);
+        assert!(result["difficulty"].as_f64().unwrap() > 0.0);
+        assert!(result["networkhashps"].as_f64().unwrap() > 0.0);
+        assert_eq!(result["chain"], "main");
+    }
+
+    #[test]
+    fn test_getnetworkinfo_full_fields() {
+        let handler = RpcHandler::new();
+        let req = make_request(METHOD_GETNETWORKINFO, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["localservices"], "0000000000000001");
+        assert_eq!(result["localrelay"], true);
+        assert_eq!(result["timeoffset"], 0);
+        assert_eq!(result["networkactive"], true);
+        assert_eq!(result["connections_in"], 0);
+        assert_eq!(result["connections_out"], 0);
+        assert!(result["networks"].is_array());
+        assert!(result["relayfee"].as_f64().unwrap() > 0.0);
+        assert!(result["incrementalfee"].as_f64().unwrap() > 0.0);
+        assert_eq!(result["warnings"], "");
+    }
+
+    #[test]
+    fn test_rpc_error_data_field_none() {
+        let resp = RpcResponse::error(Value::Number(1.into()), INTERNAL_ERROR, "boom");
+        let err = resp.error.unwrap();
+        assert!(err.data.is_none());
+        assert_eq!(err.code, INTERNAL_ERROR);
+        assert_eq!(err.message, "boom");
+    }
+
+    #[test]
+    fn test_rpc_response_success_json_has_correct_jsonrpc() {
+        let resp = RpcResponse::success(Value::Number(1.into()), serde_json::json!("ok"));
+        assert_eq!(resp.jsonrpc, "2.0");
+    }
+
+    #[test]
+    fn test_rpc_response_error_json_has_correct_jsonrpc() {
+        let resp = RpcResponse::error(Value::Null, PARSE_ERROR, "bad");
+        assert_eq!(resp.jsonrpc, "2.0");
+    }
+
+    #[test]
+    fn test_handle_raw_malformed_json_array() {
+        let handler = RpcHandler::new();
+        let raw = r#"[1,2,3]"#;
+        let resp_str = handler.handle_raw(raw);
+        let resp: RpcResponse = serde_json::from_str(&resp_str).unwrap();
+        assert!(resp.error.is_some());
+        assert_eq!(resp.error.as_ref().unwrap().code, PARSE_ERROR);
+    }
+
+    #[test]
+    fn test_handle_raw_integer() {
+        let handler = RpcHandler::new();
+        let raw = "42";
+        let resp_str = handler.handle_raw(raw);
+        let resp: RpcResponse = serde_json::from_str(&resp_str).unwrap();
+        assert!(resp.error.is_some());
+    }
+
+    #[test]
+    fn test_getblockheader_returns_all_fields() {
+        let handler = RpcHandler::new();
+        let req = make_request(
+            METHOD_GETBLOCKHEADER,
+            serde_json::json!(["000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"]),
+        );
+        let resp = handler.handle(&req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["confirmations"], 1);
+        assert_eq!(result["version"], 1);
+        assert_eq!(result["versionHex"], "00000001");
+        assert!(result["merkleroot"].is_string());
+        assert_eq!(result["time"], 1231006505_u64);
+        assert_eq!(result["mediantime"], 1231006505_u64);
+        assert_eq!(result["nonce"], 2083236893_u64);
+        assert_eq!(result["bits"], "1d00ffff");
+        assert_eq!(result["difficulty"], 1.0);
+        assert!(result["chainwork"].is_string());
+        assert_eq!(result["nTx"], 1);
+        assert!(result["previousblockhash"].is_null());
+        assert!(result["nextblockhash"].is_null());
+    }
+
+    #[test]
+    fn test_response_null_id() {
+        let handler = RpcHandler::new();
+        let req = RpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "getblockcount".to_string(),
+            params: serde_json::json!([]),
+            id: Value::Null,
+        };
+        let resp = handler.handle(&req);
+        assert!(resp.id.is_null());
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn test_method_not_found_message_contains_method_name() {
+        let handler = RpcHandler::new();
+        let req = make_request("some_unknown_rpc", serde_json::json!([]));
+        let resp = handler.handle(&req);
+        let err = resp.error.as_ref().unwrap();
+        assert!(err.message.contains("some_unknown_rpc"));
+    }
+
+    #[test]
+    fn test_getblockchaininfo_fields_comprehensive() {
+        let handler = RpcHandler::new();
+        let req = make_request(METHOD_GETBLOCKCHAININFO, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        let result = resp.result.unwrap();
+        assert!(result["mediantime"].is_number());
+        assert!(result["chainwork"].is_string());
+        assert_eq!(result["pruned"], false);
+        assert_eq!(result["warnings"], "");
+    }
+
+    #[test]
+    fn test_getblocktemplate_target_is_64_hex() {
+        let handler = RpcHandler::new();
+        let req = make_request(METHOD_GETBLOCKTEMPLATE, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        let result = resp.result.unwrap();
+        let target = result["target"].as_str().unwrap();
+        assert_eq!(target.len(), 64);
+        // target should be valid hex
+        assert!(hex::decode(target).is_ok());
+    }
+
+    #[test]
+    fn test_submitblock_valid_block_with_coinbase() {
+        use btc_primitives::block::{Block, BlockHeader};
+        use btc_primitives::compact::CompactTarget;
+        use btc_primitives::encode::Encodable;
+        use btc_primitives::hash::{BlockHash, TxHash};
+        use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
+        use btc_primitives::script::ScriptBuf;
+        use btc_primitives::amount::Amount;
+
+        let handler = RpcHandler::new();
+
+        // Build a coinbase transaction (prev_output is all-zeros txid with vout=0xffffffff)
+        let coinbase_tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::ZERO, 0xffffffff),
+                script_sig: ScriptBuf::from_bytes(vec![0x04, 0xff, 0xff, 0x00, 0x1d]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76, 0xa9, 0x14]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_blockhash: BlockHash::ZERO,
+                merkle_root: TxHash::ZERO,
+                time: 1231006505,
+                bits: CompactTarget::from_u32(0x1d00ffff),
+                nonce: 0,
+            },
+            transactions: vec![coinbase_tx],
+        };
+
+        // Encode the block to hex
+        let mut buf = Vec::new();
+        block.encode(&mut buf).unwrap();
+        let block_hex = hex::encode(&buf);
+
+        let req = make_request(METHOD_SUBMITBLOCK, serde_json::json!([block_hex]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        // Successful submission returns null
+        assert_eq!(resp.result.unwrap(), serde_json::json!(null));
+    }
+
+    #[test]
+    fn test_submitblock_block_with_no_transactions() {
+        use btc_primitives::block::{Block, BlockHeader};
+        use btc_primitives::compact::CompactTarget;
+        use btc_primitives::encode::Encodable;
+        use btc_primitives::hash::{BlockHash, TxHash};
+
+        let handler = RpcHandler::new();
+
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_blockhash: BlockHash::ZERO,
+                merkle_root: TxHash::ZERO,
+                time: 1231006505,
+                bits: CompactTarget::from_u32(0x1d00ffff),
+                nonce: 0,
+            },
+            transactions: vec![],
+        };
+
+        let mut buf = Vec::new();
+        block.encode(&mut buf).unwrap();
+        let block_hex = hex::encode(&buf);
+
+        let req = make_request(METHOD_SUBMITBLOCK, serde_json::json!([block_hex]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        let msg = resp.result.unwrap();
+        assert_eq!(msg.as_str().unwrap(), "block must have at least one transaction");
+    }
+
+    #[test]
+    fn test_submitblock_non_coinbase_first_tx() {
+        use btc_primitives::block::{Block, BlockHeader};
+        use btc_primitives::compact::CompactTarget;
+        use btc_primitives::encode::Encodable;
+        use btc_primitives::hash::{BlockHash, TxHash};
+        use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
+        use btc_primitives::script::ScriptBuf;
+        use btc_primitives::amount::Amount;
+
+        let handler = RpcHandler::new();
+
+        // Build a NON-coinbase transaction (normal outpoint, not all-zeros/0xffffffff)
+        let non_coinbase_tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0xaa; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![0x00; 10]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76, 0xa9, 0x14]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_blockhash: BlockHash::ZERO,
+                merkle_root: TxHash::ZERO,
+                time: 1231006505,
+                bits: CompactTarget::from_u32(0x1d00ffff),
+                nonce: 0,
+            },
+            transactions: vec![non_coinbase_tx],
+        };
+
+        let mut buf = Vec::new();
+        block.encode(&mut buf).unwrap();
+        let block_hex = hex::encode(&buf);
+
+        let req = make_request(METHOD_SUBMITBLOCK, serde_json::json!([block_hex]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        let msg = resp.result.unwrap();
+        assert_eq!(msg.as_str().unwrap(), "first transaction must be coinbase");
+    }
 }

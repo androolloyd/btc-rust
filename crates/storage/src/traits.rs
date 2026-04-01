@@ -49,3 +49,42 @@ pub trait DbTxMut: DbTx {
     fn set_best_block(&self, height: u64, hash: &BlockHash) -> Result<(), StorageError>;
     fn commit(self) -> Result<(), StorageError>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_storage_error_display() {
+        let err = StorageError::Database("test db error".into());
+        assert_eq!(err.to_string(), "database error: test db error");
+
+        let err = StorageError::NotFound;
+        assert_eq!(err.to_string(), "key not found");
+
+        let err = StorageError::Corruption("bad data".into());
+        assert_eq!(err.to_string(), "corruption detected: bad data");
+
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file missing");
+        let err = StorageError::Io(io_err);
+        assert!(err.to_string().contains("file missing"));
+    }
+
+    #[test]
+    fn test_storage_error_from_io() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied");
+        let storage_err: StorageError = io_err.into();
+        match storage_err {
+            StorageError::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied),
+            _ => panic!("expected Io variant"),
+        }
+    }
+
+    #[test]
+    fn test_storage_error_debug() {
+        let err = StorageError::Database("debug test".into());
+        let debug_str = format!("{:?}", err);
+        assert!(debug_str.contains("Database"));
+        assert!(debug_str.contains("debug test"));
+    }
+}

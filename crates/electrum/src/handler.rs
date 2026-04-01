@@ -860,4 +860,537 @@ mod tests {
             assert!(names.contains(name), "missing method: {}", name);
         }
     }
+
+    // -----------------------------------------------------------------
+    // Additional coverage tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_default_trait() {
+        let handler = ElectrumHandler::default();
+        let req = make_request(METHOD_SERVER_PING, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn test_server_features_updated_state() {
+        let handler = ElectrumHandler::new();
+        handler.update_chain_state(12345, "aabbccdd");
+        let req = make_request(METHOD_SERVER_FEATURES, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        let features = resp.result.unwrap();
+        assert_eq!(features["block_height"], 12345);
+        assert_eq!(features["best_block_hash"], "aabbccdd");
+    }
+
+    #[test]
+    fn test_headers_subscribe_with_mock_header() {
+        let handler = ElectrumHandler::new();
+        let header_hex = "ff".repeat(80);
+        handler.set_mock_header(0, &header_hex);
+        let req = make_request(METHOD_HEADERS_SUBSCRIBE, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["height"], 0);
+        assert_eq!(result["hex"], header_hex);
+    }
+
+    #[test]
+    fn test_headers_subscribe_default_placeholder() {
+        let handler = ElectrumHandler::new();
+        let req = make_request(METHOD_HEADERS_SUBSCRIBE, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        let result = resp.result.unwrap();
+        let hex = result["hex"].as_str().unwrap();
+        // Default placeholder is 80 zero-bytes = 160 hex chars
+        assert_eq!(hex.len(), 160);
+    }
+
+    #[test]
+    fn test_scripthash_get_balance_no_params() {
+        let handler = ElectrumHandler::new();
+        let req = make_request(METHOD_SCRIPTHASH_GET_BALANCE, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        let result = resp.result.unwrap();
+        assert_eq!(result["confirmed"], 0);
+        assert_eq!(result["unconfirmed"], 0);
+    }
+
+    #[test]
+    fn test_scripthash_get_balance_null_param() {
+        let handler = ElectrumHandler::new();
+        let req = make_request(METHOD_SCRIPTHASH_GET_BALANCE, serde_json::json!([null]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        let result = resp.result.unwrap();
+        assert_eq!(result["confirmed"], 0);
+        assert_eq!(result["unconfirmed"], 0);
+    }
+
+    #[test]
+    fn test_scripthash_get_history_no_params() {
+        let handler = ElectrumHandler::new();
+        let req = make_request(METHOD_SCRIPTHASH_GET_HISTORY, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        assert_eq!(resp.result.unwrap(), serde_json::json!([]));
+    }
+
+    #[test]
+    fn test_scripthash_get_history_null_param() {
+        let handler = ElectrumHandler::new();
+        let req = make_request(METHOD_SCRIPTHASH_GET_HISTORY, serde_json::json!([null]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        assert_eq!(resp.result.unwrap(), serde_json::json!([]));
+    }
+
+    #[test]
+    fn test_scripthash_listunspent_no_params() {
+        let handler = ElectrumHandler::new();
+        let req = make_request(METHOD_SCRIPTHASH_LISTUNSPENT, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        assert_eq!(resp.result.unwrap(), serde_json::json!([]));
+    }
+
+    #[test]
+    fn test_scripthash_listunspent_null_param() {
+        let handler = ElectrumHandler::new();
+        let req = make_request(METHOD_SCRIPTHASH_LISTUNSPENT, serde_json::json!([null]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        assert_eq!(resp.result.unwrap(), serde_json::json!([]));
+    }
+
+    #[test]
+    fn test_scripthash_listunspent_unknown_scripthash() {
+        let handler = ElectrumHandler::new();
+        let req = make_request(
+            METHOD_SCRIPTHASH_LISTUNSPENT,
+            serde_json::json!(["unknown_scripthash_hex"]),
+        );
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        assert_eq!(resp.result.unwrap(), serde_json::json!([]));
+    }
+
+    #[test]
+    fn test_scripthash_listunspent_multiple_utxos() {
+        let handler = ElectrumHandler::new();
+        let sh = "scripthash_multi";
+        handler.set_mock_unspent(
+            sh,
+            vec![
+                ("txid_a".to_string(), 0, 10_000, 100),
+                ("txid_b".to_string(), 1, 20_000, 200),
+                ("txid_c".to_string(), 2, 30_000, 300),
+            ],
+        );
+        let req = make_request(METHOD_SCRIPTHASH_LISTUNSPENT, serde_json::json!([sh]));
+        let resp = handler.handle(&req);
+        let result = resp.result.unwrap();
+        let arr = result.as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0]["tx_hash"], "txid_a");
+        assert_eq!(arr[1]["tx_pos"], 1);
+        assert_eq!(arr[2]["value"], 30_000);
+    }
+
+    #[test]
+    fn test_scripthash_subscribe_no_params() {
+        let handler = ElectrumHandler::new();
+        let req = make_request(METHOD_SCRIPTHASH_SUBSCRIBE, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        assert_eq!(resp.result, Some(Value::Null));
+    }
+
+    #[test]
+    fn test_scripthash_subscribe_null_param() {
+        let handler = ElectrumHandler::new();
+        let req = make_request(METHOD_SCRIPTHASH_SUBSCRIBE, serde_json::json!([null]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        assert_eq!(resp.result, Some(Value::Null));
+    }
+
+    #[test]
+    fn test_scripthash_subscribe_with_empty_history() {
+        let handler = ElectrumHandler::new();
+        let sh = "empty_hist_sh";
+        handler.set_mock_history(sh, vec![]);
+        let req = make_request(METHOD_SCRIPTHASH_SUBSCRIBE, serde_json::json!([sh]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        // Empty history => null status
+        assert_eq!(resp.result, Some(Value::Null));
+    }
+
+    #[test]
+    fn test_scripthash_subscribe_multiple_history_entries() {
+        let handler = ElectrumHandler::new();
+        let sh = "multi_hist_sh";
+        handler.set_mock_history(
+            sh,
+            vec![
+                ("tx_one".to_string(), 10),
+                ("tx_two".to_string(), 20),
+                ("tx_three".to_string(), 30),
+            ],
+        );
+        let req = make_request(METHOD_SCRIPTHASH_SUBSCRIBE, serde_json::json!([sh]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        let status = resp.result.unwrap();
+        let status_str = status.as_str().unwrap();
+        assert_eq!(status_str.len(), 64); // SHA-256 hex
+    }
+
+    #[test]
+    fn test_transaction_get_no_params() {
+        let handler = ElectrumHandler::new();
+        let req = make_request(METHOD_TRANSACTION_GET, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        assert_eq!(resp.result, Some(Value::Null));
+    }
+
+    #[test]
+    fn test_transaction_get_null_param() {
+        let handler = ElectrumHandler::new();
+        let req = make_request(METHOD_TRANSACTION_GET, serde_json::json!([null]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        assert_eq!(resp.result, Some(Value::Null));
+    }
+
+    #[test]
+    fn test_transaction_broadcast_no_params() {
+        let handler = ElectrumHandler::new();
+        let req = make_request(METHOD_TRANSACTION_BROADCAST, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        assert_eq!(resp.result, Some(Value::Null));
+    }
+
+    #[test]
+    fn test_transaction_broadcast_null_param() {
+        let handler = ElectrumHandler::new();
+        let req = make_request(METHOD_TRANSACTION_BROADCAST, serde_json::json!([null]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        assert_eq!(resp.result, Some(Value::Null));
+    }
+
+    #[test]
+    fn test_transaction_broadcast_deterministic_txid() {
+        let handler = ElectrumHandler::new();
+        let raw_hex = "01020304";
+        let req1 = make_request(
+            METHOD_TRANSACTION_BROADCAST,
+            serde_json::json!([raw_hex]),
+        );
+        let resp1 = handler.handle(&req1);
+        let txid1 = resp1.result.unwrap();
+
+        // Same input should produce same txid
+        let req2 = make_request(
+            METHOD_TRANSACTION_BROADCAST,
+            serde_json::json!([raw_hex]),
+        );
+        let resp2 = handler.handle(&req2);
+        let txid2 = resp2.result.unwrap();
+        assert_eq!(txid1, txid2);
+    }
+
+    #[test]
+    fn test_transaction_broadcast_invalid_hex_returns_txid() {
+        let handler = ElectrumHandler::new();
+        // Not valid hex, but hex::decode will return empty vec -> still produces a hash
+        let req = make_request(
+            METHOD_TRANSACTION_BROADCAST,
+            serde_json::json!(["not_hex_at_all"]),
+        );
+        let resp = handler.handle(&req);
+        // hex::decode("not_hex_at_all") returns error -> unwrap_or_default gives empty bytes
+        // Should still produce a valid (deterministic) txid hash of empty
+        let txid = resp.result.unwrap();
+        assert_eq!(txid.as_str().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn test_estimatefee_no_params() {
+        let handler = ElectrumHandler::new();
+        let req = make_request(METHOD_ESTIMATEFEE, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        let fee = resp.result.unwrap().as_f64().unwrap();
+        assert_eq!(fee, 0.0001);
+    }
+
+    #[test]
+    fn test_estimatefee_null_param() {
+        let handler = ElectrumHandler::new();
+        let req = make_request(METHOD_ESTIMATEFEE, serde_json::json!([null]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        let fee = resp.result.unwrap().as_f64().unwrap();
+        assert_eq!(fee, 0.0001);
+    }
+
+    #[test]
+    fn test_estimatefee_custom_nblocks() {
+        let handler = ElectrumHandler::new();
+        let req = make_request(METHOD_ESTIMATEFEE, serde_json::json!([25]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        let fee = resp.result.unwrap().as_f64().unwrap();
+        assert_eq!(fee, 0.0001);
+    }
+
+    #[test]
+    fn test_block_header_no_params() {
+        let handler = ElectrumHandler::new();
+        let req = make_request(METHOD_BLOCK_HEADER, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        assert_eq!(resp.result, Some(Value::Null));
+    }
+
+    #[test]
+    fn test_block_header_null_param() {
+        let handler = ElectrumHandler::new();
+        let req = make_request(METHOD_BLOCK_HEADER, serde_json::json!([null]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        assert_eq!(resp.result, Some(Value::Null));
+    }
+
+    #[test]
+    fn test_block_headers_no_params() {
+        let handler = ElectrumHandler::new();
+        let req = make_request(METHOD_BLOCK_HEADERS, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        assert_eq!(resp.result, Some(Value::Null));
+    }
+
+    #[test]
+    fn test_block_headers_null_param() {
+        let handler = ElectrumHandler::new();
+        let req = make_request(METHOD_BLOCK_HEADERS, serde_json::json!([null]));
+        let resp = handler.handle(&req);
+        assert!(resp.error.is_none());
+        assert_eq!(resp.result, Some(Value::Null));
+    }
+
+    #[test]
+    fn test_block_headers_default_count() {
+        let handler = ElectrumHandler::new();
+        // Only start_height provided, count defaults to 1
+        let req = make_request(METHOD_BLOCK_HEADERS, serde_json::json!([0]));
+        let resp = handler.handle(&req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["count"], 1);
+        // One header = 160 hex chars
+        assert_eq!(result["hex"].as_str().unwrap().len(), 160);
+    }
+
+    #[test]
+    fn test_block_headers_capped_at_2016() {
+        let handler = ElectrumHandler::new();
+        // Request 5000 headers -- should be capped at 2016
+        let req = make_request(METHOD_BLOCK_HEADERS, serde_json::json!([0, 5000]));
+        let resp = handler.handle(&req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["count"], 2016);
+        assert_eq!(result["max"], 2016);
+    }
+
+    #[test]
+    fn test_block_headers_with_mock_data() {
+        let handler = ElectrumHandler::new();
+        handler.set_mock_header(5, &"aa".repeat(80));
+        handler.set_mock_header(6, &"bb".repeat(80));
+        handler.set_mock_header(7, &"cc".repeat(80));
+        let req = make_request(METHOD_BLOCK_HEADERS, serde_json::json!([5, 3]));
+        let resp = handler.handle(&req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["count"], 3);
+        let hex = result["hex"].as_str().unwrap();
+        assert_eq!(hex.len(), 480); // 3 * 160
+        assert!(hex.starts_with(&"aa".repeat(80)));
+    }
+
+    #[test]
+    fn test_handle_raw_malformed_json() {
+        let handler = ElectrumHandler::new();
+        let resp_str = handler.handle_raw("[1,2,3]");
+        let resp: ElectrumResponse = serde_json::from_str(&resp_str).unwrap();
+        assert!(resp.error.is_some());
+        assert_eq!(resp.error.as_ref().unwrap().code, PARSE_ERROR);
+    }
+
+    #[test]
+    fn test_handle_raw_empty_string() {
+        let handler = ElectrumHandler::new();
+        let resp_str = handler.handle_raw("");
+        let resp: ElectrumResponse = serde_json::from_str(&resp_str).unwrap();
+        assert!(resp.error.is_some());
+    }
+
+    #[test]
+    fn test_handle_raw_unknown_method() {
+        let handler = ElectrumHandler::new();
+        let raw = r#"{"id":1,"method":"unknown.method","params":[]}"#;
+        let resp_str = handler.handle_raw(raw);
+        let resp: ElectrumResponse = serde_json::from_str(&resp_str).unwrap();
+        assert!(resp.error.is_some());
+        assert_eq!(resp.error.as_ref().unwrap().code, METHOD_NOT_FOUND);
+    }
+
+    #[test]
+    fn test_new_with_state_custom() {
+        let height = Arc::new(AtomicU64::new(500));
+        let hash = Arc::new(RwLock::new("deadbeef".to_string()));
+        let handler = ElectrumHandler::new_with_state(height, hash);
+
+        let req = make_request(METHOD_HEADERS_SUBSCRIBE, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["height"], 500);
+    }
+
+    #[test]
+    fn test_update_chain_state() {
+        let handler = ElectrumHandler::new();
+        handler.update_chain_state(999, "newblockhash");
+        let req = make_request(METHOD_HEADERS_SUBSCRIBE, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["height"], 999);
+    }
+
+    #[test]
+    fn test_set_mock_balance() {
+        let handler = ElectrumHandler::new();
+        let sh = "test_sh_balance";
+        handler.set_mock_balance(sh, 100_000, 50_000);
+        let req = make_request(METHOD_SCRIPTHASH_GET_BALANCE, serde_json::json!([sh]));
+        let resp = handler.handle(&req);
+        let result = resp.result.unwrap();
+        assert_eq!(result["confirmed"], 100_000);
+        assert_eq!(result["unconfirmed"], 50_000);
+    }
+
+    #[test]
+    fn test_set_mock_history() {
+        let handler = ElectrumHandler::new();
+        let sh = "test_sh_hist";
+        handler.set_mock_history(
+            sh,
+            vec![
+                ("txA".to_string(), 100),
+                ("txB".to_string(), -1), // mempool (unconfirmed)
+            ],
+        );
+        let req = make_request(METHOD_SCRIPTHASH_GET_HISTORY, serde_json::json!([sh]));
+        let resp = handler.handle(&req);
+        let arr = resp.result.unwrap();
+        let entries = arr.as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1]["height"], -1);
+    }
+
+    #[test]
+    fn test_set_mock_transaction() {
+        let handler = ElectrumHandler::new();
+        handler.set_mock_transaction("txid_xyz", "deadbeefcafe");
+        let req = make_request(METHOD_TRANSACTION_GET, serde_json::json!(["txid_xyz"]));
+        let resp = handler.handle(&req);
+        assert_eq!(resp.result.unwrap(), serde_json::json!("deadbeefcafe"));
+    }
+
+    #[test]
+    fn test_set_mock_header() {
+        let handler = ElectrumHandler::new();
+        let header_hex = "ab".repeat(80);
+        handler.set_mock_header(42, &header_hex);
+        let req = make_request(METHOD_BLOCK_HEADER, serde_json::json!([42]));
+        let resp = handler.handle(&req);
+        assert_eq!(resp.result.unwrap(), serde_json::json!(header_hex));
+    }
+
+    #[test]
+    fn test_server_features_genesis_hash() {
+        let handler = ElectrumHandler::new();
+        let req = make_request(METHOD_SERVER_FEATURES, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        let features = resp.result.unwrap();
+        assert_eq!(
+            features["genesis_hash"],
+            GENESIS_HASH,
+        );
+        assert!(features["hosts"].is_object());
+        assert!(features["pruning"].is_null());
+    }
+
+    #[test]
+    fn test_server_version_returns_correct_pair() {
+        let handler = ElectrumHandler::new();
+        let req = make_request(
+            METHOD_SERVER_VERSION,
+            serde_json::json!(["TestClient", "1.4"]),
+        );
+        let resp = handler.handle(&req);
+        let result = resp.result.unwrap();
+        assert_eq!(result[0], SERVER_VERSION);
+        assert_eq!(result[1], PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn test_server_banner_content() {
+        let handler = ElectrumHandler::new();
+        let req = make_request(METHOD_SERVER_BANNER, serde_json::json!([]));
+        let resp = handler.handle(&req);
+        let banner = resp.result.unwrap();
+        assert_eq!(banner, serde_json::json!(DEFAULT_BANNER));
+    }
+
+    #[test]
+    fn test_params_get_str_valid() {
+        let params = serde_json::json!(["hello", "world"]);
+        assert_eq!(params_get_str(&params, 0), Some("hello".to_string()));
+        assert_eq!(params_get_str(&params, 1), Some("world".to_string()));
+    }
+
+    #[test]
+    fn test_params_get_str_out_of_bounds() {
+        let params = serde_json::json!(["hello"]);
+        assert_eq!(params_get_str(&params, 1), None);
+    }
+
+    #[test]
+    fn test_params_get_str_non_string() {
+        let params = serde_json::json!([42, null, true]);
+        assert_eq!(params_get_str(&params, 0), None);
+        assert_eq!(params_get_str(&params, 1), None);
+        assert_eq!(params_get_str(&params, 2), None);
+    }
+
+    #[test]
+    fn test_params_get_str_empty_array() {
+        let params = serde_json::json!([]);
+        assert_eq!(params_get_str(&params, 0), None);
+    }
+
+    #[test]
+    fn test_method_names_count() {
+        let handler = ElectrumHandler::new();
+        let names = handler.method_names();
+        assert_eq!(names.len(), 14); // 14 methods registered
+    }
 }

@@ -715,4 +715,401 @@ mod tests {
         let result = CoreChainState::open(Path::new("/nonexistent/chainstate"));
         assert!(result.is_err());
     }
+
+    // -----------------------------------------------------------------------
+    // CoreChainState: open existing dir, path(), get_utxo stub, import_to stub
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_open_existing_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let cs = CoreChainState::open(dir.path()).unwrap();
+        assert_eq!(cs.path(), dir.path());
+    }
+
+    #[test]
+    fn test_get_utxo_stub_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let cs = CoreChainState::open(dir.path()).unwrap();
+        let outpoint = OutPoint::new(TxHash::from_bytes([0x01; 32]), 0);
+        let result = cs.get_utxo(&outpoint);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("leveldb feature not enabled"));
+    }
+
+    #[test]
+    fn test_import_to_stub_returns_error() {
+        use crate::redb_backend::RedbDatabase;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cs = CoreChainState::open(dir.path()).unwrap();
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("test.redb");
+        let db = RedbDatabase::new(&db_path).unwrap();
+        db.init_tables().unwrap();
+
+        let result = cs.import_to(&db);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("leveldb feature not enabled"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Varint edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_core_varint_empty_slice() {
+        assert_eq!(decode_core_varint(&[]), None);
+    }
+
+    #[test]
+    fn test_decode_core_varint_truncated() {
+        // 0x80 means "more bytes follow" but none are provided.
+        assert_eq!(decode_core_varint(&[0x80]), None);
+    }
+
+    #[test]
+    fn test_encode_core_varint_one() {
+        assert_eq!(encode_core_varint(1), vec![0x01]);
+    }
+
+    #[test]
+    fn test_encode_core_varint_large() {
+        // Test a multi-byte encoding.
+        let encoded = encode_core_varint(256);
+        let (decoded, len) = decode_core_varint(&encoded).unwrap();
+        assert_eq!(decoded, 256);
+        assert_eq!(len, encoded.len());
+    }
+
+    // -----------------------------------------------------------------------
+    // Amount compression edge cases
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compress_amount_zero() {
+        assert_eq!(compress_amount(0), 0);
+    }
+
+    #[test]
+    fn test_compress_amount_one() {
+        let c = compress_amount(1);
+        assert_eq!(decompress_amount(c), 1);
+    }
+
+    #[test]
+    fn test_compress_amount_powers_of_ten() {
+        // Powers of 10 up to 10^9 — these exercise the e<9 and e==9 branches.
+        for exp in 0..=9 {
+            let amount: u64 = 10u64.pow(exp);
+            let compressed = compress_amount(amount);
+            let decompressed = decompress_amount(compressed);
+            assert_eq!(
+                decompressed, amount,
+                "roundtrip failed for 10^{}",
+                exp
+            );
+        }
+    }
+
+    #[test]
+    fn test_compress_amount_non_round() {
+        // Amounts that are not divisible by 10 — exercise the e=0 branch.
+        let test_values = [1, 3, 7, 11, 13, 123, 999, 10001, 99999];
+        for &v in &test_values {
+            let c = compress_amount(v);
+            let d = decompress_amount(c);
+            assert_eq!(d, v, "roundtrip failed for {}", v);
+        }
+    }
+
+    #[test]
+    fn test_decompress_amount_e_equals_9() {
+        // e == 9 branch: compress an amount that's a multiple of 10^9.
+        let amount = 2_000_000_000u64; // 2 * 10^9
+        let c = compress_amount(amount);
+        let d = decompress_amount(c);
+        assert_eq!(d, amount);
+    }
+
+    // -----------------------------------------------------------------------
+    // Script decompression errors
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decompress_script_empty() {
+        let result = decompress_script(&[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decompress_script_p2pkh_truncated() {
+        // P2PKH needs 21 bytes (1 type + 20 hash).
+        let data = vec![0x00, 0x11, 0x22]; // Only 3 bytes.
+        let result = decompress_script(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decompress_script_p2sh_truncated() {
+        let data = vec![0x01]; // Only type byte.
+        let result = decompress_script(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decompress_script_compressed_pubkey_truncated() {
+        // 0x02 needs 33 bytes (1 type + 32 x-coord).
+        let data = vec![0x02, 0x33, 0x33]; // Only 3 bytes.
+        let result = decompress_script(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decompress_script_compressed_pubkey_03() {
+        let mut data = vec![0x03];
+        data.extend_from_slice(&[0x44; 32]);
+        let (script, consumed) = decompress_script(&data).unwrap();
+        assert_eq!(consumed, 33);
+        assert_eq!(script.len(), 35); // 1 (push) + 33 (pubkey) + 1 (OP_CHECKSIG)
+    }
+
+    #[test]
+    fn test_decompress_script_uncompressed_pubkey_04() {
+        // 0x04 = even y (maps to 0x02 compressed form).
+        let mut data = vec![0x04];
+        data.extend_from_slice(&[0x55; 32]);
+        let (script, consumed) = decompress_script(&data).unwrap();
+        assert_eq!(consumed, 33);
+        // Should produce a compressed pubkey starting with 0x02.
+        let bytes = script.as_bytes();
+        assert_eq!(bytes[1], 0x02); // parity byte
+    }
+
+    #[test]
+    fn test_decompress_script_uncompressed_pubkey_05() {
+        // 0x05 = odd y (maps to 0x03 compressed form).
+        let mut data = vec![0x05];
+        data.extend_from_slice(&[0x66; 32]);
+        let (script, consumed) = decompress_script(&data).unwrap();
+        assert_eq!(consumed, 33);
+        let bytes = script.as_bytes();
+        assert_eq!(bytes[1], 0x03); // parity byte
+    }
+
+    #[test]
+    fn test_decompress_script_uncompressed_pubkey_04_truncated() {
+        let data = vec![0x04, 0x55]; // Only 2 bytes.
+        let result = decompress_script(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decompress_script_uncompressed_pubkey_05_truncated() {
+        let data = vec![0x05, 0x66, 0x77]; // Only 3 bytes.
+        let result = decompress_script(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decompress_script_raw_truncated() {
+        // Type 10 means length = 10 - 6 = 4, but only 2 bytes follow.
+        let data = vec![10, 0xDE, 0xAD];
+        let result = decompress_script(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decompress_script_invalid_type_below_6() {
+        // Type byte < 6 and not a known type.
+        // 0x00-0x05 are handled, but types 6 onwards are raw (n-6 = length).
+        // So type 6 means length 0 (valid empty raw script).
+        let data = vec![6];
+        let (script, consumed) = decompress_script(&data).unwrap();
+        assert_eq!(consumed, 1);
+        assert_eq!(script.len(), 0);
+    }
+
+    #[test]
+    fn test_decompress_script_raw_zero_length() {
+        // Type 7 means length = 1.
+        let data = vec![7, 0xAA];
+        let (script, consumed) = decompress_script(&data).unwrap();
+        assert_eq!(consumed, 2);
+        assert_eq!(script.as_bytes(), &[0xAA]);
+    }
+
+    // -----------------------------------------------------------------------
+    // UTXO key decode errors
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_utxo_key_wrong_prefix() {
+        let data = vec![0x42; 40]; // 'B' prefix instead of 'C'.
+        let result = decode_utxo_key(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decode_utxo_key_empty() {
+        let result = decode_utxo_key(&[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decode_utxo_key_too_short() {
+        let data = vec![b'C', 0x01, 0x02]; // Only 3 bytes, need at least 33.
+        let result = decode_utxo_key(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decode_utxo_key_truncated_varint() {
+        // Valid prefix + 32-byte txid, but truncated varint.
+        let mut data = vec![b'C'];
+        data.extend_from_slice(&[0x01; 32]);
+        data.push(0x80); // continuation bit set, no following byte.
+        let result = decode_utxo_key(&data);
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // decode_utxo_value errors
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_utxo_value_truncated_code() {
+        let result = decode_utxo_value(&[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decode_utxo_value_truncated_amount() {
+        // Valid code but no amount.
+        let data = encode_core_varint(201); // code only
+        // No amount varint follows.
+        let result = decode_utxo_value(&data);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decode_utxo_value_truncated_script() {
+        // Valid code + amount, but no script.
+        let mut data = Vec::new();
+        data.extend_from_slice(&encode_core_varint(201));
+        data.extend_from_slice(&encode_core_varint(0));
+        // No script data follows.
+        let result = decode_utxo_value(&data);
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // UTXO key roundtrip with vout=0
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_encode_decode_utxo_key_vout_zero() {
+        let outpoint = OutPoint::new(TxHash::from_bytes([0x00; 32]), 0);
+        let key = encode_utxo_key(&outpoint);
+        let (decoded, len) = decode_utxo_key(&key).unwrap();
+        assert_eq!(decoded.txid, outpoint.txid);
+        assert_eq!(decoded.vout, 0);
+        assert_eq!(len, key.len());
+    }
+
+    #[test]
+    fn test_encode_decode_utxo_key_large_vout() {
+        let outpoint = OutPoint::new(TxHash::from_bytes([0xff; 32]), 999_999);
+        let key = encode_utxo_key(&outpoint);
+        let (decoded, len) = decode_utxo_key(&key).unwrap();
+        assert_eq!(decoded.txid, outpoint.txid);
+        assert_eq!(decoded.vout, 999_999);
+        assert_eq!(len, key.len());
+    }
+
+    // -----------------------------------------------------------------------
+    // XOR obfuscation: cycling behavior
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_xor_obfuscation_cycling() {
+        let key = vec![0xFF];
+        let mut data = vec![0x00, 0x01, 0x02, 0x03];
+        xor_obfuscate(&mut data, &key);
+        assert_eq!(data, vec![0xFF, 0xFE, 0xFD, 0xFC]);
+
+        // Apply again to restore.
+        xor_obfuscate(&mut data, &key);
+        assert_eq!(data, vec![0x00, 0x01, 0x02, 0x03]);
+    }
+
+    #[test]
+    fn test_xor_obfuscation_empty_data() {
+        let key = vec![0xAB, 0xCD];
+        let mut data: Vec<u8> = vec![];
+        xor_obfuscate(&mut data, &key);
+        assert!(data.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // decode_utxo_value: coinbase = false
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_utxo_value_not_coinbase() {
+        // code = height << 1 | 0 = 200 (height=100, coinbase=false)
+        let mut data = Vec::new();
+        data.extend_from_slice(&encode_core_varint(200));
+        data.extend_from_slice(&encode_core_varint(compress_amount(1_000_000)));
+        data.push(0x00); // P2PKH
+        data.extend_from_slice(&[0x11; 20]);
+
+        let entry = decode_utxo_value(&data).unwrap();
+        assert_eq!(entry.height, 100);
+        assert!(!entry.is_coinbase);
+        assert_eq!(entry.txout.value, Amount::from_sat(1_000_000));
+    }
+
+    // -----------------------------------------------------------------------
+    // decode_utxo_value with compressed pubkey script (0x02/0x03)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_utxo_value_compressed_pubkey() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&encode_core_varint(2)); // height=1, coinbase=false
+        data.extend_from_slice(&encode_core_varint(compress_amount(50_000)));
+        data.push(0x02); // compressed pubkey
+        data.extend_from_slice(&[0x33; 32]);
+
+        let entry = decode_utxo_value(&data).unwrap();
+        assert_eq!(entry.height, 1);
+        assert!(!entry.is_coinbase);
+        assert_eq!(entry.txout.value, Amount::from_sat(50_000));
+    }
+
+    // -----------------------------------------------------------------------
+    // UTXO_KEY_PREFIX constant
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_utxo_key_prefix() {
+        assert_eq!(UTXO_KEY_PREFIX, b'C');
+    }
+
+    // -----------------------------------------------------------------------
+    // Varint: decode with extra trailing bytes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_core_varint_with_trailing() {
+        let mut data = encode_core_varint(42);
+        data.push(0xFF); // trailing garbage
+        let (val, len) = decode_core_varint(&data).unwrap();
+        assert_eq!(val, 42);
+        assert_eq!(len, data.len() - 1); // should not consume trailing byte
+    }
 }

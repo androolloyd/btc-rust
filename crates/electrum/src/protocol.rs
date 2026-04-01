@@ -202,4 +202,157 @@ mod tests {
         assert_eq!(parsed.method, "blockchain.transaction.get");
         assert_eq!(parsed.params, serde_json::json!(["aabbccdd"]));
     }
+
+    // -----------------------------------------------------------------
+    // Additional coverage tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_default_params_function() {
+        let val = default_params();
+        assert_eq!(val, Value::Array(vec![]));
+    }
+
+    #[test]
+    fn test_response_success_fields() {
+        let resp = ElectrumResponse::success(Value::Number(42.into()), serde_json::json!("ok"));
+        assert_eq!(resp.jsonrpc, "2.0");
+        assert_eq!(resp.id, Value::Number(42.into()));
+        assert!(resp.result.is_some());
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn test_response_error_fields() {
+        let resp = ElectrumResponse::error(Value::Number(7.into()), INTERNAL_ERROR, "broken");
+        assert_eq!(resp.jsonrpc, "2.0");
+        assert_eq!(resp.id, Value::Number(7.into()));
+        assert!(resp.result.is_none());
+        let err = resp.error.as_ref().unwrap();
+        assert_eq!(err.code, INTERNAL_ERROR);
+        assert_eq!(err.message, "broken");
+    }
+
+    #[test]
+    fn test_response_to_json_success() {
+        let resp = ElectrumResponse::success(Value::Number(1.into()), serde_json::json!(true));
+        let json = resp.to_json();
+        assert!(json.contains("\"result\":true"));
+        assert!(!json.contains("\"error\""));
+    }
+
+    #[test]
+    fn test_response_to_json_error() {
+        let resp = ElectrumResponse::error(Value::Null, PARSE_ERROR, "parse failed");
+        let json = resp.to_json();
+        assert!(json.contains("\"error\""));
+        assert!(json.contains("-32700"));
+        assert!(!json.contains("\"result\""));
+    }
+
+    #[test]
+    fn test_error_roundtrip() {
+        let resp = ElectrumResponse::error(
+            Value::String("err-id".to_string()),
+            INVALID_PARAMS,
+            "bad params",
+        );
+        let json = resp.to_json();
+        let parsed: ElectrumResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.id, Value::String("err-id".to_string()));
+        let err = parsed.error.unwrap();
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert_eq!(err.message, "bad params");
+        assert!(parsed.result.is_none());
+    }
+
+    #[test]
+    fn test_request_with_object_params() {
+        let json = r#"{"id":10,"method":"server.version","params":{"client":"test"}}"#;
+        let req: ElectrumRequest = serde_json::from_str(json).unwrap();
+        assert!(req.params.is_object());
+    }
+
+    #[test]
+    fn test_request_with_numeric_id() {
+        let json = r#"{"id":999,"method":"server.ping","params":[]}"#;
+        let req: ElectrumRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.id, Value::Number(999.into()));
+    }
+
+    #[test]
+    fn test_response_success_null_result() {
+        let resp = ElectrumResponse::success(Value::Number(0.into()), Value::Null);
+        // Before serialization, result is Some(Null)
+        assert_eq!(resp.result, Some(Value::Null));
+        assert!(resp.error.is_none());
+        // Verify it serializes to valid JSON containing "result":null
+        let json = resp.to_json();
+        assert!(json.contains("\"result\":null"));
+    }
+
+    #[test]
+    fn test_error_constants() {
+        assert_eq!(PARSE_ERROR, -32700);
+        assert_eq!(INVALID_REQUEST, -32600);
+        assert_eq!(METHOD_NOT_FOUND, -32601);
+        assert_eq!(INVALID_PARAMS, -32602);
+        assert_eq!(INTERNAL_ERROR, -32603);
+    }
+
+    #[test]
+    fn test_request_serialization_with_jsonrpc() {
+        let req = ElectrumRequest {
+            id: Value::Number(1.into()),
+            method: "test".to_string(),
+            params: serde_json::json!([]),
+            jsonrpc: Some("2.0".to_string()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"jsonrpc\":\"2.0\""));
+    }
+
+    #[test]
+    fn test_request_serialization_without_jsonrpc() {
+        let req = ElectrumRequest {
+            id: Value::Number(1.into()),
+            method: "test".to_string(),
+            params: serde_json::json!([]),
+            jsonrpc: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        // jsonrpc field should not be present (skip_serializing_if)
+        assert!(!json.contains("jsonrpc"));
+    }
+
+    #[test]
+    fn test_electrum_error_debug() {
+        let err = ElectrumError {
+            code: -1,
+            message: "test error".to_string(),
+        };
+        let debug_str = format!("{:?}", err);
+        assert!(debug_str.contains("test error"));
+    }
+
+    #[test]
+    fn test_response_clone() {
+        let resp = ElectrumResponse::success(Value::Number(1.into()), serde_json::json!(42));
+        let cloned = resp.clone();
+        assert_eq!(cloned.id, resp.id);
+        assert_eq!(cloned.result, resp.result);
+    }
+
+    #[test]
+    fn test_request_clone() {
+        let req = ElectrumRequest {
+            id: Value::Number(1.into()),
+            method: "server.ping".to_string(),
+            params: serde_json::json!([]),
+            jsonrpc: None,
+        };
+        let cloned = req.clone();
+        assert_eq!(cloned.method, req.method);
+        assert_eq!(cloned.id, req.id);
+    }
 }

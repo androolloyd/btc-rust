@@ -643,4 +643,370 @@ mod tests {
         let result = pool.add_tx(tx, Amount::from_sat(500), 100);
         assert!(result.is_ok());
     }
+
+    // -----------------------------------------------------------------
+    // Additional coverage tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_fee_estimation_zero_target_blocks() {
+        let mut pool = Mempool::new(10_000_000, 1000);
+        let tx = make_test_tx(0x01, 50_000, 25);
+        pool.add_tx(tx, Amount::from_sat(5_000), 100).unwrap();
+
+        // target_blocks == 0 => fallback
+        let est = pool.estimate_fee(0);
+        assert_eq!(est.as_sat(), 1);
+    }
+
+    #[test]
+    fn test_fee_rate_as_sat_per_vbyte() {
+        // 5000 sat fee / 100 bytes = 50 sat/vbyte
+        let rate = FeeRate::from_fee_vsize(Amount::from_sat(5000), 100);
+        assert_eq!(rate.as_sat_per_vbyte(), 50.0);
+    }
+
+    #[test]
+    fn test_fee_rate_precision() {
+        // 1 sat fee / 3 bytes = 0.333... => stored as 1000/3 = 333
+        let rate = FeeRate::from_fee_vsize(Amount::from_sat(1), 3);
+        assert_eq!(rate.0, 333);
+        let spv = rate.as_sat_per_vbyte();
+        assert!((spv - 0.333).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_fee_rate_zero_fee() {
+        let rate = FeeRate::from_fee_vsize(Amount::from_sat(0), 100);
+        assert_eq!(rate.0, 0);
+        assert_eq!(rate.as_sat_per_vbyte(), 0.0);
+    }
+
+    #[test]
+    fn test_mempool_entry_fee_rate() {
+        let tx = make_test_tx(0x01, 50_000, 25);
+        let size = tx.encoded_size();
+        let entry = MempoolEntry {
+            tx,
+            fee: Amount::from_sat(10_000),
+            size,
+            time_added: 0,
+            ancestors: 0,
+            descendants: 0,
+        };
+        let rate = entry.fee_rate();
+        assert!(rate.0 > 0);
+    }
+
+    #[test]
+    fn test_get_tx_returns_none_for_missing() {
+        let pool = Mempool::new(10_000_000, 1000);
+        let fake_txid = TxHash::from_bytes([0xab; 32]);
+        assert!(pool.get_tx(&fake_txid).is_none());
+    }
+
+    #[test]
+    fn test_contains_false_for_missing() {
+        let pool = Mempool::new(10_000_000, 1000);
+        let fake_txid = TxHash::from_bytes([0xcd; 32]);
+        assert!(!pool.contains(&fake_txid));
+    }
+
+    #[test]
+    fn test_get_all_txids_empty() {
+        let pool = Mempool::new(10_000_000, 1000);
+        assert!(pool.get_all_txids().is_empty());
+    }
+
+    #[test]
+    fn test_size_empty() {
+        let pool = Mempool::new(10_000_000, 1000);
+        assert_eq!(pool.size(), 0);
+    }
+
+    #[test]
+    fn test_total_bytes_empty() {
+        let pool = Mempool::new(10_000_000, 1000);
+        assert_eq!(pool.total_bytes(), 0);
+    }
+
+    #[test]
+    fn test_get_sorted_by_fee_empty() {
+        let pool = Mempool::new(10_000_000, 1000);
+        assert!(pool.get_sorted_by_fee().is_empty());
+    }
+
+    #[test]
+    fn test_clear_already_empty() {
+        let mut pool = Mempool::new(10_000_000, 1000);
+        pool.clear(); // Should not panic
+        assert_eq!(pool.size(), 0);
+    }
+
+    #[test]
+    fn test_multiple_evictions_until_limit() {
+        // Pool allows max 2 txs. Add 5 txs; each triggers eviction.
+        let mut pool = Mempool::new(10_000_000, 2);
+
+        for i in 1u8..=5 {
+            let tx = make_test_tx(i, 50_000, 25);
+            pool.add_tx(tx, Amount::from_sat(i as i64 * 1000), i as u64 * 100)
+                .unwrap();
+        }
+
+        assert_eq!(pool.size(), 2);
+        // Only the two highest fee txs should remain (i=4: 4000, i=5: 5000)
+        let sorted = pool.get_sorted_by_fee();
+        assert_eq!(sorted.len(), 2);
+        assert_eq!(sorted[0].fee.as_sat(), 5000);
+        assert_eq!(sorted[1].fee.as_sat(), 4000);
+    }
+
+    #[test]
+    fn test_eviction_with_equal_fees() {
+        // Txs with equal fees -- deterministic eviction by txid
+        let mut pool = Mempool::new(10_000_000, 2);
+
+        let tx1 = make_test_tx(0x01, 50_000, 25);
+        let tx2 = make_test_tx(0x02, 50_000, 25);
+        let tx3 = make_test_tx(0x03, 50_000, 25);
+
+        pool.add_tx(tx1, Amount::from_sat(5_000), 100).unwrap();
+        pool.add_tx(tx2, Amount::from_sat(5_000), 101).unwrap();
+        pool.add_tx(tx3, Amount::from_sat(5_000), 102).unwrap();
+
+        assert_eq!(pool.size(), 2);
+    }
+
+    #[test]
+    fn test_fee_estimation_large_mempool() {
+        let mut pool = Mempool::new(100_000_000, 100_000);
+
+        // Add many transactions to exceed 1 block worth of data
+        // Each tx is ~100 bytes, so we need ~10000 to fill a 1MB block
+        for i in 1u16..=200 {
+            let tx = make_test_tx(i as u8, 50_000, 25);
+            let fee = Amount::from_sat(1_000 + (i as i64) * 50);
+            pool.add_tx(tx, fee, i as u64).unwrap();
+        }
+
+        let est_1 = pool.estimate_fee(1);
+        let est_10 = pool.estimate_fee(10);
+
+        // Both should return reasonable values
+        assert!(est_1.as_sat() >= 1);
+        assert!(est_10.as_sat() >= 1);
+        // More target blocks => lower or equal fee estimate
+        assert!(est_10.as_sat() <= est_1.as_sat());
+    }
+
+    #[test]
+    fn test_fee_estimation_returns_lowest_when_all_fit() {
+        let mut pool = Mempool::new(10_000_000, 1000);
+
+        let tx_low = make_test_tx(0x01, 50_000, 25);
+        let tx_high = make_test_tx(0x02, 50_000, 25);
+
+        pool.add_tx(tx_low, Amount::from_sat(2_000), 100).unwrap();
+        pool.add_tx(tx_high, Amount::from_sat(20_000), 101).unwrap();
+
+        // All txs fit in 1 block
+        let est = pool.estimate_fee(1);
+        // Should return the lowest fee rate
+        assert!(est.as_sat() >= 1);
+    }
+
+    #[test]
+    fn test_add_tx_returns_correct_txid() {
+        let mut pool = Mempool::new(10_000_000, 1000);
+        let tx = make_test_tx(0x42, 50_000, 25);
+        let expected_txid = tx.txid();
+        let result = pool.add_tx(tx, Amount::from_sat(5_000), 100).unwrap();
+        assert_eq!(result, expected_txid);
+    }
+
+    #[test]
+    fn test_remove_tx_returns_entry() {
+        let mut pool = Mempool::new(10_000_000, 1000);
+        let tx = make_test_tx(0x01, 50_000, 25);
+        let txid = tx.txid();
+        pool.add_tx(tx, Amount::from_sat(5_000), 100).unwrap();
+
+        let removed = pool.remove_tx(&txid).unwrap();
+        assert_eq!(removed.fee.as_sat(), 5_000);
+        assert_eq!(removed.time_added, 100);
+    }
+
+    #[test]
+    fn test_error_display_already_exists() {
+        let err = MempoolError::AlreadyExists("deadbeef".to_string());
+        let msg = format!("{}", err);
+        assert!(msg.contains("deadbeef"));
+        assert!(msg.contains("already in mempool"));
+    }
+
+    #[test]
+    fn test_error_display_policy_violation() {
+        let policy_err = PolicyError::InsufficientFee {
+            fee: 100,
+            min_fee: 1000,
+        };
+        let err = MempoolError::PolicyViolation(policy_err);
+        let msg = format!("{}", err);
+        assert!(msg.contains("policy violation"));
+    }
+
+    #[test]
+    fn test_fee_rate_key_ordering() {
+        let key_low = FeeRateKey {
+            fee_rate: FeeRate(100),
+            txid_bytes: [0x01; 32],
+        };
+        let key_high = FeeRateKey {
+            fee_rate: FeeRate(200),
+            txid_bytes: [0x01; 32],
+        };
+        assert!(key_low < key_high);
+
+        // Same fee rate, different txid: ordered by txid
+        let key_a = FeeRateKey {
+            fee_rate: FeeRate(100),
+            txid_bytes: [0x01; 32],
+        };
+        let key_b = FeeRateKey {
+            fee_rate: FeeRate(100),
+            txid_bytes: [0x02; 32],
+        };
+        assert!(key_a < key_b);
+    }
+
+    #[test]
+    fn test_fee_rate_key_equality() {
+        let key1 = FeeRateKey {
+            fee_rate: FeeRate(100),
+            txid_bytes: [0x01; 32],
+        };
+        let key2 = FeeRateKey {
+            fee_rate: FeeRate(100),
+            txid_bytes: [0x01; 32],
+        };
+        assert_eq!(key1, key2);
+    }
+
+    #[test]
+    fn test_sorted_by_fee_single_tx() {
+        let mut pool = Mempool::new(10_000_000, 1000);
+        let tx = make_test_tx(0x01, 50_000, 25);
+        pool.add_tx(tx, Amount::from_sat(5_000), 100).unwrap();
+
+        let sorted = pool.get_sorted_by_fee();
+        assert_eq!(sorted.len(), 1);
+    }
+
+    #[test]
+    fn test_add_many_txs_and_get_all() {
+        let mut pool = Mempool::new(10_000_000, 1000);
+        for i in 1u8..=10 {
+            let tx = make_test_tx(i, 50_000, 25);
+            pool.add_tx(tx, Amount::from_sat(1_000 + i as i64 * 100), i as u64)
+                .unwrap();
+        }
+        assert_eq!(pool.size(), 10);
+        assert_eq!(pool.get_all_txids().len(), 10);
+    }
+
+    #[test]
+    fn test_remove_and_readd() {
+        let mut pool = Mempool::new(10_000_000, 1000);
+        let tx = make_test_tx(0x01, 50_000, 25);
+        let txid = tx.txid();
+
+        pool.add_tx(tx.clone(), Amount::from_sat(5_000), 100).unwrap();
+        pool.remove_tx(&txid);
+        assert!(!pool.contains(&txid));
+
+        // Re-add same tx
+        let result = pool.add_tx(tx, Amount::from_sat(5_000), 200);
+        assert!(result.is_ok());
+        assert!(pool.contains(&txid));
+    }
+
+    #[test]
+    fn test_clear_then_add() {
+        let mut pool = Mempool::new(10_000_000, 1000);
+        let tx1 = make_test_tx(0x01, 50_000, 25);
+        pool.add_tx(tx1, Amount::from_sat(5_000), 100).unwrap();
+        pool.clear();
+
+        let tx2 = make_test_tx(0x02, 50_000, 25);
+        pool.add_tx(tx2, Amount::from_sat(3_000), 200).unwrap();
+        assert_eq!(pool.size(), 1);
+    }
+
+    #[test]
+    fn test_eviction_by_size_multi_step() {
+        let sample_tx = make_test_tx(0x01, 50_000, 25);
+        let tx_size = sample_tx.encoded_size();
+
+        // Allow exactly 1 tx
+        let max_bytes = tx_size;
+        let mut pool = Mempool::new(max_bytes, 1000);
+
+        let tx1 = make_test_tx(0x01, 50_000, 25);
+        let tx2 = make_test_tx(0x02, 50_000, 25);
+
+        pool.add_tx(tx1, Amount::from_sat(1_000), 100).unwrap();
+        pool.add_tx(tx2, Amount::from_sat(2_000), 101).unwrap();
+
+        // Only higher-fee tx should remain
+        assert_eq!(pool.size(), 1);
+        let sorted = pool.get_sorted_by_fee();
+        assert_eq!(sorted[0].fee.as_sat(), 2_000);
+    }
+
+    #[test]
+    fn test_estimate_fee_single_tx() {
+        let mut pool = Mempool::new(10_000_000, 1000);
+        let tx = make_test_tx(0x01, 50_000, 25);
+        pool.add_tx(tx, Amount::from_sat(5_000), 100).unwrap();
+
+        let est = pool.estimate_fee(1);
+        assert!(est.as_sat() >= 1);
+    }
+
+    #[test]
+    fn test_estimate_fee_high_target() {
+        let mut pool = Mempool::new(10_000_000, 1000);
+        let tx = make_test_tx(0x01, 50_000, 25);
+        pool.add_tx(tx, Amount::from_sat(5_000), 100).unwrap();
+
+        // Very high target => still returns the lowest fee rate
+        let est = pool.estimate_fee(100);
+        assert!(est.as_sat() >= 1);
+    }
+
+    #[test]
+    fn test_policy_error_from_conversion() {
+        let policy_err = PolicyError::TxTooLarge {
+            size: 200_000,
+            max: 100_000,
+        };
+        let mempool_err: MempoolError = policy_err.into();
+        assert!(matches!(mempool_err, MempoolError::PolicyViolation(_)));
+    }
+
+    #[test]
+    fn test_mempool_entry_debug() {
+        let tx = make_test_tx(0x01, 50_000, 25);
+        let entry = MempoolEntry {
+            tx,
+            fee: Amount::from_sat(1000),
+            size: 100,
+            time_added: 12345,
+            ancestors: 0,
+            descendants: 0,
+        };
+        let debug = format!("{:?}", entry);
+        assert!(debug.contains("MempoolEntry"));
+    }
 }

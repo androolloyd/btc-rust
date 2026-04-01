@@ -464,3 +464,524 @@ fn test_named_accounts() {
     assert_eq!(env.account(1).name, "bob");
     assert_eq!(env.account(2).name, "account_2");
 }
+
+// ---------------------------------------------------------------------------
+// Additional coverage tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_forge_script_default() {
+    let s = crate::script_builder::ForgeScript::default();
+    let script = s.build();
+    assert!(script.is_empty());
+}
+
+#[test]
+fn test_forge_script_push_hash() {
+    let hash = [0xAA; 32];
+    let script = ForgeScript::new().push_hash(&hash).build();
+    assert!(!script.is_empty());
+}
+
+#[test]
+fn test_forge_script_push_pubkey() {
+    let key = [0x02; 33];
+    let script = ForgeScript::new().push_pubkey(&key).build();
+    assert!(!script.is_empty());
+}
+
+#[test]
+fn test_forge_script_push_large_number() {
+    // Large positive number
+    let s = ForgeScript::new().push_num(1000).build();
+    assert!(!s.is_empty());
+
+    // Large negative number
+    let s2 = ForgeScript::new().push_num(-1000).build();
+    assert!(!s2.is_empty());
+
+    // Number that needs sign extension
+    let s3 = ForgeScript::new().push_num(128).build();
+    assert!(!s3.is_empty());
+
+    // Negative number needing sign bit
+    let s4 = ForgeScript::new().push_num(-128).build();
+    assert!(!s4.is_empty());
+}
+
+#[test]
+fn test_script_env_fund_script() {
+    let mut env = ScriptEnv::new();
+    let script = ScriptBuf::from_bytes(vec![0x51]); // OP_1
+    let utxo = env.fund_script(&script, Amount::from_sat(100_000));
+    assert!(utxo.txout.value.as_sat() > 0);
+}
+
+#[test]
+fn test_script_env_node_access() {
+    let mut env = ScriptEnv::new();
+    let node = env.node();
+    assert_eq!(node.height(), 0);
+
+    let node_mut = env.node_mut();
+    node_mut.mine_blocks(1);
+    assert_eq!(env.height(), 1);
+}
+
+#[test]
+fn test_script_env_verify_with_witness() {
+    let env = ScriptEnv::new();
+    // Push 1 as witness, then run OP_1 as witness script
+    let witness_items = vec![vec![0x01]];
+    let witness_script = ForgeScript::new().op(Opcode::OP_1).build();
+    let script_pubkey = ForgeScript::new().build(); // empty
+
+    let result = env
+        .verify_script_with_witness(&witness_items, witness_script.as_script(), script_pubkey.as_script())
+        .unwrap();
+    assert!(result.success);
+}
+
+#[test]
+fn test_script_result_fields() {
+    let env = ScriptEnv::new();
+    let script = ForgeScript::new().push_num(42).build();
+    let result = env.execute_script(script.as_script()).unwrap();
+    assert!(result.success);
+    assert!(!result.final_stack.is_empty());
+    assert_eq!(result.script_size, script.len());
+}
+
+#[test]
+fn test_debugger_run_twice_returns_cached() {
+    let script = ForgeScript::new().push_num(1).build();
+    let mut debugger = ScriptDebugger::new(script.as_script());
+    let trace1 = debugger.run();
+    let trace2 = debugger.run();
+    assert_eq!(trace1.len(), trace2.len());
+}
+
+#[test]
+fn test_debugger_step() {
+    let script = ForgeScript::new().push_num(1).build();
+    let mut debugger = ScriptDebugger::new(script.as_script());
+    let step = debugger.step();
+    // After step() calls run(), result is None (all in history)
+    assert!(step.is_none());
+}
+
+#[test]
+fn test_debugger_set_breakpoint() {
+    let script = ForgeScript::new().push_num(1).push_num(2).op(Opcode::OP_ADD).build();
+    let mut debugger = ScriptDebugger::new(script.as_script());
+    debugger.set_breakpoint(0);
+    debugger.set_breakpoint(0); // duplicate should not add
+    debugger.set_breakpoint(1);
+    // Just verify no panics
+    let trace = debugger.run();
+    assert!(!trace.is_empty());
+}
+
+#[test]
+fn test_debugger_history() {
+    let script = ForgeScript::new().push_num(1).build();
+    let mut debugger = ScriptDebugger::new(script.as_script());
+    assert!(debugger.history().is_empty());
+    debugger.run();
+    assert!(!debugger.history().is_empty());
+}
+
+#[test]
+fn test_script_analysis_with_branches() {
+    use crate::weight::{analyze_script, estimate_witness_weight};
+
+    // IF/ELSE/ENDIF script
+    let script = ForgeScript::new()
+        .op(Opcode::OP_IF)
+        .push_num(1)
+        .op(Opcode::OP_ELSE)
+        .push_num(2)
+        .op(Opcode::OP_ENDIF)
+        .build();
+
+    let analysis = analyze_script(script.as_script());
+    assert!(!analysis.branches.is_empty());
+}
+
+#[test]
+fn test_script_analysis_checksigadd() {
+    let script = ForgeScript::new()
+        .push_bytes(&[0x02; 33])
+        .op(Opcode::OP_CHECKSIGADD)
+        .build();
+    let analysis = crate::weight::analyze_script(script.as_script());
+    assert!(analysis.has_signature_ops);
+    assert_eq!(analysis.sigop_count, 1);
+}
+
+#[test]
+fn test_script_analysis_checkmultisig_unknown_n() {
+    // CHECKMULTISIG without preceding OP_N -> uses 20 sigops
+    let script = ForgeScript::new()
+        .push_bytes(&[0x02; 33])
+        .op(Opcode::OP_CHECKMULTISIG)
+        .build();
+    let analysis = crate::weight::analyze_script(script.as_script());
+    // last_n_keys was 0, so sigop_count = 20
+    assert!(analysis.sigop_count >= 20);
+}
+
+#[test]
+fn test_script_analysis_stack_operations() {
+    let script = ForgeScript::new()
+        .push_num(1)
+        .push_num(2)
+        .op(Opcode::OP_2DUP)
+        .op(Opcode::OP_3DUP)
+        .op(Opcode::OP_2DROP)
+        .op(Opcode::OP_NIP)
+        .op(Opcode::OP_SWAP)
+        .op(Opcode::OP_OVER)
+        .op(Opcode::OP_TUCK)
+        .op(Opcode::OP_DROP)
+        .op(Opcode::OP_ADD)
+        .build();
+    let analysis = crate::weight::analyze_script(script.as_script());
+    assert!(analysis.max_stack_depth > 0);
+}
+
+#[test]
+fn test_script_analysis_data_push_n_detection() {
+    // Push single byte 3, then CHECKMULTISIG -> should count 3 sigops
+    let mut script = ScriptBuf::new();
+    script.push_slice(&[3u8]);
+    script.push_opcode(Opcode::OP_CHECKMULTISIG);
+    let analysis = crate::weight::analyze_script(script.as_script());
+    assert_eq!(analysis.sigop_count, 3);
+}
+
+#[test]
+fn test_estimate_witness_weight_multiple() {
+    use crate::weight::estimate_witness_weight;
+    let witness = vec![vec![0u8; 72], vec![0u8; 33]];
+    let weight = estimate_witness_weight(&witness);
+    // 1 (count) + 1 (len) + 72 + 1 (len) + 33 = 108
+    assert_eq!(weight, 108);
+}
+
+#[test]
+fn test_tx_builder_with_sequence_out_of_bounds() {
+    let tx = crate::tx_builder::TxBuilder::new()
+        .add_input_with_script(
+            OutPoint::new(TxHash::from_bytes([0xaa; 32]), 0),
+            ScriptBuf::new(),
+        )
+        .with_sequence(5, 0xfffffffe) // out of bounds, should be no-op
+        .build();
+    // Default sequence should be SEQUENCE_FINAL
+    assert_eq!(tx.inputs[0].sequence, 0xffffffff);
+}
+
+#[test]
+fn test_tx_builder_with_witness_out_of_bounds() {
+    let tx = crate::tx_builder::TxBuilder::new()
+        .add_input_with_script(
+            OutPoint::new(TxHash::from_bytes([0xaa; 32]), 0),
+            ScriptBuf::new(),
+        )
+        .with_witness(5, vec![vec![0x01]]) // out of bounds, should be no-op
+        .build();
+    // Witness should be empty
+    assert!(tx.witness[0].is_empty());
+}
+
+#[test]
+fn test_tx_builder_default() {
+    let builder = crate::tx_builder::TxBuilder::default();
+    let tx = builder
+        .add_input_with_script(
+            OutPoint::new(TxHash::from_bytes([0xaa; 32]), 0),
+            ScriptBuf::new(),
+        )
+        .add_output(ScriptBuf::new(), Amount::from_sat(1000))
+        .build();
+    assert_eq!(tx.version, 2);
+}
+
+#[test]
+fn test_script_env_default() {
+    let env = crate::script_env::ScriptEnv::default();
+    assert_eq!(env.height(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Miniscript additional coverage
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_miniscript_witness_size_hash256() {
+    use crate::miniscript::Miniscript;
+    let ms = Miniscript::Hash256(vec![0x42; 32]);
+    assert_eq!(ms.max_satisfaction_witness_size(), 33);
+}
+
+#[test]
+fn test_miniscript_witness_size_ripemd160() {
+    use crate::miniscript::Miniscript;
+    let ms = Miniscript::Ripemd160(vec![0x42; 20]);
+    assert_eq!(ms.max_satisfaction_witness_size(), 33);
+}
+
+#[test]
+fn test_miniscript_witness_size_hash160() {
+    use crate::miniscript::Miniscript;
+    let ms = Miniscript::Hash160(vec![0x42; 20]);
+    assert_eq!(ms.max_satisfaction_witness_size(), 33);
+}
+
+#[test]
+fn test_miniscript_witness_size_andb() {
+    use crate::miniscript::Miniscript;
+    let ms = Miniscript::AndB(
+        Box::new(Miniscript::Pk(vec![0xaa; 33])),
+        Box::new(Miniscript::Pk(vec![0xbb; 33])),
+    );
+    assert_eq!(ms.max_satisfaction_witness_size(), 148);
+}
+
+#[test]
+fn test_miniscript_witness_size_orb() {
+    use crate::miniscript::Miniscript;
+    let ms = Miniscript::OrB(
+        Box::new(Miniscript::Pk(vec![0xaa; 33])),
+        Box::new(Miniscript::Pk(vec![0xbb; 33])),
+    );
+    // OrB: sum of both branches
+    assert_eq!(ms.max_satisfaction_witness_size(), 148);
+}
+
+#[test]
+fn test_miniscript_witness_size_ord() {
+    use crate::miniscript::Miniscript;
+    let ms = Miniscript::OrD(
+        Box::new(Miniscript::Pk(vec![0xaa; 33])),
+        Box::new(Miniscript::Pk(vec![0xbb; 33])),
+    );
+    // max of branches
+    assert_eq!(ms.max_satisfaction_witness_size(), 74);
+}
+
+#[test]
+fn test_miniscript_witness_size_orc() {
+    use crate::miniscript::Miniscript;
+    let ms = Miniscript::OrC(
+        Box::new(Miniscript::Pk(vec![0xaa; 33])),
+        Box::new(Miniscript::Pk(vec![0xbb; 33])),
+    );
+    assert_eq!(ms.max_satisfaction_witness_size(), 74);
+}
+
+#[test]
+fn test_miniscript_witness_size_thresh() {
+    use crate::miniscript::Miniscript;
+    let ms = Miniscript::Thresh(
+        1,
+        vec![
+            Miniscript::Pk(vec![0xaa; 33]),
+            Miniscript::Pk(vec![0xbb; 33]),
+        ],
+    );
+    // Sum all sub sizes: 74 + 74 = 148
+    assert_eq!(ms.max_satisfaction_witness_size(), 148);
+}
+
+#[test]
+fn test_miniscript_witness_size_nonzero() {
+    use crate::miniscript::Miniscript;
+    let ms = Miniscript::NonZero(Box::new(Miniscript::Pk(vec![0xaa; 33])));
+    assert_eq!(ms.max_satisfaction_witness_size(), 74);
+}
+
+#[test]
+fn test_miniscript_safety_or_variants() {
+    use crate::miniscript::Miniscript;
+    // OrB: both branches need sig
+    let ms_safe = Miniscript::OrB(
+        Box::new(Miniscript::Pk(vec![0xaa; 33])),
+        Box::new(Miniscript::Pk(vec![0xbb; 33])),
+    );
+    assert!(ms_safe.is_safe());
+
+    let ms_unsafe = Miniscript::OrB(
+        Box::new(Miniscript::Pk(vec![0xaa; 33])),
+        Box::new(Miniscript::After(100)),
+    );
+    assert!(!ms_unsafe.is_safe());
+
+    // OrD
+    let ms_ord_safe = Miniscript::OrD(
+        Box::new(Miniscript::Pk(vec![0xaa; 33])),
+        Box::new(Miniscript::Pk(vec![0xbb; 33])),
+    );
+    assert!(ms_ord_safe.is_safe());
+
+    // OrC
+    let ms_orc_safe = Miniscript::OrC(
+        Box::new(Miniscript::Pk(vec![0xaa; 33])),
+        Box::new(Miniscript::Pk(vec![0xbb; 33])),
+    );
+    assert!(ms_orc_safe.is_safe());
+}
+
+#[test]
+fn test_miniscript_safety_thresh_edge_cases() {
+    use crate::miniscript::Miniscript;
+    // k=2, 1 no-sig sub: still safe because every k=2 subset must include the sig sub
+    let ms = Miniscript::Thresh(
+        2,
+        vec![
+            Miniscript::Pk(vec![0xaa; 33]),
+            Miniscript::Pk(vec![0xbb; 33]),
+            Miniscript::After(100), // no sig
+        ],
+    );
+    assert!(ms.is_safe()); // no_sig_count=1 < k=2, safe
+
+    // k=1, 1 no-sig sub: unsafe (no_sig_count=1 >= k=1)
+    let ms2 = Miniscript::Thresh(
+        1,
+        vec![
+            Miniscript::Pk(vec![0xaa; 33]),
+            Miniscript::After(100),
+        ],
+    );
+    assert!(!ms2.is_safe());
+}
+
+#[test]
+fn test_policy_parse_sha256_invalid_hex() {
+    use crate::miniscript::Policy;
+    let result = Policy::parse("sha256(zzzz)");
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_policy_parse_empty() {
+    use crate::miniscript::Policy;
+    let result = Policy::parse("");
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_policy_parse_no_open_paren() {
+    use crate::miniscript::Policy;
+    let result = Policy::parse("pk");
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_policy_parse_thresh_invalid_k() {
+    use crate::miniscript::Policy;
+    // k = 0 is invalid
+    let result = Policy::parse("thresh(0,pk(aa))");
+    assert!(result.is_err());
+    // k > subs is invalid
+    let result2 = Policy::parse("thresh(3,pk(aa),pk(bb))");
+    assert!(result2.is_err());
+}
+
+#[test]
+fn test_policy_parse_thresh_invalid_k_string() {
+    use crate::miniscript::Policy;
+    let result = Policy::parse("thresh(abc,pk(aa))");
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_policy_parse_older_invalid() {
+    use crate::miniscript::Policy;
+    let result = Policy::parse("older(abc)");
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_policy_parse_and_missing_comma() {
+    use crate::miniscript::Policy;
+    let result = Policy::parse("and(pk(aa) pk(bb))");
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_policy_parse_or_missing_close() {
+    use crate::miniscript::Policy;
+    let result = Policy::parse("or(pk(aa),pk(bb)");
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_miniscript_andb_safety() {
+    use crate::miniscript::Miniscript;
+    let ms = Miniscript::AndB(
+        Box::new(Miniscript::Sha256(vec![0x42; 32])),
+        Box::new(Miniscript::Pk(vec![0xaa; 33])),
+    );
+    assert!(ms.is_safe()); // one branch has sig -> safe for And
+}
+
+#[test]
+fn test_script_analysis_checkmultisigverify() {
+    let script = ForgeScript::new()
+        .push_num(2)
+        .push_bytes(&[0x02; 33])
+        .push_bytes(&[0x03; 33])
+        .push_num(2)
+        .op(Opcode::OP_CHECKMULTISIGVERIFY)
+        .build();
+    let analysis = crate::weight::analyze_script(script.as_script());
+    assert!(analysis.has_signature_ops);
+    assert_eq!(analysis.sigop_count, 2); // 2 keys
+}
+
+#[test]
+fn test_script_analysis_checksigverify() {
+    let script = ForgeScript::new()
+        .push_bytes(&[0x02; 33])
+        .op(Opcode::OP_CHECKSIGVERIFY)
+        .build();
+    let analysis = crate::weight::analyze_script(script.as_script());
+    assert!(analysis.has_signature_ops);
+    assert_eq!(analysis.sigop_count, 1);
+}
+
+#[test]
+fn test_script_analysis_nested_if() {
+    let script = ForgeScript::new()
+        .op(Opcode::OP_IF)
+        .op(Opcode::OP_IF)
+        .push_num(1)
+        .op(Opcode::OP_ENDIF)
+        .op(Opcode::OP_ELSE)
+        .push_num(2)
+        .op(Opcode::OP_ENDIF)
+        .build();
+    let analysis = crate::weight::analyze_script(script.as_script());
+    assert!(!analysis.branches.is_empty());
+}
+
+#[test]
+fn test_script_analysis_op0_push() {
+    let script = ForgeScript::new().push_num(0).build();
+    let analysis = crate::weight::analyze_script(script.as_script());
+    assert_eq!(analysis.max_stack_depth, 1);
+}
+
+#[test]
+fn test_forge_error_display() {
+    use crate::script_env::ForgeError;
+    let e1 = ForgeError::ScriptExecution("exec fail".into());
+    assert!(format!("{}", e1).contains("exec fail"));
+    let e2 = ForgeError::MissingUtxo("missing".into());
+    assert!(format!("{}", e2).contains("missing"));
+    let e3 = ForgeError::InvalidArgument("bad arg".into());
+    assert!(format!("{}", e3).contains("bad arg"));
+}

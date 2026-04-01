@@ -528,4 +528,284 @@ mod tests {
         // 10000 - 5000 = 5000 == min increment -- OK
         assert!(can_replace(&new_tx, Amount::from_sat(10_000), &conflicts, &policy).is_ok());
     }
+
+    // -----------------------------------------------------------------
+    // Additional coverage tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_default_rbf_policy() {
+        let policy = RbfPolicy::default();
+        assert!(policy.enabled);
+        assert_eq!(policy.min_fee_increment.as_sat(), 1_000);
+        assert_eq!(policy.max_replacements, 100);
+    }
+
+    #[test]
+    fn test_signals_rbf_sequence_zero() {
+        let tx = make_tx(0x01, 0x00000000, 50_000);
+        assert!(signals_rbf(&tx));
+    }
+
+    #[test]
+    fn test_signals_rbf_sequence_one() {
+        let tx = make_tx(0x01, 0x00000001, 50_000);
+        assert!(signals_rbf(&tx));
+    }
+
+    #[test]
+    fn test_signals_rbf_sequence_max_minus_2() {
+        // 0xfffffffd signals RBF
+        let tx = make_tx(0x01, 0xfffffffd, 50_000);
+        assert!(signals_rbf(&tx));
+    }
+
+    #[test]
+    fn test_no_signal_sequence_max_minus_1() {
+        // 0xfffffffe does NOT signal
+        let tx = make_tx(0x01, 0xfffffffe, 50_000);
+        assert!(!signals_rbf(&tx));
+    }
+
+    #[test]
+    fn test_no_signal_all_inputs_final() {
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![
+                TxIn {
+                    previous_output: OutPoint::new(TxHash::from_bytes([0x01; 32]), 0),
+                    script_sig: ScriptBuf::from_bytes(vec![]),
+                    sequence: 0xffffffff,
+                },
+                TxIn {
+                    previous_output: OutPoint::new(TxHash::from_bytes([0x02; 32]), 0),
+                    script_sig: ScriptBuf::from_bytes(vec![]),
+                    sequence: 0xffffffff,
+                },
+            ],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76; 25]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+        assert!(!signals_rbf(&tx));
+    }
+
+    #[test]
+    fn test_replacement_with_zero_descendants() {
+        let old_tx = make_tx(0x01, 0x00000001, 50_000);
+        let old_entry = make_entry(old_tx.clone(), Amount::from_sat(2_000));
+        let old_txid = old_tx.txid();
+
+        let new_tx = make_tx(0x01, 0x00000002, 48_000);
+        let conflicts = vec![(old_txid, &old_entry)];
+
+        let policy = RbfPolicy {
+            max_replacements: 1, // Only allow displacing 1 tx
+            ..RbfPolicy::default()
+        };
+
+        // 1 (old tx) + 0 descendants = 1, which is within the limit
+        assert!(can_replace(&new_tx, Amount::from_sat(5_000), &conflicts, &policy).is_ok());
+    }
+
+    #[test]
+    fn test_replacement_exactly_at_max_with_descendants() {
+        let old_tx = make_tx(0x01, 0x00000001, 50_000);
+        let mut old_entry = make_entry(old_tx.clone(), Amount::from_sat(2_000));
+        old_entry.descendants = 4; // 1 + 4 = 5 total
+        let old_txid = old_tx.txid();
+
+        let new_tx = make_tx(0x01, 0x00000002, 48_000);
+        let conflicts = vec![(old_txid, &old_entry)];
+
+        let policy = RbfPolicy {
+            max_replacements: 5,
+            ..RbfPolicy::default()
+        };
+
+        assert!(can_replace(&new_tx, Amount::from_sat(5_000), &conflicts, &policy).is_ok());
+    }
+
+    #[test]
+    fn test_replacement_one_over_max_with_descendants() {
+        let old_tx = make_tx(0x01, 0x00000001, 50_000);
+        let mut old_entry = make_entry(old_tx.clone(), Amount::from_sat(2_000));
+        old_entry.descendants = 5; // 1 + 5 = 6 > 5
+        let old_txid = old_tx.txid();
+
+        let new_tx = make_tx(0x01, 0x00000002, 48_000);
+        let conflicts = vec![(old_txid, &old_entry)];
+
+        let policy = RbfPolicy {
+            max_replacements: 5,
+            ..RbfPolicy::default()
+        };
+
+        assert!(matches!(
+            can_replace(&new_tx, Amount::from_sat(5_000), &conflicts, &policy),
+            Err(RbfError::TooManyReplacements { count: 6, max: 5 }),
+        ));
+    }
+
+    #[test]
+    fn test_new_tx_spending_same_input_as_conflict() {
+        // New tx spends the same input as old tx -- this is the normal RBF case
+        let old_tx = make_tx(0x01, 0x00000001, 50_000);
+        let old_entry = make_entry(old_tx.clone(), Amount::from_sat(2_000));
+        let old_txid = old_tx.txid();
+
+        // New tx also spends [0x01;32]:0 (same outpoint)
+        let new_tx = make_tx(0x01, 0x00000002, 48_000);
+        let conflicts = vec![(old_txid, &old_entry)];
+        let policy = RbfPolicy::default();
+
+        assert!(can_replace(&new_tx, Amount::from_sat(5_000), &conflicts, &policy).is_ok());
+    }
+
+    #[test]
+    fn test_new_tx_with_different_confirmed_input() {
+        // New tx spends a different outpoint (not in conflict set, not a conflict txid)
+        let old_tx = make_tx(0x01, 0x00000001, 50_000);
+        let old_entry = make_entry(old_tx.clone(), Amount::from_sat(2_000));
+        let old_txid = old_tx.txid();
+
+        // New tx spends [0x01;32]:0 AND [0xbb;32]:0
+        // [0xbb;32] is NOT a conflict txid, so it's not flagged as unconfirmed
+        let new_tx = Transaction {
+            version: 2,
+            inputs: vec![
+                TxIn {
+                    previous_output: OutPoint::new(TxHash::from_bytes([0x01; 32]), 0),
+                    script_sig: ScriptBuf::from_bytes(vec![0x00; 10]),
+                    sequence: 0x00000002,
+                },
+                TxIn {
+                    previous_output: OutPoint::new(TxHash::from_bytes([0xbb; 32]), 0),
+                    script_sig: ScriptBuf::from_bytes(vec![0x00; 10]),
+                    sequence: 0x00000002,
+                },
+            ],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(40_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76; 25]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let conflicts = vec![(old_txid, &old_entry)];
+        let policy = RbfPolicy::default();
+
+        // Should pass: new input is from a confirmed tx (not in conflicts)
+        assert!(can_replace(&new_tx, Amount::from_sat(5_000), &conflicts, &policy).is_ok());
+    }
+
+    #[test]
+    fn test_rbf_error_display_disabled() {
+        let err = RbfError::Disabled;
+        let msg = format!("{}", err);
+        assert!(msg.contains("disabled"));
+    }
+
+    #[test]
+    fn test_rbf_error_display_not_signaling() {
+        let err = RbfError::NotSignaling("aabb".to_string());
+        let msg = format!("{}", err);
+        assert!(msg.contains("aabb"));
+        assert!(msg.contains("replaceability"));
+    }
+
+    #[test]
+    fn test_rbf_error_display_insufficient_fee() {
+        let err = RbfError::InsufficientFee {
+            new_fee: 3000,
+            old_fee: 5000,
+            min_increment: 1000,
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("3000"));
+        assert!(msg.contains("5000"));
+    }
+
+    #[test]
+    fn test_rbf_error_display_too_many_replacements() {
+        let err = RbfError::TooManyReplacements {
+            count: 150,
+            max: 100,
+        };
+        let msg = format!("{}", err);
+        assert!(msg.contains("150"));
+        assert!(msg.contains("100"));
+    }
+
+    #[test]
+    fn test_rbf_error_display_new_unconfirmed_input() {
+        let err = RbfError::NewUnconfirmedInput("deadbeef".to_string());
+        let msg = format!("{}", err);
+        assert!(msg.contains("deadbeef"));
+        assert!(msg.contains("unconfirmed"));
+    }
+
+    #[test]
+    fn test_rbf_error_equality() {
+        assert_eq!(RbfError::Disabled, RbfError::Disabled);
+        assert_ne!(
+            RbfError::Disabled,
+            RbfError::NotSignaling("x".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_rbf_policy_clone() {
+        let policy = RbfPolicy {
+            enabled: false,
+            min_fee_increment: Amount::from_sat(5_000),
+            max_replacements: 50,
+        };
+        let cloned = policy.clone();
+        assert_eq!(cloned.enabled, false);
+        assert_eq!(cloned.min_fee_increment.as_sat(), 5_000);
+        assert_eq!(cloned.max_replacements, 50);
+    }
+
+    #[test]
+    fn test_rbf_policy_debug() {
+        let policy = RbfPolicy::default();
+        let debug = format!("{:?}", policy);
+        assert!(debug.contains("RbfPolicy"));
+    }
+
+    #[test]
+    fn test_rbf_error_debug() {
+        let err = RbfError::Disabled;
+        let debug = format!("{:?}", err);
+        assert!(debug.contains("Disabled"));
+    }
+
+    #[test]
+    fn test_empty_conflicts() {
+        let new_tx = make_tx(0x01, 0x00000002, 48_000);
+        let conflicts: Vec<(TxHash, &MempoolEntry)> = vec![];
+        let policy = RbfPolicy::default();
+
+        // No conflicts: fee comparison (0) passes since new_fee > 0
+        // Actually: new_fee.as_sat() <= total_old_fee(0) => 5000 > 0 => passes first check
+        // increment = 5000 - 0 = 5000 >= 1000 => passes
+        // total_displaced = 0 => passes
+        // No new unconfirmed inputs to check
+        assert!(can_replace(&new_tx, Amount::from_sat(5_000), &conflicts, &policy).is_ok());
+    }
+
+    #[test]
+    fn test_make_entry_size_calculation() {
+        let tx = make_tx(0x01, 0x00000001, 50_000);
+        let entry = make_entry(tx.clone(), Amount::from_sat(1_000));
+        assert_eq!(entry.size, btc_primitives::Encodable::encoded_size(&tx));
+        assert_eq!(entry.time_added, 0);
+        assert_eq!(entry.ancestors, 0);
+        assert_eq!(entry.descendants, 0);
+    }
 }
