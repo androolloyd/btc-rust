@@ -222,4 +222,281 @@ mod tests {
         assert!(responses.is_empty());
         assert_eq!(hs.state(), HandshakeState::VersionSent);
     }
+
+    // --- Default trait ---
+
+    #[test]
+    fn test_handshake_default() {
+        let hs = Handshake::default();
+        assert_eq!(hs.state(), HandshakeState::Init);
+        assert!(hs.peer_version().is_none());
+        assert!(!hs.is_ready());
+    }
+
+    // --- version_sent only works from Init ---
+
+    #[test]
+    fn test_version_sent_only_from_init() {
+        let mut hs = Handshake::new();
+        hs.version_sent();
+        assert_eq!(hs.state(), HandshakeState::VersionSent);
+        // Calling version_sent again from VersionSent should not change state
+        hs.version_sent();
+        assert_eq!(hs.state(), HandshakeState::VersionSent);
+    }
+
+    // --- Verack received before peer version (VersionSent state) ---
+
+    #[test]
+    fn test_verack_before_version_stays_in_version_sent() {
+        let mut hs = Handshake::new();
+        hs.version_sent();
+        // Receive verack before version
+        let responses = hs.process_message(&NetworkMessage::Verack);
+        assert!(responses.is_empty());
+        // Should stay in VersionSent since we haven't received their version yet
+        assert_eq!(hs.state(), HandshakeState::VersionSent);
+    }
+
+    // --- Version received from Init state (not VersionSent) ---
+
+    #[test]
+    fn test_version_received_from_init_state() {
+        let mut hs = Handshake::new();
+        // Don't call version_sent -- receive peer's version directly from Init
+        let peer_version = VersionMessage {
+            version: 70016,
+            services: 1,
+            timestamp: 1_700_000_000,
+            receiver: NetAddress::default(),
+            sender: NetAddress::default(),
+            nonce: 99,
+            user_agent: "/test/".to_string(),
+            start_height: 100_000,
+            relay: true,
+        };
+        let responses = hs.process_message(&NetworkMessage::Version(peer_version));
+        // Should still transition to VerackSent (the wildcard match)
+        assert_eq!(hs.state(), HandshakeState::VerackSent);
+        assert!(!responses.is_empty());
+    }
+
+    // --- Peer version with version < WTXID_RELAY does not send wtxidrelay ---
+
+    #[test]
+    fn test_old_version_no_wtxidrelay() {
+        let mut hs = Handshake::new();
+        hs.version_sent();
+        let peer_version = VersionMessage {
+            version: 70015, // Below WTXID_RELAY (70016)
+            services: 1,
+            timestamp: 1_700_000_000,
+            receiver: NetAddress::default(),
+            sender: NetAddress::default(),
+            nonce: 42,
+            user_agent: "/old/".to_string(),
+            start_height: 800_000,
+            relay: true,
+        };
+        let responses = hs.process_message(&NetworkMessage::Version(peer_version));
+        // Should only send verack, no wtxidrelay
+        assert_eq!(responses.len(), 1);
+        assert!(matches!(responses[0], NetworkMessage::Verack));
+    }
+
+    // --- Peer version at exactly WTXID_RELAY sends wtxidrelay ---
+
+    #[test]
+    fn test_exact_wtxidrelay_version() {
+        let mut hs = Handshake::new();
+        hs.version_sent();
+        let peer_version = VersionMessage {
+            version: 70016, // Exactly WTXID_RELAY
+            services: 1,
+            timestamp: 1_700_000_000,
+            receiver: NetAddress::default(),
+            sender: NetAddress::default(),
+            nonce: 42,
+            user_agent: "/exact/".to_string(),
+            start_height: 800_000,
+            relay: true,
+        };
+        let responses = hs.process_message(&NetworkMessage::Version(peer_version));
+        assert_eq!(responses.len(), 2);
+        assert!(matches!(responses[0], NetworkMessage::WtxidRelay));
+        assert!(matches!(responses[1], NetworkMessage::Verack));
+    }
+
+    // --- Non-handshake messages in various states ---
+
+    #[test]
+    fn test_ignores_non_handshake_in_init() {
+        let mut hs = Handshake::new();
+        let responses = hs.process_message(&NetworkMessage::SendHeaders);
+        assert!(responses.is_empty());
+        assert_eq!(hs.state(), HandshakeState::Init);
+    }
+
+    #[test]
+    fn test_ignores_non_handshake_in_verack_sent() {
+        let mut hs = Handshake::new();
+        hs.version_sent();
+        let peer_version = VersionMessage {
+            version: 70016,
+            services: 1,
+            timestamp: 1_700_000_000,
+            receiver: NetAddress::default(),
+            sender: NetAddress::default(),
+            nonce: 42,
+            user_agent: "/test/".to_string(),
+            start_height: 800_000,
+            relay: true,
+        };
+        hs.process_message(&NetworkMessage::Version(peer_version));
+        assert_eq!(hs.state(), HandshakeState::VerackSent);
+
+        // Non-handshake messages should be ignored
+        let responses = hs.process_message(&NetworkMessage::Ping(123));
+        assert!(responses.is_empty());
+        assert_eq!(hs.state(), HandshakeState::VerackSent);
+
+        let responses = hs.process_message(&NetworkMessage::FeeFilter(1000));
+        assert!(responses.is_empty());
+        assert_eq!(hs.state(), HandshakeState::VerackSent);
+    }
+
+    // --- Verack in unexpected states ---
+
+    #[test]
+    fn test_verack_in_init_state_ignored() {
+        let mut hs = Handshake::new();
+        let responses = hs.process_message(&NetworkMessage::Verack);
+        assert!(responses.is_empty());
+        // Should stay in Init
+        assert_eq!(hs.state(), HandshakeState::Init);
+    }
+
+    #[test]
+    fn test_verack_in_ready_state_ignored() {
+        let mut hs = Handshake::new();
+        hs.version_sent();
+        let peer_version = VersionMessage {
+            version: 70016,
+            services: 1,
+            timestamp: 1_700_000_000,
+            receiver: NetAddress::default(),
+            sender: NetAddress::default(),
+            nonce: 42,
+            user_agent: "/test/".to_string(),
+            start_height: 800_000,
+            relay: true,
+        };
+        hs.process_message(&NetworkMessage::Version(peer_version));
+        hs.process_message(&NetworkMessage::Verack);
+        assert_eq!(hs.state(), HandshakeState::Ready);
+
+        // Extra verack in Ready state should be ignored
+        let responses = hs.process_message(&NetworkMessage::Verack);
+        assert!(responses.is_empty());
+        assert_eq!(hs.state(), HandshakeState::Ready);
+    }
+
+    // --- peer_version stores the version correctly ---
+
+    #[test]
+    fn test_peer_version_stored() {
+        let mut hs = Handshake::new();
+        hs.version_sent();
+        assert!(hs.peer_version().is_none());
+        let peer_version = VersionMessage {
+            version: 70015,
+            services: 0x040d,
+            timestamp: 1_600_000_000,
+            receiver: NetAddress::default(),
+            sender: NetAddress::default(),
+            nonce: 555,
+            user_agent: "/Satoshi:24.0.0/".to_string(),
+            start_height: 750_000,
+            relay: false,
+        };
+        hs.process_message(&NetworkMessage::Version(peer_version.clone()));
+        let stored = hs.peer_version().unwrap();
+        assert_eq!(stored.version, 70015);
+        assert_eq!(stored.services, 0x040d);
+        assert_eq!(stored.nonce, 555);
+        assert_eq!(stored.user_agent, "/Satoshi:24.0.0/");
+        assert_eq!(stored.start_height, 750_000);
+        assert!(!stored.relay);
+    }
+
+    // --- build_version_message for different networks ---
+
+    #[test]
+    fn test_build_version_message_testnet() {
+        let msg = Handshake::build_version_message(Network::Testnet, 100);
+        match msg {
+            NetworkMessage::Version(v) => {
+                assert_eq!(v.start_height, 100);
+                assert_eq!(v.version, ProtocolVersion::CURRENT.0);
+            }
+            other => panic!("expected Version, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_build_version_message_regtest() {
+        let msg = Handshake::build_version_message(Network::Regtest, 0);
+        match msg {
+            NetworkMessage::Version(v) => {
+                assert_eq!(v.start_height, 0);
+            }
+            other => panic!("expected Version, got {:?}", other),
+        }
+    }
+
+    // --- Full handshake with different start heights ---
+
+    #[test]
+    fn test_full_handshake_with_zero_height() {
+        let mut hs = Handshake::new();
+        hs.version_sent();
+        let peer_version = VersionMessage {
+            version: 70016,
+            services: 1,
+            timestamp: 1_700_000_000,
+            receiver: NetAddress::default(),
+            sender: NetAddress::default(),
+            nonce: 1,
+            user_agent: "/test/".to_string(),
+            start_height: 0,
+            relay: true,
+        };
+        hs.process_message(&NetworkMessage::Version(peer_version));
+        hs.process_message(&NetworkMessage::Verack);
+        assert!(hs.is_ready());
+        assert_eq!(hs.peer_version().unwrap().start_height, 0);
+    }
+
+    // --- HandshakeState equality and copy ---
+
+    #[test]
+    fn test_handshake_state_values() {
+        let states = [
+            HandshakeState::Init,
+            HandshakeState::VersionSent,
+            HandshakeState::VerackSent,
+            HandshakeState::Ready,
+            HandshakeState::Failed,
+        ];
+        // All states should be distinct
+        for i in 0..states.len() {
+            for j in 0..states.len() {
+                if i == j {
+                    assert_eq!(states[i], states[j]);
+                } else {
+                    assert_ne!(states[i], states[j]);
+                }
+            }
+        }
+    }
 }

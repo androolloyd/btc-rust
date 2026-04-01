@@ -616,4 +616,218 @@ mod tests {
         let peers = discover_peers(Network::Regtest).await;
         assert!(peers.is_empty());
     }
+
+    // --- PeerScore ---
+
+    #[test]
+    fn test_peer_score_default() {
+        let score = PeerScore::default();
+        assert!(!score.is_banned());
+        assert_eq!(score.penalty, 0);
+        assert!(score.avg_latency_ms.is_none());
+    }
+
+    #[test]
+    fn test_peer_score_touch() {
+        let mut score = PeerScore::new();
+        let before = score.last_seen;
+        // Touch should update last_seen (we can't test time precisely, but
+        // we can verify it doesn't panic)
+        score.touch();
+        // last_seen should be >= before
+        assert!(score.last_seen >= before);
+    }
+
+    #[test]
+    fn test_peer_score_latency_first_measurement() {
+        let mut score = PeerScore::new();
+        score.record_latency(200);
+        assert_eq!(score.avg_latency_ms, Some(200));
+    }
+
+    #[test]
+    fn test_peer_score_latency_averaging() {
+        let mut score = PeerScore::new();
+        score.record_latency(100);
+        score.record_latency(300);
+        // Average of 100 and 300 = 200
+        assert_eq!(score.avg_latency_ms, Some(200));
+        score.record_latency(200);
+        // Average of 200 and 200 = 200
+        assert_eq!(score.avg_latency_ms, Some(200));
+    }
+
+    #[test]
+    fn test_peer_score_penalty_below_threshold() {
+        let mut score = PeerScore::new();
+        score.add_penalty(50, BanReason::Misbehaviour);
+        assert_eq!(score.penalty, 50);
+        assert!(!score.is_banned());
+        assert!(score.ban_reason.is_none());
+    }
+
+    #[test]
+    fn test_peer_score_penalty_at_threshold() {
+        let mut score = PeerScore::new();
+        score.add_penalty(100, BanReason::InvalidMessage);
+        assert_eq!(score.penalty, 100);
+        assert!(score.is_banned());
+        assert_eq!(score.ban_reason, Some(BanReason::InvalidMessage));
+    }
+
+    #[test]
+    fn test_peer_score_penalty_saturating() {
+        let mut score = PeerScore::new();
+        score.add_penalty(u32::MAX, BanReason::Misbehaviour);
+        assert_eq!(score.penalty, u32::MAX);
+        score.add_penalty(1, BanReason::Misbehaviour);
+        assert_eq!(score.penalty, u32::MAX); // saturating
+    }
+
+    #[test]
+    fn test_ban_reason_values() {
+        assert_ne!(BanReason::WrongMagic, BanReason::InvalidMessage);
+        assert_ne!(BanReason::WrongMagic, BanReason::Misbehaviour);
+        assert_ne!(BanReason::InvalidMessage, BanReason::Misbehaviour);
+    }
+
+    #[test]
+    fn test_ban_reason_copy() {
+        let reason = BanReason::WrongMagic;
+        let copy = reason;
+        assert_eq!(reason, copy);
+    }
+
+    // --- PeerManager advanced tests ---
+
+    #[test]
+    fn test_peer_manager_score_mut_creates_default() {
+        let mut pm = PeerManager::new(Network::Mainnet);
+        let a = addr(8333);
+        // score_mut should create a default entry
+        let score = pm.score_mut(&a);
+        assert!(!score.is_banned());
+        assert_eq!(score.penalty, 0);
+    }
+
+    #[test]
+    fn test_peer_manager_score_returns_none_for_unknown() {
+        let pm = PeerManager::new(Network::Mainnet);
+        let a = addr(8333);
+        assert!(pm.score(&a).is_none());
+    }
+
+    #[test]
+    fn test_peer_manager_score_persists_after_add() {
+        let mut pm = PeerManager::new(Network::Mainnet);
+        let a = addr(8333);
+        pm.add_peer(a, dummy_peer_info(a, false));
+        let score = pm.score(&a);
+        assert!(score.is_some());
+    }
+
+    #[test]
+    fn test_peer_manager_ban_adds_to_scores() {
+        let mut pm = PeerManager::new(Network::Mainnet);
+        let a = addr(8333);
+        pm.ban_peer(&a, BanReason::WrongMagic);
+        assert!(pm.score(&a).unwrap().is_banned());
+        assert_eq!(pm.score(&a).unwrap().ban_reason, Some(BanReason::WrongMagic));
+    }
+
+    #[test]
+    fn test_peer_manager_remove_nonexistent_peer_noop() {
+        let mut pm = PeerManager::new(Network::Mainnet);
+        let a = addr(8333);
+        // Should not panic
+        pm.remove_peer(&a);
+        assert_eq!(pm.connected_count(), 0);
+    }
+
+    #[test]
+    fn test_peer_manager_on_addr_message_empty() {
+        let mut pm = PeerManager::new(Network::Mainnet);
+        pm.on_addr_message(vec![]);
+        assert!(pm.known_peers().is_empty());
+    }
+
+    #[test]
+    fn test_peer_manager_on_addr_message_deduplication() {
+        let mut pm = PeerManager::new(Network::Mainnet);
+        let a = addr(8333);
+        pm.on_addr_message(vec![a, a, a]);
+        assert_eq!(pm.known_peers().len(), 1);
+    }
+
+    #[test]
+    fn test_peer_manager_network() {
+        let pm = PeerManager::new(Network::Testnet);
+        assert_eq!(pm.network(), Network::Testnet);
+    }
+
+    #[test]
+    fn test_peer_manager_needs_more_peers_with_mix() {
+        let mut pm = PeerManager::new(Network::Mainnet);
+        // Add 4 outbound + 100 inbound
+        for i in 0..4u16 {
+            let a = addr(8333 + i);
+            pm.add_peer(a, dummy_peer_info(a, false));
+        }
+        for i in 0..100u16 {
+            let a = addr(9000 + i);
+            pm.add_peer(a, dummy_peer_info(a, true));
+        }
+        // 4 < 8 outbound slots, so needs more
+        assert!(pm.needs_more_peers());
+    }
+
+    #[test]
+    fn test_peer_manager_get_random_peer_from_multiple() {
+        let mut pm = PeerManager::new(Network::Mainnet);
+        pm.on_addr_message(vec![addr(1), addr(2), addr(3), addr(4), addr(5)]);
+        // Should return one of the known peers
+        let peer = pm.get_random_peer();
+        assert!(peer.is_some());
+        let p = peer.unwrap();
+        assert!(pm.known_peers().contains(&p));
+    }
+
+    // --- BAN_THRESHOLD constant ---
+
+    #[test]
+    fn test_ban_threshold() {
+        assert_eq!(BAN_THRESHOLD, 100);
+    }
+
+    // --- PeerManager ban then get_random_peer ---
+
+    #[test]
+    fn test_ban_all_known_peers_no_random() {
+        let mut pm = PeerManager::new(Network::Mainnet);
+        let a1 = addr(1);
+        let a2 = addr(2);
+        pm.on_addr_message(vec![a1, a2]);
+        pm.ban_peer(&a1, BanReason::InvalidMessage);
+        pm.ban_peer(&a2, BanReason::Misbehaviour);
+        assert!(pm.get_random_peer().is_none());
+    }
+
+    // --- Score mut with penalty ---
+
+    #[test]
+    fn test_score_mut_add_penalty() {
+        let mut pm = PeerManager::new(Network::Mainnet);
+        let a = addr(8333);
+        pm.score_mut(&a).add_penalty(50, BanReason::Misbehaviour);
+        assert_eq!(pm.score(&a).unwrap().penalty, 50);
+        assert!(!pm.score(&a).unwrap().is_banned());
+    }
+
+    #[test]
+    fn test_score_mut_record_latency() {
+        let mut pm = PeerManager::new(Network::Mainnet);
+        let a = addr(8333);
+        pm.score_mut(&a).record_latency(100);
+        assert_eq!(pm.score(&a).unwrap().avg_latency_ms, Some(100));
+    }
 }

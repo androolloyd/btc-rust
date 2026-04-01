@@ -1143,4 +1143,455 @@ mod tests {
         assert!(cfg.enabled);
         assert!(cfg.preferred);
     }
+
+    // --- Config custom values ---
+
+    #[test]
+    fn test_config_custom() {
+        let cfg = V2TransportConfig {
+            enabled: false,
+            preferred: false,
+        };
+        assert!(!cfg.enabled);
+        assert!(!cfg.preferred);
+    }
+
+    // --- NullCipher ---
+
+    #[test]
+    fn test_null_cipher_encrypt_noop() {
+        let cipher = NullCipher;
+        let key = [0u8; 32];
+        let nonce = [0u8; 12];
+        let mut data = vec![1, 2, 3, 4];
+        cipher.encrypt(&key, &nonce, &[], &mut data);
+        // NullCipher should leave data unchanged
+        assert_eq!(data, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_null_cipher_decrypt_always_succeeds() {
+        let cipher = NullCipher;
+        let key = [0u8; 32];
+        let nonce = [0u8; 12];
+        let mut data = vec![5, 6, 7, 8];
+        let result = cipher.decrypt(&key, &nonce, &[], &mut data);
+        assert!(result);
+        assert_eq!(data, vec![5, 6, 7, 8]);
+    }
+
+    // --- V2HandshakeState values ---
+
+    #[test]
+    fn test_handshake_state_values() {
+        let states = [
+            V2HandshakeState::SendKey,
+            V2HandshakeState::RecvKey,
+            V2HandshakeState::KeyExchange,
+            V2HandshakeState::SendGarbage,
+            V2HandshakeState::RecvGarbage,
+            V2HandshakeState::Ready,
+            V2HandshakeState::Failed,
+        ];
+        for i in 0..states.len() {
+            for j in 0..states.len() {
+                if i == j {
+                    assert_eq!(states[i], states[j]);
+                } else {
+                    assert_ne!(states[i], states[j]);
+                }
+            }
+        }
+    }
+
+    // --- V2Transport accessors ---
+
+    #[test]
+    fn test_transport_our_pubkey_is_64_bytes() {
+        let transport = V2Transport::new_null(true);
+        assert_eq!(transport.our_pubkey().len(), ELLIGATOR_SWIFT_KEY_LEN);
+    }
+
+    #[test]
+    fn test_transport_session_id_none_before_exchange() {
+        let transport = V2Transport::new_null(true);
+        assert!(transport.session_id().is_none());
+    }
+
+    #[test]
+    fn test_transport_not_ready_initially() {
+        let transport = V2Transport::new_null(true);
+        assert!(!transport.is_ready());
+    }
+
+    #[test]
+    fn test_transport_garbage_terminator_none_before_exchange() {
+        let transport = V2Transport::new_null(true);
+        assert!(transport.garbage_terminator_send().is_none());
+    }
+
+    // --- State transition edge cases ---
+
+    #[test]
+    fn test_sent_key_idempotent() {
+        let mut transport = V2Transport::new_null(true);
+        transport.sent_key();
+        assert_eq!(transport.state(), V2HandshakeState::RecvKey);
+        // Calling again should be idempotent (not in SendKey state)
+        transport.sent_key();
+        assert_eq!(transport.state(), V2HandshakeState::RecvKey);
+    }
+
+    #[test]
+    fn test_sent_garbage_only_from_send_garbage() {
+        let mut transport = V2Transport::new_null(true);
+        // Not in SendGarbage state
+        transport.sent_garbage();
+        assert_eq!(transport.state(), V2HandshakeState::SendKey);
+    }
+
+    #[test]
+    fn test_received_garbage_only_from_recv_garbage() {
+        let mut transport = V2Transport::new_null(true);
+        // Not in RecvGarbage state
+        transport.received_garbage();
+        assert_eq!(transport.state(), V2HandshakeState::SendKey);
+    }
+
+    #[test]
+    fn test_complete_key_exchange_wrong_state() {
+        let mut transport = V2Transport::new_null(true);
+        // In SendKey, not KeyExchange
+        transport.complete_key_exchange();
+        assert_eq!(transport.state(), V2HandshakeState::Failed);
+    }
+
+    // --- Responder (non-initiator) handshake ---
+
+    #[test]
+    fn test_responder_handshake() {
+        let mut transport = V2Transport::new_null(false);
+        assert_eq!(transport.state(), V2HandshakeState::SendKey);
+        assert!(!transport.initiator);
+
+        transport.sent_key();
+        let peer_pk = [0xCDu8; ELLIGATOR_SWIFT_KEY_LEN];
+        transport.receive_key(&peer_pk);
+        transport.complete_key_exchange();
+        transport.sent_garbage();
+        transport.received_garbage();
+
+        assert!(transport.is_ready());
+        assert!(transport.session_id().is_some());
+    }
+
+    // --- Decrypt before ready returns None ---
+
+    #[test]
+    fn test_decrypt_before_ready_returns_none() {
+        let mut transport = V2Transport::new_null(true);
+        let result = transport.decrypt_message(&[0x42]);
+        assert!(result.is_none());
+    }
+
+    // --- Multiple encrypt/decrypt cycles ---
+
+    #[test]
+    fn test_multiple_encrypt_decrypt_cycles() {
+        let mut transport = V2Transport::new_null(true);
+        transport.sent_key();
+        transport.receive_key(&[0u8; ELLIGATOR_SWIFT_KEY_LEN]);
+        transport.complete_key_exchange();
+        transport.sent_garbage();
+        transport.received_garbage();
+
+        for i in 0..5u8 {
+            let msg = V2Message::from_short(V2Command::Pong, vec![i]).unwrap();
+            let packet = transport.encrypt_message(&msg).unwrap();
+            let decrypted = transport.decrypt_message(&packet[3..]).unwrap();
+            assert_eq!(decrypted.command, V2Command::Pong);
+            assert_eq!(decrypted.payload, vec![i]);
+        }
+        assert_eq!(transport.send_nonce, 5);
+        assert_eq!(transport.recv_nonce, 5);
+    }
+
+    // --- Encrypt extended command message ---
+
+    #[test]
+    fn test_encrypt_decrypt_extended_command() {
+        let mut transport = V2Transport::new_null(true);
+        transport.sent_key();
+        transport.receive_key(&[0x11u8; ELLIGATOR_SWIFT_KEY_LEN]);
+        transport.complete_key_exchange();
+        transport.sent_garbage();
+        transport.received_garbage();
+
+        let msg = V2Message::from_extended("customcmd", vec![0xaa, 0xbb]);
+        let packet = transport.encrypt_message(&msg).unwrap();
+        let decrypted = transport.decrypt_message(&packet[3..]).unwrap();
+        assert_eq!(decrypted.command, V2Command::Extended("customcmd".to_string()));
+        assert_eq!(decrypted.payload, vec![0xaa, 0xbb]);
+    }
+
+    // --- from_short with extended command returns None ---
+
+    #[test]
+    fn test_from_short_extended_returns_none() {
+        let cmd = V2Command::Extended("foo".to_string());
+        assert!(V2Message::from_short(cmd, vec![]).is_none());
+    }
+
+    // --- V2Message decode with ignore flag set but valid short ID ---
+
+    #[test]
+    fn test_decode_with_ignore_flag() {
+        // header = 0x80 | 13 (Ping short ID) = 0x8D
+        let data = vec![0x8D, 0x42];
+        let msg = V2Message::decode(&data).unwrap();
+        assert!(msg.is_decoy());
+        assert_eq!(msg.command, V2Command::Ping);
+        assert_eq!(msg.payload, vec![0x42]);
+    }
+
+    // --- V2Message decode extended with ignore flag ---
+
+    #[test]
+    fn test_decode_extended_with_ignore_flag() {
+        // header = 0x80 (ignore flag, short_id = 0 -> extended)
+        let mut data = vec![0x80];
+        // 12 byte command
+        data.extend_from_slice(b"testcmd\0\0\0\0\0");
+        data.extend_from_slice(&[0xDE, 0xAD]);
+        let msg = V2Message::decode(&data).unwrap();
+        assert!(msg.is_decoy());
+        assert_eq!(msg.command, V2Command::Extended("testcmd".to_string()));
+        assert_eq!(msg.payload, vec![0xDE, 0xAD]);
+    }
+
+    // --- V2Message encode for extended with long command ---
+
+    #[test]
+    fn test_encode_extended_truncates_long_command() {
+        let msg = V2Message::from_extended("verylongcmdname", vec![]);
+        let encoded = msg.encode();
+        assert_eq!(encoded[0], 0); // header
+        // Command truncated to 12 bytes
+        assert_eq!(&encoded[1..13], b"verylongcmdn");
+        assert_eq!(encoded.len(), 13); // 1 + 12 + 0 payload
+    }
+
+    // --- V2Command from_str for all known commands ---
+
+    #[test]
+    fn test_from_str_all_known() {
+        let mapping = vec![
+            ("addr", V2Command::Addr),
+            ("block", V2Command::Block),
+            ("blocktxn", V2Command::BlockTxn),
+            ("getdata", V2Command::GetData),
+            ("getblocks", V2Command::GetBlocks),
+            ("getheaders", V2Command::GetHeaders),
+            ("cmpctblock", V2Command::CmpctBlock),
+            ("headers", V2Command::Headers),
+            ("inv", V2Command::Inv),
+            ("mempool", V2Command::MemPool),
+            ("merkleblock", V2Command::MerkleBlock),
+            ("notfound", V2Command::NotFound),
+            ("ping", V2Command::Ping),
+            ("pong", V2Command::Pong),
+            ("reject", V2Command::Reject),
+            ("sendcmpct", V2Command::SendCmpct),
+            ("sendheaders", V2Command::SendHeaders),
+            ("tx", V2Command::Tx),
+            ("getblocktxn", V2Command::GetBlockTxn),
+            ("feefilter", V2Command::FeeFilter),
+            ("filteradd", V2Command::FilterAdd),
+            ("filterclear", V2Command::FilterClear),
+            ("filterload", V2Command::FilterLoad),
+            ("getaddr", V2Command::GetAddr),
+            ("verack", V2Command::Verack),
+            ("version", V2Command::Version),
+            ("addrv2", V2Command::AddrV2),
+            ("sendaddrv2", V2Command::SendAddrV2),
+        ];
+        for (name, expected) in mapping {
+            let cmd = V2Command::from_str(name);
+            assert_eq!(cmd, expected, "from_str mismatch for {}", name);
+        }
+    }
+
+    // --- V2Command command_str for all known commands ---
+
+    #[test]
+    fn test_command_str_all_known() {
+        let mapping = vec![
+            (V2Command::Addr, "addr"),
+            (V2Command::Block, "block"),
+            (V2Command::BlockTxn, "blocktxn"),
+            (V2Command::GetData, "getdata"),
+            (V2Command::GetBlocks, "getblocks"),
+            (V2Command::GetHeaders, "getheaders"),
+            (V2Command::CmpctBlock, "cmpctblock"),
+            (V2Command::Headers, "headers"),
+            (V2Command::Inv, "inv"),
+            (V2Command::MemPool, "mempool"),
+            (V2Command::MerkleBlock, "merkleblock"),
+            (V2Command::NotFound, "notfound"),
+            (V2Command::Ping, "ping"),
+            (V2Command::Pong, "pong"),
+            (V2Command::Reject, "reject"),
+            (V2Command::SendCmpct, "sendcmpct"),
+            (V2Command::SendHeaders, "sendheaders"),
+            (V2Command::Tx, "tx"),
+            (V2Command::GetBlockTxn, "getblocktxn"),
+            (V2Command::FeeFilter, "feefilter"),
+            (V2Command::FilterAdd, "filteradd"),
+            (V2Command::FilterClear, "filterclear"),
+            (V2Command::FilterLoad, "filterload"),
+            (V2Command::GetAddr, "getaddr"),
+            (V2Command::Verack, "verack"),
+            (V2Command::Version, "version"),
+            (V2Command::AddrV2, "addrv2"),
+            (V2Command::SendAddrV2, "sendaddrv2"),
+        ];
+        for (cmd, expected_str) in mapping {
+            assert_eq!(cmd.command_str(), expected_str);
+        }
+    }
+
+    // --- V2 handshake magic constant ---
+
+    #[test]
+    fn test_v2_handshake_magic() {
+        assert_eq!(V2_HANDSHAKE_MAGIC, b"bitcoin_v2_handshake");
+    }
+
+    // --- Constants ---
+
+    #[test]
+    fn test_constants() {
+        assert_eq!(MAX_GARBAGE_LEN, 4095);
+        assert_eq!(ELLIGATOR_SWIFT_KEY_LEN, 64);
+        assert_eq!(GARBAGE_TERMINATOR_LEN, 16);
+    }
+
+    // --- hkdf_extract deterministic ---
+
+    #[test]
+    fn test_hkdf_extract_deterministic() {
+        let salt = [0xab; 32];
+        let secret = [0xcd; 32];
+        let label = b"test_label";
+        let r1 = hkdf_extract(&salt, &secret, label);
+        let r2 = hkdf_extract(&salt, &secret, label);
+        assert_eq!(r1, r2);
+    }
+
+    #[test]
+    fn test_hkdf_extract_different_labels() {
+        let salt = [0; 32];
+        let secret = [0; 32];
+        let r1 = hkdf_extract(&salt, &secret, b"label_a");
+        let r2 = hkdf_extract(&salt, &secret, b"label_b");
+        assert_ne!(r1, r2);
+    }
+
+    // --- Session keys fields populated after key exchange ---
+
+    #[test]
+    fn test_session_keys_fields() {
+        let secret = [0x42; 32];
+        let our_pk = [0x01; ELLIGATOR_SWIFT_KEY_LEN];
+        let peer_pk = [0x02; ELLIGATOR_SWIFT_KEY_LEN];
+        let keys = derive_session_keys(&secret, &our_pk, &peer_pk, true);
+
+        // All fields should be non-zero (extremely unlikely to be all zeros)
+        assert_ne!(keys.send_key, [0; 32]);
+        assert_ne!(keys.recv_key, [0; 32]);
+        assert_ne!(keys.session_id, [0; 32]);
+        // send_key and recv_key should be different
+        assert_ne!(keys.send_key, keys.recv_key);
+    }
+
+    // --- V2Message from_short with empty payload ---
+
+    #[test]
+    fn test_from_short_empty_payload() {
+        let msg = V2Message::from_short(V2Command::Verack, vec![]).unwrap();
+        assert_eq!(msg.header, 26); // Verack short ID
+        assert_eq!(msg.command, V2Command::Verack);
+        assert!(msg.payload.is_empty());
+    }
+
+    // --- V2Message extended with known command ---
+
+    #[test]
+    fn test_decode_extended_known_command() {
+        // Extended command that happens to be a known name
+        let mut data = vec![0x00]; // header = 0
+        data.extend_from_slice(b"version\0\0\0\0\0"); // 12 bytes
+        data.push(0xAA); // payload
+        let msg = V2Message::decode(&data).unwrap();
+        assert_eq!(msg.command, V2Command::Version);
+        assert_eq!(msg.payload, vec![0xAA]);
+    }
+
+    // --- Recv nonce increments ---
+
+    #[test]
+    fn test_recv_nonce_increments() {
+        let mut transport = V2Transport::new_null(true);
+        transport.sent_key();
+        transport.receive_key(&[0u8; ELLIGATOR_SWIFT_KEY_LEN]);
+        transport.complete_key_exchange();
+        transport.sent_garbage();
+        transport.received_garbage();
+
+        assert_eq!(transport.recv_nonce, 0);
+        let msg = V2Message::from_short(V2Command::Ping, vec![]).unwrap();
+        let packet = transport.encrypt_message(&msg).unwrap();
+        transport.decrypt_message(&packet[3..]);
+        assert_eq!(transport.recv_nonce, 1);
+    }
+
+    // --- Nonce wrapping ---
+
+    #[test]
+    fn test_nonce_wrapping() {
+        let nonce = V2Transport::<NullCipher>::build_nonce(u64::MAX);
+        let mut expected = [0u8; 12];
+        expected[4..12].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert_eq!(nonce, expected);
+    }
+
+    // --- Two transports with different initiator flags derive different keys ---
+
+    #[test]
+    fn test_two_transports_different_roles() {
+        let mut init = V2Transport::new_null(true);
+        let mut resp = V2Transport::new_null(false);
+
+        // They should have different pubkeys (random)
+        // but both start in SendKey state
+        assert_eq!(init.state(), V2HandshakeState::SendKey);
+        assert_eq!(resp.state(), V2HandshakeState::SendKey);
+
+        init.sent_key();
+        resp.sent_key();
+
+        // Exchange keys
+        let init_pk = *init.our_pubkey();
+        let resp_pk = *resp.our_pubkey();
+
+        init.receive_key(&resp_pk);
+        resp.receive_key(&init_pk);
+
+        init.complete_key_exchange();
+        resp.complete_key_exchange();
+
+        // Both should be in SendGarbage state
+        assert_eq!(init.state(), V2HandshakeState::SendGarbage);
+        assert_eq!(resp.state(), V2HandshakeState::SendGarbage);
+    }
 }

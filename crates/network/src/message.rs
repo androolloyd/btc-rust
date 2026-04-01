@@ -226,4 +226,295 @@ mod tests {
             "reject"
         );
     }
+
+    // --- All message variant command strings ---
+
+    #[test]
+    fn test_all_command_strings() {
+        let test_cases: Vec<(NetworkMessage, &str)> = vec![
+            (
+                NetworkMessage::Version(VersionMessage {
+                    version: 70016,
+                    services: 1,
+                    timestamp: 0,
+                    receiver: NetAddress::default(),
+                    sender: NetAddress::default(),
+                    nonce: 0,
+                    user_agent: String::new(),
+                    start_height: 0,
+                    relay: true,
+                }),
+                "version",
+            ),
+            (NetworkMessage::Verack, "verack"),
+            (NetworkMessage::Ping(0), "ping"),
+            (NetworkMessage::Pong(0), "pong"),
+            (
+                NetworkMessage::GetHeaders(GetHeadersMessage {
+                    version: 70016,
+                    locator_hashes: vec![],
+                    stop_hash: btc_primitives::hash::BlockHash::ZERO,
+                }),
+                "getheaders",
+            ),
+            (NetworkMessage::Headers(vec![]), "headers"),
+            (
+                NetworkMessage::GetBlocks(GetHeadersMessage {
+                    version: 70016,
+                    locator_hashes: vec![],
+                    stop_hash: btc_primitives::hash::BlockHash::ZERO,
+                }),
+                "getblocks",
+            ),
+            (NetworkMessage::Inv(vec![]), "inv"),
+            (NetworkMessage::GetData(vec![]), "getdata"),
+            (
+                NetworkMessage::Block(btc_primitives::block::Block {
+                    header: btc_primitives::block::BlockHeader {
+                        version: 1,
+                        prev_blockhash: btc_primitives::hash::BlockHash::ZERO,
+                        merkle_root: btc_primitives::hash::TxHash::from_bytes([0; 32]),
+                        time: 0,
+                        bits: btc_primitives::compact::CompactTarget::from_u32(0x1d00ffff),
+                        nonce: 0,
+                    },
+                    transactions: vec![],
+                }),
+                "block",
+            ),
+            (
+                NetworkMessage::Tx(btc_primitives::transaction::Transaction {
+                    version: 1,
+                    inputs: vec![],
+                    outputs: vec![],
+                    witness: vec![],
+                    lock_time: 0,
+                }),
+                "tx",
+            ),
+            (NetworkMessage::Addr(vec![]), "addr"),
+            (NetworkMessage::SendHeaders, "sendheaders"),
+            (NetworkMessage::FeeFilter(0), "feefilter"),
+            (NetworkMessage::WtxidRelay, "wtxidrelay"),
+            (NetworkMessage::NotFound(vec![]), "notfound"),
+            (
+                NetworkMessage::Reject {
+                    message: String::new(),
+                    code: 0,
+                    reason: String::new(),
+                    data: vec![],
+                },
+                "reject",
+            ),
+            (NetworkMessage::MemPool, "mempool"),
+            (NetworkMessage::GetAddr, "getaddr"),
+            (
+                NetworkMessage::SendCmpct {
+                    announce: false,
+                    version: 1,
+                },
+                "sendcmpct",
+            ),
+            (
+                NetworkMessage::Unknown("custom".to_string(), vec![]),
+                "custom",
+            ),
+        ];
+
+        for (msg, expected_cmd) in test_cases {
+            assert_eq!(msg.command(), expected_cmd, "command mismatch for {:?}", expected_cmd);
+        }
+    }
+
+    // --- MessageHeader ---
+
+    #[test]
+    fn test_message_header_new() {
+        let magic = Network::Mainnet.magic();
+        let payload = b"test";
+        let header = MessageHeader::new(magic, "ping", payload);
+        assert_eq!(header.magic, magic);
+        assert_eq!(header.command_str(), "ping");
+        assert_eq!(header.payload_size, 4);
+        assert!(header.verify_checksum(payload));
+    }
+
+    #[test]
+    fn test_message_header_size_constant() {
+        assert_eq!(MessageHeader::SIZE, 24);
+    }
+
+    #[test]
+    fn test_message_header_encode_decode() {
+        let header = MessageHeader::new(Network::Mainnet.magic(), "verack", b"");
+        let encoded = encode::encode(&header);
+        assert_eq!(encoded.len(), 24);
+        let decoded: MessageHeader = encode::decode(&encoded).unwrap();
+        assert_eq!(decoded, header);
+    }
+
+    #[test]
+    fn test_message_header_verify_checksum_wrong_data() {
+        let header = MessageHeader::new(Network::Mainnet.magic(), "ping", b"hello");
+        assert!(header.verify_checksum(b"hello"));
+        assert!(!header.verify_checksum(b"world"));
+        assert!(!header.verify_checksum(b""));
+    }
+
+    #[test]
+    fn test_message_header_command_str_null_padded() {
+        let header = MessageHeader::new(Network::Mainnet.magic(), "tx", b"");
+        assert_eq!(header.command_str(), "tx");
+    }
+
+    #[test]
+    fn test_message_header_command_str_full_length() {
+        // 12-byte command name
+        let header = MessageHeader::new(Network::Mainnet.magic(), "abcdefghijkl", b"");
+        assert_eq!(header.command_str(), "abcdefghijkl");
+    }
+
+    #[test]
+    fn test_message_header_command_truncates_long_name() {
+        let header = MessageHeader::new(Network::Mainnet.magic(), "toolongcommand", b"");
+        // Should be truncated to 12 bytes
+        assert_eq!(header.command_str(), "toolongcomma");
+    }
+
+    // --- NetAddress ---
+
+    #[test]
+    fn test_net_address_default() {
+        let addr = NetAddress::default();
+        assert_eq!(addr.services, 0);
+        assert_eq!(addr.ip, [0; 16]);
+        assert_eq!(addr.port, 0);
+    }
+
+    #[test]
+    fn test_net_address_ipv4_mapped() {
+        let addr = NetAddress {
+            services: 1,
+            ip: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 168, 1, 1],
+            port: 8333,
+        };
+        assert_eq!(addr.services, 1);
+        assert_eq!(addr.ip[12], 192);
+        assert_eq!(addr.ip[13], 168);
+        assert_eq!(addr.ip[14], 1);
+        assert_eq!(addr.ip[15], 1);
+        assert_eq!(addr.port, 8333);
+    }
+
+    // --- InvType ---
+
+    #[test]
+    fn test_inv_type_values() {
+        assert_eq!(InvType::Error as u32, 0);
+        assert_eq!(InvType::Tx as u32, 1);
+        assert_eq!(InvType::Block as u32, 2);
+        assert_eq!(InvType::FilteredBlock as u32, 3);
+        assert_eq!(InvType::CompactBlock as u32, 4);
+        assert_eq!(InvType::WtxId as u32, 5);
+        assert_eq!(InvType::WitnessTx as u32, 0x40000001);
+        assert_eq!(InvType::WitnessBlock as u32, 0x40000002);
+    }
+
+    // --- InvItem ---
+
+    #[test]
+    fn test_inv_item_equality() {
+        let item1 = InvItem {
+            inv_type: InvType::Tx,
+            hash: btc_primitives::hash::Hash256::from_bytes([0xaa; 32]),
+        };
+        let item2 = InvItem {
+            inv_type: InvType::Tx,
+            hash: btc_primitives::hash::Hash256::from_bytes([0xaa; 32]),
+        };
+        let item3 = InvItem {
+            inv_type: InvType::Block,
+            hash: btc_primitives::hash::Hash256::from_bytes([0xaa; 32]),
+        };
+        assert_eq!(item1, item2);
+        assert_ne!(item1, item3);
+    }
+
+    #[test]
+    fn test_inv_item_copy() {
+        let item = InvItem {
+            inv_type: InvType::Tx,
+            hash: btc_primitives::hash::Hash256::from_bytes([0xbb; 32]),
+        };
+        let copy = item;
+        assert_eq!(item, copy);
+    }
+
+    // --- GetHeadersMessage ---
+
+    #[test]
+    fn test_get_headers_message_clone() {
+        let msg = GetHeadersMessage {
+            version: 70016,
+            locator_hashes: vec![
+                btc_primitives::hash::BlockHash::from_bytes([0x01; 32]),
+                btc_primitives::hash::BlockHash::from_bytes([0x02; 32]),
+            ],
+            stop_hash: btc_primitives::hash::BlockHash::ZERO,
+        };
+        let cloned = msg.clone();
+        assert_eq!(cloned.version, msg.version);
+        assert_eq!(cloned.locator_hashes.len(), msg.locator_hashes.len());
+    }
+
+    // --- VersionMessage ---
+
+    #[test]
+    fn test_version_message_clone() {
+        let ver = VersionMessage {
+            version: 70016,
+            services: 0x040d,
+            timestamp: 1_700_000_000,
+            receiver: NetAddress {
+                services: 1,
+                ip: [0; 16],
+                port: 8333,
+            },
+            sender: NetAddress {
+                services: 1,
+                ip: [0; 16],
+                port: 8334,
+            },
+            nonce: 0xdeadbeef,
+            user_agent: "/btc-rust:0.1.0/".to_string(),
+            start_height: 800_000,
+            relay: true,
+        };
+        let cloned = ver.clone();
+        assert_eq!(cloned.version, ver.version);
+        assert_eq!(cloned.services, ver.services);
+        assert_eq!(cloned.timestamp, ver.timestamp);
+        assert_eq!(cloned.nonce, ver.nonce);
+        assert_eq!(cloned.user_agent, ver.user_agent);
+        assert_eq!(cloned.start_height, ver.start_height);
+        assert_eq!(cloned.relay, ver.relay);
+        assert_eq!(cloned.receiver.port, ver.receiver.port);
+        assert_eq!(cloned.sender.port, ver.sender.port);
+    }
+
+    // --- NetworkMessage Debug ---
+
+    #[test]
+    fn test_network_message_debug() {
+        let msg = NetworkMessage::Verack;
+        let debug_str = format!("{:?}", msg);
+        assert!(debug_str.contains("Verack"));
+    }
+
+    #[test]
+    fn test_network_message_clone() {
+        let msg = NetworkMessage::Ping(42);
+        let cloned = msg.clone();
+        assert_eq!(cloned.command(), "ping");
+    }
 }

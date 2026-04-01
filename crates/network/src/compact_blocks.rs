@@ -514,4 +514,385 @@ mod tests {
         let missing = result.unwrap_err();
         assert_eq!(missing.len(), 1, "exactly 1 tx should be missing");
     }
+
+    // --- SipHash tests ---
+
+    #[test]
+    fn test_siphash_empty_different_keys() {
+        let h1 = siphash_2_4(1, 2, &[]);
+        let h2 = siphash_2_4(3, 4, &[]);
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn test_siphash_single_byte() {
+        let h = siphash_2_4(0, 0, &[0x42]);
+        assert_ne!(h, 0);
+    }
+
+    #[test]
+    fn test_siphash_8_bytes_exact_block() {
+        // Exactly one 8-byte block, no remainder
+        let data = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        let h = siphash_2_4(0, 0, &data);
+        assert_ne!(h, 0);
+    }
+
+    #[test]
+    fn test_siphash_16_bytes_two_blocks() {
+        let data = [0u8; 16];
+        let h = siphash_2_4(1, 1, &data);
+        assert_ne!(h, 0);
+    }
+
+    #[test]
+    fn test_siphash_remainder_bytes() {
+        // 11 bytes = 1 block (8 bytes) + 3 remainder
+        let data = [0xaa; 11];
+        let h = siphash_2_4(0x0706050403020100, 0x0f0e0d0c0b0a0908, &data);
+        assert_ne!(h, 0);
+    }
+
+    #[test]
+    fn test_siphash_7_bytes_remainder() {
+        // 7 bytes = 0 blocks + 7 remainder
+        let data = [0xbb; 7];
+        let h = siphash_2_4(42, 43, &data);
+        assert_ne!(h, 0);
+    }
+
+    #[test]
+    fn test_siphash_large_input() {
+        let data = vec![0xcc; 256];
+        let h = siphash_2_4(1, 2, &data);
+        assert_ne!(h, 0);
+    }
+
+    // --- ShortIdKey tests ---
+
+    #[test]
+    fn test_short_id_key_different_nonces() {
+        let block_hash = [0xab; 32];
+        let key1 = ShortIdKey::new(&block_hash, 1);
+        let key2 = ShortIdKey::new(&block_hash, 2);
+        // Different nonces should produce different keys
+        assert!(key1.k0 != key2.k0 || key1.k1 != key2.k1);
+    }
+
+    #[test]
+    fn test_short_id_key_different_block_hashes() {
+        let key1 = ShortIdKey::new(&[0x01; 32], 42);
+        let key2 = ShortIdKey::new(&[0x02; 32], 42);
+        assert!(key1.k0 != key2.k0 || key1.k1 != key2.k1);
+    }
+
+    #[test]
+    fn test_short_id_6_byte_mask() {
+        let key = ShortIdKey::new(&[0xff; 32], 0);
+        let txid = TxHash::from_bytes([0xff; 32]);
+        let sid = key.short_id(&txid);
+        // Must fit in 6 bytes (48 bits)
+        assert_eq!(sid & !0x0000_ffff_ffff_ffff, 0);
+    }
+
+    // --- CompactBlock from_block tests ---
+
+    #[test]
+    fn test_compact_block_empty_transactions() {
+        let header = BlockHeader {
+            version: 1,
+            prev_blockhash: BlockHash::ZERO,
+            merkle_root: TxHash::from_bytes([0; 32]),
+            time: 1231006505,
+            bits: CompactTarget::MAX_TARGET,
+            nonce: 0,
+        };
+        let compact = CompactBlock::from_block(header, &[], 0);
+        assert!(compact.prefilled_txs.is_empty());
+        assert!(compact.short_ids.is_empty());
+    }
+
+    #[test]
+    fn test_compact_block_coinbase_only() {
+        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
+        use btc_primitives::script::ScriptBuf;
+        use btc_primitives::amount::Amount;
+
+        let header = BlockHeader {
+            version: 1,
+            prev_blockhash: BlockHash::ZERO,
+            merkle_root: TxHash::from_bytes([0; 32]),
+            time: 1231006505,
+            bits: CompactTarget::MAX_TARGET,
+            nonce: 0,
+        };
+
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::COINBASE,
+                script_sig: ScriptBuf::from_bytes(vec![0x04]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let compact = CompactBlock::from_block(header, &[coinbase.clone()], 0);
+        assert_eq!(compact.prefilled_txs.len(), 1);
+        assert_eq!(compact.prefilled_txs[0].index, 0);
+        assert!(compact.short_ids.is_empty());
+    }
+
+    #[test]
+    fn test_compact_block_many_transactions() {
+        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
+        use btc_primitives::script::ScriptBuf;
+        use btc_primitives::amount::Amount;
+
+        let header = BlockHeader {
+            version: 1,
+            prev_blockhash: BlockHash::ZERO,
+            merkle_root: TxHash::from_bytes([0xab; 32]),
+            time: 1231006505,
+            bits: CompactTarget::MAX_TARGET,
+            nonce: 0,
+        };
+
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::COINBASE,
+                script_sig: ScriptBuf::from_bytes(vec![0x04]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let make_tx = |id: u8| Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([id; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![id]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(1_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let txs: Vec<Transaction> = (1..=10).map(|i| make_tx(i)).collect();
+        let mut all_txs = vec![coinbase];
+        all_txs.extend(txs);
+
+        let compact = CompactBlock::from_block(header, &all_txs, 99);
+        assert_eq!(compact.prefilled_txs.len(), 1); // only coinbase
+        assert_eq!(compact.short_ids.len(), 10); // 10 non-coinbase txs
+    }
+
+    // --- Reconstruct with all transactions in mempool ---
+
+    #[test]
+    fn test_reconstruct_all_from_mempool() {
+        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
+        use btc_primitives::script::ScriptBuf;
+        use btc_primitives::amount::Amount;
+
+        let header = BlockHeader {
+            version: 1,
+            prev_blockhash: BlockHash::ZERO,
+            merkle_root: TxHash::from_bytes([0xab; 32]),
+            time: 1231006505,
+            bits: CompactTarget::MAX_TARGET,
+            nonce: 0,
+        };
+
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::COINBASE,
+                script_sig: ScriptBuf::from_bytes(vec![0x04]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let make_tx = |id: u8| Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([id; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![id]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(1_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let tx1 = make_tx(0x11);
+        let tx2 = make_tx(0x22);
+        let tx3 = make_tx(0x33);
+
+        let compact = CompactBlock::from_block(
+            header,
+            &[coinbase.clone(), tx1.clone(), tx2.clone(), tx3.clone()],
+            42,
+        );
+
+        let mut mempool = std::collections::HashMap::new();
+        mempool.insert(tx1.txid(), tx1.clone());
+        mempool.insert(tx2.txid(), tx2.clone());
+        mempool.insert(tx3.txid(), tx3.clone());
+
+        let result = compact.reconstruct(&mempool);
+        assert!(result.is_ok());
+        let txs = result.unwrap();
+        assert_eq!(txs.len(), 4);
+        assert_eq!(txs[0].txid(), coinbase.txid());
+        assert_eq!(txs[1].txid(), tx1.txid());
+        assert_eq!(txs[2].txid(), tx2.txid());
+        assert_eq!(txs[3].txid(), tx3.txid());
+    }
+
+    // --- BlockTxnRequest and BlockTxnResponse ---
+
+    #[test]
+    fn test_block_txn_request() {
+        let req = BlockTxnRequest {
+            block_hash: [0xaa; 32],
+            indices: vec![1, 2, 5],
+        };
+        assert_eq!(req.block_hash, [0xaa; 32]);
+        assert_eq!(req.indices, vec![1, 2, 5]);
+    }
+
+    #[test]
+    fn test_block_txn_response() {
+        let resp = BlockTxnResponse {
+            block_hash: [0xbb; 32],
+            transactions: vec![],
+        };
+        assert_eq!(resp.block_hash, [0xbb; 32]);
+        assert!(resp.transactions.is_empty());
+    }
+
+    // --- PrefilledTx ---
+
+    #[test]
+    fn test_prefilled_tx() {
+        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
+        use btc_primitives::script::ScriptBuf;
+        use btc_primitives::amount::Amount;
+
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::COINBASE,
+                script_sig: ScriptBuf::from_bytes(vec![]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(0),
+                script_pubkey: ScriptBuf::from_bytes(vec![]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let ptx = PrefilledTx {
+            index: 0,
+            tx: tx.clone(),
+        };
+        assert_eq!(ptx.index, 0);
+        assert_eq!(ptx.tx.txid(), tx.txid());
+    }
+
+    // --- CompactBlock clone and debug ---
+
+    #[test]
+    fn test_compact_block_clone() {
+        let header = BlockHeader {
+            version: 1,
+            prev_blockhash: BlockHash::ZERO,
+            merkle_root: TxHash::from_bytes([0; 32]),
+            time: 0,
+            bits: CompactTarget::MAX_TARGET,
+            nonce: 0,
+        };
+        let compact = CompactBlock {
+            header,
+            nonce: 42,
+            short_ids: vec![1, 2, 3],
+            prefilled_txs: vec![],
+        };
+        let cloned = compact.clone();
+        assert_eq!(cloned.nonce, 42);
+        assert_eq!(cloned.short_ids, vec![1, 2, 3]);
+    }
+
+    // --- sipround produces different results each call ---
+
+    #[test]
+    fn test_sipround_modifies_state() {
+        let (mut v0, mut v1, mut v2, mut v3) = (1u64, 2u64, 3u64, 4u64);
+        let orig = (v0, v1, v2, v3);
+        sipround(&mut v0, &mut v1, &mut v2, &mut v3);
+        assert_ne!((v0, v1, v2, v3), orig);
+    }
+
+    // --- SipHash with known 32-byte input (txid-sized) ---
+
+    #[test]
+    fn test_siphash_32_bytes() {
+        // 32 bytes = 4 blocks, 0 remainder
+        let data = [0xab; 32];
+        let h1 = siphash_2_4(0, 0, &data);
+        let h2 = siphash_2_4(0, 0, &data);
+        assert_eq!(h1, h2);
+        assert_ne!(h1, 0);
+    }
+
+    // --- Reconstruct with empty block (no txs) ---
+
+    #[test]
+    fn test_reconstruct_empty_compact_block() {
+        let header = BlockHeader {
+            version: 1,
+            prev_blockhash: BlockHash::ZERO,
+            merkle_root: TxHash::from_bytes([0; 32]),
+            time: 0,
+            bits: CompactTarget::MAX_TARGET,
+            nonce: 0,
+        };
+        let compact = CompactBlock {
+            header,
+            nonce: 0,
+            short_ids: vec![],
+            prefilled_txs: vec![],
+        };
+        let mempool = std::collections::HashMap::new();
+        let result = compact.reconstruct(&mempool);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
 }

@@ -1101,4 +1101,772 @@ mod tests {
         assert!(result.is_ok(), "Version message with valid user agent should succeed");
         assert_eq!(result.unwrap().user_agent, "btc-rust/1");
     }
+
+    // --- Oversized payload rejected ---
+
+    #[test]
+    fn test_oversized_payload_rejected() {
+        let mut codec = mainnet_codec();
+        let mut buf = BytesMut::new();
+        // Manually build a header with payload_size > MAX_PAYLOAD_SIZE
+        let magic = Network::Mainnet.magic();
+        buf.extend_from_slice(&magic);
+        let mut cmd = [0u8; 12];
+        cmd[..4].copy_from_slice(b"ping");
+        buf.extend_from_slice(&cmd);
+        // payload_size = MAX_PAYLOAD_SIZE + 1
+        let oversize = (32 * 1024 * 1024 + 1) as u32;
+        buf.extend_from_slice(&oversize.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 4]); // checksum
+        let err = codec.decode(&mut buf).unwrap_err();
+        assert!(err.to_string().contains("payload too large"));
+    }
+
+    // --- Partial header returns None ---
+
+    #[test]
+    fn test_partial_header_returns_none() {
+        let mut codec = mainnet_codec();
+        // Fewer than 24 bytes
+        let mut buf = BytesMut::from(&[0xf9, 0xbe, 0xb4, 0xd9, 0x00][..]);
+        assert!(codec.decode(&mut buf).unwrap().is_none());
+    }
+
+    // --- Partial payload returns None (header present, payload not complete) ---
+
+    #[test]
+    fn test_partial_payload_returns_none() {
+        let mut codec = mainnet_codec();
+        let mut buf = BytesMut::new();
+        codec
+            .encode(NetworkMessage::Ping(999), &mut buf)
+            .expect("encode failed");
+        let full_len = buf.len();
+        // Remove last byte so payload is incomplete
+        buf.truncate(full_len - 1);
+        assert!(codec.decode(&mut buf).unwrap().is_none());
+    }
+
+    // --- Net address encoding/decoding ---
+
+    #[test]
+    fn test_net_address_encode_decode_roundtrip() {
+        let addr = NetAddress {
+            services: 0x040d,
+            ip: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 10, 20, 30, 40],
+            port: 8333,
+        };
+        let mut buf = Vec::new();
+        encode_net_address(&addr, &mut buf).unwrap();
+        let decoded = decode_net_address(&mut std::io::Cursor::new(&buf)).unwrap();
+        assert_eq!(decoded.services, addr.services);
+        assert_eq!(decoded.ip, addr.ip);
+        assert_eq!(decoded.port, addr.port);
+    }
+
+    #[test]
+    fn test_net_address_port_big_endian() {
+        let addr = NetAddress {
+            services: 0,
+            ip: [0; 16],
+            port: 0x1234,
+        };
+        let mut buf = Vec::new();
+        encode_net_address(&addr, &mut buf).unwrap();
+        // Port is the last 2 bytes, big-endian
+        let len = buf.len();
+        assert_eq!(buf[len - 2], 0x12);
+        assert_eq!(buf[len - 1], 0x34);
+    }
+
+    // --- InvItem encoding/decoding ---
+
+    #[test]
+    fn test_inv_item_all_types_roundtrip() {
+        let types = [
+            InvType::Error,
+            InvType::Tx,
+            InvType::Block,
+            InvType::FilteredBlock,
+            InvType::CompactBlock,
+            InvType::WtxId,
+            InvType::WitnessTx,
+            InvType::WitnessBlock,
+        ];
+        for inv_type in types {
+            let item = InvItem {
+                inv_type,
+                hash: Hash256::from_bytes([0xab; 32]),
+            };
+            let mut buf = Vec::new();
+            encode_inv_item(&item, &mut buf).unwrap();
+            let decoded = decode_inv_item(&mut std::io::Cursor::new(&buf)).unwrap();
+            assert_eq!(decoded.inv_type, inv_type);
+            assert_eq!(decoded.hash, item.hash);
+        }
+    }
+
+    #[test]
+    fn test_inv_item_unknown_type_becomes_error() {
+        // Unknown inv type should be mapped to InvType::Error
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&9999u32.to_le_bytes()); // unknown type
+        buf.extend_from_slice(&[0xcc; 32]); // hash
+        let decoded = decode_inv_item(&mut std::io::Cursor::new(&buf)).unwrap();
+        assert_eq!(decoded.inv_type, InvType::Error);
+    }
+
+    // --- Inv vector too large ---
+
+    #[test]
+    fn test_inv_vec_too_large_rejected() {
+        let mut buf = Vec::new();
+        VarInt(50_001).encode(&mut buf).unwrap();
+        let result = decode_inv_vec(&mut std::io::Cursor::new(&buf));
+        assert!(result.is_err());
+    }
+
+    // --- Empty inv vector ---
+
+    #[test]
+    fn test_empty_inv_roundtrip() {
+        match roundtrip(NetworkMessage::Inv(vec![])) {
+            NetworkMessage::Inv(items) => assert!(items.is_empty()),
+            other => panic!("expected Inv, got {:?}", other),
+        }
+    }
+
+    // --- GetHeaders/GetBlocks with too many locator hashes ---
+
+    #[test]
+    fn test_getheaders_too_many_locators_rejected() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&70016u32.to_le_bytes());
+        VarInt(102).encode(&mut buf).unwrap(); // max is 101
+        let result = decode_getheaders(&mut std::io::Cursor::new(&buf));
+        assert!(result.is_err());
+    }
+
+    // --- Headers message too many headers ---
+
+    #[test]
+    fn test_headers_too_many_rejected() {
+        let mut buf = Vec::new();
+        VarInt(2001).encode(&mut buf).unwrap(); // max is 2000
+        let result = decode_headers(&mut std::io::Cursor::new(&buf));
+        assert!(result.is_err());
+    }
+
+    // --- Addr vec too many addresses ---
+
+    #[test]
+    fn test_addr_vec_too_many_rejected() {
+        let mut buf = Vec::new();
+        VarInt(1001).encode(&mut buf).unwrap(); // max is 1000
+        let result = decode_addr_vec(&mut std::io::Cursor::new(&buf));
+        assert!(result.is_err());
+    }
+
+    // --- Empty addr message ---
+
+    #[test]
+    fn test_empty_addr_roundtrip() {
+        match roundtrip(NetworkMessage::Addr(vec![])) {
+            NetworkMessage::Addr(decoded) => assert!(decoded.is_empty()),
+            other => panic!("expected Addr, got {:?}", other),
+        }
+    }
+
+    // --- Version message without relay byte (optional per BIP37) ---
+
+    #[test]
+    fn test_version_without_relay_byte_defaults_to_true() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&70016u32.to_le_bytes());
+        payload.extend_from_slice(&1u64.to_le_bytes());
+        payload.extend_from_slice(&1_700_000_000i64.to_le_bytes());
+        // receiver
+        payload.extend_from_slice(&1u64.to_le_bytes());
+        payload.extend_from_slice(&[0u8; 16]);
+        payload.extend_from_slice(&8333u16.to_be_bytes());
+        // sender
+        payload.extend_from_slice(&1u64.to_le_bytes());
+        payload.extend_from_slice(&[0u8; 16]);
+        payload.extend_from_slice(&8333u16.to_be_bytes());
+        payload.extend_from_slice(&42u64.to_le_bytes());
+        // user_agent
+        VarInt(0).encode(&mut payload).unwrap();
+        payload.extend_from_slice(&800_000i32.to_le_bytes());
+        // no relay byte
+
+        let result = decode_version(&mut std::io::Cursor::new(&payload));
+        assert!(result.is_ok());
+        assert!(result.unwrap().relay);
+    }
+
+    // --- Version message with relay=false ---
+
+    #[test]
+    fn test_version_relay_false() {
+        let ver = VersionMessage {
+            version: 70016,
+            services: 1,
+            timestamp: 1_700_000_000,
+            receiver: NetAddress::default(),
+            sender: NetAddress::default(),
+            nonce: 42,
+            user_agent: "/test/".to_string(),
+            start_height: 0,
+            relay: false,
+        };
+        let decoded = roundtrip(NetworkMessage::Version(ver));
+        match decoded {
+            NetworkMessage::Version(v) => assert!(!v.relay),
+            other => panic!("expected Version, got {:?}", other),
+        }
+    }
+
+    // --- encode_payload and decode_payload for each message type ---
+
+    #[test]
+    fn test_encode_decode_payload_verack() {
+        let payload = encode_payload(&NetworkMessage::Verack).unwrap();
+        assert!(payload.is_empty());
+        let decoded = decode_payload("verack", &payload).unwrap();
+        assert!(matches!(decoded, NetworkMessage::Verack));
+    }
+
+    #[test]
+    fn test_encode_decode_payload_sendheaders() {
+        let payload = encode_payload(&NetworkMessage::SendHeaders).unwrap();
+        assert!(payload.is_empty());
+        let decoded = decode_payload("sendheaders", &payload).unwrap();
+        assert!(matches!(decoded, NetworkMessage::SendHeaders));
+    }
+
+    #[test]
+    fn test_encode_decode_payload_wtxidrelay() {
+        let payload = encode_payload(&NetworkMessage::WtxidRelay).unwrap();
+        assert!(payload.is_empty());
+        let decoded = decode_payload("wtxidrelay", &payload).unwrap();
+        assert!(matches!(decoded, NetworkMessage::WtxidRelay));
+    }
+
+    #[test]
+    fn test_encode_decode_payload_mempool() {
+        let payload = encode_payload(&NetworkMessage::MemPool).unwrap();
+        assert!(payload.is_empty());
+        let decoded = decode_payload("mempool", &payload).unwrap();
+        assert!(matches!(decoded, NetworkMessage::MemPool));
+    }
+
+    #[test]
+    fn test_encode_decode_payload_getaddr() {
+        let payload = encode_payload(&NetworkMessage::GetAddr).unwrap();
+        assert!(payload.is_empty());
+        let decoded = decode_payload("getaddr", &payload).unwrap();
+        assert!(matches!(decoded, NetworkMessage::GetAddr));
+    }
+
+    #[test]
+    fn test_encode_decode_payload_ping() {
+        let payload = encode_payload(&NetworkMessage::Ping(0xdeadbeef)).unwrap();
+        assert_eq!(payload.len(), 8);
+        let decoded = decode_payload("ping", &payload).unwrap();
+        match decoded {
+            NetworkMessage::Ping(n) => assert_eq!(n, 0xdeadbeef),
+            other => panic!("expected Ping, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_payload_pong() {
+        let payload = encode_payload(&NetworkMessage::Pong(0xcafebabe)).unwrap();
+        assert_eq!(payload.len(), 8);
+        let decoded = decode_payload("pong", &payload).unwrap();
+        match decoded {
+            NetworkMessage::Pong(n) => assert_eq!(n, 0xcafebabe),
+            other => panic!("expected Pong, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_payload_feefilter() {
+        let payload = encode_payload(&NetworkMessage::FeeFilter(1234)).unwrap();
+        assert_eq!(payload.len(), 8);
+        let decoded = decode_payload("feefilter", &payload).unwrap();
+        match decoded {
+            NetworkMessage::FeeFilter(r) => assert_eq!(r, 1234),
+            other => panic!("expected FeeFilter, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_payload_sendcmpct() {
+        let payload = encode_payload(&NetworkMessage::SendCmpct {
+            announce: true,
+            version: 2,
+        })
+        .unwrap();
+        assert_eq!(payload.len(), 9); // 1 byte announce + 8 bytes version
+        let decoded = decode_payload("sendcmpct", &payload).unwrap();
+        match decoded {
+            NetworkMessage::SendCmpct { announce, version } => {
+                assert!(announce);
+                assert_eq!(version, 2);
+            }
+            other => panic!("expected SendCmpct, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_payload_unknown() {
+        let data = vec![0x01, 0x02, 0x03];
+        let payload = encode_payload(&NetworkMessage::Unknown("foobar".into(), data.clone())).unwrap();
+        assert_eq!(payload, data);
+        let decoded = decode_payload("foobar", &payload).unwrap();
+        match decoded {
+            NetworkMessage::Unknown(cmd, d) => {
+                assert_eq!(cmd, "foobar");
+                assert_eq!(d, data);
+            }
+            other => panic!("expected Unknown, got {:?}", other),
+        }
+    }
+
+    // --- GetheadersMessage encode/decode ---
+
+    #[test]
+    fn test_getheaders_encode_decode() {
+        let msg = GetHeadersMessage {
+            version: 70016,
+            locator_hashes: vec![
+                BlockHash::from_bytes([0x01; 32]),
+                BlockHash::from_bytes([0x02; 32]),
+                BlockHash::from_bytes([0x03; 32]),
+            ],
+            stop_hash: BlockHash::from_bytes([0xff; 32]),
+        };
+        let mut buf = Vec::new();
+        encode_getheaders(&msg, &mut buf).unwrap();
+        let decoded = decode_getheaders(&mut std::io::Cursor::new(&buf)).unwrap();
+        assert_eq!(decoded.version, 70016);
+        assert_eq!(decoded.locator_hashes.len(), 3);
+        assert_eq!(decoded.stop_hash.as_bytes(), &[0xff; 32]);
+    }
+
+    // --- GetBlocks uses same format as GetHeaders ---
+
+    #[test]
+    fn test_getblocks_encode_decode_payload() {
+        let msg = GetHeadersMessage {
+            version: 70015,
+            locator_hashes: vec![BlockHash::from_bytes([0xaa; 32])],
+            stop_hash: BlockHash::ZERO,
+        };
+        let payload = encode_payload(&NetworkMessage::GetBlocks(msg)).unwrap();
+        let decoded = decode_payload("getblocks", &payload).unwrap();
+        match decoded {
+            NetworkMessage::GetBlocks(gh) => {
+                assert_eq!(gh.version, 70015);
+                assert_eq!(gh.locator_hashes.len(), 1);
+            }
+            other => panic!("expected GetBlocks, got {:?}", other),
+        }
+    }
+
+    // --- Multiple inv items with different types ---
+
+    #[test]
+    fn test_inv_vec_encode_decode_multiple_types() {
+        let items = vec![
+            InvItem { inv_type: InvType::Error, hash: Hash256::from_bytes([0; 32]) },
+            InvItem { inv_type: InvType::Tx, hash: Hash256::from_bytes([1; 32]) },
+            InvItem { inv_type: InvType::Block, hash: Hash256::from_bytes([2; 32]) },
+            InvItem { inv_type: InvType::FilteredBlock, hash: Hash256::from_bytes([3; 32]) },
+            InvItem { inv_type: InvType::CompactBlock, hash: Hash256::from_bytes([4; 32]) },
+            InvItem { inv_type: InvType::WtxId, hash: Hash256::from_bytes([5; 32]) },
+            InvItem { inv_type: InvType::WitnessTx, hash: Hash256::from_bytes([6; 32]) },
+            InvItem { inv_type: InvType::WitnessBlock, hash: Hash256::from_bytes([7; 32]) },
+        ];
+        let mut buf = Vec::new();
+        encode_inv_vec(&items, &mut buf).unwrap();
+        let decoded = decode_inv_vec(&mut std::io::Cursor::new(&buf)).unwrap();
+        assert_eq!(decoded, items);
+    }
+
+    // --- Reject message encode/decode via payload functions ---
+
+    #[test]
+    fn test_reject_payload_encode_decode() {
+        let msg = NetworkMessage::Reject {
+            message: "block".to_string(),
+            code: 0x43,
+            reason: "duplicate".to_string(),
+            data: vec![0xab; 32],
+        };
+        let payload = encode_payload(&msg).unwrap();
+        let decoded = decode_payload("reject", &payload).unwrap();
+        match decoded {
+            NetworkMessage::Reject { message, code, reason, data } => {
+                assert_eq!(message, "block");
+                assert_eq!(code, 0x43);
+                assert_eq!(reason, "duplicate");
+                assert_eq!(data.len(), 32);
+            }
+            other => panic!("expected Reject, got {:?}", other),
+        }
+    }
+
+    // --- Headers encode/decode with 0 tx_count varint ---
+
+    #[test]
+    fn test_headers_encode_decode_payload() {
+        let headers = vec![BlockHeader {
+            version: 536870912,
+            prev_blockhash: BlockHash::from_bytes([0x11; 32]),
+            merkle_root: TxHash::from_bytes([0x22; 32]),
+            time: 1700000000,
+            bits: CompactTarget::from_u32(0x1d00ffff),
+            nonce: 42,
+        }];
+        let payload = encode_payload(&NetworkMessage::Headers(headers.clone())).unwrap();
+        let decoded = decode_payload("headers", &payload).unwrap();
+        match decoded {
+            NetworkMessage::Headers(h) => {
+                assert_eq!(h.len(), 1);
+                assert_eq!(h[0], headers[0]);
+            }
+            other => panic!("expected Headers, got {:?}", other),
+        }
+    }
+
+    // --- Addr encode/decode with timestamp ---
+
+    #[test]
+    fn test_addr_encode_decode_payload() {
+        let addrs = vec![
+            NetAddress { services: 0x0d, ip: [0; 16], port: 8333 },
+            NetAddress { services: 0x01, ip: [0; 16], port: 18333 },
+        ];
+        let payload = encode_payload(&NetworkMessage::Addr(addrs.clone())).unwrap();
+        let decoded = decode_payload("addr", &payload).unwrap();
+        match decoded {
+            NetworkMessage::Addr(a) => {
+                assert_eq!(a.len(), 2);
+                assert_eq!(a[0].services, 0x0d);
+                assert_eq!(a[0].port, 8333);
+                assert_eq!(a[1].port, 18333);
+            }
+            other => panic!("expected Addr, got {:?}", other),
+        }
+    }
+
+    // --- Codec: testnet magic ---
+
+    #[test]
+    fn test_testnet_codec_roundtrip() {
+        let mut codec = BitcoinCodec::new(Network::Testnet.magic());
+        let mut buf = BytesMut::new();
+        codec.encode(NetworkMessage::Ping(42), &mut buf).unwrap();
+        let decoded = codec.decode(&mut buf).unwrap().unwrap();
+        match decoded {
+            NetworkMessage::Ping(n) => assert_eq!(n, 42),
+            other => panic!("expected Ping, got {:?}", other),
+        }
+    }
+
+    // --- Codec: regtest magic ---
+
+    #[test]
+    fn test_regtest_codec_roundtrip() {
+        let mut codec = BitcoinCodec::new(Network::Regtest.magic());
+        let mut buf = BytesMut::new();
+        codec.encode(NetworkMessage::Verack, &mut buf).unwrap();
+        let decoded = codec.decode(&mut buf).unwrap().unwrap();
+        assert!(matches!(decoded, NetworkMessage::Verack));
+    }
+
+    // --- Codec: signet magic ---
+
+    #[test]
+    fn test_signet_codec_roundtrip() {
+        let mut codec = BitcoinCodec::new(Network::Signet.magic());
+        let mut buf = BytesMut::new();
+        codec.encode(NetworkMessage::SendHeaders, &mut buf).unwrap();
+        let decoded = codec.decode(&mut buf).unwrap().unwrap();
+        assert!(matches!(decoded, NetworkMessage::SendHeaders));
+    }
+
+    // --- Codec: wrong magic from different network ---
+
+    #[test]
+    fn test_wrong_network_magic_rejected() {
+        let mut mainnet_codec = mainnet_codec();
+        let mut testnet_codec = BitcoinCodec::new(Network::Testnet.magic());
+        let mut buf = BytesMut::new();
+        // Encode with testnet
+        testnet_codec.encode(NetworkMessage::Verack, &mut buf).unwrap();
+        // Decode with mainnet -- should fail
+        let err = mainnet_codec.decode(&mut buf).unwrap_err();
+        assert!(err.to_string().contains("invalid magic"));
+    }
+
+    // --- Empty buffer returns None ---
+
+    #[test]
+    fn test_empty_buffer_returns_none() {
+        let mut codec = mainnet_codec();
+        let mut buf = BytesMut::new();
+        assert!(codec.decode(&mut buf).unwrap().is_none());
+    }
+
+    // --- Header with zero-length payload ---
+
+    #[test]
+    fn test_header_zero_payload_command() {
+        let header = MessageHeader::new(Network::Mainnet.magic(), "verack", b"");
+        assert_eq!(header.payload_size, 0);
+        assert!(header.verify_checksum(b""));
+    }
+
+    // --- Header command truncation ---
+
+    #[test]
+    fn test_header_command_long_name() {
+        let header = MessageHeader::new(Network::Mainnet.magic(), "verylongcommand", b"");
+        // Command field is 12 bytes, should be truncated
+        assert_eq!(header.command_str(), "verylongcomm");
+    }
+
+    // --- Header with full 12-byte command (no null terminator) ---
+
+    #[test]
+    fn test_header_full_12_byte_command() {
+        let header = MessageHeader::new(Network::Mainnet.magic(), "123456789012", b"");
+        assert_eq!(header.command_str(), "123456789012");
+    }
+
+    // --- NotFound payload roundtrip ---
+
+    #[test]
+    fn test_notfound_payload_roundtrip() {
+        let items = vec![
+            InvItem { inv_type: InvType::Tx, hash: Hash256::from_bytes([0x11; 32]) },
+            InvItem { inv_type: InvType::Block, hash: Hash256::from_bytes([0x22; 32]) },
+        ];
+        let payload = encode_payload(&NetworkMessage::NotFound(items.clone())).unwrap();
+        let decoded = decode_payload("notfound", &payload).unwrap();
+        match decoded {
+            NetworkMessage::NotFound(d) => assert_eq!(d, items),
+            other => panic!("expected NotFound, got {:?}", other),
+        }
+    }
+
+    // --- GetData payload roundtrip ---
+
+    #[test]
+    fn test_getdata_payload_roundtrip() {
+        let items = vec![InvItem {
+            inv_type: InvType::WitnessTx,
+            hash: Hash256::from_bytes([0x33; 32]),
+        }];
+        let payload = encode_payload(&NetworkMessage::GetData(items.clone())).unwrap();
+        let decoded = decode_payload("getdata", &payload).unwrap();
+        match decoded {
+            NetworkMessage::GetData(d) => assert_eq!(d, items),
+            other => panic!("expected GetData, got {:?}", other),
+        }
+    }
+
+    // --- Version with empty user agent ---
+
+    #[test]
+    fn test_version_empty_user_agent() {
+        let ver = VersionMessage {
+            version: 70016,
+            services: 1,
+            timestamp: 1_700_000_000,
+            receiver: NetAddress::default(),
+            sender: NetAddress::default(),
+            nonce: 1,
+            user_agent: "".to_string(),
+            start_height: 0,
+            relay: true,
+        };
+        let decoded = roundtrip(NetworkMessage::Version(ver));
+        match decoded {
+            NetworkMessage::Version(v) => assert_eq!(v.user_agent, ""),
+            other => panic!("expected Version, got {:?}", other),
+        }
+    }
+
+    // --- Decode unknown command ---
+
+    #[test]
+    fn test_decode_payload_unknown_command() {
+        let data = vec![0xaa, 0xbb, 0xcc];
+        let decoded = decode_payload("weirdcommand", &data).unwrap();
+        match decoded {
+            NetworkMessage::Unknown(cmd, d) => {
+                assert_eq!(cmd, "weirdcommand");
+                assert_eq!(d, data);
+            }
+            other => panic!("expected Unknown, got {:?}", other),
+        }
+    }
+
+    // --- Encoder produces valid header ---
+
+    #[test]
+    fn test_encoder_produces_correct_header_size() {
+        let mut codec = mainnet_codec();
+        let mut buf = BytesMut::new();
+        codec.encode(NetworkMessage::Verack, &mut buf).unwrap();
+        // Verack has no payload, so total = 24 (header only)
+        assert_eq!(buf.len(), MessageHeader::SIZE);
+    }
+
+    #[test]
+    fn test_encoder_header_magic_in_output() {
+        let mut codec = mainnet_codec();
+        let mut buf = BytesMut::new();
+        codec.encode(NetworkMessage::Verack, &mut buf).unwrap();
+        let magic = Network::Mainnet.magic();
+        assert_eq!(&buf[0..4], &magic);
+    }
+
+    // --- inv/getdata roundtrip with WitnessBlock ---
+
+    #[test]
+    fn test_inv_witness_block_roundtrip() {
+        let items = vec![InvItem {
+            inv_type: InvType::WitnessBlock,
+            hash: Hash256::from_bytes([0xff; 32]),
+        }];
+        match roundtrip(NetworkMessage::Inv(items.clone())) {
+            NetworkMessage::Inv(decoded) => assert_eq!(decoded, items),
+            other => panic!("expected Inv, got {:?}", other),
+        }
+    }
+
+    // --- Block with multiple transactions ---
+
+    #[test]
+    fn test_block_multiple_txs_roundtrip() {
+        let coinbase = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::COINBASE,
+                script_sig: ScriptBuf::from_bytes(vec![0x04, 0xff]),
+                sequence: TxIn::SEQUENCE_FINAL,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76, 0xa9]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+        let tx1 = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0x11; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![0x01]),
+                sequence: TxIn::SEQUENCE_FINAL,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+        let block = btc_primitives::block::Block {
+            header: BlockHeader {
+                version: 4,
+                prev_blockhash: BlockHash::from_bytes([0xaa; 32]),
+                merkle_root: TxHash::from_bytes([0xbb; 32]),
+                time: 1700000000,
+                bits: CompactTarget::from_u32(0x1d00ffff),
+                nonce: 999,
+            },
+            transactions: vec![coinbase, tx1],
+        };
+        match roundtrip(NetworkMessage::Block(block.clone())) {
+            NetworkMessage::Block(decoded) => {
+                assert_eq!(decoded.header, block.header);
+                assert_eq!(decoded.transactions.len(), 2);
+            }
+            other => panic!("expected Block, got {:?}", other),
+        }
+    }
+
+    // --- FeeFilter zero ---
+
+    #[test]
+    fn test_feefilter_zero_roundtrip() {
+        match roundtrip(NetworkMessage::FeeFilter(0)) {
+            NetworkMessage::FeeFilter(r) => assert_eq!(r, 0),
+            other => panic!("expected FeeFilter, got {:?}", other),
+        }
+    }
+
+    // --- FeeFilter max value ---
+
+    #[test]
+    fn test_feefilter_max_roundtrip() {
+        match roundtrip(NetworkMessage::FeeFilter(u64::MAX)) {
+            NetworkMessage::FeeFilter(r) => assert_eq!(r, u64::MAX),
+            other => panic!("expected FeeFilter, got {:?}", other),
+        }
+    }
+
+    // --- Reject with empty strings ---
+
+    #[test]
+    fn test_reject_empty_strings_roundtrip() {
+        let msg = NetworkMessage::Reject {
+            message: "".to_string(),
+            code: 0,
+            reason: "".to_string(),
+            data: vec![],
+        };
+        match roundtrip(msg) {
+            NetworkMessage::Reject { message, code, reason, data } => {
+                assert_eq!(message, "");
+                assert_eq!(code, 0);
+                assert_eq!(reason, "");
+                assert!(data.is_empty());
+            }
+            other => panic!("expected Reject, got {:?}", other),
+        }
+    }
+
+    // --- GetHeaders with no locator hashes ---
+
+    #[test]
+    fn test_getheaders_no_locators_roundtrip() {
+        let msg = GetHeadersMessage {
+            version: 70016,
+            locator_hashes: vec![],
+            stop_hash: BlockHash::ZERO,
+        };
+        match roundtrip(NetworkMessage::GetHeaders(msg)) {
+            NetworkMessage::GetHeaders(decoded) => {
+                assert!(decoded.locator_hashes.is_empty());
+            }
+            other => panic!("expected GetHeaders, got {:?}", other),
+        }
+    }
+
+    // --- Headers empty list ---
+
+    #[test]
+    fn test_headers_empty_list_roundtrip() {
+        match roundtrip(NetworkMessage::Headers(vec![])) {
+            NetworkMessage::Headers(decoded) => assert!(decoded.is_empty()),
+            other => panic!("expected Headers, got {:?}", other),
+        }
+    }
 }
