@@ -102,12 +102,9 @@ impl QmdbDatabase {
         })?;
 
         let config = Config::from_dir(dir);
-        // Only initialize if the directory doesn't contain QMDB data.
-        // init_dir DELETES existing data and creates fresh tables.
-        let data_subdir = std::path::Path::new(dir).join("data");
-        if !data_subdir.exists() {
-            AdsCore::init_dir(&config);
-        }
+        // init_dir is now idempotent (patched in androolloyd/qmdb) —
+        // it skips initialization if the data directory already exists.
+        AdsCore::init_dir(&config);
         let ads = AdsWrap::new(&config);
 
         // Read the current height from QMDB's root hash to resume from
