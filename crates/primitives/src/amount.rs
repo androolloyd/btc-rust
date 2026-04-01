@@ -91,4 +91,44 @@ mod tests {
         assert_eq!(Amount::ONE_BTC.to_string(), "1.00000000 BTC");
         assert_eq!(Amount::from_sat(123456789).to_string(), "1.23456789 BTC");
     }
+
+    #[test]
+    fn test_amount_display_negative() {
+        assert_eq!(Amount::from_sat(-100_000_000).to_string(), "-1.00000000 BTC");
+        assert_eq!(Amount::from_sat(-50_000_000).to_string(), "-0.50000000 BTC");
+    }
+
+    #[test]
+    fn test_amount_display_zero() {
+        assert_eq!(Amount::ZERO.to_string(), "0.00000000 BTC");
+    }
+
+    #[test]
+    fn test_amount_from_btc() {
+        assert_eq!(Amount::from_btc(1).as_sat(), 100_000_000);
+        assert_eq!(Amount::from_btc(21_000_000), Amount::MAX_MONEY);
+    }
+
+    #[test]
+    fn test_amount_as_btc() {
+        assert_eq!(Amount::from_sat(100_000_000).as_btc(), 1.0);
+        assert_eq!(Amount::from_sat(50_000_000).as_btc(), 0.5);
+    }
+
+    #[test]
+    fn test_amount_ordering() {
+        assert!(Amount::from_sat(100) > Amount::from_sat(50));
+        assert!(Amount::from_sat(50) < Amount::from_sat(100));
+        assert!(Amount::from_sat(50) == Amount::from_sat(50));
+    }
+
+    #[test]
+    fn test_amount_default() {
+        assert_eq!(Amount::default(), Amount::ZERO);
+    }
+
+    #[test]
+    fn test_amount_one_sat() {
+        assert_eq!(Amount::ONE_SAT.as_sat(), 1);
+    }
 }

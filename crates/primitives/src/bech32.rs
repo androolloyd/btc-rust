@@ -649,6 +649,233 @@ mod tests {
         assert_eq!(back, original);
     }
 
+    // Additional bech32 coverage tests
+
+    #[test]
+    fn test_bech32_variant_display() {
+        assert_eq!(Bech32Variant::Bech32.to_string(), "Bech32");
+        assert_eq!(Bech32Variant::Bech32m.to_string(), "Bech32m");
+    }
+
+    #[test]
+    fn test_bech32_variant_constant() {
+        assert_eq!(Bech32Variant::Bech32.constant(), 1);
+        assert_eq!(Bech32Variant::Bech32m.constant(), 0x2bc830a3);
+    }
+
+    #[test]
+    fn test_bech32_error_display() {
+        let errors = vec![
+            Bech32Error::InvalidChar('x'),
+            Bech32Error::MixedCase,
+            Bech32Error::MissingSeparator,
+            Bech32Error::EmptyHrp,
+            Bech32Error::HrpTooLong,
+            Bech32Error::InvalidHrpChar,
+            Bech32Error::DataTooShort,
+            Bech32Error::StringTooLong,
+            Bech32Error::InvalidChecksum,
+            Bech32Error::InvalidWitnessVersion(17),
+            Bech32Error::InvalidProgramLength(50),
+            Bech32Error::InvalidV0ProgramLength(15),
+            Bech32Error::WrongVariant {
+                version: 0,
+                expected: Bech32Variant::Bech32,
+                got: Bech32Variant::Bech32m,
+            },
+            Bech32Error::PaddingError,
+            Bech32Error::HrpMismatch {
+                expected: "bc".to_string(),
+                got: "tb".to_string(),
+            },
+        ];
+        for e in errors {
+            let s = format!("{}", e);
+            assert!(!s.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_bech32_encode_empty_hrp() {
+        let result = bech32_encode("", &[0], Bech32Variant::Bech32);
+        assert_eq!(result, Err(Bech32Error::EmptyHrp));
+    }
+
+    #[test]
+    fn test_bech32_encode_hrp_too_long() {
+        let long_hrp = "a".repeat(84);
+        let result = bech32_encode(&long_hrp, &[0], Bech32Variant::Bech32);
+        assert_eq!(result, Err(Bech32Error::HrpTooLong));
+    }
+
+    #[test]
+    fn test_bech32_encode_invalid_hrp_char() {
+        let result = bech32_encode("bc\x01", &[0], Bech32Variant::Bech32);
+        assert_eq!(result, Err(Bech32Error::InvalidHrpChar));
+    }
+
+    #[test]
+    fn test_bech32_decode_data_too_short() {
+        let result = bech32_decode("bc1qqqq");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_bech32_encode_decode_full_roundtrip() {
+        let data5 = vec![0u8, 14, 20, 15, 7, 13, 26, 0, 25, 18, 6, 11, 13, 8, 21,
+                         4, 20, 3, 17, 2, 29, 3, 12, 29, 3, 4, 15, 24, 20, 6, 14,
+                         30, 22];
+        let encoded = bech32_encode("bc", &data5, Bech32Variant::Bech32).unwrap();
+        let (hrp, decoded, variant) = bech32_decode(&encoded).unwrap();
+        assert_eq!(hrp, "bc");
+        assert_eq!(decoded, data5);
+        assert_eq!(variant, Bech32Variant::Bech32);
+    }
+
+    #[test]
+    fn test_bech32m_encode_decode_full_roundtrip() {
+        let data5 = vec![1u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                         0, 0, 0];
+        let encoded = bech32_encode("bc", &data5, Bech32Variant::Bech32m).unwrap();
+        let (hrp, decoded, variant) = bech32_decode(&encoded).unwrap();
+        assert_eq!(hrp, "bc");
+        assert_eq!(decoded, data5);
+        assert_eq!(variant, Bech32Variant::Bech32m);
+    }
+
+    #[test]
+    fn test_bech32_long_encode_decode_roundtrip() {
+        // Create a long data payload that would exceed 90 chars
+        let data5: Vec<u8> = (0..200).map(|i| (i % 32) as u8).collect();
+        let encoded = bech32_encode_long("sp", &data5, Bech32Variant::Bech32m).unwrap();
+        assert!(encoded.len() > 90);
+        let (hrp, decoded, variant) = bech32_decode_long(&encoded).unwrap();
+        assert_eq!(hrp, "sp");
+        assert_eq!(decoded, data5);
+        assert_eq!(variant, Bech32Variant::Bech32m);
+    }
+
+    #[test]
+    fn test_bech32_long_errors() {
+        assert_eq!(
+            bech32_encode_long("", &[0], Bech32Variant::Bech32),
+            Err(Bech32Error::EmptyHrp)
+        );
+        let long_hrp = "a".repeat(84);
+        assert_eq!(
+            bech32_encode_long(&long_hrp, &[0], Bech32Variant::Bech32),
+            Err(Bech32Error::HrpTooLong)
+        );
+        assert_eq!(
+            bech32_encode_long("bc\x01", &[0], Bech32Variant::Bech32),
+            Err(Bech32Error::InvalidHrpChar)
+        );
+    }
+
+    #[test]
+    fn test_bech32_decode_long_mixed_case() {
+        let result = bech32_decode_long("Bc1Qtest");
+        assert_eq!(result, Err(Bech32Error::MixedCase));
+    }
+
+    #[test]
+    fn test_bech32_decode_long_empty_hrp() {
+        let result = bech32_decode_long("1pzry9x0s0muk");
+        assert_eq!(result, Err(Bech32Error::EmptyHrp));
+    }
+
+    #[test]
+    fn test_bech32_decode_long_data_too_short() {
+        let result = bech32_decode_long("sp1qqqq");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_bech32_decode_long_no_separator() {
+        let result = bech32_decode_long("noseperator");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_bech32_decode_long_invalid_hrp_char() {
+        // Build a string with invalid HRP bytes but a separator
+        let result = bech32_decode_long("\x011qqqqqq");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_bech32_decode_long_invalid_checksum() {
+        // Valid format but bad checksum
+        let result = bech32_decode_long("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t5");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_bech32_decode_long_invalid_char() {
+        let result = bech32_decode_long("bc1qb");  // 'b' is invalid
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_convert_bits_padding_error_no_pad() {
+        // 5-bit value with non-zero padding when pad=false should error
+        let result = convert_bits(&[0x1f], 5, 8, false);
+        assert_eq!(result, Err(Bech32Error::PaddingError));
+    }
+
+    #[test]
+    fn test_convert_bits_input_too_large() {
+        // Value 32 is too large for 5-bit input
+        let result = convert_bits(&[32], 5, 8, true);
+        assert_eq!(result, Err(Bech32Error::PaddingError));
+    }
+
+    #[test]
+    fn test_encode_witness_program_too_short() {
+        let result = encode_witness_address("bc", 0, &[0u8; 1]);
+        assert!(matches!(result, Err(Bech32Error::InvalidProgramLength(1))));
+    }
+
+    #[test]
+    fn test_encode_witness_program_too_long() {
+        let result = encode_witness_address("bc", 1, &[0u8; 41]);
+        assert!(matches!(result, Err(Bech32Error::InvalidProgramLength(41))));
+    }
+
+    #[test]
+    fn test_decode_witness_too_long_string() {
+        let long = format!("bc1{}", "q".repeat(88));
+        let result = decode_witness_address(&long, "bc");
+        assert_eq!(result, Err(Bech32Error::StringTooLong));
+    }
+
+    #[test]
+    fn test_decode_witness_hrp_mismatch() {
+        let addr = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+        let result = decode_witness_address(addr, "tb");
+        assert!(matches!(result, Err(Bech32Error::HrpMismatch { .. })));
+    }
+
+    #[test]
+    fn test_all_upper_case_decodes_ok() {
+        let addr = "BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4";
+        let (ver, prog) = decode_witness_address(addr, "bc").unwrap();
+        assert_eq!(ver, 0);
+        assert_eq!(prog.len(), 20);
+    }
+
+    #[test]
+    fn test_encode_witness_v2_bech32m() {
+        // Witness version 2 with 32-byte program should use bech32m
+        let prog = [0xab; 32];
+        let encoded = encode_witness_address("bc", 2, &prog).unwrap();
+        let (ver, decoded) = decode_witness_address(&encoded, "bc").unwrap();
+        assert_eq!(ver, 2);
+        assert_eq!(decoded, prog);
+    }
+
     #[test]
     fn test_convert_bits_invalid_input() {
         let result = convert_bits(&[0x20], 5, 8, true);

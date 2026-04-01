@@ -213,6 +213,30 @@ impl Transaction {
         TxHash::compute(&buf)
     }
 
+    /// Compute the base (non-witness) serialized size in bytes.
+    pub fn base_size(&self) -> usize {
+        let mut counter = crate::encode::CountWriter(0);
+        self.encode_legacy(&mut counter).expect("counting should not fail");
+        counter.0
+    }
+
+    /// Compute the total (witness-inclusive) serialized size in bytes.
+    pub fn total_size(&self) -> usize {
+        let mut counter = crate::encode::CountWriter(0);
+        if self.is_segwit() {
+            self.encode_segwit(&mut counter).expect("counting should not fail");
+        } else {
+            self.encode_legacy(&mut counter).expect("counting should not fail");
+        }
+        counter.0
+    }
+
+    /// Compute the BIP141 weight of this transaction.
+    /// weight = base_size * 3 + total_size
+    pub fn weight(&self) -> usize {
+        self.base_size() * 3 + self.total_size()
+    }
+
     /// Encode in legacy (non-witness) format
     fn encode_legacy<W: Write>(&self, writer: &mut W) -> Result<usize, EncodeError> {
         let mut written = writer.write_i32_le(self.version)?;
@@ -454,5 +478,196 @@ mod tests {
         assert!(tx.is_segwit());
         assert!(tx.is_coinbase());
         assert_eq!(tx.witness.len(), 1);
+    }
+
+    #[test]
+    fn test_legacy_tx_weight_is_4x_size() {
+        // For a legacy (non-witness) transaction, base_size == total_size,
+        // so weight = base_size * 3 + total_size = base_size * 4.
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::COINBASE,
+                script_sig: ScriptBuf::from_bytes(vec![0x04, 0xff, 0xff, 0x00, 0x1d]),
+                sequence: TxIn::SEQUENCE_FINAL,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x76, 0xa9, 0x14]),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let encoded_len = encode::encode(&tx).len();
+        assert_eq!(tx.base_size(), encoded_len);
+        assert_eq!(tx.total_size(), encoded_len);
+        assert_eq!(tx.weight(), encoded_len * 4);
+    }
+
+    #[test]
+    fn test_segwit_tx_weight() {
+        // Decode a real segwit transaction and verify weight = base * 3 + total.
+        let raw = hex::decode(
+            "02000000000101000000000000000000000000000000000000000000000000000000000000\
+             0000ffffffff03510101ffffffff0200f2052a01000000160014751e76e8199196d454941c\
+             45d1b3a323f1433bd60000000000000000266a24aa21a9ede2f61c3f71d1defd3fa999dfa3\
+             6953755c690689799962b48bebd836974e8cf90120000000000000000000000000000000000\
+             00000000000000000000000000000000000000000"
+        ).unwrap();
+        let tx: Transaction = encode::decode(&raw).unwrap();
+
+        let base = tx.base_size();
+        let total = tx.total_size();
+
+        // total_size includes marker(1) + flag(1) + witness data, so total > base
+        assert!(total > base, "segwit total_size ({}) should exceed base_size ({})", total, base);
+
+        // weight = base_size * 3 + total_size
+        assert_eq!(tx.weight(), base * 3 + total);
+
+        // For a segwit tx, weight should be less than total_size * 4
+        // (witness data is discounted)
+        assert!(tx.weight() < total * 4);
+    }
+
+    #[test]
+    fn test_witness_basic_operations() {
+        let mut w = Witness::new();
+        assert!(w.is_empty());
+        assert_eq!(w.len(), 0);
+        assert!(w.get(0).is_none());
+
+        w.push(vec![0x01, 0x02]);
+        w.push(vec![0x03]);
+        assert!(!w.is_empty());
+        assert_eq!(w.len(), 2);
+        assert_eq!(w.get(0), Some(&[0x01, 0x02][..]));
+        assert_eq!(w.get(1), Some(&[0x03][..]));
+        assert!(w.get(2).is_none());
+
+        let items: Vec<_> = w.iter().collect();
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn test_witness_from_items() {
+        let items = vec![vec![0x01], vec![0x02, 0x03]];
+        let w = Witness::from_items(items.clone());
+        assert_eq!(w.len(), 2);
+        assert_eq!(w.get(0), Some(&[0x01][..]));
+    }
+
+    #[test]
+    fn test_witness_default() {
+        let w = Witness::default();
+        assert!(w.is_empty());
+    }
+
+    #[test]
+    fn test_outpoint_new_and_is_coinbase() {
+        let op = OutPoint::new(TxHash::ZERO, 0xffffffff);
+        assert!(op.is_coinbase());
+
+        let op2 = OutPoint::new(TxHash::from_bytes([0x01; 32]), 0);
+        assert!(!op2.is_coinbase());
+    }
+
+    #[test]
+    fn test_txin_is_coinbase() {
+        let coinbase_in = TxIn {
+            previous_output: OutPoint::COINBASE,
+            script_sig: ScriptBuf::new(),
+            sequence: TxIn::SEQUENCE_FINAL,
+        };
+        assert!(coinbase_in.is_coinbase());
+
+        let normal_in = TxIn {
+            previous_output: OutPoint::new(TxHash::from_bytes([0x01; 32]), 0),
+            script_sig: ScriptBuf::new(),
+            sequence: TxIn::SEQUENCE_FINAL,
+        };
+        assert!(!normal_in.is_coinbase());
+    }
+
+    #[test]
+    fn test_is_segwit_with_empty_witness_items() {
+        // witness vec is non-empty but all items are empty
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0xaa; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+            witness: vec![Witness::new()], // non-empty vec, but witness is empty
+            lock_time: 0,
+        };
+        assert!(!tx.is_segwit()); // should not be segwit since all witnesses are empty
+    }
+
+    #[test]
+    fn test_wtxid_for_legacy_tx() {
+        let tx = Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::COINBASE,
+                script_sig: ScriptBuf::from_bytes(vec![0x04, 0xff]),
+                sequence: TxIn::SEQUENCE_FINAL,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+        // For legacy tx, wtxid == txid
+        assert_eq!(tx.wtxid(), tx.txid());
+    }
+
+    #[test]
+    fn test_weight_matches_manual_calculation() {
+        // Construct a segwit tx with known witness data and verify sizes manually.
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0xaa; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x00, 0x14, 0x01, 0x02, 0x03]),
+            }],
+            witness: vec![Witness::from_items(vec![
+                vec![0x30; 72], // mock signature
+                vec![0x02; 33], // mock pubkey
+            ])],
+            lock_time: 0,
+        };
+
+        assert!(tx.is_segwit());
+
+        // base_size: version(4) + varint_inputs(1) + outpoint(36) + script_sig_len(1) +
+        //            sequence(4) + varint_outputs(1) + value(8) + script_len(1) +
+        //            script(5) + locktime(4) = 65
+        let base = tx.base_size();
+        assert_eq!(base, 65);
+
+        // total_size: version(4) + marker(1) + flag(1) + varint_inputs(1) +
+        //             outpoint(36) + script_sig_len(1) + sequence(4) +
+        //             varint_outputs(1) + value(8) + script_len(1) + script(5) +
+        //             witness: item_count(1) + sig_len(1) + sig(72) + pk_len(1) + pk(33) +
+        //             locktime(4) = 175
+        let total = tx.total_size();
+        assert_eq!(total, 175);
+
+        // weight = 65 * 3 + 175 = 370
+        assert_eq!(tx.weight(), 370);
     }
 }

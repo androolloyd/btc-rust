@@ -674,4 +674,236 @@ mod tests {
         let decoded: ScriptBuf = crate::encode::decode(&encoded).unwrap();
         assert_eq!(script, decoded);
     }
+
+    #[test]
+    fn test_script_empty() {
+        let script = ScriptBuf::new();
+        assert!(script.is_empty());
+        assert_eq!(script.len(), 0);
+    }
+
+    #[test]
+    fn test_script_from_bytes_and_into_bytes() {
+        let bytes = vec![0x76, 0xa9, 0x14];
+        let script = ScriptBuf::from_bytes(bytes.clone());
+        assert_eq!(script.as_bytes(), &bytes);
+        assert_eq!(script.clone().into_bytes(), bytes);
+    }
+
+    #[test]
+    fn test_script_deref() {
+        let script = ScriptBuf::p2pkh(&[0; 20]);
+        let s: &Script = &script;
+        assert!(s.is_p2pkh());
+    }
+
+    #[test]
+    fn test_script_to_owned() {
+        let data = vec![0x76, 0xa9];
+        let script = Script::from_bytes(&data);
+        let owned = script.to_owned();
+        assert_eq!(owned.as_bytes(), &data);
+    }
+
+    #[test]
+    fn test_script_debug() {
+        let script = ScriptBuf::from_bytes(vec![0xab, 0xcd]);
+        let debug = format!("{:?}", script);
+        assert!(debug.contains("abcd"));
+    }
+
+    #[test]
+    fn test_script_display() {
+        let script = ScriptBuf::from_bytes(vec![0xab, 0xcd]);
+        let display = format!("{}", script.as_script());
+        assert_eq!(display, "abcd");
+    }
+
+    #[test]
+    fn test_script_debug_borrowed() {
+        let data = vec![0x01, 0x02];
+        let script = Script::from_bytes(&data);
+        let debug = format!("{:?}", script);
+        assert!(debug.contains("0102"));
+    }
+
+    #[test]
+    fn test_witness_program_detection() {
+        // OP_0 + 20 bytes = P2WPKH (valid v0 witness)
+        let p2wpkh = ScriptBuf::p2wpkh(&[0; 20]);
+        assert!(p2wpkh.is_witness_program());
+
+        // OP_1 + 32 bytes = P2TR (valid v1 witness)
+        let p2tr = ScriptBuf::p2tr(&[0; 32]);
+        assert!(p2tr.is_witness_program());
+
+        // Too short
+        let short = ScriptBuf::from_bytes(vec![0x00, 0x01, 0x02]);
+        assert!(!short.is_witness_program());
+
+        // Too long
+        let mut long = vec![0x00, 41u8];
+        long.extend_from_slice(&[0u8; 41]);
+        let long_script = ScriptBuf::from_bytes(long);
+        assert!(!long_script.is_witness_program());
+
+        // Invalid version
+        let bad_ver = ScriptBuf::from_bytes(vec![0x4f, 0x02, 0x01, 0x02]);
+        assert!(!bad_ver.is_witness_program());
+    }
+
+    #[test]
+    fn test_push_slice_pushdata1() {
+        let mut script = ScriptBuf::new();
+        let data = vec![0xAB; 100]; // > 75 bytes, <= 255
+        script.push_slice(&data);
+        let bytes = script.as_bytes();
+        assert_eq!(bytes[0], Opcode::OP_PUSHDATA1 as u8);
+        assert_eq!(bytes[1], 100);
+        assert_eq!(&bytes[2..], &data);
+    }
+
+    #[test]
+    fn test_push_slice_pushdata2() {
+        let mut script = ScriptBuf::new();
+        let data = vec![0xAB; 300]; // > 255, <= 65535
+        script.push_slice(&data);
+        let bytes = script.as_bytes();
+        assert_eq!(bytes[0], Opcode::OP_PUSHDATA2 as u8);
+        let len = u16::from_le_bytes([bytes[1], bytes[2]]);
+        assert_eq!(len, 300);
+    }
+
+    #[test]
+    fn test_push_slice_pushdata4() {
+        let mut script = ScriptBuf::new();
+        let data = vec![0xAB; 70000]; // > 65535
+        script.push_slice(&data);
+        let bytes = script.as_bytes();
+        assert_eq!(bytes[0], Opcode::OP_PUSHDATA4 as u8);
+        let len = u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
+        assert_eq!(len, 70000);
+    }
+
+    #[test]
+    fn test_push_slice_empty() {
+        let mut script = ScriptBuf::new();
+        script.push_slice(&[]);
+        assert!(script.is_empty()); // nothing pushed
+    }
+
+    #[test]
+    fn test_instructions_op0() {
+        let script = ScriptBuf::from_bytes(vec![0x00]);
+        let instrs: Vec<_> = script.instructions().collect::<Result<_, _>>().unwrap();
+        assert_eq!(instrs.len(), 1);
+        assert_eq!(instrs[0], Instruction::Op(Opcode::OP_0));
+    }
+
+    #[test]
+    fn test_instructions_pushdata1_truncated() {
+        // OP_PUSHDATA1 with no length byte
+        let script = ScriptBuf::from_bytes(vec![Opcode::OP_PUSHDATA1 as u8]);
+        let instrs: Vec<_> = script.instructions().collect();
+        assert!(instrs[0].is_err());
+    }
+
+    #[test]
+    fn test_instructions_pushdata2_truncated() {
+        // OP_PUSHDATA2 with only 1 length byte
+        let script = ScriptBuf::from_bytes(vec![Opcode::OP_PUSHDATA2 as u8, 0x01]);
+        let instrs: Vec<_> = script.instructions().collect();
+        assert!(instrs[0].is_err());
+    }
+
+    #[test]
+    fn test_instructions_pushdata4_truncated() {
+        // OP_PUSHDATA4 with only 3 length bytes
+        let script = ScriptBuf::from_bytes(vec![Opcode::OP_PUSHDATA4 as u8, 0x01, 0x02, 0x03]);
+        let instrs: Vec<_> = script.instructions().collect();
+        assert!(instrs[0].is_err());
+    }
+
+    #[test]
+    fn test_instructions_push_truncated() {
+        // Push 10 bytes, but only 5 available
+        let script = ScriptBuf::from_bytes(vec![10, 0x01, 0x02, 0x03, 0x04, 0x05]);
+        let instrs: Vec<_> = script.instructions().collect();
+        assert!(instrs[0].is_err());
+    }
+
+    #[test]
+    fn test_instructions_pushdata1_data_truncated() {
+        // OP_PUSHDATA1 claims 10 bytes but only 5 available
+        let script = ScriptBuf::from_bytes(vec![Opcode::OP_PUSHDATA1 as u8, 10, 0x01, 0x02, 0x03, 0x04, 0x05]);
+        let instrs: Vec<_> = script.instructions().collect();
+        assert!(instrs[0].is_err());
+    }
+
+    #[test]
+    fn test_instructions_pushdata2_data_truncated() {
+        let mut script_bytes = vec![Opcode::OP_PUSHDATA2 as u8, 0x0A, 0x00]; // claims 10 bytes
+        script_bytes.extend_from_slice(&[0x01; 5]); // only 5
+        let script = ScriptBuf::from_bytes(script_bytes);
+        let instrs: Vec<_> = script.instructions().collect();
+        assert!(instrs[0].is_err());
+    }
+
+    #[test]
+    fn test_instructions_pushdata4_data_truncated() {
+        let mut script_bytes = vec![Opcode::OP_PUSHDATA4 as u8, 0x0A, 0x00, 0x00, 0x00]; // claims 10
+        script_bytes.extend_from_slice(&[0x01; 5]); // only 5
+        let script = ScriptBuf::from_bytes(script_bytes);
+        let instrs: Vec<_> = script.instructions().collect();
+        assert!(instrs[0].is_err());
+    }
+
+    #[test]
+    fn test_opcode_from_u8_all_known() {
+        // Test a sampling of known opcodes
+        assert_eq!(Opcode::from_u8(0x00), Opcode::OP_0);
+        assert_eq!(Opcode::from_u8(0x51), Opcode::OP_1);
+        assert_eq!(Opcode::from_u8(0x60), Opcode::OP_16);
+        assert_eq!(Opcode::from_u8(0x76), Opcode::OP_DUP);
+        assert_eq!(Opcode::from_u8(0xa9), Opcode::OP_HASH160);
+        assert_eq!(Opcode::from_u8(0xac), Opcode::OP_CHECKSIG);
+        assert_eq!(Opcode::from_u8(0xba), Opcode::OP_CHECKSIGADD);
+    }
+
+    #[test]
+    fn test_opcode_from_u8_unknown() {
+        assert_eq!(Opcode::from_u8(0xBB), Opcode::OP_INVALIDOPCODE);
+        assert_eq!(Opcode::from_u8(0xCC), Opcode::OP_INVALIDOPCODE);
+    }
+
+    #[test]
+    fn test_opcode_to_u8() {
+        assert_eq!(Opcode::OP_0.to_u8(), 0x00);
+        assert_eq!(Opcode::OP_1.to_u8(), 0x51);
+        assert_eq!(Opcode::OP_CHECKSIG.to_u8(), 0xac);
+    }
+
+    #[test]
+    fn test_not_op_return() {
+        let script = ScriptBuf::p2pkh(&[0; 20]);
+        assert!(!script.is_op_return());
+    }
+
+    #[test]
+    fn test_not_p2tr_wrong_length() {
+        let script = ScriptBuf::from_bytes(vec![0x51, 0x20, 0x01]); // too short
+        assert!(!script.is_p2tr());
+    }
+
+    #[test]
+    fn test_script_hash() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        let s1 = ScriptBuf::p2pkh(&[0; 20]);
+        let s2 = ScriptBuf::p2pkh(&[1; 20]);
+        set.insert(s1.clone());
+        set.insert(s2);
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&s1));
+    }
 }

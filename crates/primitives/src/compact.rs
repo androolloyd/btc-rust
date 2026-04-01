@@ -107,4 +107,104 @@ mod tests {
         // Should produce a valid target with non-zero bytes
         assert!(target.iter().any(|&b| b != 0));
     }
+
+    #[test]
+    fn test_compact_zero_exponent() {
+        let compact = CompactTarget(0x00123456);
+        let target = compact.to_target();
+        assert_eq!(target, [0u8; 32]);
+    }
+
+    #[test]
+    fn test_compact_negative_flag() {
+        // If bit 23 of mantissa is set and mantissa != 0, target should be 0
+        let compact = CompactTarget(0x01800000);
+        let target = compact.to_target();
+        assert_eq!(target, [0u8; 32]);
+    }
+
+    #[test]
+    fn test_compact_exponent_1() {
+        let compact = CompactTarget(0x01000042);
+        let target = compact.to_target();
+        // exponent=1, mantissa=0x000042, shifted right by 8*(3-1)=16
+        // So mantissa >> 16 = 0, target[31] = 0
+        assert_eq!(target[31], 0);
+    }
+
+    #[test]
+    fn test_compact_exponent_2() {
+        let compact = CompactTarget(0x02004200);
+        let target = compact.to_target();
+        // exponent=2, mantissa=0x004200, shifted right by 8*(3-2)=8
+        // mantissa >> 8 = 0x42, but then only lower bits used
+        // target[31] = (mantissa >> 0) & 0xff after shifting = (0x004200 >> 8) & 0xff = 0x42
+        // target[30] = (mantissa >> 8 >> 8) & 0xff = 0
+        // Actually: mantissa >>= 8 => mantissa = 0x0042
+        // target[31] = mantissa & 0xff = 0x42
+        // exponent >= 2 => target[30] = (mantissa >> 8) & 0xff = 0x00
+        assert_eq!(target[31], 0x42);
+    }
+
+    #[test]
+    fn test_compact_exponent_3() {
+        let compact = CompactTarget(0x03420000);
+        let target = compact.to_target();
+        // exponent=3, mantissa=0x420000
+        // target[29] = 0x42
+        assert_eq!(target[29], 0x42);
+    }
+
+    #[test]
+    fn test_compact_from_u32_to_u32() {
+        let compact = CompactTarget::from_u32(0xDEADBEEF);
+        assert_eq!(compact.to_u32(), 0xDEADBEEF);
+    }
+
+    #[test]
+    fn test_hash_meets_target_equal() {
+        let compact = CompactTarget(0x1d00ffff);
+        let target = compact.to_target();
+        // Build a hash that equals the target exactly (should return true)
+        let mut hash = [0u8; 32];
+        // Target is big-endian, hash is little-endian (reversed)
+        for i in 0..32 {
+            hash[31 - i] = target[i];
+        }
+        assert!(compact.hash_meets_target(&hash));
+    }
+
+    #[test]
+    fn test_hash_meets_target_less() {
+        let compact = CompactTarget(0x1d00ffff);
+        // Hash of all zeros (lowest possible) should meet any target
+        let hash = [0u8; 32];
+        assert!(compact.hash_meets_target(&hash));
+    }
+
+    #[test]
+    fn test_hash_meets_target_greater() {
+        let compact = CompactTarget(0x1d00ffff);
+        // Hash of all 0xFF (highest possible) should not meet target
+        let hash = [0xffu8; 32];
+        assert!(!compact.hash_meets_target(&hash));
+    }
+
+    #[test]
+    fn test_compact_default() {
+        let compact = CompactTarget::default();
+        assert_eq!(compact.to_u32(), 0);
+    }
+
+    #[test]
+    fn test_compact_large_exponent() {
+        // exponent = 32, mantissa = 0x000100
+        // start = 32 - 32 = 0
+        // target[0] = (mantissa >> 16) & 0xff = 0
+        // target[1] = (mantissa >> 8) & 0xff = 0x01
+        // target[2] = mantissa & 0xff = 0x00
+        let compact = CompactTarget(0x20000100);
+        let target = compact.to_target();
+        assert_eq!(target[1], 0x01);
+    }
 }

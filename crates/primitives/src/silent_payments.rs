@@ -394,6 +394,107 @@ mod tests {
     }
 
     #[test]
+    fn test_address_roundtrip_signet() {
+        let (scan, spend) = test_keys();
+        let addr = SilentPaymentAddress {
+            scan_key: scan,
+            spend_key: spend,
+            network: Network::Signet,
+        };
+        let encoded = addr.encode().unwrap();
+        assert!(encoded.starts_with("tsp1"), "signet address must start with tsp1, got {encoded}");
+        let decoded = SilentPaymentAddress::decode(&encoded).unwrap();
+        assert_eq!(decoded.network, Network::Testnet); // signet decodes as testnet HRP "tsp"
+    }
+
+    #[test]
+    fn test_address_roundtrip_regtest() {
+        let (scan, spend) = test_keys();
+        let addr = SilentPaymentAddress {
+            scan_key: scan,
+            spend_key: spend,
+            network: Network::Regtest,
+        };
+        let encoded = addr.encode().unwrap();
+        assert!(encoded.starts_with("tsp1"));
+    }
+
+    #[test]
+    fn test_silent_payment_error_display() {
+        let errors: Vec<SilentPaymentError> = vec![
+            SilentPaymentError::Bech32(crate::bech32::Bech32Error::InvalidChecksum),
+            SilentPaymentError::InvalidHrp("bad".into()),
+            SilentPaymentError::InvalidDataLength(10),
+            SilentPaymentError::InvalidScanKeyLength(10),
+            SilentPaymentError::InvalidSpendKeyLength(10),
+            SilentPaymentError::WrongVariant,
+            SilentPaymentError::UnsupportedVersion(1),
+            SilentPaymentError::NullPointer,
+        ];
+        for e in errors {
+            let s = format!("{}", e);
+            assert!(!s.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_derive_output_key_different_outpoints() {
+        let secret = [0x42u8; 32];
+        let (_, spend) = test_keys();
+
+        let k1 = derive_output_key(&secret, &spend, &[0xAB; 36], 0);
+        let k2 = derive_output_key(&secret, &spend, &[0xCD; 36], 0);
+        assert_ne!(k1, k2, "different outpoints must yield different keys");
+    }
+
+    #[test]
+    fn test_scan_transaction_multiple_outputs() {
+        let secret = [0x42u8; 32];
+        let (_, spend) = test_keys();
+
+        let outpoints_blob = {
+            let mut v = Vec::new();
+            v.extend_from_slice(&[0xDD; 32]);
+            v.extend_from_slice(&0u32.to_le_bytes());
+            v
+        };
+
+        // Create two taproot outputs, one matching at index 0, one non-matching at index 1
+        let derived0 = derive_output_key(&secret, &spend, &outpoints_blob, 0);
+        let mut spk0 = vec![0x51, 0x20];
+        spk0.extend_from_slice(&derived0[1..]);
+
+        // Second output won't match (random x-coordinate)
+        let mut spk1 = vec![0x51, 0x20];
+        spk1.extend_from_slice(&[0xFF; 32]);
+
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([0xDD; 32]), 0),
+                script_sig: ScriptBuf::from_bytes(vec![]),
+                sequence: 0xffff_ffff,
+            }],
+            outputs: vec![
+                TxOut {
+                    value: Amount::from_sat(10_000),
+                    script_pubkey: ScriptBuf::from_bytes(spk0),
+                },
+                TxOut {
+                    value: Amount::from_sat(5_000),
+                    script_pubkey: ScriptBuf::from_bytes(spk1),
+                },
+            ],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let matches = scan_transaction(&secret, &spend, &tx);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].0, 0);
+    }
+
+    #[test]
     fn test_scan_transaction_with_match() {
         let secret = [0x42u8; 32];
         let (_, spend) = test_keys();

@@ -89,6 +89,22 @@ impl Block {
     pub fn check_merkle_root(&self) -> bool {
         self.compute_merkle_root() == self.header.merkle_root
     }
+
+    /// Compute the BIP141 weight of this block.
+    ///
+    /// Block weight is the sum of all transaction weights plus the weight of the
+    /// block header overhead (header + tx count varint). The header and varint
+    /// are non-witness data, so they count at 4x (base * 3 + total, where
+    /// base == total for non-witness data).
+    pub fn weight(&self) -> usize {
+        // Header (80 bytes) + tx-count varint are purely non-witness data.
+        let header_size = BlockHeader::SIZE
+            + crate::encode::VarInt(self.transactions.len() as u64).encoded_size();
+        let overhead_weight = header_size * 4;
+
+        let tx_weight: usize = self.transactions.iter().map(|tx| tx.weight()).sum();
+        overhead_weight + tx_weight
+    }
 }
 
 impl Encodable for Block {
@@ -258,5 +274,144 @@ mod tests {
         assert!(result.is_err(), "Block with >100k transactions should be rejected");
         let err_msg = format!("{}", result.unwrap_err());
         assert!(err_msg.contains("too many transactions"), "Error should mention too many transactions, got: {}", err_msg);
+    }
+
+    #[test]
+    fn test_merkle_root_empty() {
+        let root = merkle_root(&[]);
+        assert_eq!(root, [0u8; 32]);
+    }
+
+    #[test]
+    fn test_block_hash_via_block() {
+        let header = BlockHeader {
+            version: 1,
+            prev_blockhash: BlockHash::ZERO,
+            merkle_root: TxHash::from_bytes([0u8; 32]),
+            time: 1231006505,
+            bits: CompactTarget::MAX_TARGET,
+            nonce: 0,
+        };
+        let block = Block {
+            header,
+            transactions: Vec::new(),
+        };
+        assert_eq!(block.block_hash(), header.block_hash());
+    }
+
+    #[test]
+    fn test_block_compute_merkle_root_single_tx() {
+        let tx = crate::transaction::Transaction {
+            version: 1,
+            inputs: vec![crate::transaction::TxIn {
+                previous_output: crate::transaction::OutPoint::COINBASE,
+                script_sig: crate::script::ScriptBuf::from_bytes(vec![0x04]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![crate::transaction::TxOut {
+                value: crate::amount::Amount::from_sat(5_000_000_000),
+                script_pubkey: crate::script::ScriptBuf::new(),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let header = BlockHeader {
+            version: 1,
+            prev_blockhash: BlockHash::ZERO,
+            merkle_root: TxHash::from_bytes(tx.txid().to_bytes()),
+            time: 1231006505,
+            bits: CompactTarget::MAX_TARGET,
+            nonce: 0,
+        };
+
+        let block = Block {
+            header,
+            transactions: vec![tx],
+        };
+
+        assert!(block.check_merkle_root());
+    }
+
+    #[test]
+    fn test_block_weight() {
+        let tx = crate::transaction::Transaction {
+            version: 1,
+            inputs: vec![crate::transaction::TxIn {
+                previous_output: crate::transaction::OutPoint::COINBASE,
+                script_sig: crate::script::ScriptBuf::from_bytes(vec![0x04]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![crate::transaction::TxOut {
+                value: crate::amount::Amount::from_sat(5_000_000_000),
+                script_pubkey: crate::script::ScriptBuf::new(),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_blockhash: BlockHash::ZERO,
+                merkle_root: TxHash::from_bytes([0u8; 32]),
+                time: 0,
+                bits: CompactTarget::MAX_TARGET,
+                nonce: 0,
+            },
+            transactions: vec![tx.clone()],
+        };
+
+        let header_overhead = BlockHeader::SIZE + crate::encode::VarInt(1u64).encoded_size();
+        let expected_weight = header_overhead * 4 + tx.weight();
+        assert_eq!(block.weight(), expected_weight);
+    }
+
+    #[test]
+    fn test_block_encode_decode_roundtrip() {
+        let tx = crate::transaction::Transaction {
+            version: 1,
+            inputs: vec![crate::transaction::TxIn {
+                previous_output: crate::transaction::OutPoint::COINBASE,
+                script_sig: crate::script::ScriptBuf::from_bytes(vec![0x04, 0xff]),
+                sequence: 0xffffffff,
+            }],
+            outputs: vec![crate::transaction::TxOut {
+                value: crate::amount::Amount::from_sat(5_000_000_000),
+                script_pubkey: crate::script::ScriptBuf::new(),
+            }],
+            witness: Vec::new(),
+            lock_time: 0,
+        };
+
+        let block = Block {
+            header: BlockHeader {
+                version: 1,
+                prev_blockhash: BlockHash::ZERO,
+                merkle_root: TxHash::from_bytes([0xAB; 32]),
+                time: 1234567890,
+                bits: CompactTarget::MAX_TARGET,
+                nonce: 42,
+            },
+            transactions: vec![tx],
+        };
+
+        let encoded = encode::encode(&block);
+        let decoded: Block = encode::decode(&encoded).unwrap();
+        assert_eq!(decoded.header, block.header);
+        assert_eq!(decoded.transactions.len(), 1);
+    }
+
+    #[test]
+    fn test_block_header_encoded_size() {
+        let header = BlockHeader {
+            version: 1,
+            prev_blockhash: BlockHash::ZERO,
+            merkle_root: TxHash::from_bytes([0; 32]),
+            time: 0,
+            bits: CompactTarget::MAX_TARGET,
+            nonce: 0,
+        };
+        assert_eq!(header.encoded_size(), 80);
     }
 }

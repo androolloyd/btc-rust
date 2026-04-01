@@ -170,4 +170,81 @@ mod tests {
     fn test_hash_zero() {
         assert_eq!(BlockHash::ZERO.to_bytes(), [0u8; 32]);
     }
+
+    #[test]
+    fn test_hash_from_slice() {
+        let bytes = [0xAB; 32];
+        let hash = BlockHash::from_slice(&bytes);
+        assert_eq!(hash.to_bytes(), bytes);
+    }
+
+    #[test]
+    fn test_hash_as_bytes() {
+        let bytes = [0xCD; 32];
+        let hash = BlockHash::from_bytes(bytes);
+        assert_eq!(hash.as_bytes(), &bytes);
+    }
+
+    #[test]
+    fn test_hash_as_ref() {
+        let bytes = [0xEF; 32];
+        let hash = BlockHash::from_bytes(bytes);
+        let r: &[u8] = hash.as_ref();
+        assert_eq!(r, &bytes);
+    }
+
+    #[test]
+    fn test_hash_from_array() {
+        let bytes = [0x12; 32];
+        let hash: BlockHash = bytes.into();
+        assert_eq!(hash.to_bytes(), bytes);
+    }
+
+    #[test]
+    fn test_hash_debug_display() {
+        let hash = BlockHash::from_bytes([0x01; 32]);
+        let debug = format!("{:?}", hash);
+        assert!(debug.starts_with("BlockHash("));
+        let display = format!("{}", hash);
+        assert!(!display.is_empty());
+    }
+
+    #[test]
+    fn test_hash_from_hex_internal() {
+        let hex_str = "0101010101010101010101010101010101010101010101010101010101010101";
+        let hash = BlockHash::from_hex_internal(hex_str).unwrap();
+        assert_eq!(hash.to_bytes(), [0x01; 32]);
+    }
+
+    #[test]
+    fn test_txhash_compute() {
+        let data = b"some transaction bytes";
+        let hash = TxHash::compute(data);
+        assert_ne!(hash, TxHash::ZERO);
+    }
+
+    #[test]
+    fn test_hash160_type() {
+        let hash = Hash160::from_bytes([0xAA; 20]);
+        assert_eq!(Hash160::LEN, 20);
+        assert_eq!(hash.to_bytes(), [0xAA; 20]);
+        let hex = hash.to_hex();
+        assert_eq!(hex.len(), 40);
+    }
+
+    #[test]
+    fn test_hash256_type() {
+        let hash = Hash256::from_bytes([0xBB; 32]);
+        assert_eq!(Hash256::LEN, 32);
+        assert_eq!(hash.to_bytes(), [0xBB; 32]);
+    }
+
+    #[test]
+    fn test_hash_equality() {
+        let a = TxHash::from_bytes([0x01; 32]);
+        let b = TxHash::from_bytes([0x01; 32]);
+        let c = TxHash::from_bytes([0x02; 32]);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
 }

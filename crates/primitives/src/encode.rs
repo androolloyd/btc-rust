@@ -240,7 +240,7 @@ impl Decodable for Vec<u8> {
 }
 
 /// Helper to count bytes written without allocating
-struct CountWriter(usize);
+pub struct CountWriter(pub usize);
 
 impl Write for CountWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -316,5 +316,109 @@ mod tests {
         assert_eq!(encoded, vec![0x04, 0x01, 0x02, 0x03, 0x04]);
         let decoded: Vec<u8> = decode(&encoded).unwrap();
         assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_varint_encoded_size() {
+        assert_eq!(VarInt(0).encoded_size(), 1);
+        assert_eq!(VarInt(0xfc).encoded_size(), 1);
+        assert_eq!(VarInt(0xfd).encoded_size(), 3);
+        assert_eq!(VarInt(0xffff).encoded_size(), 3);
+        assert_eq!(VarInt(0x10000).encoded_size(), 5);
+        assert_eq!(VarInt(0xffff_ffff).encoded_size(), 5);
+        assert_eq!(VarInt(0x1_0000_0000).encoded_size(), 9);
+    }
+
+    #[test]
+    fn test_varint_from_usize() {
+        let vi = VarInt::from(42usize);
+        assert_eq!(vi.0, 42);
+    }
+
+    #[test]
+    fn test_u8_roundtrip() {
+        let val: u8 = 0xAB;
+        let encoded = encode(&val);
+        assert_eq!(encoded, vec![0xAB]);
+        let decoded: u8 = decode(&encoded).unwrap();
+        assert_eq!(decoded, val);
+    }
+
+    #[test]
+    fn test_u16_roundtrip() {
+        let val: u16 = 0xBEEF;
+        let encoded = encode(&val);
+        assert_eq!(encoded, vec![0xEF, 0xBE]);
+        let decoded: u16 = decode(&encoded).unwrap();
+        assert_eq!(decoded, val);
+    }
+
+    #[test]
+    fn test_i32_roundtrip() {
+        let val: i32 = -42;
+        let encoded = encode(&val);
+        let decoded: i32 = decode(&encoded).unwrap();
+        assert_eq!(decoded, val);
+    }
+
+    #[test]
+    fn test_u64_roundtrip() {
+        let val: u64 = 0xDEADBEEFCAFEBABE;
+        let encoded = encode(&val);
+        let decoded: u64 = decode(&encoded).unwrap();
+        assert_eq!(decoded, val);
+    }
+
+    #[test]
+    fn test_i64_roundtrip() {
+        let val: i64 = -999_999_999;
+        let encoded = encode(&val);
+        let decoded: i64 = decode(&encoded).unwrap();
+        assert_eq!(decoded, val);
+    }
+
+    #[test]
+    fn test_count_writer() {
+        let mut counter = CountWriter(0);
+        counter.write_all(b"hello").unwrap();
+        counter.flush().unwrap();
+        assert_eq!(counter.0, 5);
+    }
+
+    #[test]
+    fn test_encodable_encoded_size() {
+        let val: u32 = 42;
+        assert_eq!(val.encoded_size(), 4);
+        let vi = VarInt(0xfd);
+        assert_eq!(vi.encoded_size(), 3);
+    }
+
+    #[test]
+    fn test_encode_decode_helpers() {
+        let val: u32 = 12345;
+        let bytes = encode(&val);
+        let decoded: u32 = decode(&bytes).unwrap();
+        assert_eq!(decoded, val);
+    }
+
+    #[test]
+    fn test_vec_decode_too_large() {
+        // Create a varint encoding for a length > MAX_VEC_DECODE_SIZE
+        let mut buf = Vec::new();
+        VarInt(33 * 1024 * 1024).encode(&mut buf).unwrap();
+        let result = decode::<Vec<u8>>(&buf);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_encode_error_display() {
+        let e1 = EncodeError::Io(io::Error::new(io::ErrorKind::Other, "test"));
+        assert!(format!("{}", e1).contains("test"));
+        let e2 = EncodeError::InvalidData("bad data".into());
+        assert!(format!("{}", e2).contains("bad data"));
+        let e3 = EncodeError::VarIntTooLarge;
+        assert!(format!("{}", e3).contains("varint"));
+        let e4 = EncodeError::UnexpectedEof;
+        assert!(format!("{}", e4).contains("end"));
     }
 }

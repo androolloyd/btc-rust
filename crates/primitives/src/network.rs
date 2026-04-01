@@ -119,4 +119,69 @@ mod tests {
         assert_eq!(Network::Mainnet.p2pkh_version(), 0x00);
         assert_eq!(Network::Testnet.p2pkh_version(), 0x6f);
     }
+
+    #[test]
+    fn test_all_networks_magic() {
+        assert_eq!(Network::Signet.magic(), [0x0a, 0x03, 0xcf, 0x40]);
+        assert_eq!(Network::Regtest.magic(), [0xfa, 0xbf, 0xb5, 0xda]);
+    }
+
+    #[test]
+    fn test_all_networks_ports() {
+        assert_eq!(Network::Testnet.default_port(), 18333);
+        assert_eq!(Network::Signet.default_port(), 38333);
+        assert_eq!(Network::Regtest.default_port(), 18444);
+        assert_eq!(Network::Testnet.default_rpc_port(), 18332);
+        assert_eq!(Network::Signet.default_rpc_port(), 38332);
+        assert_eq!(Network::Regtest.default_rpc_port(), 18443);
+    }
+
+    #[test]
+    fn test_p2sh_versions() {
+        assert_eq!(Network::Mainnet.p2sh_version(), 0x05);
+        assert_eq!(Network::Testnet.p2sh_version(), 0xc4);
+        assert_eq!(Network::Signet.p2sh_version(), 0xc4);
+        assert_eq!(Network::Regtest.p2sh_version(), 0xc4);
+    }
+
+    #[test]
+    fn test_p2pkh_versions_all() {
+        assert_eq!(Network::Signet.p2pkh_version(), 0x6f);
+        assert_eq!(Network::Regtest.p2pkh_version(), 0x6f);
+    }
+
+    #[test]
+    fn test_bech32_hrp() {
+        assert_eq!(Network::Mainnet.bech32_hrp(), "bc");
+        assert_eq!(Network::Testnet.bech32_hrp(), "tb");
+        assert_eq!(Network::Signet.bech32_hrp(), "tb");
+        assert_eq!(Network::Regtest.bech32_hrp(), "bcrt");
+    }
+
+    #[test]
+    fn test_xprv_version() {
+        assert_eq!(Network::Mainnet.xprv_version(), [0x04, 0x88, 0xAD, 0xE4]);
+        assert_eq!(Network::Testnet.xprv_version(), [0x04, 0x35, 0x83, 0x94]);
+        assert_eq!(Network::Signet.xprv_version(), [0x04, 0x35, 0x83, 0x94]);
+        assert_eq!(Network::Regtest.xprv_version(), [0x04, 0x35, 0x83, 0x94]);
+    }
+
+    #[test]
+    fn test_xpub_version() {
+        assert_eq!(Network::Mainnet.xpub_version(), [0x04, 0x88, 0xB2, 0x1E]);
+        assert_eq!(Network::Testnet.xpub_version(), [0x04, 0x35, 0x87, 0xCF]);
+    }
+
+    #[test]
+    fn test_network_default() {
+        assert_eq!(Network::default(), Network::Mainnet);
+    }
+
+    #[test]
+    fn test_network_display() {
+        assert_eq!(Network::Mainnet.to_string(), "mainnet");
+        assert_eq!(Network::Testnet.to_string(), "testnet");
+        assert_eq!(Network::Signet.to_string(), "signet");
+        assert_eq!(Network::Regtest.to_string(), "regtest");
+    }
 }

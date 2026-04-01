@@ -819,4 +819,198 @@ mod tests {
         let parsed = parse_taptree(&s).unwrap();
         assert_eq!(parsed, tree);
     }
+
+    // ---- Additional coverage tests ----
+
+    #[test]
+    fn test_descriptor_error_display() {
+        // Cover all error Display impls via format!
+        let e1 = DescriptorError::Empty;
+        assert!(format!("{}", e1).contains("empty"));
+
+        let e2 = DescriptorError::MissingCloseParen;
+        assert!(format!("{}", e2).contains("closing parenthesis"));
+
+        let e3 = DescriptorError::TrailingCharacters("extra".into());
+        assert!(format!("{}", e3).contains("extra"));
+
+        let e4 = DescriptorError::UnknownType("foo".into());
+        assert!(format!("{}", e4).contains("foo"));
+
+        let e5 = DescriptorError::InvalidKey("badkey".into());
+        assert!(format!("{}", e5).contains("badkey"));
+
+        let e6 = DescriptorError::InvalidThreshold("abc".into());
+        assert!(format!("{}", e6).contains("abc"));
+
+        let e7 = DescriptorError::ThresholdTooHigh { k: 5, n: 2 };
+        assert!(format!("{}", e7).contains("5"));
+
+        let e8 = DescriptorError::MultiNoKeys;
+        assert!(format!("{}", e8).contains("at least one key"));
+
+        let e9 = DescriptorError::InvalidChecksum {
+            expected: "aaa".into(),
+            got: "bbb".into(),
+        };
+        assert!(format!("{}", e9).contains("aaa"));
+
+        let e10 = DescriptorError::UnsupportedScriptPubkey;
+        assert!(format!("{}", e10).contains("not supported"));
+
+        let e11 = DescriptorError::InvalidHex("badhex".into());
+        assert!(format!("{}", e11).contains("badhex"));
+    }
+
+    #[test]
+    fn test_parse_no_paren() {
+        // String with no '(' should yield UnknownType
+        assert!(matches!(
+            Descriptor::parse("noparens"),
+            Err(DescriptorError::UnknownType(_))
+        ));
+    }
+
+    #[test]
+    fn test_invalid_threshold_non_numeric() {
+        assert!(matches!(
+            Descriptor::parse("multi(abc,key1,key2)"),
+            Err(DescriptorError::InvalidThreshold(_))
+        ));
+    }
+
+    #[test]
+    fn test_raw_invalid_hex() {
+        let desc = Descriptor::Raw("zzzz".to_string());
+        assert!(matches!(desc.script_pubkey(), Err(DescriptorError::InvalidHex(_))));
+    }
+
+    #[test]
+    fn test_pkh_invalid_key_hex() {
+        let desc = Descriptor::Pkh("not_hex".to_string());
+        assert!(matches!(desc.script_pubkey(), Err(DescriptorError::InvalidKey(_))));
+    }
+
+    #[test]
+    fn test_wpkh_invalid_key_hex() {
+        let desc = Descriptor::Wpkh("not_hex".to_string());
+        assert!(matches!(desc.script_pubkey(), Err(DescriptorError::InvalidKey(_))));
+    }
+
+    #[test]
+    fn test_sh_unsupported_script_pubkey() {
+        let desc = Descriptor::Sh(Box::new(Descriptor::Pk("aa".to_string())));
+        assert!(matches!(desc.script_pubkey(), Err(DescriptorError::UnsupportedScriptPubkey)));
+    }
+
+    #[test]
+    fn test_wsh_unsupported_script_pubkey() {
+        let desc = Descriptor::Wsh(Box::new(Descriptor::Pk("aa".to_string())));
+        assert!(matches!(desc.script_pubkey(), Err(DescriptorError::UnsupportedScriptPubkey)));
+    }
+
+    #[test]
+    fn test_tr_unsupported_script_pubkey() {
+        let desc = Descriptor::Tr("key".to_string(), None);
+        assert!(matches!(desc.script_pubkey(), Err(DescriptorError::UnsupportedScriptPubkey)));
+    }
+
+    #[test]
+    fn test_multi_unsupported_script_pubkey() {
+        let desc = Descriptor::Multi(1, vec!["k1".to_string()]);
+        assert!(matches!(desc.script_pubkey(), Err(DescriptorError::UnsupportedScriptPubkey)));
+    }
+
+    #[test]
+    fn test_sortedmulti_unsupported_script_pubkey() {
+        let desc = Descriptor::SortedMulti(1, vec!["k1".to_string()]);
+        assert!(matches!(desc.script_pubkey(), Err(DescriptorError::UnsupportedScriptPubkey)));
+    }
+
+    #[test]
+    fn test_descriptor_checksum_different_types() {
+        let c1 = descriptor_checksum("pkh(key)").unwrap();
+        let c2 = descriptor_checksum("wpkh(key)").unwrap();
+        assert_ne!(c1, c2);
+    }
+
+    #[test]
+    fn test_polymod_coverage() {
+        // Exercise polymod with values that set different bits in c0
+        let mut c: u64 = 0xf_ffff_ffff; // large enough to set bits 0-4 in c0
+        c = polymod(c, 0);
+        assert_ne!(c, 0); // just verify it runs without panic
+    }
+
+    #[test]
+    fn test_descriptor_checksum_clscount_boundary() {
+        // A descriptor whose length is not a multiple of 3 exercises the clscount > 0 final path
+        let c = descriptor_checksum("pk(a)").unwrap();
+        assert_eq!(c.len(), 8);
+        // A descriptor with length that IS a multiple of 3
+        let c2 = descriptor_checksum("abc").unwrap();
+        assert_eq!(c2.len(), 8);
+    }
+
+    #[test]
+    fn test_display_all_descriptor_types() {
+        // Ensure Display works for every variant
+        assert_eq!(Descriptor::Pk("k".into()).to_string(), "pk(k)");
+        assert_eq!(Descriptor::Pkh("k".into()).to_string(), "pkh(k)");
+        assert_eq!(Descriptor::Wpkh("k".into()).to_string(), "wpkh(k)");
+        assert_eq!(
+            Descriptor::Sh(Box::new(Descriptor::Pk("k".into()))).to_string(),
+            "sh(pk(k))"
+        );
+        assert_eq!(
+            Descriptor::Wsh(Box::new(Descriptor::Pk("k".into()))).to_string(),
+            "wsh(pk(k))"
+        );
+        assert_eq!(Descriptor::Tr("k".into(), None).to_string(), "tr(k)");
+        assert_eq!(
+            Descriptor::Tr("k".into(), Some(Box::new(TapTree::Leaf("l".into())))).to_string(),
+            "tr(k,l)"
+        );
+        assert_eq!(
+            Descriptor::Multi(2, vec!["a".into(), "b".into()]).to_string(),
+            "multi(2,a,b)"
+        );
+        assert_eq!(
+            Descriptor::SortedMulti(1, vec!["x".into()]).to_string(),
+            "sortedmulti(1,x)"
+        );
+        assert_eq!(Descriptor::Addr("addr1".into()).to_string(), "addr(addr1)");
+        assert_eq!(Descriptor::Raw("ff".into()).to_string(), "raw(ff)");
+    }
+
+    #[test]
+    fn test_taptree_leaf_display() {
+        let leaf = TapTree::Leaf("mydata".to_string());
+        assert_eq!(leaf.to_string(), "mydata");
+    }
+
+    #[test]
+    fn test_parse_whitespace_trimming() {
+        let desc = Descriptor::parse("  pk(key)  ").unwrap();
+        assert!(matches!(desc, Descriptor::Pk(_)));
+    }
+
+    #[test]
+    fn test_split_top_level_commas_nested() {
+        let parts = split_top_level_commas("a,b(c,d),e");
+        assert_eq!(parts, vec!["a", "b(c,d)", "e"]);
+    }
+
+    #[test]
+    fn test_find_matching_paren_with_braces() {
+        let s = "a({b,c})";
+        let pos = find_matching_paren(s, 1).unwrap();
+        assert_eq!(pos, 7);
+    }
+
+    #[test]
+    fn test_taptree_missing_comma() {
+        let result = parse_taptree("{leftright}");
+        assert!(result.is_err());
+    }
 }

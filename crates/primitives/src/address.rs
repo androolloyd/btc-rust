@@ -411,4 +411,196 @@ mod tests {
         let decoded = Address::from_bech32(&s, Network::Mainnet).unwrap();
         assert_eq!(decoded, addr);
     }
+
+    // ---- Additional coverage tests ----
+
+    #[test]
+    fn test_p2pkh_from_pubkey() {
+        let pubkey = hex::decode("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798").unwrap();
+        let addr = Address::p2pkh_from_pubkey(&pubkey, Network::Mainnet);
+        match addr {
+            Address::P2pkh { network, .. } => assert_eq!(network, Network::Mainnet),
+            _ => panic!("expected P2PKH"),
+        }
+    }
+
+    #[test]
+    fn test_address_network() {
+        let cases = vec![
+            Address::P2pkh { hash: [0; 20], network: Network::Mainnet },
+            Address::P2sh { hash: [0; 20], network: Network::Testnet },
+            Address::P2wpkh { hash: [0; 20], network: Network::Signet },
+            Address::P2wsh { hash: [0; 32], network: Network::Regtest },
+            Address::P2tr { output_key: [0; 32], network: Network::Mainnet },
+        ];
+        let expected = vec![Network::Mainnet, Network::Testnet, Network::Signet, Network::Regtest, Network::Mainnet];
+        for (addr, net) in cases.iter().zip(expected.iter()) {
+            assert_eq!(addr.network(), *net);
+        }
+    }
+
+    #[test]
+    fn test_script_pubkey_all_types() {
+        let addr_p2pkh = Address::P2pkh { hash: [0xab; 20], network: Network::Mainnet };
+        assert!(addr_p2pkh.script_pubkey().is_p2pkh());
+
+        let addr_p2sh = Address::P2sh { hash: [0xcd; 20], network: Network::Mainnet };
+        assert!(addr_p2sh.script_pubkey().is_p2sh());
+
+        let addr_p2wpkh = Address::P2wpkh { hash: [0xef; 20], network: Network::Mainnet };
+        assert!(addr_p2wpkh.script_pubkey().is_p2wpkh());
+
+        let addr_p2wsh = Address::P2wsh { hash: [0x12; 32], network: Network::Mainnet };
+        assert!(addr_p2wsh.script_pubkey().is_p2wsh());
+
+        let addr_p2tr = Address::P2tr { output_key: [0x34; 32], network: Network::Mainnet };
+        assert!(addr_p2tr.script_pubkey().is_p2tr());
+    }
+
+    #[test]
+    fn test_to_base58_only_for_legacy() {
+        let addr_p2pkh = Address::P2pkh { hash: [0; 20], network: Network::Mainnet };
+        assert!(addr_p2pkh.to_base58().is_some());
+
+        let addr_p2sh = Address::P2sh { hash: [0; 20], network: Network::Mainnet };
+        assert!(addr_p2sh.to_base58().is_some());
+
+        let addr_p2wpkh = Address::P2wpkh { hash: [0; 20], network: Network::Mainnet };
+        assert!(addr_p2wpkh.to_base58().is_none());
+
+        let addr_p2wsh = Address::P2wsh { hash: [0; 32], network: Network::Mainnet };
+        assert!(addr_p2wsh.to_base58().is_none());
+
+        let addr_p2tr = Address::P2tr { output_key: [0; 32], network: Network::Mainnet };
+        assert!(addr_p2tr.to_base58().is_none());
+    }
+
+    #[test]
+    fn test_p2sh_base58_roundtrip() {
+        let hash = [0xab; 20];
+        let addr = Address::P2sh { hash, network: Network::Mainnet };
+        let encoded = addr.to_base58().unwrap();
+        let decoded = Address::from_base58(&encoded, Network::Mainnet).unwrap();
+        assert_eq!(decoded, addr);
+    }
+
+    #[test]
+    fn test_from_base58_unknown_version() {
+        // Create a base58check with an unknown version byte
+        let encoded = base58check_encode(0xFF, &[0; 20]);
+        let result = Address::from_base58(&encoded, Network::Mainnet);
+        assert!(matches!(result, Err(AddressError::UnknownVersion(0xFF))));
+    }
+
+    #[test]
+    fn test_from_base58_invalid_length() {
+        // payload != 20 bytes
+        let encoded = base58check_encode(0x00, &[0; 10]);
+        let result = Address::from_base58(&encoded, Network::Mainnet);
+        assert!(matches!(result, Err(AddressError::InvalidLength)));
+    }
+
+    #[test]
+    fn test_base58_decode_invalid_char() {
+        let result = base58_decode("0OIl"); // O, I, l not in base58
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_base58_decode_empty() {
+        let result = base58_decode("").unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_base58_encode_empty() {
+        let result = base58_encode(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_base58check_decode_too_short() {
+        let result = base58check_decode("111");
+        assert!(matches!(result, Err(AddressError::InvalidLength)));
+    }
+
+    #[test]
+    fn test_base58_leading_zeros() {
+        let data = vec![0, 0, 0, 1, 2, 3];
+        let encoded = base58_encode(&data);
+        assert!(encoded.starts_with("111")); // leading zeros map to '1'
+        let decoded = base58_decode(&encoded).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_display_p2pkh() {
+        let hash = hex::decode("62e907b15cbf27d5425399ebf6f0fb50ebb88f18").unwrap();
+        let mut h = [0u8; 20];
+        h.copy_from_slice(&hash);
+        let addr = Address::P2pkh { hash: h, network: Network::Mainnet };
+        let displayed = addr.to_string();
+        assert_eq!(displayed, "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa");
+    }
+
+    #[test]
+    fn test_display_p2sh() {
+        let hash = [0xab; 20];
+        let addr = Address::P2sh { hash, network: Network::Mainnet };
+        let displayed = addr.to_string();
+        // Should be a valid base58 P2SH address
+        let decoded = Address::from_base58(&displayed, Network::Mainnet).unwrap();
+        assert_eq!(decoded, addr);
+    }
+
+    #[test]
+    fn test_from_bech32_invalid_checksum() {
+        // Invalid checksum should fail
+        let result = Address::from_bech32("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t5", Network::Mainnet);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_testnet_p2pkh_address() {
+        let hash = [0; 20];
+        let addr = Address::P2pkh { hash, network: Network::Testnet };
+        let encoded = addr.to_base58().unwrap();
+        // Testnet P2PKH starts with 'm' or 'n'
+        let first = encoded.chars().next().unwrap();
+        assert!(first == 'm' || first == 'n');
+        let decoded = Address::from_base58(&encoded, Network::Testnet).unwrap();
+        assert_eq!(decoded, addr);
+    }
+
+    #[test]
+    fn test_testnet_p2sh_address() {
+        let hash = [0; 20];
+        let addr = Address::P2sh { hash, network: Network::Testnet };
+        let encoded = addr.to_base58().unwrap();
+        // Testnet P2SH starts with '2'
+        assert!(encoded.starts_with('2'));
+        let decoded = Address::from_base58(&encoded, Network::Testnet).unwrap();
+        assert_eq!(decoded, addr);
+    }
+
+    #[test]
+    fn test_address_error_display() {
+        let e1 = AddressError::InvalidBase58Char('!');
+        assert!(format!("{}", e1).contains("!"));
+        let e2 = AddressError::InvalidChecksum;
+        assert!(format!("{}", e2).contains("checksum"));
+        let e3 = AddressError::InvalidLength;
+        assert!(format!("{}", e3).contains("length"));
+        let e4 = AddressError::UnknownVersion(0xFF);
+        assert!(format!("{}", e4).contains("255"));
+    }
+
+    #[test]
+    fn test_from_bech32_p2wsh() {
+        let hash = [0xcd; 32];
+        let addr = Address::P2wsh { hash, network: Network::Mainnet };
+        let s = addr.to_string();
+        let decoded = Address::from_bech32(&s, Network::Mainnet).unwrap();
+        assert_eq!(decoded, addr);
+    }
 }
