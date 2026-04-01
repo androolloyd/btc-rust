@@ -18,13 +18,16 @@ use btc_primitives::encode;
 use btc_primitives::hash::{BlockHash, TxHash};
 use btc_primitives::transaction::{OutPoint, Transaction, TxOut};
 
-use crate::traits::{Database, DbTx, DbTxMut, StorageError};
+use crate::traits::{AddressIndexValue, Database, DbTx, DbTxMut, StorageError, TxBlockLocation};
 
 // Key namespace prefixes — separate logical tables within QMDB's flat keyspace
 const NS_BLOCK_HEADER: &[u8] = b"bh:";
 const NS_BLOCK_HEIGHT: &[u8] = b"ht:";
 const NS_TRANSACTION: &[u8] = b"tx:";
 const NS_UTXO: &[u8] = b"ut:";
+
+const NS_TX_BLOCK_INDEX: &[u8] = b"ti:";
+const NS_ADDRESS_INDEX: &[u8] = b"ai:";
 
 // Metadata keys
 const META_BEST_HEIGHT: &[u8] = b"mt:best_height";
@@ -223,6 +226,26 @@ impl DbTx for QmdbTx {
             _ => Err(StorageError::Corruption("invalid best hash".into())),
         }
     }
+
+    fn get_tx_block_index(&self, txid: &TxHash) -> Result<Option<TxBlockLocation>, StorageError> {
+        let key = make_key(NS_TX_BLOCK_INDEX, txid.as_bytes());
+        match self.read_value(&key) {
+            Some(bytes) if bytes.len() == 36 => {
+                let block_hash = BlockHash::from_slice(&bytes[..32]);
+                let mut pos_buf = [0u8; 4];
+                pos_buf.copy_from_slice(&bytes[32..36]);
+                Ok(Some(TxBlockLocation { block_hash, tx_position: u32::from_le_bytes(pos_buf) }))
+            }
+            Some(_) => Err(StorageError::Corruption("invalid tx_block_index length".into())),
+            None => Ok(None),
+        }
+    }
+
+    fn get_address_txs(&self, _script_hash: &[u8; 32]) -> Result<Vec<AddressIndexValue>, StorageError> {
+        // QMDB does not support range scans natively; return empty for now.
+        // A full implementation would use a separate index or iterate.
+        Ok(Vec::new())
+    }
 }
 
 /// Buffered write operation
@@ -344,6 +367,25 @@ impl DbTx for QmdbTxMut {
             _ => Err(StorageError::Corruption("invalid best hash".into())),
         }
     }
+
+    fn get_tx_block_index(&self, txid: &TxHash) -> Result<Option<TxBlockLocation>, StorageError> {
+        let key = make_key(NS_TX_BLOCK_INDEX, txid.as_bytes());
+        match self.read_value(&key) {
+            Some(bytes) if bytes.len() == 36 => {
+                let block_hash = BlockHash::from_slice(&bytes[..32]);
+                let mut pos_buf = [0u8; 4];
+                pos_buf.copy_from_slice(&bytes[32..36]);
+                Ok(Some(TxBlockLocation { block_hash, tx_position: u32::from_le_bytes(pos_buf) }))
+            }
+            Some(_) => Err(StorageError::Corruption("invalid tx_block_index length".into())),
+            None => Ok(None),
+        }
+    }
+
+    fn get_address_txs(&self, _script_hash: &[u8; 32]) -> Result<Vec<AddressIndexValue>, StorageError> {
+        // QMDB does not support range scans natively; return empty for now.
+        Ok(Vec::new())
+    }
 }
 
 impl DbTxMut for QmdbTxMut {
@@ -377,6 +419,42 @@ impl DbTxMut for QmdbTxMut {
     fn set_best_block(&self, height: u64, hash: &BlockHash) -> Result<(), StorageError> {
         self.buffer_upsert(META_BEST_HEIGHT.to_vec(), height.to_be_bytes().to_vec());
         self.buffer_upsert(META_BEST_HASH.to_vec(), hash.as_bytes().to_vec());
+        Ok(())
+    }
+
+    fn put_tx_block_index(
+        &self,
+        txid: &TxHash,
+        block_hash: &BlockHash,
+        tx_position: u32,
+    ) -> Result<(), StorageError> {
+        let key = make_key(NS_TX_BLOCK_INDEX, txid.as_bytes());
+        let mut value = Vec::with_capacity(36);
+        value.extend_from_slice(block_hash.as_bytes());
+        value.extend_from_slice(&tx_position.to_le_bytes());
+        self.buffer_upsert(key, value);
+        Ok(())
+    }
+
+    fn put_address_tx(
+        &self,
+        script_hash: &[u8; 32],
+        entry: &AddressIndexValue,
+    ) -> Result<(), StorageError> {
+        // Key: namespace + script_hash(32) + height(8 BE) + tx_position(4 BE) + output_index(4 BE)
+        let mut key = Vec::with_capacity(NS_ADDRESS_INDEX.len() + 48);
+        key.extend_from_slice(NS_ADDRESS_INDEX);
+        key.extend_from_slice(script_hash);
+        key.extend_from_slice(&entry.height.to_be_bytes());
+        key.extend_from_slice(&entry.tx_position.to_be_bytes());
+        key.extend_from_slice(&entry.output_index.to_be_bytes());
+
+        // Value: txid(32) + value(8 LE)
+        let mut value = Vec::with_capacity(40);
+        value.extend_from_slice(entry.txid.as_bytes());
+        value.extend_from_slice(&entry.value.to_le_bytes());
+
+        self.buffer_upsert(key, value);
         Ok(())
     }
 

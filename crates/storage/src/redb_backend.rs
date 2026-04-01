@@ -9,10 +9,10 @@ use btc_primitives::hash::{BlockHash, TxHash};
 use btc_primitives::transaction::{OutPoint, Transaction, TxOut};
 
 use crate::tables::{
-    META_BEST_HASH, META_BEST_HEIGHT, TABLE_BLOCK_INDEX, TABLE_HEADERS, TABLE_META,
-    TABLE_TRANSACTIONS, TABLE_UTXOS,
+    META_BEST_HASH, META_BEST_HEIGHT, TABLE_ADDRESS_INDEX, TABLE_BLOCK_INDEX, TABLE_HEADERS,
+    TABLE_META, TABLE_TRANSACTIONS, TABLE_TX_BLOCK_INDEX, TABLE_UTXOS,
 };
-use crate::traits::{Database, DbTx, DbTxMut, StorageError};
+use crate::traits::{AddressIndexValue, Database, DbTx, DbTxMut, StorageError, TxBlockLocation};
 
 /// Table definitions for redb.
 /// All tables use `&[u8]` keys and `&[u8]` values — serialization is handled
@@ -22,6 +22,10 @@ const BLOCK_INDEX: TableDefinition<&[u8], &[u8]> = TableDefinition::new(TABLE_BL
 const TRANSACTIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new(TABLE_TRANSACTIONS);
 const UTXOS: TableDefinition<&[u8], &[u8]> = TableDefinition::new(TABLE_UTXOS);
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new(TABLE_META);
+const TX_BLOCK_INDEX: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new(TABLE_TX_BLOCK_INDEX);
+const ADDRESS_INDEX: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new(TABLE_ADDRESS_INDEX);
 
 /// Concrete redb-backed database implementing the `Database` trait.
 pub struct RedbDatabase {
@@ -56,6 +60,12 @@ impl RedbDatabase {
             .map_err(|e| StorageError::Database(e.to_string()))?;
         write_txn
             .open_table(META)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        write_txn
+            .open_table(TX_BLOCK_INDEX)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        write_txn
+            .open_table(ADDRESS_INDEX)
             .map_err(|e| StorageError::Database(e.to_string()))?;
         write_txn
             .commit()
@@ -110,6 +120,90 @@ fn outpoint_key(outpoint: &OutPoint) -> [u8; 36] {
     key[..32].copy_from_slice(outpoint.txid.as_bytes());
     key[32..].copy_from_slice(&outpoint.vout.to_le_bytes());
     key
+}
+
+/// Encode an address-index key: script_hash(32) + height(8 BE) + tx_position(4 BE) + output_index(4 BE) = 48 bytes.
+/// This gives lexicographic ordering by (script_hash, height, tx_position, output_index).
+fn address_index_key(script_hash: &[u8; 32], height: u64, tx_position: u32, output_index: u32) -> [u8; 48] {
+    let mut key = [0u8; 48];
+    key[..32].copy_from_slice(script_hash);
+    key[32..40].copy_from_slice(&height.to_be_bytes());
+    key[40..44].copy_from_slice(&tx_position.to_be_bytes());
+    key[44..48].copy_from_slice(&output_index.to_be_bytes());
+    key
+}
+
+/// Encode a TxBlockLocation as block_hash(32) + tx_position(4 LE) = 36 bytes.
+fn encode_tx_block_location(loc: &TxBlockLocation) -> [u8; 36] {
+    let mut buf = [0u8; 36];
+    buf[..32].copy_from_slice(loc.block_hash.as_bytes());
+    buf[32..].copy_from_slice(&loc.tx_position.to_le_bytes());
+    buf
+}
+
+/// Decode a TxBlockLocation from 36 bytes.
+fn decode_tx_block_location(data: &[u8]) -> Result<TxBlockLocation, StorageError> {
+    if data.len() != 36 {
+        return Err(StorageError::Corruption(format!(
+            "tx_block_location has invalid length: {}",
+            data.len()
+        )));
+    }
+    let block_hash = BlockHash::from_slice(&data[..32]);
+    let mut pos_buf = [0u8; 4];
+    pos_buf.copy_from_slice(&data[32..36]);
+    let tx_position = u32::from_le_bytes(pos_buf);
+    Ok(TxBlockLocation { block_hash, tx_position })
+}
+
+/// Encode an AddressIndexValue for storage.
+/// Layout: txid(32) + value(8 LE i64) = 40 bytes.
+/// (height, tx_position, output_index are encoded in the key.)
+fn encode_address_index_value(entry: &AddressIndexValue) -> [u8; 40] {
+    let mut buf = [0u8; 40];
+    buf[..32].copy_from_slice(entry.txid.as_bytes());
+    buf[32..40].copy_from_slice(&entry.value.to_le_bytes());
+    buf
+}
+
+/// Decode an AddressIndexValue from key (48 bytes) + value (40 bytes).
+fn decode_address_index_entry(key: &[u8], val: &[u8]) -> Result<AddressIndexValue, StorageError> {
+    if key.len() != 48 {
+        return Err(StorageError::Corruption(format!(
+            "address_index key has invalid length: {}",
+            key.len()
+        )));
+    }
+    if val.len() != 40 {
+        return Err(StorageError::Corruption(format!(
+            "address_index value has invalid length: {}",
+            val.len()
+        )));
+    }
+    let mut height_buf = [0u8; 8];
+    height_buf.copy_from_slice(&key[32..40]);
+    let height = u64::from_be_bytes(height_buf);
+
+    let mut pos_buf = [0u8; 4];
+    pos_buf.copy_from_slice(&key[40..44]);
+    let tx_position = u32::from_be_bytes(pos_buf);
+
+    let mut out_buf = [0u8; 4];
+    out_buf.copy_from_slice(&key[44..48]);
+    let output_index = u32::from_be_bytes(out_buf);
+
+    let txid = TxHash::from_slice(&val[..32]);
+    let mut val_buf = [0u8; 8];
+    val_buf.copy_from_slice(&val[32..40]);
+    let value = i64::from_le_bytes(val_buf);
+
+    Ok(AddressIndexValue {
+        txid,
+        height,
+        tx_position,
+        value,
+        output_index,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -256,6 +350,78 @@ impl DbTx for RedbTx {
             None => Ok(BlockHash::ZERO),
         }
     }
+
+    fn get_tx_block_index(&self, txid: &TxHash) -> Result<Option<TxBlockLocation>, StorageError> {
+        let table = self
+            .inner
+            .open_table(TX_BLOCK_INDEX)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let key = txhash_key(txid);
+        match table
+            .get(key.as_slice())
+            .map_err(|e| StorageError::Database(e.to_string()))?
+        {
+            Some(val) => Ok(Some(decode_tx_block_location(val.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn get_address_txs(&self, script_hash: &[u8; 32]) -> Result<Vec<AddressIndexValue>, StorageError> {
+        let table = self
+            .inner
+            .open_table(ADDRESS_INDEX)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        // Range scan: all keys starting with script_hash.
+        // Start key: script_hash + 0x00...
+        let start = address_index_key(script_hash, 0, 0, 0);
+        // End key: script_hash + 0xFF... (exclusive upper bound)
+        let mut end_hash = *script_hash;
+        // Increment the last byte that can be incremented, to get the exclusive upper bound.
+        // For simplicity, use an end key one-past the script_hash prefix.
+        let mut end = [0xffu8; 48];
+        end[..32].copy_from_slice(&end_hash);
+
+        // Actually, we want all keys where the first 32 bytes == script_hash.
+        // Use range: [start, end) where end is script_hash with all suffix bytes = 0xFF + 1.
+        // The simplest approach: increment the script_hash for the end bound.
+        let mut carry = true;
+        for i in (0..32).rev() {
+            if carry {
+                let (new_val, overflow) = end_hash[i].overflowing_add(1);
+                end_hash[i] = new_val;
+                carry = overflow;
+            }
+        }
+
+        let mut results = Vec::new();
+
+        if carry {
+            // script_hash was all 0xFF — scan to end of table
+            for entry in table
+                .range(start.as_slice()..)
+                .map_err(|e| StorageError::Database(e.to_string()))?
+            {
+                let (k, v) = entry.map_err(|e| StorageError::Database(e.to_string()))?;
+                let key_bytes = k.value();
+                if &key_bytes[..32] != script_hash {
+                    break;
+                }
+                results.push(decode_address_index_entry(key_bytes, v.value())?);
+            }
+        } else {
+            let end_key = address_index_key(&end_hash, 0, 0, 0);
+            for entry in table
+                .range(start.as_slice()..end_key.as_slice())
+                .map_err(|e| StorageError::Database(e.to_string()))?
+            {
+                let (k, v) = entry.map_err(|e| StorageError::Database(e.to_string()))?;
+                results.push(decode_address_index_entry(k.value(), v.value())?);
+            }
+        }
+
+        Ok(results)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -399,6 +565,69 @@ impl DbTx for RedbTxMut {
             None => Ok(BlockHash::ZERO),
         }
     }
+
+    fn get_tx_block_index(&self, txid: &TxHash) -> Result<Option<TxBlockLocation>, StorageError> {
+        let table = self
+            .inner
+            .open_table(TX_BLOCK_INDEX)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let key = txhash_key(txid);
+        let guard = table
+            .get(key.as_slice())
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        match guard {
+            Some(val) => {
+                let loc = decode_tx_block_location(val.value())?;
+                Ok(Some(loc))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn get_address_txs(&self, script_hash: &[u8; 32]) -> Result<Vec<AddressIndexValue>, StorageError> {
+        let table = self
+            .inner
+            .open_table(ADDRESS_INDEX)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+
+        let start = address_index_key(script_hash, 0, 0, 0);
+        let mut end_hash = *script_hash;
+        let mut carry = true;
+        for i in (0..32).rev() {
+            if carry {
+                let (new_val, overflow) = end_hash[i].overflowing_add(1);
+                end_hash[i] = new_val;
+                carry = overflow;
+            }
+        }
+
+        let mut results = Vec::new();
+
+        if carry {
+            for entry in table
+                .range(start.as_slice()..)
+                .map_err(|e| StorageError::Database(e.to_string()))?
+            {
+                let (k, v) = entry.map_err(|e| StorageError::Database(e.to_string()))?;
+                let key_bytes = k.value();
+                if &key_bytes[..32] != script_hash {
+                    break;
+                }
+                results.push(decode_address_index_entry(key_bytes, v.value())?);
+            }
+        } else {
+            let end_key = address_index_key(&end_hash, 0, 0, 0);
+            for entry in table
+                .range(start.as_slice()..end_key.as_slice())
+                .map_err(|e| StorageError::Database(e.to_string()))?
+            {
+                let (k, v) = entry.map_err(|e| StorageError::Database(e.to_string()))?;
+                results.push(decode_address_index_entry(k.value(), v.value())?);
+            }
+        }
+
+        Ok(results)
+    }
 }
 
 impl DbTxMut for RedbTxMut {
@@ -483,6 +712,45 @@ impl DbTxMut for RedbTxMut {
             .map_err(|e| StorageError::Database(e.to_string()))?;
         table
             .insert(META_BEST_HASH, hash.as_bytes().as_slice())
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    fn put_tx_block_index(
+        &self,
+        txid: &TxHash,
+        block_hash: &BlockHash,
+        tx_position: u32,
+    ) -> Result<(), StorageError> {
+        let mut table = self
+            .inner
+            .open_table(TX_BLOCK_INDEX)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let key = txhash_key(txid);
+        let loc = TxBlockLocation {
+            block_hash: *block_hash,
+            tx_position,
+        };
+        let value = encode_tx_block_location(&loc);
+        table
+            .insert(key.as_slice(), value.as_slice())
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    fn put_address_tx(
+        &self,
+        script_hash: &[u8; 32],
+        entry: &AddressIndexValue,
+    ) -> Result<(), StorageError> {
+        let mut table = self
+            .inner
+            .open_table(ADDRESS_INDEX)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let key = address_index_key(script_hash, entry.height, entry.tx_position, entry.output_index);
+        let value = encode_address_index_value(entry);
+        table
+            .insert(key.as_slice(), value.as_slice())
             .map_err(|e| StorageError::Database(e.to_string()))?;
         Ok(())
     }
@@ -1121,5 +1389,298 @@ mod tests {
 
         let provider = BlockchainProvider::new(db);
         assert_eq!(provider.utxo(&outpoint).unwrap(), Some(txout));
+    }
+
+    // -----------------------------------------------------------------------
+    // Transaction block index
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tx_block_index_roundtrip() {
+        let (db, _dir) = temp_db();
+        let txid = TxHash::from_bytes([0xaa; 32]);
+        let block_hash = BlockHash::from_bytes([0xbb; 32]);
+
+        {
+            let tx = db.tx_mut().unwrap();
+            tx.put_tx_block_index(&txid, &block_hash, 5).unwrap();
+            tx.commit().unwrap();
+        }
+
+        {
+            let tx = db.tx().unwrap();
+            let loc = tx.get_tx_block_index(&txid).unwrap().unwrap();
+            assert_eq!(loc.block_hash, block_hash);
+            assert_eq!(loc.tx_position, 5);
+        }
+    }
+
+    #[test]
+    fn test_tx_block_index_missing() {
+        let (db, _dir) = temp_db();
+        let tx = db.tx().unwrap();
+        let missing = tx
+            .get_tx_block_index(&TxHash::from_bytes([0xff; 32]))
+            .unwrap();
+        assert!(missing.is_none());
+    }
+
+    #[test]
+    fn test_tx_block_index_overwrite() {
+        let (db, _dir) = temp_db();
+        let txid = TxHash::from_bytes([0xcc; 32]);
+        let hash1 = BlockHash::from_bytes([0x11; 32]);
+        let hash2 = BlockHash::from_bytes([0x22; 32]);
+
+        {
+            let tx = db.tx_mut().unwrap();
+            tx.put_tx_block_index(&txid, &hash1, 0).unwrap();
+            tx.commit().unwrap();
+        }
+        {
+            let tx = db.tx_mut().unwrap();
+            tx.put_tx_block_index(&txid, &hash2, 3).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let tx = db.tx().unwrap();
+        let loc = tx.get_tx_block_index(&txid).unwrap().unwrap();
+        assert_eq!(loc.block_hash, hash2);
+        assert_eq!(loc.tx_position, 3);
+    }
+
+    #[test]
+    fn test_tx_block_index_read_through_write_tx() {
+        let (db, _dir) = temp_db();
+        let txid = TxHash::from_bytes([0xdd; 32]);
+        let block_hash = BlockHash::from_bytes([0xee; 32]);
+
+        let tx = db.tx_mut().unwrap();
+        tx.put_tx_block_index(&txid, &block_hash, 7).unwrap();
+
+        // Read back via same write tx
+        let loc = tx.get_tx_block_index(&txid).unwrap().unwrap();
+        assert_eq!(loc.block_hash, block_hash);
+        assert_eq!(loc.tx_position, 7);
+
+        // Missing txid
+        assert!(tx
+            .get_tx_block_index(&TxHash::from_bytes([0x00; 32]))
+            .unwrap()
+            .is_none());
+
+        tx.commit().unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Address index
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_address_index_roundtrip() {
+        use crate::traits::AddressIndexValue;
+
+        let (db, _dir) = temp_db();
+        let script_hash = [0xaa; 32];
+        let entry = AddressIndexValue {
+            txid: TxHash::from_bytes([0xbb; 32]),
+            height: 100,
+            tx_position: 1,
+            value: 50_000,
+            output_index: 0,
+        };
+
+        {
+            let tx = db.tx_mut().unwrap();
+            tx.put_address_tx(&script_hash, &entry).unwrap();
+            tx.commit().unwrap();
+        }
+
+        {
+            let tx = db.tx().unwrap();
+            let results = tx.get_address_txs(&script_hash).unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].txid, entry.txid);
+            assert_eq!(results[0].height, 100);
+            assert_eq!(results[0].tx_position, 1);
+            assert_eq!(results[0].value, 50_000);
+            assert_eq!(results[0].output_index, 0);
+        }
+    }
+
+    #[test]
+    fn test_address_index_multiple_entries() {
+        use crate::traits::AddressIndexValue;
+
+        let (db, _dir) = temp_db();
+        let script_hash = [0xcc; 32];
+
+        let entries = vec![
+            AddressIndexValue {
+                txid: TxHash::from_bytes([0x01; 32]),
+                height: 10,
+                tx_position: 0,
+                value: 100_000,
+                output_index: 0,
+            },
+            AddressIndexValue {
+                txid: TxHash::from_bytes([0x02; 32]),
+                height: 20,
+                tx_position: 1,
+                value: -50_000,
+                output_index: 0,
+            },
+            AddressIndexValue {
+                txid: TxHash::from_bytes([0x03; 32]),
+                height: 30,
+                tx_position: 0,
+                value: 200_000,
+                output_index: 1,
+            },
+        ];
+
+        {
+            let tx = db.tx_mut().unwrap();
+            for entry in &entries {
+                tx.put_address_tx(&script_hash, entry).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        {
+            let tx = db.tx().unwrap();
+            let results = tx.get_address_txs(&script_hash).unwrap();
+            assert_eq!(results.len(), 3);
+            // Should be ordered by height (lexicographic key order)
+            assert_eq!(results[0].height, 10);
+            assert_eq!(results[1].height, 20);
+            assert_eq!(results[2].height, 30);
+        }
+    }
+
+    #[test]
+    fn test_address_index_empty() {
+        let (db, _dir) = temp_db();
+        let tx = db.tx().unwrap();
+        let missing = [0xff; 32];
+        let results = tx.get_address_txs(&missing).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_address_index_different_scripts_isolated() {
+        use crate::traits::AddressIndexValue;
+
+        let (db, _dir) = temp_db();
+        let script_a = [0xaa; 32];
+        let script_b = [0xbb; 32];
+
+        {
+            let tx = db.tx_mut().unwrap();
+            tx.put_address_tx(
+                &script_a,
+                &AddressIndexValue {
+                    txid: TxHash::from_bytes([0x01; 32]),
+                    height: 1,
+                    tx_position: 0,
+                    value: 1000,
+                    output_index: 0,
+                },
+            )
+            .unwrap();
+            tx.put_address_tx(
+                &script_b,
+                &AddressIndexValue {
+                    txid: TxHash::from_bytes([0x02; 32]),
+                    height: 2,
+                    tx_position: 0,
+                    value: 2000,
+                    output_index: 0,
+                },
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        {
+            let tx = db.tx().unwrap();
+            let a_results = tx.get_address_txs(&script_a).unwrap();
+            assert_eq!(a_results.len(), 1);
+            assert_eq!(a_results[0].value, 1000);
+
+            let b_results = tx.get_address_txs(&script_b).unwrap();
+            assert_eq!(b_results.len(), 1);
+            assert_eq!(b_results[0].value, 2000);
+        }
+    }
+
+    #[test]
+    fn test_address_index_read_through_write_tx() {
+        use crate::traits::AddressIndexValue;
+
+        let (db, _dir) = temp_db();
+        let script_hash = [0xdd; 32];
+        let entry = AddressIndexValue {
+            txid: TxHash::from_bytes([0xee; 32]),
+            height: 50,
+            tx_position: 2,
+            value: 75_000,
+            output_index: 1,
+        };
+
+        let tx = db.tx_mut().unwrap();
+        tx.put_address_tx(&script_hash, &entry).unwrap();
+
+        // Read back via same write tx
+        let results = tx.get_address_txs(&script_hash).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].value, 75_000);
+        assert_eq!(results[0].output_index, 1);
+
+        tx.commit().unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Key encoding helpers (new)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_address_index_key_encoding() {
+        let hash = [0xab; 32];
+        let key = address_index_key(&hash, 100, 5, 2);
+        assert_eq!(key.len(), 48);
+        assert_eq!(&key[..32], &[0xab; 32]);
+        assert_eq!(&key[32..40], &100u64.to_be_bytes());
+        assert_eq!(&key[40..44], &5u32.to_be_bytes());
+        assert_eq!(&key[44..48], &2u32.to_be_bytes());
+    }
+
+    #[test]
+    fn test_address_index_key_ordering() {
+        let hash = [0xab; 32];
+        // Same script_hash, different heights should sort correctly.
+        let k1 = address_index_key(&hash, 0, 0, 0);
+        let k2 = address_index_key(&hash, 1, 0, 0);
+        let k3 = address_index_key(&hash, 100, 0, 0);
+        assert!(k1 < k2);
+        assert!(k2 < k3);
+    }
+
+    #[test]
+    fn test_tx_block_location_encoding() {
+        let loc = TxBlockLocation {
+            block_hash: BlockHash::from_bytes([0xcc; 32]),
+            tx_position: 42,
+        };
+        let encoded = encode_tx_block_location(&loc);
+        let decoded = decode_tx_block_location(&encoded).unwrap();
+        assert_eq!(decoded.block_hash, loc.block_hash);
+        assert_eq!(decoded.tx_position, loc.tx_position);
+    }
+
+    #[test]
+    fn test_tx_block_location_decoding_invalid_length() {
+        let result = decode_tx_block_location(&[0u8; 10]);
+        assert!(result.is_err());
     }
 }

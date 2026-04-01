@@ -29,6 +29,30 @@ pub trait Database: Send + Sync + 'static {
     fn tx_mut(&self) -> Result<Self::TXMut, StorageError>;
 }
 
+/// A transaction's location within the blockchain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxBlockLocation {
+    /// The hash of the block containing this transaction.
+    pub block_hash: BlockHash,
+    /// The position of the transaction within the block (0 = coinbase).
+    pub tx_position: u32,
+}
+
+/// An entry in the per-address (per-script) index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressIndexValue {
+    /// The txid that affected this script.
+    pub txid: TxHash,
+    /// The block height.
+    pub height: u64,
+    /// Position of the tx within the block.
+    pub tx_position: u32,
+    /// Satoshi value: positive for received outputs, negative for spends.
+    pub value: i64,
+    /// Output index (vout) for receives, or the original output index for spends.
+    pub output_index: u32,
+}
+
 /// Read-only database transaction
 pub trait DbTx: Send + Sync {
     fn get_block_header(&self, hash: &BlockHash) -> Result<Option<BlockHeader>, StorageError>;
@@ -37,6 +61,12 @@ pub trait DbTx: Send + Sync {
     fn get_utxo(&self, outpoint: &OutPoint) -> Result<Option<TxOut>, StorageError>;
     fn get_best_block_height(&self) -> Result<u64, StorageError>;
     fn get_best_block_hash(&self) -> Result<BlockHash, StorageError>;
+
+    /// Look up which block contains a transaction.
+    fn get_tx_block_index(&self, txid: &TxHash) -> Result<Option<TxBlockLocation>, StorageError>;
+
+    /// Get all transaction entries for a given script hash (address index).
+    fn get_address_txs(&self, script_hash: &[u8; 32]) -> Result<Vec<AddressIndexValue>, StorageError>;
 }
 
 /// Read-write database transaction
@@ -47,6 +77,22 @@ pub trait DbTxMut: DbTx {
     fn put_utxo(&self, outpoint: &OutPoint, txout: &TxOut) -> Result<(), StorageError>;
     fn delete_utxo(&self, outpoint: &OutPoint) -> Result<(), StorageError>;
     fn set_best_block(&self, height: u64, hash: &BlockHash) -> Result<(), StorageError>;
+
+    /// Store which block contains a transaction.
+    fn put_tx_block_index(
+        &self,
+        txid: &TxHash,
+        block_hash: &BlockHash,
+        tx_position: u32,
+    ) -> Result<(), StorageError>;
+
+    /// Index a transaction's effect on a script (address).
+    fn put_address_tx(
+        &self,
+        script_hash: &[u8; 32],
+        entry: &AddressIndexValue,
+    ) -> Result<(), StorageError>;
+
     fn commit(self) -> Result<(), StorageError>;
 }
 

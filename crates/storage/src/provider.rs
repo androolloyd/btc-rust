@@ -1,7 +1,7 @@
 use btc_primitives::block::BlockHeader;
 use btc_primitives::hash::{BlockHash, TxHash};
 use btc_primitives::transaction::{Transaction, TxOut, OutPoint};
-use crate::traits::{Database, DbTx, StorageError};
+use crate::traits::{AddressIndexValue, Database, DbTx, StorageError, TxBlockLocation};
 
 /// High-level provider over raw database operations (reth-style two-tier pattern)
 pub struct BlockchainProvider<DB: Database> {
@@ -45,6 +45,33 @@ impl<DB: Database> BlockchainProvider<DB> {
     pub fn best_block_hash(&self) -> Result<BlockHash, StorageError> {
         let tx = self.db.tx()?;
         tx.get_best_block_hash()
+    }
+
+    /// Look up which block contains a transaction.
+    pub fn tx_block_location(&self, txid: &TxHash) -> Result<Option<TxBlockLocation>, StorageError> {
+        let tx = self.db.tx()?;
+        tx.get_tx_block_index(txid)
+    }
+
+    /// Get all transaction entries for a given script hash.
+    pub fn address_txs(&self, script_hash: &[u8; 32]) -> Result<Vec<AddressIndexValue>, StorageError> {
+        let tx = self.db.tx()?;
+        tx.get_address_txs(script_hash)
+    }
+
+    /// Get unspent outputs for a given script hash.
+    pub fn address_utxos(&self, script_hash: &[u8; 32]) -> Result<Vec<AddressIndexValue>, StorageError> {
+        let entries = self.address_txs(script_hash)?;
+        // Collect spent (txid, output_index) pairs
+        let spent: std::collections::HashSet<(TxHash, u32)> = entries
+            .iter()
+            .filter(|e| e.value < 0)
+            .map(|e| (e.txid, e.output_index))
+            .collect();
+        Ok(entries
+            .into_iter()
+            .filter(|e| e.value > 0 && !spent.contains(&(e.txid, e.output_index)))
+            .collect())
     }
 
     pub fn db(&self) -> &DB {

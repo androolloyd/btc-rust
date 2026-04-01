@@ -347,12 +347,22 @@ impl Clone for MetricsCollector {
 
 /// Handle all incoming HTTP requests and route them.
 pub fn handle_request(req: &HttpRequest, metrics: &MetricsCollector) -> HttpResponse {
+    // Strip query string for routing.
+    let path = req.path.split('?').next().unwrap_or(&req.path);
+
+    // POST /api/tx -- broadcast raw transaction
+    if req.method == "POST" && path == "/api/tx" {
+        return handle_broadcast_tx(req, metrics);
+    }
+
+    // GET /api/mempool/txids -- all mempool txids
+    if req.method == "GET" && path == "/api/mempool/txids" {
+        return handle_mempool_txids(metrics);
+    }
+
     if req.method != "GET" {
         return HttpResponse::bad_request("only GET is supported");
     }
-
-    // Strip query string for routing.
-    let path = req.path.split('?').next().unwrap_or(&req.path);
 
     // ---- Prometheus metrics ----
     if path == "/metrics" {
@@ -398,12 +408,32 @@ pub fn handle_request(req: &HttpRequest, metrics: &MetricsCollector) -> HttpResp
         return handle_block_height(&params, metrics);
     }
 
-    // GET /api/block/:hash
+    // GET /api/block/:hash/txids -- list of txids in block
+    if let Some(params) = match_route(path, "/api/block/:hash/txids") {
+        return handle_block_txids(&params, metrics);
+    }
+
+    // GET /api/block/:hash -- block info as JSON
     if let Some(params) = match_route(path, "/api/block/:hash") {
         return handle_block_by_hash(&params, metrics);
     }
 
-    // GET /api/tx/:txid
+    // GET /api/tx/:txid/hex -- raw transaction hex
+    if let Some(params) = match_route(path, "/api/tx/:txid/hex") {
+        return handle_tx_hex(&params, metrics);
+    }
+
+    // GET /api/tx/:txid/merkle-proof -- merkle proof
+    if let Some(params) = match_route(path, "/api/tx/:txid/merkle-proof") {
+        return handle_tx_merkle_proof(&params, metrics);
+    }
+
+    // GET /api/tx/:txid/outspend/:vout -- spending info for output
+    if let Some(params) = match_route(path, "/api/tx/:txid/outspend/:vout") {
+        return handle_tx_outspend(&params, metrics);
+    }
+
+    // GET /api/tx/:txid -- transaction info as JSON
     if let Some(params) = match_route(path, "/api/tx/:txid") {
         return handle_tx(&params, metrics);
     }
@@ -416,6 +446,16 @@ pub fn handle_request(req: &HttpRequest, metrics: &MetricsCollector) -> HttpResp
     // GET /api/address/:address/utxo
     if let Some(params) = match_route(path, "/api/address/:address/utxo") {
         return handle_address_utxo(&params, metrics);
+    }
+
+    // GET /api/address/:address -- address info (tx count, balance)
+    if let Some(params) = match_route(path, "/api/address/:address") {
+        return handle_address_info(&params, metrics);
+    }
+
+    // GET /api/scripthash/:hash/utxo
+    if let Some(params) = match_route(path, "/api/scripthash/:hash/utxo") {
+        return handle_scripthash_utxo(&params, metrics);
     }
 
     HttpResponse::not_found()
@@ -516,6 +556,144 @@ fn handle_address_utxo(
     }
     // Stub: return an empty array.
     HttpResponse::json("[]")
+}
+
+/// `GET /api/block/:hash/txids` -- list of txids in a block.
+fn handle_block_txids(
+    params: &HashMap<String, String>,
+    _metrics: &MetricsCollector,
+) -> HttpResponse {
+    let hash = match params.get("hash") {
+        Some(h) => h,
+        None => return HttpResponse::bad_request("missing hash parameter"),
+    };
+    if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return HttpResponse::bad_request("invalid block hash");
+    }
+    // Stub: return an empty array. A real implementation would look up the block
+    // and return its transaction IDs.
+    HttpResponse::json("[]")
+}
+
+/// `GET /api/tx/:txid/hex` -- raw transaction as hex.
+fn handle_tx_hex(
+    params: &HashMap<String, String>,
+    _metrics: &MetricsCollector,
+) -> HttpResponse {
+    let txid = match params.get("txid") {
+        Some(t) => t,
+        None => return HttpResponse::bad_request("missing txid parameter"),
+    };
+    if txid.len() != 64 || !txid.chars().all(|c| c.is_ascii_hexdigit()) {
+        return HttpResponse::bad_request("invalid txid");
+    }
+    // Stub: return empty hex. A real implementation would serialize the tx.
+    HttpResponse::text("")
+}
+
+/// `GET /api/tx/:txid/merkle-proof` -- merkle inclusion proof.
+fn handle_tx_merkle_proof(
+    params: &HashMap<String, String>,
+    _metrics: &MetricsCollector,
+) -> HttpResponse {
+    let txid = match params.get("txid") {
+        Some(t) => t,
+        None => return HttpResponse::bad_request("missing txid parameter"),
+    };
+    if txid.len() != 64 || !txid.chars().all(|c| c.is_ascii_hexdigit()) {
+        return HttpResponse::bad_request("invalid txid");
+    }
+    // Stub: return a proof skeleton.
+    let json = format!(
+        r#"{{"block_height":0,"merkle":[],"pos":0}}"#,
+    );
+    HttpResponse::json(&json)
+}
+
+/// `GET /api/tx/:txid/outspend/:vout` -- spending info for a specific output.
+fn handle_tx_outspend(
+    params: &HashMap<String, String>,
+    _metrics: &MetricsCollector,
+) -> HttpResponse {
+    let txid = match params.get("txid") {
+        Some(t) => t,
+        None => return HttpResponse::bad_request("missing txid parameter"),
+    };
+    if txid.len() != 64 || !txid.chars().all(|c| c.is_ascii_hexdigit()) {
+        return HttpResponse::bad_request("invalid txid");
+    }
+    let vout_str = match params.get("vout") {
+        Some(v) => v,
+        None => return HttpResponse::bad_request("missing vout parameter"),
+    };
+    let _vout: u32 = match vout_str.parse() {
+        Ok(v) => v,
+        Err(_) => return HttpResponse::bad_request("invalid vout"),
+    };
+    // Stub: return unspent. A real implementation would check the UTXO set.
+    HttpResponse::json(r#"{"spent":false}"#)
+}
+
+/// `GET /api/address/:address` -- address summary info.
+fn handle_address_info(
+    params: &HashMap<String, String>,
+    _metrics: &MetricsCollector,
+) -> HttpResponse {
+    let address = match params.get("address") {
+        Some(a) => a,
+        None => return HttpResponse::bad_request("missing address parameter"),
+    };
+    if address.is_empty() {
+        return HttpResponse::bad_request("empty address");
+    }
+    // Stub: return zero-balance address info.
+    let json = format!(
+        r#"{{"address":"{address}","chain_stats":{{"funded_txo_count":0,"funded_txo_sum":0,"spent_txo_count":0,"spent_txo_sum":0,"tx_count":0}},"mempool_stats":{{"funded_txo_count":0,"funded_txo_sum":0,"spent_txo_count":0,"spent_txo_sum":0,"tx_count":0}}}}"#,
+    );
+    HttpResponse::json(&json)
+}
+
+/// `GET /api/scripthash/:hash/utxo` -- UTXOs for a script hash.
+fn handle_scripthash_utxo(
+    params: &HashMap<String, String>,
+    _metrics: &MetricsCollector,
+) -> HttpResponse {
+    let hash = match params.get("hash") {
+        Some(h) => h,
+        None => return HttpResponse::bad_request("missing hash parameter"),
+    };
+    if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return HttpResponse::bad_request("invalid script hash");
+    }
+    // Stub: return empty array.
+    HttpResponse::json("[]")
+}
+
+/// `GET /api/mempool/txids` -- all mempool transaction IDs.
+fn handle_mempool_txids(_metrics: &MetricsCollector) -> HttpResponse {
+    // Stub: return empty array. A real implementation would enumerate the mempool.
+    HttpResponse::json("[]")
+}
+
+/// `POST /api/tx` -- broadcast a raw transaction.
+fn handle_broadcast_tx(
+    req: &HttpRequest,
+    _metrics: &MetricsCollector,
+) -> HttpResponse {
+    // The body should be the raw transaction hex.
+    let body = std::str::from_utf8(&req.body).unwrap_or("").trim();
+    if body.is_empty() {
+        return HttpResponse::bad_request("missing transaction hex in body");
+    }
+    if !body.chars().all(|c| c.is_ascii_hexdigit()) {
+        return HttpResponse::bad_request("invalid hex in body");
+    }
+    // Stub: accept the broadcast and return a fake txid.
+    // A real implementation would decode, validate, and relay the tx.
+    // Compute a simple hash of the hex to produce a deterministic response.
+    let txid_bytes = btc_primitives::hash::sha256d(body.as_bytes());
+    let txid = hex::encode(txid_bytes);
+    HttpResponse::text(&txid)
 }
 
 /// `GET /api/fee-estimates` -- fee rate estimates keyed by confirmation target.
@@ -1307,5 +1485,248 @@ mod tests {
         let resp = handle_request(&req, &m);
         assert_eq!(resp.status, 200);
         assert_eq!(std::str::from_utf8(&resp.body).unwrap(), "800000");
+    }
+
+    // -----------------------------------------------------------------------
+    // Esplora: block txids endpoint
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_block_txids() {
+        let m = make_metrics();
+        let hash = "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5";
+        let resp = handle_request(
+            &make_request(&format!("/api/block/{}/txids", hash)),
+            &m,
+        );
+        assert_eq!(resp.status, 200);
+        let body = std::str::from_utf8(&resp.body).unwrap();
+        // Should be valid JSON array
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert!(parsed.is_array());
+    }
+
+    #[test]
+    fn test_block_txids_invalid_hash() {
+        let m = make_metrics();
+        let resp = handle_request(&make_request("/api/block/badhash/txids"), &m);
+        assert_eq!(resp.status, 400);
+    }
+
+    // -----------------------------------------------------------------------
+    // Esplora: tx hex endpoint
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tx_hex() {
+        let m = make_metrics();
+        let txid = "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b";
+        let resp = handle_request(
+            &make_request(&format!("/api/tx/{}/hex", txid)),
+            &m,
+        );
+        assert_eq!(resp.status, 200);
+    }
+
+    #[test]
+    fn test_tx_hex_invalid() {
+        let m = make_metrics();
+        let resp = handle_request(&make_request("/api/tx/bad/hex"), &m);
+        assert_eq!(resp.status, 400);
+    }
+
+    // -----------------------------------------------------------------------
+    // Esplora: tx merkle proof endpoint
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tx_merkle_proof() {
+        let m = make_metrics();
+        let txid = "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b";
+        let resp = handle_request(
+            &make_request(&format!("/api/tx/{}/merkle-proof", txid)),
+            &m,
+        );
+        assert_eq!(resp.status, 200);
+        let body = std::str::from_utf8(&resp.body).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert!(parsed["merkle"].is_array());
+        assert!(parsed["block_height"].is_number());
+        assert!(parsed["pos"].is_number());
+    }
+
+    #[test]
+    fn test_tx_merkle_proof_invalid() {
+        let m = make_metrics();
+        let resp = handle_request(&make_request("/api/tx/bad/merkle-proof"), &m);
+        assert_eq!(resp.status, 400);
+    }
+
+    // -----------------------------------------------------------------------
+    // Esplora: tx outspend endpoint
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tx_outspend() {
+        let m = make_metrics();
+        let txid = "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b";
+        let resp = handle_request(
+            &make_request(&format!("/api/tx/{}/outspend/0", txid)),
+            &m,
+        );
+        assert_eq!(resp.status, 200);
+        let body = std::str::from_utf8(&resp.body).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert!(parsed["spent"].is_boolean());
+    }
+
+    #[test]
+    fn test_tx_outspend_invalid_txid() {
+        let m = make_metrics();
+        let resp = handle_request(&make_request("/api/tx/bad/outspend/0"), &m);
+        assert_eq!(resp.status, 400);
+    }
+
+    #[test]
+    fn test_tx_outspend_invalid_vout() {
+        let m = make_metrics();
+        let txid = "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b";
+        let resp = handle_request(
+            &make_request(&format!("/api/tx/{}/outspend/abc", txid)),
+            &m,
+        );
+        assert_eq!(resp.status, 400);
+    }
+
+    // -----------------------------------------------------------------------
+    // Esplora: address info endpoint
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_address_info() {
+        let m = make_metrics();
+        let resp = handle_request(
+            &make_request("/api/address/bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"),
+            &m,
+        );
+        assert_eq!(resp.status, 200);
+        let body = std::str::from_utf8(&resp.body).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            parsed["address"].as_str().unwrap(),
+            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+        );
+        assert!(parsed["chain_stats"].is_object());
+        assert!(parsed["mempool_stats"].is_object());
+        assert_eq!(parsed["chain_stats"]["tx_count"].as_u64().unwrap(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Esplora: scripthash utxo endpoint
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_scripthash_utxo() {
+        let m = make_metrics();
+        let hash = "0000000000000000000000000000000000000000000000000000000000000000";
+        let resp = handle_request(
+            &make_request(&format!("/api/scripthash/{}/utxo", hash)),
+            &m,
+        );
+        assert_eq!(resp.status, 200);
+        assert_eq!(std::str::from_utf8(&resp.body).unwrap(), "[]");
+    }
+
+    #[test]
+    fn test_scripthash_utxo_invalid_hash() {
+        let m = make_metrics();
+        let resp = handle_request(
+            &make_request("/api/scripthash/badhash/utxo"),
+            &m,
+        );
+        assert_eq!(resp.status, 400);
+    }
+
+    // -----------------------------------------------------------------------
+    // Esplora: mempool txids endpoint
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mempool_txids() {
+        let m = make_metrics();
+        let resp = handle_request(&make_request("/api/mempool/txids"), &m);
+        assert_eq!(resp.status, 200);
+        let body = std::str::from_utf8(&resp.body).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert!(parsed.is_array());
+    }
+
+    // -----------------------------------------------------------------------
+    // Esplora: broadcast transaction endpoint
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_broadcast_tx() {
+        let m = make_metrics();
+        let req = HttpRequest {
+            method: "POST".into(),
+            path: "/api/tx".into(),
+            headers: HashMap::new(),
+            body: b"0100000001000000000000".to_vec(),
+        };
+        let resp = handle_request(&req, &m);
+        assert_eq!(resp.status, 200);
+        let body = std::str::from_utf8(&resp.body).unwrap();
+        // Should return a hex string (txid)
+        assert_eq!(body.len(), 64);
+        assert!(body.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_broadcast_tx_empty_body() {
+        let m = make_metrics();
+        let req = HttpRequest {
+            method: "POST".into(),
+            path: "/api/tx".into(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+        let resp = handle_request(&req, &m);
+        assert_eq!(resp.status, 400);
+    }
+
+    #[test]
+    fn test_broadcast_tx_invalid_hex() {
+        let m = make_metrics();
+        let req = HttpRequest {
+            method: "POST".into(),
+            path: "/api/tx".into(),
+            headers: HashMap::new(),
+            body: b"not_hex_data!!!".to_vec(),
+        };
+        let resp = handle_request(&req, &m);
+        assert_eq!(resp.status, 400);
+    }
+
+    #[test]
+    fn test_broadcast_tx_deterministic() {
+        let m = make_metrics();
+        let body = b"aabbccdd".to_vec();
+        let req1 = HttpRequest {
+            method: "POST".into(),
+            path: "/api/tx".into(),
+            headers: HashMap::new(),
+            body: body.clone(),
+        };
+        let req2 = HttpRequest {
+            method: "POST".into(),
+            path: "/api/tx".into(),
+            headers: HashMap::new(),
+            body,
+        };
+        let resp1 = handle_request(&req1, &m);
+        let resp2 = handle_request(&req2, &m);
+        // Same input should produce same txid
+        assert_eq!(resp1.body, resp2.body);
     }
 }

@@ -18,6 +18,14 @@ pub const TABLE_UTXOS: &str = "UTXOs";
 /// Chain metadata: &str -> Vec<u8>
 pub const TABLE_META: &str = "Meta";
 
+/// Transaction block index: TxHash -> (BlockHash, tx_position)
+/// Maps a txid to the block that contains it and the tx's position within that block.
+pub const TABLE_TX_BLOCK_INDEX: &str = "TxBlockIndex";
+
+/// Address/script index: script_hash(32) + height(8 BE) + tx_position(4 BE) -> AddressIndexValue
+/// Maps SHA256(scriptPubKey) to transaction entries affecting that script.
+pub const TABLE_ADDRESS_INDEX: &str = "AddressIndex";
+
 pub const META_BEST_HEIGHT: &str = "best_height";
 pub const META_BEST_HASH: &str = "best_hash";
 
@@ -32,6 +40,8 @@ mod tests {
         assert_eq!(TABLE_TRANSACTIONS, "Transactions");
         assert_eq!(TABLE_UTXOS, "UTXOs");
         assert_eq!(TABLE_META, "Meta");
+        assert_eq!(TABLE_TX_BLOCK_INDEX, "TxBlockIndex");
+        assert_eq!(TABLE_ADDRESS_INDEX, "AddressIndex");
     }
 
     #[test]
