@@ -1,3 +1,11 @@
+[package]
+name = "btc-rust"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/example/btc-rust"
+
 [workspace]
 exclude = ["fuzz"]
 members = [
@@ -15,6 +23,44 @@ members = [
     "crates/forge",
 ]
 resolver = "2"
+
+[dependencies]
+btc-primitives = { path = "crates/primitives" }
+btc-consensus = { path = "crates/consensus" }
+btc-exex = { path = "crates/exex" }
+btc-forge = { path = "crates/forge" }
+btc-test = { path = "crates/test-harness" }
+hex = { version = "0.4" }
+tokio = { version = "1", features = ["full"] }
+eyre = "0.6"
+
+[[example]]
+name = "decode_transaction"
+path = "examples/decode_transaction.rs"
+
+[[example]]
+name = "script_playground"
+path = "examples/script_playground.rs"
+
+[[example]]
+name = "exex_plugin"
+path = "examples/exex_plugin.rs"
+
+[[example]]
+name = "forge_htlc"
+path = "examples/forge_htlc.rs"
+
+[[example]]
+name = "miniscript_compile"
+path = "examples/miniscript_compile.rs"
+
+[[example]]
+name = "regtest_mine"
+path = "examples/regtest_mine.rs"
+
+[[example]]
+name = "address_types"
+path = "examples/address_types.rs"
 
 [workspace.package]
 version = "0.1.0"
