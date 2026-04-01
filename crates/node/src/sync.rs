@@ -949,7 +949,7 @@ impl SyncManager {
                         {
                             let mut utxo_set = self.utxo_set.write().await;
                             utxo_set.apply_update(&utxo_update);
-                            utxo_set.enforce_limit();
+                            
                             if block_height % 500 == 0 {
                                 info!(
                                     height = block_height,
