@@ -1,12 +1,16 @@
 use std::io::Write;
 
 use clap::{Parser, Subcommand};
+use sha2::{Digest, Sha256};
 
 use btc_consensus::script_engine::{ScriptEngine, ScriptFlags};
 use btc_consensus::sig_verify::Secp256k1Verifier;
+use btc_forge::miniscript::Policy;
 use btc_node::builder::{DatabaseHandle, NetworkHandle, NodeBuilder, NodeConfig};
 use btc_node::output::{self, OutputFormat};
+use btc_primitives::address::Address;
 use btc_primitives::block::BlockHeader;
+use btc_primitives::encode::Encodable;
 use btc_primitives::script::{Instruction, Opcode, Script, ScriptBuf};
 use btc_primitives::transaction::Transaction;
 use btc_primitives::Network;
@@ -107,6 +111,24 @@ enum Commands {
 
     /// Interactive script playground
     Playground,
+
+    /// Watch an address for incoming/outgoing transactions
+    Watch {
+        /// Bitcoin address to watch (any format)
+        address: String,
+    },
+
+    /// Simulate a transaction against current UTXO set (dry run)
+    SimulateTx {
+        /// Raw transaction hex
+        hex: String,
+    },
+
+    /// Compile a miniscript policy to Bitcoin Script
+    Compile {
+        /// Policy string (e.g., "and(pk(KEY),after(100))")
+        policy: String,
+    },
 }
 
 fn parse_network(s: &str) -> Network {
@@ -160,6 +182,9 @@ async fn main() -> eyre::Result<()> {
         Some(Commands::DecodeScript { hex }) => cmd_decode_script(&hex, format),
         Some(Commands::DecodeHeader { hex }) => cmd_decode_header(&hex, format),
         Some(Commands::Playground) => cmd_playground(),
+        Some(Commands::Watch { address }) => cmd_watch(&address, network, format),
+        Some(Commands::SimulateTx { hex }) => cmd_simulate_tx(&hex, format),
+        Some(Commands::Compile { policy }) => cmd_compile(&policy, format),
     }
 }
 
@@ -403,6 +428,178 @@ fn cmd_decode_header(hex_str: &str, format: OutputFormat) -> eyre::Result<()> {
         "time": header.time,
         "bits": format!("{:#010x}", header.bits.to_u32()),
         "nonce": header.nonce,
+    });
+    output::emit(format, &info);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Watch address
+// ---------------------------------------------------------------------------
+
+fn cmd_watch(address_str: &str, network: Network, format: OutputFormat) -> eyre::Result<()> {
+    // Try parsing as bech32 first, then base58
+    let addr = Address::from_bech32(address_str, network)
+        .or_else(|_| Address::from_base58(address_str, network))
+        .map_err(|e| eyre::eyre!("failed to parse address '{}': {}", address_str, e))?;
+
+    let script_pubkey = addr.script_pubkey();
+    let spk_bytes = script_pubkey.as_bytes();
+
+    // Compute script hash (SHA256 of the scriptPubKey)
+    let mut hasher = Sha256::new();
+    hasher.update(spk_bytes);
+    let script_hash: [u8; 32] = hasher.finalize().into();
+
+    let addr_type = match &addr {
+        Address::P2pkh { .. } => "p2pkh",
+        Address::P2sh { .. } => "p2sh",
+        Address::P2wpkh { .. } => "p2wpkh",
+        Address::P2wsh { .. } => "p2wsh",
+        Address::P2tr { .. } => "p2tr",
+    };
+
+    let info = serde_json::json!({
+        "address": address_str,
+        "type": addr_type,
+        "network": network.to_string(),
+        "script_pubkey_hex": hex::encode(spk_bytes),
+        "script_hash": hex::encode(script_hash),
+        "status": "watching",
+        "message": "Polling for new blocks. Connect to a running node for live updates.",
+    });
+    output::emit(format, &info);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Simulate transaction
+// ---------------------------------------------------------------------------
+
+fn cmd_simulate_tx(hex_str: &str, format: OutputFormat) -> eyre::Result<()> {
+    let bytes = hex::decode(hex_str)
+        .map_err(|e| eyre::eyre!("invalid hex: {}", e))?;
+    let tx: Transaction = btc_primitives::decode(&bytes)
+        .map_err(|e| eyre::eyre!("failed to decode transaction: {}", e))?;
+
+    // Compute sizes
+    let legacy_size = {
+        let mut buf = Vec::new();
+        // We compute legacy size by encoding without witness
+        let legacy_tx = Transaction {
+            version: tx.version,
+            inputs: tx.inputs.clone(),
+            outputs: tx.outputs.clone(),
+            witness: Vec::new(),
+            lock_time: tx.lock_time,
+        };
+        let _ = legacy_tx.encode(&mut buf);
+        buf.len()
+    };
+
+    let total_size = {
+        let mut buf = Vec::new();
+        let _ = tx.encode(&mut buf);
+        buf.len()
+    };
+
+    // Weight = base_size * 3 + total_size  (BIP141)
+    let weight = legacy_size * 3 + total_size;
+    let vsize = (weight + 3) / 4; // ceiling division
+
+    // Check if it's a coinbase
+    let is_coinbase = tx.is_coinbase();
+
+    // Compute total output value
+    let total_output: i64 = tx.outputs.iter().map(|o| o.value.as_sat()).sum();
+
+    // For a real simulation, we'd look up each input's UTXO to get the input
+    // values and run script verification. Since we don't have the UTXO set
+    // available in CLI-only mode, we report what we can.
+    let mut input_details: Vec<serde_json::Value> = Vec::new();
+    for (i, inp) in tx.inputs.iter().enumerate() {
+        let mut detail = serde_json::json!({
+            "index": i,
+            "prev_txid": inp.previous_output.txid.to_hex(),
+            "prev_vout": inp.previous_output.vout,
+            "sequence": inp.sequence,
+            "script_sig_size": inp.script_sig.len(),
+        });
+        if tx.is_segwit() {
+            if let Some(w) = tx.witness.get(i) {
+                detail["witness_items"] = serde_json::json!(w.len());
+            }
+        }
+        input_details.push(detail);
+    }
+
+    let mut output_details: Vec<serde_json::Value> = Vec::new();
+    for (i, out) in tx.outputs.iter().enumerate() {
+        output_details.push(serde_json::json!({
+            "index": i,
+            "value_sat": out.value.as_sat(),
+            "value_btc": out.value.as_btc(),
+            "script_pubkey_hex": hex::encode(out.script_pubkey.as_bytes()),
+            "type": script_type(&out.script_pubkey),
+        }));
+    }
+
+    // Build result
+    let result = serde_json::json!({
+        "txid": tx.txid().to_hex(),
+        "version": tx.version,
+        "locktime": tx.lock_time,
+        "is_segwit": tx.is_segwit(),
+        "is_coinbase": is_coinbase,
+        "inputs_count": tx.inputs.len(),
+        "outputs_count": tx.outputs.len(),
+        "total_output_sat": total_output,
+        "total_output_btc": total_output as f64 / 100_000_000.0,
+        "size": total_size,
+        "weight": weight,
+        "vsize": vsize,
+        "inputs": input_details,
+        "outputs": output_details,
+        "simulation": {
+            "utxo_lookup": "unavailable (no running node connection)",
+            "fee": "unknown (requires UTXO lookup for input values)",
+            "script_verification": "skipped (requires UTXO data)",
+            "valid": "indeterminate (dry-run without UTXO set)",
+        },
+    });
+    output::emit(format, &result);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Compile miniscript policy
+// ---------------------------------------------------------------------------
+
+fn cmd_compile(policy_str: &str, format: OutputFormat) -> eyre::Result<()> {
+    let policy = Policy::parse(policy_str)
+        .map_err(|e| eyre::eyre!("failed to parse policy: {}", e))?;
+
+    let script = policy.compile();
+    let script_ref = script.as_script();
+
+    // Disassemble
+    let mut asm_ops = Vec::new();
+    for instruction in script_ref.instructions() {
+        match instruction {
+            Ok(Instruction::Op(op)) => asm_ops.push(format!("{:?}", op)),
+            Ok(Instruction::PushBytes(data)) => {
+                asm_ops.push(format!("PUSH({})", hex::encode(data)))
+            }
+            Err(e) => asm_ops.push(format!("ERROR: {}", e)),
+        }
+    }
+
+    let info = serde_json::json!({
+        "policy": policy_str,
+        "script_hex": hex::encode(script.as_bytes()),
+        "script_size": script.len(),
+        "asm": asm_ops.join(" "),
+        "opcodes": asm_ops,
     });
     output::emit(format, &info);
     Ok(())

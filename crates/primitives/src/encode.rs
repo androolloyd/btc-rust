@@ -13,7 +13,7 @@ pub enum EncodeError {
     UnexpectedEof,
 }
 
-/// Bitcoin consensus-encodable type
+/// A type that can be serialised into the Bitcoin consensus wire format.
 pub trait Encodable {
     fn encode<W: Write>(&self, writer: &mut W) -> Result<usize, EncodeError>;
 
@@ -24,7 +24,7 @@ pub trait Encodable {
     }
 }
 
-/// Bitcoin consensus-decodable type
+/// A type that can be deserialised from the Bitcoin consensus wire format.
 pub trait Decodable: Sized {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, EncodeError>;
 }
@@ -42,7 +42,7 @@ pub fn decode<T: Decodable>(bytes: &[u8]) -> Result<T, EncodeError> {
     T::decode(&mut cursor)
 }
 
-/// Variable-length integer encoding used throughout Bitcoin protocol
+/// A variable-length integer encoding used throughout the Bitcoin wire protocol (1, 3, 5, or 9 bytes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VarInt(pub u64);
 

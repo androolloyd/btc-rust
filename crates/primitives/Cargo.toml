@@ -1,9 +1,13 @@
 [package]
 name = "btc-primitives"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Bitcoin primitives library — types, encoding, hashing, script, bech32. No rust-bitcoin dependency."
+repository = "https://github.com/androolloyd/btc-rust"
+keywords = ["bitcoin", "crypto", "blockchain"]
+categories = ["cryptography::cryptocurrencies"]
+readme = "README.md"
 
 [dependencies]
 serde = { workspace = true }

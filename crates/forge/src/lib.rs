@@ -10,12 +10,14 @@ pub mod script_builder;
 pub mod debugger;
 pub mod tx_builder;
 pub mod weight;
+pub mod miniscript;
 
 pub use script_env::{ScriptEnv, Account, FundedUtxo, ScriptResult, ForgeError};
 pub use script_builder::ForgeScript;
 pub use debugger::{ScriptDebugger, DebugStep};
 pub use tx_builder::TxBuilder;
 pub use weight::{analyze_script, estimate_witness_weight, ScriptAnalysis, ScriptBranch};
+pub use miniscript::{Policy, MiniscriptError};
 
 // Re-export core types for convenience so users do not need to depend on
 // lower-level crates directly.

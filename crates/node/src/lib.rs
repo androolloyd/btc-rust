@@ -1,6 +1,7 @@
 pub mod builder;
 pub mod explorer;
 pub mod http;
+pub mod nostr;
 pub mod output;
 pub mod state;
 pub mod sync;

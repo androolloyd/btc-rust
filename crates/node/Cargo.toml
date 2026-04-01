@@ -14,6 +14,8 @@ btc-network = { workspace = true }
 btc-stages = { workspace = true }
 btc-rpc = { workspace = true }
 btc-exex = { workspace = true }
+btc-forge = { workspace = true }
+sha2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 clap = { workspace = true }
@@ -23,6 +25,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 eyre = { workspace = true }
 hex = { workspace = true }
+secp256k1 = { workspace = true }
 
 redb = { workspace = true }
 

@@ -4,7 +4,7 @@ use crate::script::ScriptBuf;
 use crate::amount::Amount;
 use std::io::{Read, Write};
 
-/// A Bitcoin transaction outpoint (reference to a previous output)
+/// A reference to a specific output of a previous transaction, identified by txid and index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OutPoint {
     pub txid: TxHash,
@@ -46,7 +46,7 @@ impl Decodable for OutPoint {
     }
 }
 
-/// Transaction input
+/// A transaction input that spends a previous output, with a script signature and sequence number.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TxIn {
     pub previous_output: OutPoint,
@@ -84,7 +84,7 @@ impl Decodable for TxIn {
     }
 }
 
-/// Transaction output
+/// A transaction output specifying an amount and the spending conditions (script).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TxOut {
     pub value: Amount,
@@ -111,7 +111,7 @@ impl Decodable for TxOut {
     }
 }
 
-/// Segregated Witness data for a transaction input
+/// Segregated Witness stack items associated with a transaction input.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Witness {
     items: Vec<Vec<u8>>,
@@ -175,7 +175,7 @@ impl Witness {
     }
 }
 
-/// A Bitcoin transaction
+/// A Bitcoin transaction consisting of inputs, outputs, and optional witness data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transaction {
     pub version: i32,

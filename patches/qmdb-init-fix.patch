@@ -1,0 +1,48 @@
+--- a/qmdb/src/lib.rs
++++ b/qmdb/src/lib.rs
+@@ -395,12 +395,14 @@
+     fn _init_dir(
+         dir: &str,
+         file_segment_size: usize,
+         with_twig_file: bool,
+         aes_keys: &Option<[u8; 96]>,
+     ) {
+         let (data_dir, meta_dir, _indexer_dir) = Self::get_sub_dirs(dir);
+
+-        if Path::new(dir).exists() {
+-            fs::remove_dir_all(dir).unwrap();
++        // Only create directories that don't already exist.
++        // Previously this would remove_dir_all and recreate from scratch,
++        // which destroyed all persisted data on every restart.
++        if Path::new(dir).exists() {
++            // Directory already exists with data -- nothing to do.
++            return;
+         }
+         fs::create_dir(dir).unwrap();
+         let (mut ciphers, _, meta_db_cipher) = get_ciphers(aes_keys);
+
+Description
+----------
+The QMDB _init_dir function unconditionally deletes the entire data directory
+and recreates it from scratch every time init_dir is called. This means that
+reopening a QMDB database wipes all previously persisted state.
+
+The fix makes _init_dir idempotent: if the top-level directory already exists,
+we assume the database was previously initialized and return early. Fresh
+initialization (creating the dir, shard files, twig files, and MetaDB) only
+runs when the directory does not yet exist.
+
+Upstream impact: This should be submitted as a PR to the qmdb repository.
+
+Workaround in btc-rust
+-----------------------
+In crates/storage/src/qmdb_backend.rs, QmdbDatabase::new() already guards the
+init_dir call behind a check:
+
+    let data_subdir = std::path::Path::new(dir).join("data");
+    if !data_subdir.exists() {
+        AdsCore::init_dir(&config);
+    }
+
+This workaround prevents the destructive init_dir from being called when data
+already exists, so the node survives restarts even with the unpatched upstream.

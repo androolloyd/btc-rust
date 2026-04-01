@@ -2,7 +2,7 @@ use std::fmt;
 use crate::encode::{Encodable, Decodable, EncodeError, VarInt, ReadExt};
 use std::io::{Read, Write};
 
-/// A reference to a script (immutable view)
+/// A borrowed reference to a Bitcoin script byte slice, providing inspection methods.
 #[derive(PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct Script([u8]);
@@ -106,7 +106,7 @@ impl fmt::Display for Script {
     }
 }
 
-/// Owned script buffer
+/// An owned, mutable Bitcoin script buffer for constructing and serialising scripts.
 #[derive(Clone, PartialEq, Eq, Hash, Default)]
 pub struct ScriptBuf(Vec<u8>);
 
@@ -331,7 +331,7 @@ impl<'a> Iterator for ScriptInstructions<'a> {
     }
 }
 
-/// Bitcoin script opcodes
+/// Bitcoin Script opcodes as defined by the consensus rules (OP_0 through OP_CHECKSIGADD).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 #[allow(non_camel_case_types)]

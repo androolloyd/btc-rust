@@ -4,7 +4,7 @@ use crate::compact::CompactTarget;
 use crate::transaction::Transaction;
 use std::io::{Read, Write};
 
-/// Bitcoin block header (80 bytes)
+/// An 80-byte Bitcoin block header containing version, previous hash, merkle root, timestamp, difficulty target, and nonce.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockHeader {
     pub version: i32,
@@ -64,7 +64,7 @@ impl Decodable for BlockHeader {
     }
 }
 
-/// A full Bitcoin block
+/// A full Bitcoin block consisting of a header and an ordered list of transactions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
     pub header: BlockHeader,
