@@ -9,8 +9,8 @@ use btc_consensus::sig_verify::Secp256k1Verifier;
 use btc_primitives::amount::Amount;
 use btc_primitives::encode::Decodable;
 use btc_primitives::hash::TxHash;
-use btc_primitives::script::{Opcode, Script, ScriptBuf};
-use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut, Witness};
+use btc_primitives::script::{Opcode, ScriptBuf};
+use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
 
 // ---------------------------------------------------------------------------
 // Script text parser – mirrors Bitcoin Core's `script_tests.json` format
@@ -483,6 +483,7 @@ fn build_mock_tx(script_sig: &ScriptBuf, script_pubkey: &ScriptBuf, amount_sat: 
 
 /// Extract the last push data from a script (for P2SH redeem script extraction).
 /// Returns the pushed data bytes if the script's last instruction is a push.
+#[allow(dead_code)]
 fn extract_last_push_data(script: &ScriptBuf) -> Option<Vec<u8>> {
     let mut last_push = None;
     for instruction in script.as_script().instructions() {

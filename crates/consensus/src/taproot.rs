@@ -7,7 +7,7 @@
 
 use btc_primitives::encode::{VarInt, Encodable};
 use btc_primitives::hash::sha256;
-use btc_primitives::script::{Opcode, Script, ScriptBuf};
+use btc_primitives::script::Script;
 use btc_primitives::transaction::{Transaction, TxOut, Witness};
 use crate::sig_verify::SignatureVerifier;
 use crate::sighash::{sighash_taproot, SighashType};
@@ -142,7 +142,7 @@ pub fn verify_key_path(
     match sig_verifier.verify_schnorr(&sighash, schnorr_sig, output_key) {
         Ok(true) => Ok(()),
         Ok(false) => Err(TaprootError::SignatureVerificationFailed),
-        Err(e) => Err(TaprootError::SignatureVerificationFailed),
+        Err(_) => Err(TaprootError::SignatureVerificationFailed),
     }
 }
 
@@ -150,15 +150,15 @@ pub fn verify_key_path(
 ///
 /// Witness stack: [script_args..., script, control_block] (possibly with annex)
 pub fn verify_script_path(
-    output_key: &[u8; 32],
+    _output_key: &[u8; 32],
     witness: &Witness,
-    tx: &Transaction,
-    input_index: usize,
-    prevouts: &[TxOut],
-    sig_verifier: &dyn SignatureVerifier,
-    flags: &ScriptFlags,
+    _tx: &Transaction,
+    _input_index: usize,
+    _prevouts: &[TxOut],
+    _sig_verifier: &dyn SignatureVerifier,
+    _flags: &ScriptFlags,
 ) -> Result<(), TaprootError> {
-    let (annex, effective_len) = extract_annex(witness);
+    let (_annex, effective_len) = extract_annex(witness);
 
     if effective_len < 2 {
         return Err(TaprootError::EmptyWitness);
@@ -186,7 +186,8 @@ pub fn verify_script_path(
     let merkle_root = current;
 
     // Compute the expected output key from internal_key and merkle_root
-    let tweak_hash = tap_tweak_hash(&internal_key, Some(&merkle_root));
+    // TODO: Full tweak verification requires EC point operations
+    let _tweak_hash = tap_tweak_hash(&internal_key, Some(&merkle_root));
 
     // Verify: output_key == internal_key tweaked by tweak_hash
     // This requires checking that the x-only pubkey after tweaking matches
@@ -282,7 +283,7 @@ pub fn verify_taproot_input(
         return Err(TaprootError::EmptyWitness);
     }
 
-    let (annex, effective_len) = extract_annex(witness);
+    let (_annex, effective_len) = extract_annex(witness);
 
     if effective_len == 1 {
         // Key path spend: single witness item is the signature
@@ -296,6 +297,7 @@ pub fn verify_taproot_input(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use btc_primitives::script::{Opcode, ScriptBuf};
 
     #[test]
     fn test_tagged_hash() {

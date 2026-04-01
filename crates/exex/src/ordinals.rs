@@ -8,7 +8,7 @@
 use crate::{ExEx, ExExContext, ExExNotification};
 use btc_primitives::hash::TxHash;
 use btc_primitives::script::Opcode;
-use btc_primitives::transaction::{Transaction, Witness};
+use btc_primitives::transaction::Transaction;
 use tokio::sync::broadcast;
 use tracing::{info, warn};
 
@@ -329,9 +329,7 @@ mod tests {
     use super::*;
     use crate::ExExManager;
     use btc_primitives::amount::Amount;
-    use btc_primitives::block::{Block, BlockHeader};
-    use btc_primitives::compact::CompactTarget;
-    use btc_primitives::hash::{BlockHash, TxHash};
+    use btc_primitives::hash::TxHash;
     use btc_primitives::network::Network;
     use btc_primitives::script::ScriptBuf;
     use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut, Witness};

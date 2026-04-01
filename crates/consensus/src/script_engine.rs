@@ -532,6 +532,7 @@ impl<'a> ScriptEngine<'a> {
 
     /// Peek at the top of stack and decode it as a script number,
     /// enforcing MINIMALDATA if the flag is set.
+    #[allow(dead_code)]
     fn top_num(&self) -> Result<i64, ScriptError> {
         let data = self.top()?;
         if self.flags.verify_minimaldata && !is_minimal_script_num(data) {
@@ -1273,7 +1274,6 @@ fn is_low_der_signature(sig: &[u8]) -> bool {
 /// Check if the hashtype byte is one of the defined types (STRICTENC).
 fn is_defined_hashtype(hash_type: u8) -> bool {
     let base = hash_type & 0x1f;
-    let anyonecanpay = hash_type & 0x80 != 0;
     let rest = hash_type & !0x9f; // bits besides base and ANYONECANPAY
     if rest != 0 { return false; }
     matches!(base, 1 | 2 | 3) // ALL, NONE, SINGLE

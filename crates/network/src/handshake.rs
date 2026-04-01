@@ -6,6 +6,7 @@ use crate::message::{NetAddress, NetworkMessage, VersionMessage};
 use crate::protocol::{ProtocolVersion, ServiceFlags, USER_AGENT};
 
 /// Compact block protocol version we support (BIP152).
+#[allow(dead_code)]
 const SENDCMPCT_VERSION: u64 = 2;
 
 /// State machine for the Bitcoin version handshake.

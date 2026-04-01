@@ -5,7 +5,7 @@
 
 use btc_test::{TestNode, TestKeyPair, ScriptBuilder};
 use btc_primitives::script::{Opcode, ScriptBuf};
-use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint, Witness};
+use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint};
 use btc_primitives::amount::Amount;
 use btc_primitives::hash::TxHash;
 
@@ -16,7 +16,7 @@ use btc_primitives::hash::TxHash;
 #[test]
 fn test_spend_coinbase_after_maturity() {
     let mut node = TestNode::new();
-    let key = TestKeyPair::generate();
+    let _key = TestKeyPair::generate();
 
     // Mine 101 blocks — coinbase at height 1 matures at height 101
     node.mine_blocks(101);
@@ -28,9 +28,9 @@ fn test_spend_coinbase_after_maturity() {
 #[test]
 fn test_chain_of_spends() {
     let mut node = TestNode::new();
-    let key1 = TestKeyPair::generate();
-    let key2 = TestKeyPair::generate();
-    let key3 = TestKeyPair::generate();
+    let _key1 = TestKeyPair::generate();
+    let _key2 = TestKeyPair::generate();
+    let _key3 = TestKeyPair::generate();
 
     // Mine blocks to get spendable coins
     node.mine_blocks(101);
@@ -93,7 +93,6 @@ fn test_deep_if_nesting() {
     // Execute through script engine
     use btc_consensus::script_engine::{ScriptEngine, ScriptFlags};
     use btc_consensus::sig_verify::Secp256k1Verifier;
-    use btc_primitives::script::Script;
 
     static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
     let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
@@ -126,7 +125,7 @@ fn test_max_script_size() {
 #[test]
 fn test_script_over_size_limit_rejected() {
     // Script over the 10KB limit
-    let mut data = vec![Opcode::OP_NOP as u8; 10_001];
+    let data = vec![Opcode::OP_NOP as u8; 10_001];
     let script = ScriptBuf::from_bytes(data);
 
     use btc_consensus::script_engine::{ScriptEngine, ScriptFlags};
@@ -182,7 +181,7 @@ fn test_arithmetic_boundary_values() {
 
 #[test]
 fn test_negative_numbers() {
-    use btc_consensus::script_engine::{ScriptEngine, ScriptFlags, encode_num, decode_num};
+    use btc_consensus::script_engine::{ScriptEngine, ScriptFlags, decode_num};
     use btc_consensus::sig_verify::Secp256k1Verifier;
 
     static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
@@ -375,7 +374,7 @@ fn test_cltv_rejects_premature_spend() {
 
 #[test]
 fn test_opcat_stress() {
-    use btc_consensus::opcode_plugin::{OpCat, OpcodePlugin, OpcodeRegistry};
+    use btc_consensus::opcode_plugin::{OpCat, OpcodeRegistry};
     use btc_consensus::script_engine::{ScriptEngine, ScriptFlags};
     use btc_consensus::sig_verify::Secp256k1Verifier;
 
@@ -412,7 +411,7 @@ fn test_opcat_stress() {
 
 #[test]
 fn test_opcat_rejects_oversized() {
-    use btc_consensus::opcode_plugin::{OpCat, OpcodePlugin, OpcodeRegistry};
+    use btc_consensus::opcode_plugin::{OpCat, OpcodeRegistry};
     use btc_consensus::script_engine::{ScriptEngine, ScriptFlags};
     use btc_consensus::sig_verify::Secp256k1Verifier;
 

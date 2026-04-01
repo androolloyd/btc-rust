@@ -8,8 +8,8 @@
 use btc_primitives::block::BlockHeader;
 use btc_primitives::hash::{sha256d, TxHash};
 use btc_primitives::transaction::Transaction;
-use btc_primitives::encode::{Encodable, Decodable, EncodeError, VarInt, ReadExt, WriteExt};
-use std::io::{Read, Write};
+
+
 
 /// SipHash key derived from block header + nonce
 /// Used to compute short transaction IDs
@@ -286,7 +286,6 @@ mod tests {
         use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
         use btc_primitives::script::ScriptBuf;
         use btc_primitives::amount::Amount;
-        use btc_primitives::transaction::Witness;
 
         let header = BlockHeader {
             version: 1,

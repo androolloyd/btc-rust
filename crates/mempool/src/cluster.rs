@@ -8,11 +8,7 @@
 use std::collections::{HashMap, HashSet};
 
 use btc_primitives::hash::TxHash;
-use btc_primitives::transaction::{OutPoint, Transaction};
-use btc_primitives::amount::Amount;
-use btc_primitives::encode::Encodable;
-
-use crate::pool::{Mempool, MempoolEntry};
+use crate::pool::Mempool;
 
 // ---------------------------------------------------------------------------
 // TxCluster
@@ -236,8 +232,10 @@ pub fn select_for_block(clusters: &[TxCluster], max_weight: usize) -> Vec<TxHash
 #[cfg(test)]
 mod tests {
     use super::*;
+    use btc_primitives::amount::Amount;
+    use btc_primitives::encode::Encodable;
     use btc_primitives::script::ScriptBuf;
-    use btc_primitives::transaction::{TxIn, TxOut};
+    use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
 
     /// Helper: build a transaction that optionally spends from a given parent txid.
     fn make_tx(id_byte: u8, parent_txid: Option<TxHash>, output_value: i64) -> Transaction {
@@ -440,11 +438,11 @@ mod tests {
         // A cluster of two chained txs
         let tx_a = make_tx(0x01, None, 50_000);
         let txid_a = tx_a.txid();
-        let size_a = tx_a.encoded_size();
+        let _size_a = tx_a.encoded_size();
         pool.add_tx(tx_a, Amount::from_sat(10_000), 100).unwrap();
 
         let tx_b = make_tx(0x02, Some(txid_a), 40_000);
-        let size_b = tx_b.encoded_size();
+        let _size_b = tx_b.encoded_size();
         pool.add_tx(tx_b, Amount::from_sat(10_000), 101).unwrap();
 
         // An independent tx with lower feerate
@@ -480,7 +478,7 @@ mod tests {
 
         // B: spends from A
         let tx_b = make_tx(0x02, Some(txid_a), 40_000);
-        let txid_b = tx_b.txid();
+        let _txid_b = tx_b.txid();
         pool.add_tx(tx_b, Amount::from_sat(2_000), 101).unwrap();
 
         // C: also spends from A (via a different "virtual" output -- we use

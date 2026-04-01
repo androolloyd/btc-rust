@@ -113,9 +113,9 @@ impl QmdbDatabase {
         // Read the current height from QMDB's root hash to resume from
         // the correct block height. If we can't determine it, start at 1.
         let current_height = {
-            let shared = ads.get_shared();
+            let _shared = ads.get_shared();
             // Try reading heights 1, 10, 100, 1000... to find the highest committed block
-            let mut h = 1i64;
+            let h = 1i64;
             // QMDB tracks its own block height internally
             h
         };
