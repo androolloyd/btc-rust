@@ -9,6 +9,7 @@ btc-node --json decode-psbt "$PSBT_HEX"
 btc-node --json convert-psbt "$PSBT_HEX" --version 2
 btc-node --json convert-psbt "$PSBT_V2_HEX" --version 0
 btc-node --json extract-psbt "$FINALIZED_PSBT_HEX"
+btc-node --json verify-psbt "$FINALIZED_PSBT_HEX"
 ```
 
 Inspection reports the actual unsigned transaction, PSBT version, resolved
@@ -26,7 +27,7 @@ not mean the output has been confirmed or is currently unspent. Witness-only
 records have `txid_linked: false` and remain claims from the updater.
 `unsigned_txid` identifies the transaction being signed;
 BIP370's `psbt_id` uses zero sequences as required by its unique-identification
-rule. The tools set `signatures_verified` to false: parsing and copying external
+rule. Decode, convert and extract set `signatures_verified` to false: parsing and copying external
 final fields do not prove that a transaction can spend its inputs. Submit extracted
 transactions through the validated mempool or an independent validating node.
 The tools do not sign, derive wallet keys, choose coins, or automatically finalize
@@ -34,6 +35,37 @@ partial signatures.
 Inspection exposes the declared `sighash_type`, per-key partial-signature types,
 the Taproot key-signature type and script-signature key/leaf/type records.
 An implicit 64-byte Taproot signature reports type zero (DEFAULT).
+
+`verify-psbt` evaluates the final transaction's spending conditions with the node's
+real ECDSA/Schnorr verifier and all supplied prevouts. It supports P2PKH/P2PK and
+bare canonical multisig, native/wrapped P2WPKH, native/wrapped P2WSH with P2PK,
+P2PKH or canonical multisig scripts, Taproot key paths, and version-c0 single-key
+`<32-byte key> CHECKSIG` Taproot leaves. An annex is included in the Taproot digest.
+Legacy P2SH, arbitrary witness/tapscript programs, future witness/leaf/key versions,
+OP_SUCCESS and signature-free scripts return explicit errors. This bounded wallet
+scope prevents consensus forward-compatibility success from becoming a signature
+verification claim; ordinary node consensus rules are unchanged.
+
+Every input needs final fields and a resolved UTXO. Legacy inputs additionally
+require a txid-linked full parent; witness-only legacy amounts cannot establish
+the fee because legacy signatures do not commit to them. Final signature types
+must be defined and match a retained declaration. ECDSA signatures require strict
+DER and low S, and witness-v0 public keys are compressed. Wrapped witness scriptSigs
+must be canonical single pushes. Known scripts/controls and actual signature
+equations must succeed for every input. Duplicate/null inputs, excessive weight,
+out-of-range totals and outputs exceeding supplied values fail as well.
+
+On success, `spending_conditions_verified` and `signatures_verified` are true;
+`signatures_checked` counts real successful equations. `tx_hex` is the verified
+transaction and `fee_sat` is the difference of supplied values.
+`verification_scope` is `finalized_spends_against_supplied_prevouts` and
+`txid_linked_prevouts` reports full-parent linkage per input. Witness-only values
+remain supplied claims, particularly for other inputs under ANYONECANPAY.
+`partial_signatures_verified` and `active_chain_verified` remain false: unused
+partial records and key origins are not verified, and this offline command does
+not establish confirmation, unspentness, maturity, chain finality, activation at
+a historical height, mempool fee/standardness policy or full Core consensus parity.
+Submit the verified transaction through a validating node for chain admission.
 
 V2 serialization excludes the global unsigned transaction and includes transaction
 version, counts, per-input prevouts, and per-output amounts/scripts. Optional
@@ -127,7 +159,7 @@ records validates these relationships before changing the receiver.
 These checks validate encoding and metadata consistency. Parsing does not
 validate signature equations, complete sighash context, full claimed key
 derivations or script satisfactions. Remaining
-BIP174/371 signature/context and full key-origin verification, witness-only legacy signing restrictions,
+BIP174/371 partial-signature/general-script context and full key-origin verification, witness-only legacy signing restrictions,
 active-chain/unspentness checks, wallet signing/finalization,
 descriptor operations and MuSig2 remain unfinished. Empty v2 creator maps can be
 represented; converting an empty-input creator to v0 is rejected by the legacy
@@ -199,6 +231,13 @@ ANYONECANPAY. Metadata/encoding substitution fails the compiled tools; unchanged
 valid signatures survive conversion and independent Core finalization/admission.
 Final scriptSig/witness fields remain opaque external records. Their signature
 encoding, declared-type agreement and equations are not verified by extraction.
+The separate `verify-psbt` command checks those properties for supported templates.
+
+Final-spend references: [BIP174 Extractor and retained UTXOs](https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki#transaction-extractor),
+[BIP143 amount and script commitments](https://github.com/bitcoin/bips/blob/master/bip-0143.mediawiki),
+[BIP341 all-prevout and annex commitments](https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki),
+[BIP342 future success/key semantics](https://github.com/bitcoin/bips/blob/master/bip-0342.mediawiki),
+and [Core v29 finalized PSBT verification](https://github.com/bitcoin/bitcoin/blob/v29.0/src/psbt.cpp).
 
 Signature references: [BIP66 strict DER](https://github.com/bitcoin/bips/blob/master/bip-0066.mediawiki),
 [BIP340 vectors](https://github.com/bitcoin/bips/blob/master/bip-0340/test-vectors.csv),

@@ -168,6 +168,9 @@ enum Commands {
     /// Extract externally finalized PSBT fields (does not verify signatures)
     ExtractPsbt { hex: String },
 
+    /// Verify supported finalized PSBT spends against supplied prevouts (offline)
+    VerifyPsbt { hex: String },
+
     /// Decode a raw script hex
     DecodeScript {
         /// Raw script hex
@@ -308,6 +311,10 @@ async fn main() -> eyre::Result<()> {
         }
         Some(Commands::ExtractPsbt { hex }) => {
             output::emit(format, &cli::extract_psbt(&hex)?);
+            Ok(())
+        }
+        Some(Commands::VerifyPsbt { hex }) => {
+            output::emit(format, &cli::verify_psbt(&hex)?);
             Ok(())
         }
         Some(Commands::DecodeScript { hex }) => cmd_decode_script(&hex, format),

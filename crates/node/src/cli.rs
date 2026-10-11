@@ -227,6 +227,23 @@ pub fn extract_psbt(hex_str: &str) -> eyre::Result<serde_json::Value> {
     }))
 }
 
+/// Verify supported finalized spends against supplied prevouts, without a chain lookup.
+pub fn verify_psbt(hex_str: &str) -> eyre::Result<serde_json::Value> {
+    let verified = crate::wallet::verify_finalized_psbt(&parse_psbt_hex(hex_str)?)?;
+    Ok(serde_json::json!({
+        "tx_hex": hex::encode(btc_primitives::encode(&verified.transaction)),
+        "txid": verified.transaction.txid().to_hex(),
+        "verification_scope": "finalized_spends_against_supplied_prevouts",
+        "spending_conditions_verified": true,
+        "signatures_verified": true,
+        "signatures_checked": verified.signatures_checked,
+        "partial_signatures_verified": false,
+        "active_chain_verified": false,
+        "txid_linked_prevouts": verified.txid_linked_prevouts,
+        "fee_sat": verified.fee_sat,
+    }))
+}
+
 /// Decode a raw transaction hex string and return a JSON representation.
 pub fn decode_tx(hex_str: &str) -> eyre::Result<serde_json::Value> {
     let bytes = hex::decode(hex_str)?;

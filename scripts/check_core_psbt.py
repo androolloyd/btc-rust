@@ -59,10 +59,9 @@ def check_taproot_metadata(decoded, independent):
         assert tree == core_tree
 
 
-def script_addresses(port, kind):
+def script_addresses(port, kind, descriptors):
     # The BIP341 NUMS point has no known secret; the wallet must spend a leaf.
     nums = "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0"
-    descriptors = core_rpc(port, "listdescriptors", [True])["descriptors"]
     prefix = "tr(" if kind == "taproot-script" else "wpkh("
     original = next(d["desc"] for d in descriptors
                     if d["active"] and not d["internal"] and d["desc"].startswith(prefix))
@@ -72,8 +71,12 @@ def script_addresses(port, kind):
         second = key[:-4] + "/1/*"
         private = f"tr({nums},{{pk({key}),pk({second})}})"
     else:
-        private = f"wsh(pk({key}))"
-        if kind == "sh-wsh":
+        if kind.endswith("multisig"):
+            second = key[:-4] + "/1/*"
+            private = f"wsh(multi(2,{key},{second}))"
+        else:
+            private = f"wsh(pk({key}))"
+        if kind.startswith("sh-wsh"):
             private = f"sh({private})"
     info = core_rpc(port, "getdescriptorinfo", [private])
     checked_private = private + "#" + info["checksum"]
@@ -93,7 +96,7 @@ def compact_size(n):
     return bytes([{2: 253, 4: 254, 8: 255}[size]]) + n.to_bytes(size, "little")
 
 
-def psbt_maps(raw):
+def psbt_maps(raw, expected_maps=3):
     stream = io.BytesIO(bytes.fromhex(raw))
     assert stream.read(5) == b"psbt\xff"
 
@@ -108,7 +111,7 @@ def psbt_maps(raw):
             key = stream.read(size)
             records[key] = stream.read(count())
         maps.append(records)
-    assert len(maps) == 3  # these real spends have one input and one output
+    assert len(maps) == expected_maps
     return maps
 
 
@@ -146,6 +149,8 @@ def check_spending_data(args, port, raw, finalized, coin, expected_tx):
         assert result["complete"] is True and result["hex"] == expected_tx
         if original == finalized:
             assert cli(args.node, "extract-psbt", restored["psbt_hex"])["tx_hex"] == expected_tx
+            verified = cli(args.node, "verify-psbt", restored["psbt_hex"])
+            assert verified["tx_hex"] == expected_tx and verified["txid_linked_prevouts"] == [True]
         # Mutating the parent's locktime changes its txid even when outputs agree.
         corrupted = psbt_maps(good)
         corrupted[1][b"\x00"] = parent[:-4] + (int.from_bytes(parent[-4:], "little") ^ 1).to_bytes(4, "little")
@@ -167,6 +172,73 @@ def check_spending_data(args, port, raw, finalized, coin, expected_tx):
                 corrupted = psbt_maps(good)
                 corrupted[scope][key] += b"\x00"
                 reject_spending_data(args, encode_maps(corrupted), "does not match")
+
+
+def reject_verification(args, raw, reason):
+    result = subprocess.run([str(args.node), "--json", "verify-psbt", raw],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode != 0 and reason in result.stderr, result.stderr
+
+
+def witness_items(data):
+    stream = io.BytesIO(data)
+    def size():
+        prefix = stream.read(1)[0]
+        return prefix if prefix < 253 else int.from_bytes(stream.read({253:2,254:4,255:8}[prefix]), "little")
+    result = [stream.read(size()) for _ in range(size())]
+    assert stream.read() == b""
+    return result
+
+
+def encoded_witness(items):
+    return compact_size(len(items)) + b"".join(compact_size(len(item)) + item for item in items)
+
+
+def check_final_verification(args, port, raw, expected_tx, signatures=1):
+    verified = cli(args.node, "verify-psbt", raw)
+    assert verified["tx_hex"] == expected_tx
+    assert verified["signatures_verified"] is True and verified["spending_conditions_verified"] is True
+    assert verified["signatures_checked"] == signatures
+    assert verified["active_chain_verified"] is False and verified["partial_signatures_verified"] is False
+    assert verified["verification_scope"] == "finalized_spends_against_supplied_prevouts"
+    assert verified["fee_sat"] == 2000
+    assert core_rpc(port, "testmempoolaccept", [[verified["tx_hex"]]])[0]["allowed"] is True
+    # A signature with unchanged encoding but a different scalar must fail the
+    # real equation, even though decoding and unchecked extraction still work.
+    bad = psbt_maps(raw)
+    if b"\x08" in bad[1]:
+        items = witness_items(bad[1][b"\x08"])
+        slot = next(i for i, item in enumerate(items) if item)
+        sig = bytearray(items[slot]); sig[-2] ^= 1; items[slot] = bytes(sig)
+        bad[1][b"\x08"] = encoded_witness(items)
+    else:
+        script = bytearray(bad[1][b"\x07"])
+        assert 9 <= script[0] <= 73
+        script[script[0] - 1] ^= 1
+        bad[1][b"\x07"] = bytes(script)
+    mutated = encode_maps(bad)
+    cli(args.node, "decode-psbt", mutated)
+    extracted = cli(args.node, "extract-psbt", mutated)
+    reject_verification(args, mutated, "spending verification failed")
+    assert core_rpc(port, "testmempoolaccept", [[extracted["tx_hex"]]])[0]["allowed"] is False
+    # Declared types in final PSBTs are opaque to decode/extract, but the new
+    # verifier binds them to the actual signatures it evaluates.
+    bad = psbt_maps(raw)
+    if b"\x08" in bad[1]:
+        original_sig = next(item for item in witness_items(bad[1][b"\x08"]) if item)
+    else:
+        script = bad[1][b"\x07"]; original_sig = script[1:1 + script[0]]
+    taproot = cli(args.node, "decode-psbt", raw)["inputs"][0]["utxo"]["script_pubkey"].startswith("5120")
+    original_type = 0 if taproot and len(original_sig) == 64 else original_sig[-1]
+    bad[1][b"\x03"] = (2 if original_type != 2 else 1).to_bytes(4,"little")
+    reject_verification(args, encode_maps(bad), "declared sighash")
+    # Locktime is covered by every defined sighash mode.
+    bad = psbt_maps(raw)
+    unsigned = bytearray(bad[0][b"\x00"]); unsigned[-4] ^= 1; bad[0][b"\x00"] = bytes(unsigned)
+    reject_verification(args, encode_maps(bad), "spending verification failed")
+    bad = psbt_maps(raw)
+    bad[1].pop(b"\x00", None); bad[1].pop(b"\x01", None)
+    reject_verification(args, encode_maps(bad), "missing UTXO")
 
 
 def check_published_taproot_vectors(args, port):
@@ -325,6 +397,8 @@ def check_signed_sighash_variants(args, port, unsigned, kind):
         finalized = core_rpc(port, "finalizepsbt", [encode64(raw)])
         assert finalized["complete"] is True, (kind, name)
         assert core_rpc(port, "testmempoolaccept", [[finalized["hex"]]])[0]["allowed"] is True
+        final_psbt = core_rpc(port, "finalizepsbt", [encode64(raw), False])["psbt"]
+        check_final_verification(args, port, base64.b64decode(final_psbt).hex(), finalized["hex"])
         decoded = cli(args.node, "decode-psbt", raw)
         fields = decoded["inputs"][0]
         assert fields["sighash_type"] == hash_type and decoded["signatures_verified"] is False
@@ -409,7 +483,7 @@ def check_published_commitment_vectors(args, port):
 
 
 def check_wallet(args, port, kind, script_pair=None):
-    if kind in ["taproot-script", "wsh", "sh-wsh"]:
+    if kind in ["taproot-script", "wsh", "sh-wsh", "wsh-multisig", "sh-wsh-multisig"]:
         assert script_pair is not None
         address, destination = script_pair
     else:
@@ -427,6 +501,7 @@ def check_wallet(args, port, kind, script_pair=None):
     # Keep the real signatures/derivations in the PSBT for the conversion check.
     signed = core_rpc(port, "walletprocesspsbt", [original, True, "ALL", True, False])["psbt"]
     original_hex = base64.b64decode(signed, validate=True).hex()
+    reject_verification(args, original_hex, "not finalized")
     decoded = cli(args.node, "decode-psbt", original_hex)
     independent = core_rpc(port, "decodepsbt", [signed])
     assert decoded["unsigned_txid"] == independent["tx"]["txid"]
@@ -467,6 +542,7 @@ def check_wallet(args, port, kind, script_pair=None):
     final_psbt = core_rpc(port, "finalizepsbt", [signed, False])["psbt"]
     final_hex = base64.b64decode(final_psbt, validate=True).hex()
     check_spending_data(args, port, original_hex, final_hex, coin, expected["hex"])
+    check_final_verification(args, port, final_hex, expected["hex"], 2 if kind.endswith("multisig") else 1)
     v2_final = cli(args.node, "convert-psbt", final_hex, "--version", "2")
     final_restored = cli(args.node, "convert-psbt", v2_final["psbt_hex"], "--version", "0")
     assert core_rpc(port, "finalizepsbt", [encode64(final_restored["psbt_hex"])])["hex"] == expected["hex"]
@@ -474,6 +550,8 @@ def check_wallet(args, port, kind, script_pair=None):
         extracted = cli(args.node, "extract-psbt", encoded)
         assert extracted["tx_hex"] == expected["hex"]
         assert extracted["signatures_verified"] is False
+        verified = cli(args.node, "verify-psbt", encoded)
+        assert verified["tx_hex"] == expected["hex"] and verified["signatures_verified"] is True
         assert core_rpc(port, "testmempoolaccept", [[extracted["tx_hex"]]])[0]["allowed"] is True
     core_rpc(port, "sendrawtransaction", [finalized["hex"]])
     core_rpc(port, "generatetoaddress", [1, address])
@@ -482,6 +560,37 @@ def check_wallet(args, port, kind, script_pair=None):
                                capture_output=True, text=True, timeout=30)
     assert malformed.returncode != 0
     print(f"PASSED: Core v29 {kind} real signed/finalized PSBT v0 -> v2 -> v0", flush=True)
+
+
+def check_two_input_taproot_verification(args, port):
+    address = core_rpc(port, "getnewaddress", ["", "bech32m"])
+    destination = core_rpc(port, "getnewaddress", ["", "bech32m"])
+    core_rpc(port, "generatetoaddress", [102, address], timeout=30)
+    coins = [coin for coin in core_rpc(port, "listunspent", [100]) if coin["address"] == address][:2]
+    assert len(coins) == 2
+    original = core_rpc(port, "createpsbt", [[{"txid": coin["txid"], "vout": coin["vout"], "sequence": 0xfffffffd} for coin in coins],
+                                            {destination: round(sum(coin["amount"] for coin in coins) - 0.00002, 8)}, 23])
+    signed = core_rpc(port, "walletprocesspsbt", [original, True, "DEFAULT", True, False])["psbt"]
+    expected = core_rpc(port, "finalizepsbt", [signed])
+    assert expected["complete"] is True
+    raw = base64.b64decode(core_rpc(port, "finalizepsbt", [signed, False])["psbt"]).hex()
+    v2 = cli(args.node, "convert-psbt", raw, "--version", "2")["psbt_hex"]
+    for encoded in [raw, v2]:
+        verified = cli(args.node, "verify-psbt", encoded)
+        assert verified["tx_hex"] == expected["hex"] and verified["signatures_checked"] == 2
+        assert verified["fee_sat"] == 2000 and verified["txid_linked_prevouts"] == [False, False]
+        assert core_rpc(port, "testmempoolaccept", [[verified["tx_hex"]]])[0]["allowed"] is True
+    # Mutating only the second supplied amount must invalidate the first
+    # signature's BIP341 digest: verification has to supply every prevout.
+    bad = psbt_maps(raw, expected_maps=4)
+    amount = bad[2][b"\x01"]
+    bad[2][b"\x01"] = (int.from_bytes(amount[:8],"little") + 1).to_bytes(8,"little") + amount[8:]
+    reject_verification(args, encode_maps(bad), "input 0: spending verification failed")
+    bad = psbt_maps(raw, expected_maps=4); bad[2].pop(b"\x01")
+    reject_verification(args, encode_maps(bad), "input 1: missing UTXO")
+    core_rpc(port, "sendrawtransaction", [expected["hex"]])
+    core_rpc(port, "generatetoaddress", [1, address])
+    print("PASSED: Core two-input Taproot final verification and cross-input prevout substitution rejection", flush=True)
 
 
 def main():
@@ -506,15 +615,20 @@ def main():
                 core_rpc(port, "createwallet", ["psbt-interop"])
                 # Import before mining: only genesis needs scanning, and all
                 # subsequent test coins are observed as their blocks arrive.
-                script_pairs = {kind: script_addresses(port, kind)
-                                for kind in ["wsh", "sh-wsh", "taproot-script"]}
+                # Read the original private roots before importing the NUMS
+                # descriptor: its deliberately unknown internal secret cannot
+                # be exported by listdescriptors(private=true).
+                descriptors = core_rpc(port, "listdescriptors", [True])["descriptors"]
+                script_pairs = {kind: script_addresses(port, kind, descriptors)
+                                for kind in ["wsh", "sh-wsh", "taproot-script", "wsh-multisig", "sh-wsh-multisig"]}
                 check_published_taproot_vectors(args, port)
                 check_published_spending_vectors(args, port)
                 check_published_key_vectors(args, port)
                 check_published_signature_vectors(args, port)
                 check_published_commitment_vectors(args, port)
-                for kind in ["legacy", "p2sh-segwit", "bech32", "wsh", "sh-wsh", "bech32m", "taproot-script"]:
+                for kind in ["legacy", "p2sh-segwit", "bech32", "wsh", "sh-wsh", "bech32m", "taproot-script", "wsh-multisig", "sh-wsh-multisig"]:
                     check_wallet(args, port, kind, script_pairs.get(kind))
+                check_two_input_taproot_verification(args, port)
                 core_rpc(port, "stop", [])
                 core.wait(timeout=15)
                 assert core.returncode == 0

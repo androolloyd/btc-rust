@@ -453,6 +453,7 @@ btc-node decode-header  Decode raw block header hex
 btc-node decode-psbt    Inspect PSBT v0/v2 hex
 btc-node convert-psbt   Convert PSBT hex with --version 0 or 2
 btc-node extract-psbt   Extract externally finalized PSBT fields
+btc-node verify-psbt    Verify supported finalized spends against supplied prevouts
 btc-node watch ADDR   Watch address for transactions
 btc-node simulate-tx  Simulate transaction (dry run)
 btc-node compile      Compile miniscript policy to script
