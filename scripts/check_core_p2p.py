@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check real v1/v2 transport and bidirectional regtest relay against Core v29.
+"""Check inbound/outbound v1/v2 relay, reconnect and restart against Core v29.
 
 Requires a checksum-verified bitcoind binary; uses disposable data directories
 and loopback connections, with discovery disabled on both regtest nodes.
@@ -78,9 +78,10 @@ def rust_rpc(port, method, params):
     return result["result"]
 
 
-def scenario(args, encrypted):
+def scenario(args, encrypted, outbound):
     mode = "v2" if encrypted else "v1"
-    with tempfile.TemporaryDirectory(prefix=f"btc-core-{mode}-") as directory:
+    direction = "outbound" if outbound else "inbound"
+    with tempfile.TemporaryDirectory(prefix=f"btc-core-{direction}-{mode}-") as directory:
         root = Path(directory)
         core_data, rust_data = root / "core", root / "rust"
         core_data.mkdir()
@@ -88,48 +89,89 @@ def scenario(args, encrypted):
         core_port = free_port()
         rust_port = free_port(3, {core_port})
         p2p_port = free_port(excluded={core_port, *range(rust_port, rust_port + 3)})
+        core_p2p = free_port(excluded={core_port, p2p_port, *range(rust_port, rust_port + 3)})
         processes = []
         with (root / "core.log").open("w") as core_log, (root / "rust.log").open("w") as rust_log:
             try:
-                core = subprocess.Popen([
-                    str(args.bitcoind), "-regtest", f"-datadir={core_data}", "-server", "-listen=0",
+                core_command = [
+                    str(args.bitcoind), "-regtest", f"-datadir={core_data}", "-server", f"-listen={int(outbound)}",
                     "-dnsseed=0", "-discover=0", "-connect=0", "-listenonion=0", "-par=1",
                     f"-rpcport={core_port}", "-rpcbind=127.0.0.1", "-rpcallowip=127.0.0.1",
                     "-rpcuser=interop", "-rpcpassword=regtest-only", f"-v2transport={int(encrypted)}",
-                ], stdout=core_log, stderr=core_log)
+                ]
+                if outbound:
+                    core_command += [f"-bind=127.0.0.1:{core_p2p}", f"-port={core_p2p}"]
+                core = subprocess.Popen(core_command, stdout=core_log, stderr=core_log)
                 processes.append(core)
-                rust = subprocess.Popen([
-                    str(args.node), "--network", "regtest", "--datadir", str(rust_data),
-                    "--rpc-port", str(rust_port), "--port", str(p2p_port), "--log-level", "warn", "run",
-                ], stdout=rust_log, stderr=rust_log)
-                processes.append(rust)
                 wait_until(lambda: core_rpc(core_port, "getblockchaininfo", []))
+                address = "mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn"
+                initial_height = 19 if outbound else 0
+                if initial_height:
+                    core_rpc(core_port, "generatetoaddress", [initial_height, address])
+                rust_command = [
+                    str(args.node), "--network", "regtest", "--datadir", str(rust_data),
+                    "--rpc-port", str(rust_port), "--port", str(p2p_port), "--log-level", "warn",
+                ]
+                if outbound:
+                    rust_command += ["--connect", f"127.0.0.1:{core_p2p}"]
+                rust_command += ["run"]
+                rust = subprocess.Popen(rust_command, stdout=rust_log, stderr=rust_log)
+                processes.append(rust)
                 wait_until(lambda: rust_rpc(rust_port, "getblockchaininfo", []))
-                core_rpc(core_port, "addnode", [f"127.0.0.1:{p2p_port}", "onetry", encrypted])
+                if not outbound:
+                    core_rpc(core_port, "addnode", [f"127.0.0.1:{p2p_port}", "onetry", encrypted])
                 core_peers = wait_until(lambda: [peer for peer in core_rpc(core_port, "getpeerinfo", [])
                                                 if peer.get("version", 0) >= 70016 and peer.get("transport_protocol_type") == mode])
                 rust_peers = wait_until(lambda: rust_rpc(rust_port, "getpeerinfo", []))
                 assert len(core_peers) == len(rust_peers) == 1
                 assert core_peers[0]["transport_protocol_type"] == mode, core_peers
                 assert rust_peers[0]["transport_protocol_type"] == mode, rust_peers
-                assert rust_peers[0]["inbound"] is True
+                assert rust_peers[0]["inbound"] is (not outbound)
+                assert core_peers[0]["inbound"] is outbound
+                wait_until(lambda: rust_rpc(rust_port, "getblockcount", []) == initial_height)
                 assert core_peers[0]["relaytxes"] is False
                 if encrypted:
                     assert core_peers[0]["session_id"] == rust_peers[0]["session_id"]
                     assert int(core_peers[0]["services"], 16) & (1 << 11)
-                address = "mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn"
                 rust_hashes = rust_rpc(rust_port, "generatetoaddress", [3, address])
                 wait_until(lambda: core_rpc(core_port, "getbestblockhash", []) == rust_hashes[-1])
                 # Core independently checks our coinbase construction and proof of work.
-                assert core_rpc(core_port, "getblockcount", []) == 3
+                assert core_rpc(core_port, "getblockcount", []) == initial_height + 3
                 core_hashes = core_rpc(core_port, "generatetoaddress", [2, address])
                 wait_until(lambda: rust_rpc(rust_port, "getbestblockhash", []) == core_hashes[-1])
-                assert rust_rpc(rust_port, "getblockcount", []) == 5
+                assert rust_rpc(rust_port, "getblockcount", []) == initial_height + 5
                 assert core_rpc(core_port, "getblock", [core_hashes[-1], 0]) == rust_rpc(rust_port, "getblock", [core_hashes[-1], 0])
+                if outbound:
+                    # Core drops our outbound connection; recover missing history
+                    # across more than one live-download window, then keep relaying.
+                    previous_peer = core_peers[0]["id"]
+                    core_rpc(core_port, "disconnectnode", ["", previous_peer])
+                    core_hashes = core_rpc(core_port, "generatetoaddress", [20, address])
+                    wait_until(lambda: rust_rpc(rust_port, "getbestblockhash", []) == core_hashes[-1], timeout=60)
+                    core_peers = core_rpc(core_port, "getpeerinfo", [])
+                    rust_peers = rust_rpc(rust_port, "getpeerinfo", [])
+                    assert len(core_peers) == len(rust_peers) == 1
+                    assert core_peers[0]["id"] != previous_peer
+                    assert rust_peers[0]["inbound"] is False
+                    assert core_peers[0]["transport_protocol_type"] == rust_peers[0]["transport_protocol_type"] == mode
+                    if encrypted:
+                        assert core_peers[0]["session_id"] == rust_peers[0]["session_id"]
+                    rust_rpc(rust_port, "stop", [])
+                    assert rust.wait(10) == 0
+                    wait_until(lambda: not core_rpc(core_port, "getpeerinfo", []))
+                    core_hashes = core_rpc(core_port, "generatetoaddress", [2, address])
+                    rust = subprocess.Popen(rust_command, stdout=rust_log, stderr=rust_log)
+                    processes.append(rust)
+                    wait_until(lambda: rust_rpc(rust_port, "getbestblockhash", []) == core_hashes[-1])
+                    assert rust_rpc(rust_port, "getblockcount", []) == initial_height + 27
+                    rust_hashes = rust_rpc(rust_port, "generatetoaddress", [1, address])
+                    wait_until(lambda: core_rpc(core_port, "getbestblockhash", []) == rust_hashes[-1])
+                    assert core_rpc(core_port, "getblock", [rust_hashes[-1], 0]) == rust_rpc(rust_port, "getblock", [rust_hashes[-1], 0])
                 rust_rpc(rust_port, "stop", [])
                 core_rpc(core_port, "stop", [])
                 assert rust.wait(10) == core.wait(10) == 0
-                print(f"{mode}: Core/Rust handshake, session comparison, real blocks both ways, and shutdown passed")
+                print(f"{direction} {mode}: Core/Rust sessions, real blocks both ways, "
+                      + ("IBD, reconnect/restart, " if outbound else "") + "and shutdown passed")
             except Exception:
                 print((root / "rust.log").read_text())
                 debug = core_data / "regtest" / "debug.log"
@@ -153,8 +195,9 @@ def main():
     args = parser.parse_args()
     args.bitcoind = args.bitcoind.resolve()
     args.node = args.node.resolve()
-    scenario(args, False)
-    scenario(args, True)
+    for outbound in [False, True]:
+        for encrypted in [False, True]:
+            scenario(args, encrypted, outbound)
 
 
 if __name__ == "__main__":

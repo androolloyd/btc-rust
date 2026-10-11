@@ -1,4 +1,4 @@
-//! Inbound v1/BIP324 peers serving and relaying the committed chain.
+//! Shared inbound/outbound v1/BIP324 sessions serving the committed chain.
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -172,7 +172,6 @@ async fn serve_peer(
     peers: Arc<PeerTable>,
     shutdown: Arc<RpcHandler>,
 ) -> eyre::Result<()> {
-    let mut events = backend.subscribe_blocks();
     let mut connection =
         tokio::time::timeout(IO_TIMEOUT, Connection::accept_inbound(stream, network)).await??;
     let height = i32::try_from(backend.tip()?.0)?;
@@ -185,15 +184,47 @@ async fn serve_peer(
         .peer_version()
         .ok_or_else(|| eyre::eyre!("missing peer version"))?;
     let _peer = peers.register(address, true, &connection, version)?;
-    send(&mut connection, NetworkMessage::SendHeaders).await?;
-    request_headers(&mut connection, &backend).await?;
+    run_peer_session(&mut connection, backend, Some(shutdown), None, false).await
+}
+
+/// Both directions use the same bounded download, validation and committed-data
+/// serving path. The outbound manager retains its handshake/IBD peer guard.
+pub(crate) async fn run_peer_session(
+    connection: &mut Connection,
+    backend: Arc<NodeChainBackend>,
+    shutdown: Option<Arc<RpcHandler>>,
+    exex: Option<broadcast::Sender<btc_exex::ExExNotification>>,
+    announce_tip: bool,
+) -> eyre::Result<()> {
+    let mut events = backend.subscribe_blocks();
+    send(connection, NetworkMessage::SendHeaders).await?;
+    request_headers(connection, &backend).await?;
+    // RPC/inbound commits during outbound IBD preceded this subscription. Make
+    // our durable tip known immediately, then relay future commit events.
+    if announce_tip {
+        let hash = backend.tip()?.1;
+        send(
+            connection,
+            NetworkMessage::Inv(vec![InvItem {
+                inv_type: InvType::Block,
+                hash: Hash256::from_bytes(hash.to_bytes()),
+            }]),
+        )
+        .await?;
+    }
     let mut send_headers = false;
     let mut pending = HashSet::new();
     let mut queued: HashMap<BlockHash, Block> = HashMap::new();
     loop {
         let message = tokio::select! {
             biased;
-            _ = shutdown.wait_for_shutdown() => return Ok(()),
+            _ = async {
+                if let Some(shutdown) = &shutdown {
+                    shutdown.wait_for_shutdown().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => return Ok(()),
             event = events.recv() => {
                 let hash = match event {
                     Ok(hash) => hash,
@@ -202,10 +233,10 @@ async fn serve_peer(
                 };
                 if send_headers {
                     if let Some(header) = backend.header(&hash).map_err(|e| eyre::eyre!(e.message))? {
-                        send(&mut connection, NetworkMessage::Headers(vec![header])).await?;
+                        send(connection, NetworkMessage::Headers(vec![header])).await?;
                     }
                 } else {
-                    send(&mut connection, NetworkMessage::Inv(vec![InvItem { inv_type: InvType::Block, hash: Hash256::from_bytes(hash.to_bytes()) }])).await?;
+                    send(connection, NetworkMessage::Inv(vec![InvItem { inv_type: InvType::Block, hash: Hash256::from_bytes(hash.to_bytes()) }])).await?;
                 }
                 continue;
             }
@@ -213,9 +244,7 @@ async fn serve_peer(
         };
         let is_blocks_request = matches!(&message, NetworkMessage::GetBlocks(_));
         match message {
-            NetworkMessage::Ping(nonce) => {
-                send(&mut connection, NetworkMessage::Pong(nonce)).await?
-            }
+            NetworkMessage::Ping(nonce) => send(connection, NetworkMessage::Pong(nonce)).await?,
             NetworkMessage::SendHeaders => send_headers = true,
             NetworkMessage::GetHeaders(request) | NetworkMessage::GetBlocks(request) => {
                 let is_blocks = is_blocks_request;
@@ -228,7 +257,7 @@ async fn serve_peer(
                     .map_err(|e| eyre::eyre!(e.message))?;
                 if is_blocks {
                     send(
-                        &mut connection,
+                        connection,
                         NetworkMessage::Inv(
                             headers
                                 .into_iter()
@@ -241,7 +270,7 @@ async fn serve_peer(
                     )
                     .await?;
                 } else {
-                    send(&mut connection, NetworkMessage::Headers(headers)).await?;
+                    send(connection, NetworkMessage::Headers(headers)).await?;
                 }
             }
             NetworkMessage::GetData(items) => {
@@ -258,7 +287,7 @@ async fn serve_peer(
                                         tx.witness.clear();
                                     }
                                 }
-                                send(&mut connection, NetworkMessage::Block(block)).await?;
+                                send(connection, NetworkMessage::Block(block)).await?;
                             } else {
                                 missing.push(item);
                             }
@@ -271,7 +300,7 @@ async fn serve_peer(
                                 if item.inv_type == InvType::Tx {
                                     tx.witness.clear();
                                 }
-                                send(&mut connection, NetworkMessage::Tx(tx)).await?;
+                                send(connection, NetworkMessage::Tx(tx)).await?;
                             } else {
                                 missing.push(item);
                             }
@@ -280,35 +309,50 @@ async fn serve_peer(
                     }
                 }
                 if !missing.is_empty() {
-                    send(&mut connection, NetworkMessage::NotFound(missing)).await?;
+                    send(connection, NetworkMessage::NotFound(missing)).await?;
                 }
             }
             NetworkMessage::Inv(items) => {
-                let mut requests = Vec::new();
+                // An inv may advertise only the newest tip after several missed
+                // blocks. Fetch the connecting headers before requesting bodies
+                // (BIP130); otherwise the tip body looks like an unsupported fork.
+                let mut unknown_block = false;
                 for item in items {
-                    if !matches!(item.inv_type, InvType::Block | InvType::WitnessBlock) {
-                        continue;
-                    }
-                    let hash = BlockHash::from_bytes(item.hash.to_bytes());
-                    if backend
-                        .header(&hash)
-                        .map_err(|e| eyre::eyre!(e.message))?
-                        .is_none()
-                        && pending.len() < MAX_PENDING_BLOCKS
-                        && !queued.contains_key(&hash)
-                        && pending.insert(hash)
-                    {
-                        requests.push(InvItem {
-                            inv_type: InvType::WitnessBlock,
-                            hash: item.hash,
-                        });
+                    if matches!(item.inv_type, InvType::Block | InvType::WitnessBlock) {
+                        let hash = BlockHash::from_bytes(item.hash.to_bytes());
+                        if backend
+                            .header(&hash)
+                            .map_err(|e| eyre::eyre!(e.message))?
+                            .is_none()
+                            && !pending.contains(&hash)
+                            && !queued.contains_key(&hash)
+                        {
+                            unknown_block = true;
+                            break;
+                        }
                     }
                 }
-                if !requests.is_empty() {
-                    send(&mut connection, NetworkMessage::GetData(requests)).await?;
+                if unknown_block {
+                    request_headers(connection, &backend).await?;
                 }
             }
             NetworkMessage::Headers(headers) => {
+                if let Some(first) = headers.first() {
+                    if backend
+                        .header(&first.block_hash())
+                        .map_err(|e| eyre::eyre!(e.message))?
+                        .is_none()
+                        && backend
+                            .header(&first.prev_blockhash)
+                            .map_err(|e| eyre::eyre!(e.message))?
+                            .is_none()
+                        && !pending.contains(&first.prev_blockhash)
+                        && !queued.contains_key(&first.prev_blockhash)
+                    {
+                        request_headers(connection, &backend).await?;
+                        continue;
+                    }
+                }
                 let mut requests = Vec::new();
                 for header in headers {
                     let hash = header.block_hash();
@@ -332,7 +376,7 @@ async fn serve_peer(
                     });
                 }
                 if !requests.is_empty() {
-                    send(&mut connection, NetworkMessage::GetData(requests)).await?;
+                    send(connection, NetworkMessage::GetData(requests)).await?;
                 }
             }
             NetworkMessage::Block(block) => {
@@ -375,12 +419,22 @@ async fn serve_peer(
                     };
                     let block = queued.remove(&next).unwrap();
                     let worker = backend.clone();
-                    if let Err(error) =
-                        tokio::task::spawn_blocking(move || worker.submit_block(&block)).await?
+                    let submitted = block.clone();
+                    match tokio::task::spawn_blocking(move || worker.submit_block(&submitted))
+                        .await?
                     {
-                        if error.code != -27 {
-                            return Err(eyre::eyre!(error.message));
+                        Ok(accepted) => {
+                            if let Some(sender) = &exex {
+                                let _ = sender.send(btc_exex::ExExNotification::BlockCommitted {
+                                    height: accepted.height,
+                                    hash: accepted.hash,
+                                    block,
+                                    utxo_changes: accepted.update,
+                                });
+                            }
                         }
+                        Err(error) if error.code == -27 => {}
+                        Err(error) => return Err(eyre::eyre!(error.message)),
                     }
                 }
                 if pending.is_empty() {
@@ -389,12 +443,16 @@ async fn serve_peer(
                             "persistent fork/reorg integration is unavailable"
                         ));
                     }
-                    request_headers(&mut connection, &backend).await?;
+                    request_headers(connection, &backend).await?;
                 }
             }
             NetworkMessage::NotFound(items) => {
                 for item in items {
-                    pending.remove(&BlockHash::from_bytes(item.hash.to_bytes()));
+                    if matches!(item.inv_type, InvType::Block | InvType::WitnessBlock)
+                        && pending.contains(&BlockHash::from_bytes(item.hash.to_bytes()))
+                    {
+                        return Err(eyre::eyre!("peer cannot supply a requested block"));
+                    }
                 }
             }
             NetworkMessage::Version(_) | NetworkMessage::Verack => {
@@ -556,6 +614,20 @@ mod tests {
         let mut miner = TestNode::new();
         let blocks = miner.mine_blocks(2);
         connection
+            .send_message(NetworkMessage::Inv(vec![InvItem {
+                inv_type: InvType::Block,
+                hash: Hash256::from_bytes(blocks[1].block_hash().to_bytes()),
+            }]))
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                receive(&mut connection).await,
+                NetworkMessage::GetHeaders(_)
+            ),
+            "a tip-only inv must fetch its missing ancestor before requesting bodies"
+        );
+        connection
             .send_message(NetworkMessage::Headers(
                 blocks.iter().map(|b| b.header).collect(),
             ))
@@ -644,5 +716,145 @@ mod tests {
         assert!(backend.block(&invalid.block_hash()).unwrap().is_none());
         shutdown.request_shutdown();
         task.await.unwrap().unwrap();
+    }
+    #[tokio::test]
+    async fn outbound_sync_relays_after_ibd_and_resumes_after_reconnect() {
+        use btc_consensus::{chain::ChainState, validation::ChainParams};
+        use btc_network::discovery::PeerManager;
+        use tokio::sync::RwLock;
+        let dir = tempfile::tempdir().unwrap();
+        let remote_state = NodeState::new(Network::Regtest);
+        let local_state = NodeState::new(Network::Regtest);
+        let remote = Arc::new(
+            NodeChainBackend::open(&dir.path().join("remote.redb"), remote_state.clone()).unwrap(),
+        );
+        let local_path = dir.path().join("local.redb");
+        let local = Arc::new(NodeChainBackend::open(&local_path, local_state.clone()).unwrap());
+        let mine = |backend: &NodeChainBackend, count| {
+            backend
+                .call(
+                    "generatetoaddress",
+                    json!([count, "mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn"]),
+                )
+                .unwrap()
+        };
+        mine(&remote, 20);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let remote_shutdown = Arc::new(RpcHandler::new());
+        let remote_peers = Arc::new(PeerTable::new(remote_state.peer_count.clone()));
+        let server = tokio::spawn(P2pServer::run(
+            listener,
+            Network::Regtest,
+            remote.clone(),
+            remote_peers.clone(),
+            remote_shutdown.clone(),
+        ));
+        let local_peers = Arc::new(PeerTable::new(local_state.peer_count.clone()));
+        let peer_manager = Arc::new(RwLock::new(PeerManager::new(Network::Regtest)));
+        let params = ChainParams::from_network(Network::Regtest);
+        let mut manager = crate::sync::SyncManager::with_backend(
+            Network::Regtest,
+            Arc::new(RwLock::new(ChainState::new(params.clone()))),
+            peer_manager.clone(),
+            params,
+            dir.path().to_path_buf(),
+            local.clone(),
+        )
+        .unwrap();
+        manager.set_connect_peers(vec![address]);
+        manager.set_peer_table(local_peers.clone());
+        manager.set_node_state(local_state.clone());
+        let (sender, mut notifications) = broadcast::channel(128);
+        manager.set_exex_sender(sender);
+        let shutdown = Arc::new(RpcHandler::new().with_chain_backend(local.clone()));
+        let task_shutdown = shutdown.clone();
+        let task = tokio::spawn(async move {
+            manager.run(task_shutdown).await;
+        });
+        async fn wait_tip(backend: &NodeChainBackend, height: u64) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while backend.tip().unwrap().0 != height {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        wait_tip(&local, 20).await;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while local_state.syncing.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(local_peers.snapshot().unwrap()[0]["inbound"], false);
+        let first_id = local_peers.snapshot().unwrap()[0]["id"].clone();
+        // More than the 16-body window must drain through subsequent locators.
+        mine(&remote, 20);
+        wait_tip(&local, 40).await;
+        assert_eq!(local.tip().unwrap(), remote.tip().unwrap());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let btc_exex::ExExNotification::BlockCommitted {
+                    height: 40,
+                    hash,
+                    block,
+                    ..
+                } = notifications.recv().await.unwrap()
+                {
+                    assert_eq!(hash, local.tip().unwrap().1);
+                    assert_eq!(block.block_hash(), hash);
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        mine(&local, 2);
+        wait_tip(&remote, 42).await;
+        remote_shutdown.request_shutdown();
+        server.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while local_state.peer_count.load(Ordering::SeqCst) != 0
+                || peer_manager.read().await.connected_count() != 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(peer_manager.read().await.connected_count(), 0);
+        // While disconnected RPC can advance our durable tip. The next session
+        // must use that tip, not its stale header clone/checkpoint.
+        mine(&local, 3);
+        let listener = TcpListener::bind(address).await.unwrap();
+        let remote_shutdown = Arc::new(RpcHandler::new());
+        let server = tokio::spawn(P2pServer::run(
+            listener,
+            Network::Regtest,
+            remote.clone(),
+            remote_peers,
+            remote_shutdown.clone(),
+        ));
+        wait_tip(&remote, 45).await;
+        assert_ne!(local_peers.snapshot().unwrap()[0]["id"], first_id);
+        assert_eq!(local.tip().unwrap(), remote.tip().unwrap());
+        shutdown.request_shutdown();
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(local_state.peer_count.load(Ordering::SeqCst), 0);
+        assert_eq!(peer_manager.read().await.connected_count(), 0);
+        remote_shutdown.request_shutdown();
+        server.await.unwrap().unwrap();
+        let final_tip = local.tip().unwrap();
+        drop(shutdown);
+        drop(local);
+        let reopened =
+            NodeChainBackend::open(&local_path, NodeState::new(Network::Regtest)).unwrap();
+        assert_eq!(reopened.tip().unwrap(), final_tip);
     }
 }

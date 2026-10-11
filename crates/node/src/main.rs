@@ -45,6 +45,10 @@ struct Cli {
     #[arg(long, global = true)]
     port: Option<u16>,
 
+    /// Connect only to these IP:port peers; repeat to supply alternatives.
+    #[arg(long = "connect", global = true)]
+    connect_peers: Vec<std::net::SocketAddr>,
+
     /// Log level
     #[arg(long, default_value = "info", global = true)]
     log_level: String,
@@ -211,7 +215,8 @@ async fn main() -> eyre::Result<()> {
 
     let mut config = NodeConfig::new(network)
         .with_datadir(&cli.datadir)
-        .with_log_level(&cli.log_level);
+        .with_log_level(&cli.log_level)
+        .with_connect_peers(cli.connect_peers);
 
     if let Some(rpc_port) = cli.rpc_port {
         config = config.with_rpc_port(rpc_port);

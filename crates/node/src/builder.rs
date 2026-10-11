@@ -41,6 +41,7 @@ pub struct NodeConfig {
     pub datadir: PathBuf,
     pub rpc_port: u16,
     pub p2p_port: u16,
+    pub connect_peers: Vec<std::net::SocketAddr>,
     pub log_level: String,
 }
 
@@ -53,6 +54,7 @@ impl NodeConfig {
             datadir: PathBuf::from("~/.btc-rust"),
             rpc_port,
             p2p_port,
+            connect_peers: Vec::new(),
             log_level: "info".to_string(),
         }
     }
@@ -69,6 +71,12 @@ impl NodeConfig {
 
     pub fn with_p2p_port(mut self, port: u16) -> Self {
         self.p2p_port = port;
+        self
+    }
+
+    /// Restrict outbound connections to these addresses, disabling DNS seeds.
+    pub fn with_connect_peers(mut self, peers: Vec<std::net::SocketAddr>) -> Self {
+        self.connect_peers = peers;
         self
     }
 
@@ -341,15 +349,12 @@ impl Node {
         sync_mgr.set_exex_sender(exex_manager.sender().clone());
         sync_mgr.set_node_state(node_state.clone());
         sync_mgr.set_peer_table(peer_table);
+        sync_mgr.set_connect_peers(self.config.connect_peers);
 
         info!("starting initial block download");
 
-        let sync_handle = tokio::spawn(async move {
-            match sync_mgr.start().await {
-                Ok(()) => info!(state = %sync_mgr.state(), "sync connection ended"),
-                Err(e) => tracing::error!(error = %e, "sync failed"),
-            }
-        });
+        let sync_shutdown = rpc_handler.clone();
+        let mut sync_handle = tokio::spawn(async move { sync_mgr.run(sync_shutdown).await });
 
         info!("btc-node running — press Ctrl+C or use stop RPC to stop");
         let result = tokio::select! {
@@ -364,8 +369,13 @@ impl Node {
             },
         };
         info!("shutting down");
-        sync_handle.abort();
         rpc_handler.request_shutdown();
+        if tokio::time::timeout(std::time::Duration::from_secs(2), &mut sync_handle)
+            .await
+            .is_err()
+        {
+            sync_handle.abort();
+        }
         if !rpc_handle.is_finished() {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut rpc_handle).await;
         }

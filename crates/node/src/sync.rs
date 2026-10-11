@@ -435,6 +435,10 @@ pub struct SyncManager {
     chain_backend: Option<Arc<crate::chain_backend::NodeChainBackend>>,
     peer_table: Option<Arc<crate::p2p::PeerTable>>,
     outbound_peer: Option<crate::p2p::PeerGuard>,
+    outbound_address: Option<SocketAddr>,
+    /// An explicit list disables DNS discovery; useful for private/regtest peers.
+    connect_peers: Vec<SocketAddr>,
+    shutdown: Option<Arc<btc_rpc::handler::RpcHandler>>,
 }
 
 impl SyncManager {
@@ -466,6 +470,9 @@ impl SyncManager {
             chain_backend: None,
             peer_table: None,
             outbound_peer: None,
+            outbound_address: None,
+            connect_peers: Vec::new(),
+            shutdown: None,
         }
     }
 
@@ -510,6 +517,9 @@ impl SyncManager {
             chain_backend: None,
             peer_table: None,
             outbound_peer: None,
+            outbound_address: None,
+            connect_peers: Vec::new(),
+            shutdown: None,
         }
     }
 
@@ -546,6 +556,45 @@ impl SyncManager {
 
     pub fn set_peer_table(&mut self, table: Arc<crate::p2p::PeerTable>) {
         self.peer_table = Some(table);
+    }
+
+    pub fn set_connect_peers(&mut self, peers: Vec<SocketAddr>) {
+        self.connect_peers = peers;
+    }
+
+    /// Retry a disconnected/failed session with bounded backoff. Every attempt
+    /// resumes from the durable backend, including blocks committed by RPC or
+    /// inbound peers while this connection was unavailable.
+    pub async fn run(&mut self, shutdown: Arc<btc_rpc::handler::RpcHandler>) {
+        self.shutdown = Some(shutdown.clone());
+        let mut delay = std::time::Duration::from_secs(1);
+        loop {
+            let started = tokio::time::Instant::now();
+            let result = tokio::select! {
+                biased;
+                _ = shutdown.wait_for_shutdown() => None,
+                result = self.start() => Some(result),
+            };
+            self.outbound_peer.take();
+            if let Some(address) = self.outbound_address.take() {
+                self.peer_manager.write().await.remove_peer(&address);
+            }
+            let Some(result) = result else {
+                return;
+            };
+            if let Err(error) = result {
+                warn!(%error, "outbound sync connection ended; retrying");
+            }
+            if started.elapsed() >= std::time::Duration::from_secs(60) {
+                delay = std::time::Duration::from_secs(1);
+            }
+            tokio::select! {
+                biased;
+                _ = shutdown.wait_for_shutdown() => return,
+                _ = tokio::time::sleep(delay) => {},
+            }
+            delay = (delay * 2).min(std::time::Duration::from_secs(60));
+        }
     }
 
     /// Return a reference to the reorg manager (for testing / inspection).
@@ -614,9 +663,19 @@ impl SyncManager {
 
         // Phase 1 -- bootstrap peer addresses.
         self.sync_state = SyncState::ConnectingPeers;
-        {
+        if self.connect_peers.is_empty() {
             let mut pm = self.peer_manager.write().await;
             pm.bootstrap().await;
+        }
+        if let Some(backend) = &self.chain_backend {
+            *self.chain_state.write().await = backend
+                .header_chain()
+                .map_err(|e| SyncError::Aborted(e.to_string()))?;
+            self.validated_tip = Some(
+                backend
+                    .tip()
+                    .map_err(|e| SyncError::Aborted(e.to_string()))?,
+            );
         }
 
         // Phase 2 -- connect to peers and handshake.
@@ -705,9 +764,7 @@ impl SyncManager {
 
         // Phase 7 -- steady-state listening for new blocks and transactions.
         info!("entering steady state - listening for new blocks and transactions");
-        self.steady_state_loop(&mut conn).await;
-
-        Ok(())
+        self.steady_state_loop(&mut conn).await
     }
 
     // ------------------------------------------------------------------
@@ -715,49 +772,19 @@ impl SyncManager {
     // ------------------------------------------------------------------
 
     /// After IBD completes, listen for new block and transaction announcements.
-    async fn steady_state_loop(&mut self, peer: &mut Connection) {
-        loop {
-            match peer.recv_message().await {
-                Ok(NetworkMessage::Inv(items)) => {
-                    // Separate block and tx announcements.
-                    let block_items: Vec<_> = items
-                        .iter()
-                        .filter(|i| matches!(i.inv_type, InvType::Block | InvType::WitnessBlock))
-                        .collect();
-                    let tx_items: Vec<_> = items
-                        .iter()
-                        .filter(|i| matches!(i.inv_type, InvType::Tx | InvType::WitnessTx))
-                        .collect();
-
-                    if !block_items.is_empty() {
-                        debug!(
-                            count = block_items.len(),
-                            "steady state: received block inv"
-                        );
-                    }
-                    if !tx_items.is_empty() {
-                        debug!(
-                            count = tx_items.len(),
-                            "steady state: received tx inv announcements"
-                        );
-                    }
-                }
-                Ok(NetworkMessage::Tx(tx)) => {
-                    let txid = tx.txid();
-                    debug!(%txid, "steady state: received transaction from peer");
-                }
-                Ok(NetworkMessage::Ping(nonce)) => {
-                    peer.send_message(NetworkMessage::Pong(nonce)).await.ok();
-                }
-                Ok(other) => {
-                    debug!(cmd = other.command(), "steady state: ignoring message");
-                }
-                Err(e) => {
-                    warn!(error = %e, "peer disconnected in steady state");
-                    break;
-                }
-            }
-        }
+    async fn steady_state_loop(&mut self, peer: &mut Connection) -> Result<(), SyncError> {
+        let backend = self.chain_backend.clone().ok_or_else(|| {
+            SyncError::Aborted("steady-state relay requires the shared validated backend".into())
+        })?;
+        crate::p2p::run_peer_session(
+            peer,
+            backend,
+            self.shutdown.clone(),
+            self.exex_sender.clone(),
+            true,
+        )
+        .await
+        .map_err(|e| SyncError::Aborted(e.to_string()))
     }
 
     // ------------------------------------------------------------------
@@ -767,7 +794,9 @@ impl SyncManager {
     /// Connect to a single outbound peer, trying multiple addresses until one works.
     async fn connect_to_peer(&mut self) -> Result<Connection, SyncError> {
         // Collect all known peers and try them in order
-        let addrs: Vec<SocketAddr> = {
+        let addrs: Vec<SocketAddr> = if !self.connect_peers.is_empty() {
+            self.connect_peers.clone()
+        } else {
             let pm = self.peer_manager.read().await;
             // Try up to 20 peers
             let mut candidates = Vec::new();
@@ -786,12 +815,6 @@ impl SyncManager {
         }
 
         for addr in &addrs {
-            // Skip IPv6 if likely unsupported
-            if addr.is_ipv6() {
-                debug!(%addr, "skipping IPv6 peer");
-                continue;
-            }
-
             info!(%addr, "connecting to peer");
             let conn_result = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
@@ -845,6 +868,7 @@ impl SyncManager {
                         let mut pm = self.peer_manager.write().await;
                         pm.add_peer(*addr, peer_info);
                     }
+                    self.outbound_address = Some(*addr);
                     info!(%addr, "peer connected and handshake complete");
                     return Ok(conn);
                 }
