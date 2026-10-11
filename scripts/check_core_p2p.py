@@ -2,7 +2,9 @@
 """Check inbound/outbound v1/v2 relay, reconnect and restart against Core v29.
 
 Requires a checksum-verified bitcoind binary; uses disposable data directories
-and loopback connections, with discovery disabled on both regtest nodes.
+and loopback connections, with discovery disabled on both regtest nodes. Core's
+regtest clock is advanced during transaction relay waits so privacy trickling
+does not make acceptance depend on unbounded random wall-clock delays.
 """
 import argparse
 import base64
@@ -16,7 +18,11 @@ import urllib.error
 import urllib.request
 
 
-def wait_until(check, timeout=30):
+class WaitTimeout(RuntimeError):
+    pass
+
+
+def wait_until(check, timeout=30, description="condition", on_retry=None):
     deadline = time.monotonic() + timeout
     last = None
     while time.monotonic() < deadline:
@@ -24,10 +30,13 @@ def wait_until(check, timeout=30):
             value = check()
             if value:
                 return value
+            last = value
         except (OSError, ValueError, RuntimeError) as error:
             last = error
+        if on_retry is not None:
+            on_retry()
         time.sleep(0.05)
-    raise RuntimeError(f"condition timed out: {last}")
+    raise WaitTimeout(f"{description} timed out: last observation: {last}")
 
 
 def free_port(span=1, excluded=()):
@@ -78,6 +87,50 @@ def rust_rpc(port, method, params):
     return result["result"]
 
 
+class CoreClock:
+    """Drive Core's actual regtest relay scheduler without relaxing validation.
+
+    Core v29 net_processing.cpp uses exponentially distributed 5s/2s inventory
+    intervals and mockable GetTime. Freeze time from process startup, then move
+    it one second per retry. Retain the wall-clock timeout and cap advancement
+    below the two-hour future-block bound of the real-time Rust validator.
+    """
+    def __init__(self, port):
+        self.port = port
+        self.initial = self.now = int(time.time())
+
+    def advance(self):
+        if self.now - self.initial >= 3600:
+            raise RuntimeError("Core relay test clock exceeded its one-hour bound")
+        self.now += 1
+        core_rpc(self.port, "setmocktime", [self.now])
+
+
+def relay_snapshot(core_port, rust_port):
+    snapshot = {}
+    for node, port, rpc in [("Core", core_port, core_rpc), ("Rust", rust_port, rust_rpc)]:
+        snapshot[node] = {}
+        for method in ["getbestblockhash", "getrawmempool", "getpeerinfo"]:
+            try:
+                snapshot[node][method] = rpc(port, method, [])
+            except (OSError, ValueError, RuntimeError) as error:
+                snapshot[node][method] = str(error)
+    return json.dumps(snapshot, sort_keys=True)
+
+
+def wait_for_tx_relay(core_port, rust_port, clock, txid, from_core):
+    source = core_rpc if from_core else rust_rpc
+    target = rust_rpc if from_core else core_rpc
+    source_port, target_port = (core_port, rust_port) if from_core else (rust_port, core_port)
+    direction = "Core -> Rust" if from_core else "Rust -> Core"
+    assert txid in source(source_port, "getrawmempool", []), f"{direction}: missing source transaction {txid}"
+    try:
+        wait_until(lambda: txid in target(target_port, "getrawmempool", []),
+                   description=f"{direction} mempool relay of {txid}", on_retry=clock.advance)
+    except RuntimeError as error:
+        raise RuntimeError(f"{error}; mocktime={clock.now}; {relay_snapshot(core_port, rust_port)}") from error
+
+
 def signed_wallet_spend(core_port, coin=None, fee=0.00002):
     # Core supplies a real mature wallet coin and independently signs SegWit.
     if coin is None:
@@ -92,14 +145,26 @@ def signed_wallet_spend(core_port, coin=None, fee=0.00002):
     return signed["hex"], coin
 
 
-def check_reorg_and_mempool(core_port, rust_port, p2p_port, outbound, encrypted):
+def check_reorg_and_mempool(core_port, rust_port, p2p_port, outbound, encrypted, clock):
     core_rpc(core_port, "createwallet", ["interop-wallet"])
     address = core_rpc(core_port, "getnewaddress", ["", "bech32"])
     hashes = core_rpc(core_port, "generatetoaddress", [105, address], timeout=30)
     wait_until(lambda: rust_rpc(rust_port, "getbestblockhash", []) == hashes[-1], timeout=60)
     # Core -> Rust wtxid announcement and actual signature-checked admission.
     parent_id = core_rpc(core_port, "sendtoaddress", ["mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn", 0.25])
-    wait_until(lambda: parent_id in rust_rpc(rust_port, "getrawmempool", []))
+    assert parent_id in core_rpc(core_port, "getrawmempool", [])
+    # Negative control: a completed handshake and synchronized chain cannot
+    # guarantee a transaction announcement while Core's privacy timer is frozen.
+    # This reproduces the scheduler dependency without waiting 30 real seconds.
+    try:
+        wait_until(lambda: parent_id in rust_rpc(rust_port, "getrawmempool", []),
+                   timeout=0.25, description="frozen-clock transaction relay")
+    except WaitTimeout:
+        assert parent_id not in rust_rpc(rust_port, "getrawmempool", [])
+        assert len(core_rpc(core_port, "getpeerinfo", [])) == len(rust_rpc(rust_port, "getpeerinfo", [])) == 1
+    else:
+        raise AssertionError("Core announced a transaction without advancing its frozen trickle timer")
+    wait_for_tx_relay(core_port, rust_port, clock, parent_id, from_core=True)
     raw, replacement_coin = signed_wallet_spend(core_port)
     core_accept = core_rpc(core_port, "testmempoolaccept", [[raw]])[0]
     rust_accept = rust_rpc(rust_port, "testmempoolaccept", [[raw]])[0]
@@ -110,13 +175,13 @@ def check_reorg_and_mempool(core_port, rust_port, p2p_port, outbound, encrypted)
     assert rust_rpc(rust_port, "testmempoolaccept", [[raw], 0.00001])[0]["allowed"] is False
     # Rust -> Core relay lets Core independently verify the same witness tx.
     child_id = rust_rpc(rust_port, "sendrawtransaction", [raw])
-    wait_until(lambda: child_id in core_rpc(core_port, "getrawmempool", []))
+    wait_for_tx_relay(core_port, rust_port, clock, child_id, from_core=False)
     replacement, _ = signed_wallet_spend(core_port, replacement_coin, 0.00008)
     assert core_rpc(core_port, "testmempoolaccept", [[replacement]])[0]["allowed"] is True
     assert rust_rpc(rust_port, "testmempoolaccept", [[replacement]])[0]["allowed"] is True
     replaced_id = child_id
     child_id = rust_rpc(rust_port, "sendrawtransaction", [replacement])
-    wait_until(lambda: child_id in core_rpc(core_port, "getrawmempool", []))
+    wait_for_tx_relay(core_port, rust_port, clock, child_id, from_core=False)
     assert replaced_id not in core_rpc(core_port, "getrawmempool", [])
     assert replaced_id not in rust_rpc(rust_port, "getrawmempool", [])
     assert rust_rpc(rust_port, "getmempoolinfo", [])["size"] == 2
@@ -150,7 +215,7 @@ def check_reorg_and_mempool(core_port, rust_port, p2p_port, outbound, encrypted)
     assert restored["value"] == coin["amount"]
     assert restored["confirmations"] == core_rpc(core_port, "gettxout", [coin["txid"], coin["vout"], False])["confirmations"]
     assert fork_txid in rust_rpc(rust_port, "getrawmempool", [])
-    wait_until(lambda: fork_txid in core_rpc(core_port, "getrawmempool", []))
+    wait_for_tx_relay(core_port, rust_port, clock, fork_txid, from_core=False)
     final = rust_rpc(rust_port, "generatetoaddress", [1, address])[-1]
     wait_until(lambda: core_rpc(core_port, "getbestblockhash", []) == final)
     assert fork_txid in core_rpc(core_port, "getblock", [final])["tx"]
@@ -168,6 +233,7 @@ def scenario(args, encrypted, outbound):
         core_data.mkdir()
         rust_data.mkdir()
         core_port = free_port()
+        clock = CoreClock(core_port)
         rust_port = free_port(3, {core_port})
         p2p_port = free_port(excluded={core_port, *range(rust_port, rust_port + 3)})
         core_p2p = free_port(excluded={core_port, p2p_port, *range(rust_port, rust_port + 3)})
@@ -179,6 +245,7 @@ def scenario(args, encrypted, outbound):
                     "-dnsseed=0", "-discover=0", "-connect=0", "-listenonion=0", "-par=1",
                     f"-rpcport={core_port}", "-rpcbind=127.0.0.1", "-rpcallowip=127.0.0.1",
                     "-rpcuser=interop", "-rpcpassword=regtest-only", "-fallbackfee=0.00002", f"-v2transport={int(encrypted)}",
+                    f"-mocktime={clock.now}", "-debug=net", "-debug=mempool",
                 ]
                 if outbound:
                     core_command += [f"-bind=127.0.0.1:{core_p2p}", f"-port={core_p2p}"]
@@ -191,7 +258,7 @@ def scenario(args, encrypted, outbound):
                     core_rpc(core_port, "generatetoaddress", [initial_height, address])
                 rust_command = [
                     str(args.node), "--network", "regtest", "--datadir", str(rust_data),
-                    "--rpc-port", str(rust_port), "--port", str(p2p_port), "--log-level", "warn",
+                    "--rpc-port", str(rust_port), "--port", str(p2p_port), "--log-level", "debug",
                 ]
                 if outbound:
                     rust_command += ["--connect", f"127.0.0.1:{core_p2p}"]
@@ -211,6 +278,7 @@ def scenario(args, encrypted, outbound):
                 assert core_peers[0]["inbound"] is outbound
                 wait_until(lambda: rust_rpc(rust_port, "getblockcount", []) == initial_height)
                 assert core_peers[0]["relaytxes"] is True
+                assert core_peers[0]["permissions"] == [], "acceptance must use ordinary peer validation"
                 if encrypted:
                     assert core_peers[0]["session_id"] == rust_peers[0]["session_id"]
                     assert int(core_peers[0]["services"], 16) & (1 << 11)
@@ -248,7 +316,7 @@ def scenario(args, encrypted, outbound):
                     rust_hashes = rust_rpc(rust_port, "generatetoaddress", [1, address])
                     wait_until(lambda: core_rpc(core_port, "getbestblockhash", []) == rust_hashes[-1])
                     assert core_rpc(core_port, "getblock", [rust_hashes[-1], 0]) == rust_rpc(rust_port, "getblock", [rust_hashes[-1], 0])
-                final, stale = check_reorg_and_mempool(core_port, rust_port, p2p_port, outbound, encrypted)
+                final, stale = check_reorg_and_mempool(core_port, rust_port, p2p_port, outbound, encrypted, clock)
                 rust_rpc(rust_port, "stop", [])
                 assert rust.wait(10) == 0
                 wait_until(lambda: not core_rpc(core_port, "getpeerinfo", []))
@@ -262,10 +330,12 @@ def scenario(args, encrypted, outbound):
                 assert rust.wait(10) == core.wait(10) == 0
                 print(f"{direction} {mode}: Core/Rust sessions, real blocks both ways, "
                       + ("IBD, reconnect/restart, " if outbound else "") + "signed mempool relay/mining, spend reorg/undo, restart, and shutdown passed")
+                print(f"{direction} {mode}: frozen-clock negative control and actual P2P relay passed "
+                      f"with {clock.now - clock.initial}s of bounded Core clock advancement")
             except Exception:
-                print((root / "rust.log").read_text())
+                print((root / "rust.log").read_text()[-20000:])
                 debug = core_data / "regtest" / "debug.log"
-                print(debug.read_text()[-10000:] if debug.exists() else (root / "core.log").read_text())
+                print(debug.read_text()[-20000:] if debug.exists() else (root / "core.log").read_text())
                 raise
             finally:
                 for process in processes:
