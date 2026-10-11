@@ -33,7 +33,7 @@ def origin_records(entries, core=False):
         if core:
             path = [int(part.rstrip("h'")) | (0x80000000 if part.endswith(("h", "'")) else 0)
                     for part in path.split("/")[1:]]
-        records[entry["pubkey"]] = (entry["master_fingerprint"], path, sorted(entry["leaf_hashes"]))
+        records[entry["pubkey"]] = (entry["master_fingerprint"], path, sorted(entry.get("leaf_hashes", [])))
     return records
 
 
@@ -207,6 +207,90 @@ def check_published_spending_vectors(args, port):
     print("PASSED: 8 published BIP174 spends preserve Core data; 3 signer-script failures rejected", flush=True)
 
 
+def core_rejects_key(port, raw):
+    try:
+        core_rpc(port, "decodepsbt", [encode64(raw)])
+    except RuntimeError as error:
+        assert error.args[0]["code"] == -22, error
+    else:
+        raise AssertionError("Core accepted an invalid curve/key record")
+
+
+def check_key_substitutions(args, port, raw):
+    maps = psbt_maps(raw)
+    # The off-curve x=7 point is published in BIP32 vector 5; its encoding has
+    # the correct prefix and length, so length-only wallet checks cannot catch it.
+    bad_point = b"\x02" + b"\x00" * 31 + b"\x07"
+    for scope, kind in [(1, 2), (1, 6), (2, 2)]:
+        for key in maps[scope]:
+            if key[0] != kind or len(key) not in (34, 66):
+                continue
+            bad = psbt_maps(raw)
+            value = bad[scope].pop(key)
+            bad[scope][bytes([kind]) + bad_point] = value
+            corrupted = encode_maps(bad)
+            reject_spending_data(args, corrupted, "public key")
+            core_rejects_key(port, corrupted)
+            break
+
+
+def check_published_key_vectors(args, port):
+    fixture = Path(__file__).resolve().parents[1] / "crates/primitives/tests/data/bip32-keys.json"
+    data = json.loads(fixture.read_text())
+    for vector in data["psbt_vectors"]:
+        raw = vector["hex"]
+        if vector["status"] == "invalid":
+            reject_spending_data(args, raw, "xpub" if "global xpub" in vector["case"] else "public key")
+            if vector["core_parse_reject"]:
+                core_rejects_key(port, raw)
+            else:
+                # Core's PSBT decoder preserves custom version bytes. This
+                # implementation explicitly supports standard xpub/tpub only.
+                core_rpc(port, "decodepsbt", [encode64(raw)])
+            continue
+        expected = data["valid_keys"][vector["valid_key_index"]]
+        decoded = cli(args.node, "decode-psbt", raw)
+        independent = core_rpc(port, "decodepsbt", [encode64(raw)])
+        extended = decoded["global_xpub_records"][0]
+        assert decoded["global_xpubs"] == 1 and decoded["signatures_verified"] is False
+        assert extended["xpub"] == expected["xpub"] == independent["global_xpubs"][0]["xpub"]
+        assert extended["serialized_xpub"] == expected["serialized_xpub"]
+        assert extended["master_fingerprint"] == expected["master_fingerprint"]
+        assert extended["path"] == expected["child_indices"]
+        for name in ["inputs", "outputs"]:
+            assert origin_records(decoded[name][0]["bip32_derivation"]) == origin_records(
+                independent[name][0]["bip32_derivs"], core=True)
+        converted = cli(args.node, "convert-psbt", raw, "--version", "2")
+        restored = cli(args.node, "convert-psbt", converted["psbt_hex"], "--version", "0")
+        assert core_rpc(port, "decodepsbt", [encode64(restored["psbt_hex"])]) == independent
+        check_key_substitutions(args, port, raw)
+        maps = psbt_maps(raw)
+        global_key = next(key for key in maps[0] if key[0] == 1)
+        bad = psbt_maps(raw)
+        bad[0][global_key] += b"\x00\x00\x00\x00"
+        corrupted = encode_maps(bad)
+        # Core's decoder does not bind origin paths to extended-key headers.
+        core_rpc(port, "decodepsbt", [encode64(corrupted)])
+        reject_spending_data(args, corrupted, "depth")
+        if extended["path"]:
+            bad = psbt_maps(raw)
+            value = bytearray(bad[0][global_key])
+            value[-4] ^= 1
+            bad[0][global_key] = bytes(value)
+            corrupted = encode_maps(bad)
+            core_rpc(port, "decodepsbt", [encode64(corrupted)])
+            reject_spending_data(args, corrupted, "child number")
+        if len(extended["path"]) <= 1:
+            bad = psbt_maps(raw)
+            value = bytearray(bad[0][global_key])
+            value[0] ^= 1
+            bad[0][global_key] = bytes(value)
+            corrupted = encode_maps(bad)
+            core_rpc(port, "decodepsbt", [encode64(corrupted)])
+            reject_spending_data(args, corrupted, "fingerprint")
+    print("PASSED: 27 BIP32/BIP174 PSBT key cases, Core curve-key rejection and explicit origin/version checks", flush=True)
+
+
 def check_taproot_substitutions(args, raw):
     maps = psbt_maps(raw)
     generator = bytes.fromhex("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
@@ -281,6 +365,7 @@ def check_wallet(args, port, kind, script_pair=None):
     assert decoded["locktime"] == independent["tx"]["locktime"] == 23
     assert decoded["signatures_verified"] is False
     check_taproot_metadata(decoded, independent)
+    check_key_substitutions(args, port, original_hex)
     if kind == "taproot-script":
         fields = decoded["inputs"][0]
         assert len(fields["tap_leaf_scripts"]) == 2
@@ -357,6 +442,7 @@ def main():
                                 for kind in ["wsh", "sh-wsh", "taproot-script"]}
                 check_published_taproot_vectors(args, port)
                 check_published_spending_vectors(args, port)
+                check_published_key_vectors(args, port)
                 check_published_commitment_vectors(args, port)
                 for kind in ["legacy", "p2sh-segwit", "bech32", "wsh", "sh-wsh", "bech32m", "taproot-script"]:
                     check_wallet(args, port, kind, script_pairs.get(kind))

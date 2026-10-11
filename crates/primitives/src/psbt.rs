@@ -312,6 +312,40 @@ fn public_key_shape(key: &[u8]) -> Result<(), PsbtError> {
     if !((key.len() == 33 && matches!(key[0], 2 | 3)) || (key.len() == 65 && key[0] == 4)) {
         return Err(PsbtError::Other("invalid PSBT public key encoding".into()));
     }
+    secp256k1::PublicKey::from_slice(key)
+        .map_err(|_| PsbtError::Other("PSBT public key is not a secp256k1 point".into()))?;
+    Ok(())
+}
+
+/// BIP174's origin must describe this BIP32 header. These local consistency
+/// checks do not prove the derivation from an absent ancestor or wallet seed.
+fn check_global_xpub(data: &[u8], source: &KeySource) -> Result<(), PsbtError> {
+    let key = crate::bip32::ExtendedPubKey::deserialize(data)
+        .map_err(|error| PsbtError::Other(format!("invalid PSBT global xpub: {error}")))?;
+    if source.1.len() != usize::from(key.depth) {
+        return Err(PsbtError::Other(
+            "global xpub depth disagrees with origin path".into(),
+        ));
+    }
+    if source
+        .1
+        .last()
+        .is_some_and(|index| *index != key.child_number.0)
+    {
+        return Err(PsbtError::Other(
+            "global xpub child number disagrees with origin path".into(),
+        ));
+    }
+    let known_master = match key.depth {
+        0 => Some(key.fingerprint()),
+        1 => Some(key.parent_fingerprint),
+        _ => None,
+    };
+    if known_master.is_some_and(|fingerprint| fingerprint != source.0) {
+        return Err(PsbtError::Other(
+            "global xpub master fingerprint disagrees with origin".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -952,10 +986,9 @@ impl Psbt {
                     unsigned_tx = Some(tx_from_bytes(&value)?);
                 }
                 PSBT_GLOBAL_XPUB => {
-                    if key_data.len() != 78 {
-                        return Err(PsbtError::Other("global xpub must be 78 bytes".into()));
-                    }
-                    xpub.push((key_data.to_vec(), decode_key_source(&value)?));
+                    let source = decode_key_source(&value)?;
+                    check_global_xpub(key_data, &source)?;
+                    xpub.push((key_data.to_vec(), source));
                 }
                 PSBT_GLOBAL_VERSION => {
                     singleton(key_data)?;
@@ -1303,7 +1336,18 @@ impl Psbt {
         }) {
             return Err(PsbtError::Other("PSBT output value out of range".into()));
         }
+        for (data, source) in &self.xpub {
+            check_global_xpub(data, source)?;
+        }
         for (index, input) in self.inputs.iter().enumerate() {
+            for key in input
+                .partial_sigs
+                .iter()
+                .map(|(key, _)| key)
+                .chain(input.bip32_derivation.iter().map(|(key, _)| key))
+            {
+                public_key_shape(key)?;
+            }
             let utxo = self.input_utxo(index)?;
             check_script_commitments(
                 utxo.map(|output| &output.script_pubkey),
@@ -1315,6 +1359,9 @@ impl Psbt {
                 .map_err(|reason| PsbtError::InconsistentInput { index, reason })?;
         }
         for (index, output) in self.outputs.iter().enumerate() {
+            for (key, _) in &output.bip32_derivation {
+                public_key_shape(key)?;
+            }
             check_script_commitments(
                 Some(&self.unsigned_tx.outputs[index].script_pubkey),
                 output.redeem_script.as_ref(),
@@ -1618,6 +1665,188 @@ fn merge_output(mine: &mut PsbtOutput, theirs: &PsbtOutput) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key_vectors() -> serde_json::Value {
+        serde_json::from_str(include_str!("../tests/data/bip32-keys.json")).unwrap()
+    }
+
+    fn test_global_xpub() -> (Vec<u8>, KeySource) {
+        let fixture = key_vectors();
+        let vector = &fixture["valid_keys"][1];
+        (
+            hex::decode(vector["serialized_xpub"].as_str().unwrap()).unwrap(),
+            (
+                hex::decode(vector["master_fingerprint"].as_str().unwrap())
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+                vector["child_indices"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|i| i.as_u64().unwrap() as u32)
+                    .collect(),
+            ),
+        )
+    }
+
+    fn test_public_key(prefix: u8) -> Vec<u8> {
+        let mut key = vec![prefix];
+        key.extend_from_slice(&test_xonly_key());
+        key
+    }
+
+    #[test]
+    fn published_bip32_psbt_key_records() {
+        let fixture = key_vectors();
+        let vectors = fixture["psbt_vectors"].as_array().unwrap();
+        assert_eq!(vectors.len(), 27);
+        for vector in vectors {
+            let bytes = hex::decode(vector["hex"].as_str().unwrap()).unwrap();
+            if vector["status"] == "invalid" {
+                assert!(Psbt::deserialize(&bytes).is_err(), "{}", vector["case"]);
+                continue;
+            }
+            let original = Psbt::deserialize(&bytes).unwrap();
+            let expected =
+                &fixture["valid_keys"][vector["valid_key_index"].as_u64().unwrap() as usize];
+            assert_eq!(
+                hex::encode(&original.xpub[0].0),
+                expected["serialized_xpub"]
+            );
+            assert_eq!(
+                hex::encode(original.xpub[0].1 .0),
+                expected["master_fingerprint"]
+            );
+            for version in [0, 2] {
+                let model = original.convert_version(version).unwrap();
+                assert_eq!(
+                    Psbt::deserialize(&model.try_serialize().unwrap()).unwrap(),
+                    model
+                );
+                assert_eq!(model.xpub, original.xpub);
+                assert_eq!(
+                    model.inputs[0].bip32_derivation,
+                    original.inputs[0].bip32_derivation
+                );
+                assert_eq!(
+                    model.outputs[0].bip32_derivation,
+                    original.outputs[0].bip32_derivation
+                );
+                let mut combined = model.clone();
+                combined.merge(&model).unwrap();
+                assert_eq!(combined, model);
+            }
+        }
+    }
+
+    #[test]
+    fn curve_and_xpub_origin_substitutions_fail_before_extraction_or_merge() {
+        let fixture = key_vectors();
+        let base = Psbt::deserialize(
+            &hex::decode(fixture["psbt_vectors"][1]["hex"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        let mut invalid_keys = vec![vec![0; 33], vec![0xff; 33], vec![0; 65]];
+        // The off-curve x=7 point is independently published in BIP32 vector 5.
+        for prefix in [2, 3] {
+            let mut key = vec![0; 33];
+            key[0] = prefix;
+            key[32] = 7;
+            invalid_keys.push(key);
+            let mut key = vec![0xff; 33];
+            key[0] = prefix;
+            invalid_keys.push(key);
+        }
+        invalid_keys[2][0] = 4; // correctly shaped uncompressed point (0,0)
+        let public = secp256k1::PublicKey::from_slice(&base.xpub[0].0[45..]).unwrap();
+        let mut hybrid = public.serialize_uncompressed().to_vec();
+        hybrid[0] = 6;
+        invalid_keys.push(hybrid);
+        for version in [0, 2] {
+            let good = base.convert_version(version).unwrap();
+            let mut bad_models = Vec::new();
+            for key in &invalid_keys {
+                let mut bad = good.clone();
+                bad.inputs[0]
+                    .partial_sigs
+                    .push((key.clone(), hex::decode("300602010102010101").unwrap()));
+                bad_models.push(bad);
+                let mut bad = good.clone();
+                bad.inputs[0].bip32_derivation[0].0 = key.clone();
+                bad_models.push(bad);
+                let mut bad = good.clone();
+                bad.outputs[0].bip32_derivation[0].0 = key.clone();
+                bad_models.push(bad);
+            }
+            for variant in 0..10 {
+                let mut bad = good.clone();
+                match variant {
+                    0 => {
+                        bad.xpub[0].0.pop();
+                    }
+                    1 => bad.xpub[0].0.push(0),
+                    2 => bad.xpub[0].0[45..].fill(0),
+                    3 => bad.xpub[0].0[..4].copy_from_slice(&[4, 0x88, 0xad, 0xe4]),
+                    4 => bad.xpub[0].1 .1.push(1),
+                    5 => bad.xpub[0].1 .1[0] ^= 1,
+                    6 => bad.xpub[0].1 .0[0] ^= 1,
+                    7 => {
+                        bad.xpub[0].0[4] = 0;
+                        bad.xpub[0].1 .1.clear();
+                    }
+                    8 | 9 => {
+                        let root = &fixture["valid_keys"][0];
+                        bad.xpub[0].0 =
+                            hex::decode(root["serialized_xpub"].as_str().unwrap()).unwrap();
+                        bad.xpub[0].1 .1.clear();
+                        if variant == 8 {
+                            bad.xpub[0].0[12] = 1;
+                        } else {
+                            bad.xpub[0].1 .0[0] ^= 1;
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                bad_models.push(bad);
+            }
+            for mut bad in bad_models {
+                bad.inputs[0].final_script_sig = Some(ScriptBuf::from_bytes(vec![0x51]));
+                assert!(bad.try_serialize().is_err());
+                assert!(bad
+                    .convert_version(if version == 0 { 2 } else { 0 })
+                    .is_err());
+                assert!(!matches!(
+                    bad.finalize(),
+                    Err(PsbtError::NotFinalized { .. }) | Ok(_)
+                ));
+                let mut wire = Vec::new();
+                bad.serialize_to(&mut wire).unwrap();
+                assert!(Psbt::deserialize(&wire).is_err());
+                let mut destination = good.clone();
+                assert!(destination.merge(&bad).is_err());
+                assert_eq!(destination, good);
+            }
+            // Both standard point encodings are valid. At depth >1 the master
+            // fingerprint remains an updater claim without the missing ancestor.
+            let mut incomplete = good.clone();
+            incomplete.xpub[0] = (
+                hex::decode(
+                    fixture["valid_keys"][2]["serialized_xpub"]
+                        .as_str()
+                        .unwrap(),
+                )
+                .unwrap(),
+                ([0xab; 4], vec![0x80000000, 1]),
+            );
+            incomplete.inputs[0].bip32_derivation[0].0 = public.serialize_uncompressed().to_vec();
+            incomplete.outputs[0].bip32_derivation[0].0 = public.serialize_uncompressed().to_vec();
+            incomplete.try_serialize().unwrap();
+            let mut testnet = good.clone();
+            testnet.xpub[0].0[..4].copy_from_slice(&[4, 0x35, 0x87, 0xcf]);
+            testnet.try_serialize().unwrap();
+        }
+    }
 
     fn commitment_vectors() -> serde_json::Value {
         serde_json::from_str(include_str!("../tests/data/bip341-commitments.json")).unwrap()
@@ -2457,18 +2686,18 @@ mod tests {
         // Add some data to exercise more paths
         psbt.inputs[0].sighash_type = Some(1);
         psbt.inputs[0].partial_sigs.push((
-            vec![0x02; 33], // compressed pubkey
-            vec![0x30; 72], // DER sig placeholder
+            test_public_key(2), // compressed pubkey
+            vec![0x30; 72],     // DER sig placeholder
         ));
         psbt.inputs[0].bip32_derivation.push((
-            vec![0x02; 33],
+            test_public_key(2),
             (
                 [0xDE, 0xAD, 0xBE, 0xEF],
                 vec![44 | 0x80000000, 0x80000000, 0],
             ),
         ));
         psbt.outputs[0].bip32_derivation.push((
-            vec![0x03; 33],
+            test_public_key(3),
             (
                 [0xCA, 0xFE, 0xBA, 0xBE],
                 vec![44 | 0x80000000, 0x80000000, 1],
@@ -2530,14 +2759,14 @@ mod tests {
         let mut psbt_b = Psbt::from_unsigned_tx(tx).unwrap();
 
         // Signer A adds their sig
-        let pubkey_a = vec![0x02; 33];
+        let pubkey_a = test_public_key(2);
         let sig_a = vec![0x30; 72];
         psbt_a.inputs[0]
             .partial_sigs
             .push((pubkey_a.clone(), sig_a.clone()));
 
         // Signer B adds their sig
-        let pubkey_b = vec![0x03; 33];
+        let pubkey_b = test_public_key(3);
         let sig_b = vec![0x45; 72];
         psbt_b.inputs[0]
             .partial_sigs
@@ -2575,7 +2804,7 @@ mod tests {
         let mut psbt = Psbt::from_unsigned_tx(tx.clone()).unwrap();
         psbt.inputs[0]
             .partial_sigs
-            .push((vec![0x02; 33], vec![0xAB; 64]));
+            .push((test_public_key(2), vec![0xAB; 64]));
 
         let copy = psbt.clone();
         psbt.merge(&copy).unwrap();
@@ -2604,7 +2833,7 @@ mod tests {
         let tx = make_unsigned_tx();
         let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
 
-        let witness_items = vec![vec![0x30; 72], vec![0x02; 33]];
+        let witness_items = vec![vec![0x30; 72], test_public_key(2)];
         psbt.inputs[0].final_script_witness = Some(witness_items.clone());
 
         let finalized_tx = psbt.finalize().unwrap();
@@ -2696,7 +2925,7 @@ mod tests {
         let tx = make_unsigned_tx();
         let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
 
-        let wit = vec![vec![0x30; 72], vec![0x02; 33], vec![]];
+        let wit = vec![vec![0x30; 72], test_public_key(2), vec![]];
         psbt.inputs[0].final_script_witness = Some(wit.clone());
         psbt.inputs[0].final_script_sig = Some(ScriptBuf::new()); // also finalize with empty
 
@@ -2724,8 +2953,7 @@ mod tests {
         let tx = make_unsigned_tx();
         let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
 
-        let xpub_data = vec![0x04; 78]; // typical xpub is 78 bytes
-        let key_source: KeySource = ([0xDE, 0xAD, 0xBE, 0xEF], vec![44 | 0x80000000, 0]);
+        let (xpub_data, key_source) = test_global_xpub();
         psbt.xpub.push((xpub_data.clone(), key_source.clone()));
 
         let bytes = psbt.serialize();
@@ -2743,10 +2971,10 @@ mod tests {
 
         psbt_a.inputs[0]
             .bip32_derivation
-            .push((vec![0x02; 33], ([0xAA; 4], vec![44 | 0x80000000, 0])));
+            .push((test_public_key(2), ([0xAA; 4], vec![44 | 0x80000000, 0])));
         psbt_b.inputs[0]
             .bip32_derivation
-            .push((vec![0x03; 33], ([0xBB; 4], vec![44 | 0x80000000, 1])));
+            .push((test_public_key(3), ([0xBB; 4], vec![44 | 0x80000000, 1])));
 
         psbt_a.merge(&psbt_b).unwrap();
         assert_eq!(psbt_a.inputs[0].bip32_derivation.len(), 2);
@@ -2854,7 +3082,7 @@ mod tests {
 
     #[test]
     fn test_witness_stack_roundtrip() {
-        let items = vec![vec![0x30; 72], vec![0x02; 33], vec![]];
+        let items = vec![vec![0x30; 72], test_public_key(2), vec![]];
         let encoded = encode_witness_stack(&items);
         let decoded = decode_witness_stack(&encoded).unwrap();
         assert_eq!(decoded, items);
@@ -2883,7 +3111,7 @@ mod tests {
         psbt_b.outputs[0]
             .unknown
             .push((vec![0xFD, 0x02, 0x01], vec![0x64]));
-        psbt_b.xpub.push((vec![0x04; 78], ([0xAA; 4], vec![44])));
+        psbt_b.xpub.push(test_global_xpub());
         psbt_b.proprietary.push((vec![0xFC, 0x01], vec![0x70]));
         psbt_b.unknown.push((vec![0xFD, 0x00, 0x01], vec![0x80]));
 
@@ -2916,7 +3144,7 @@ mod tests {
         let mut psbt_b = Psbt::from_unsigned_tx(tx).unwrap();
 
         // Both have the same xpub, proprietary, unknown, tap_script_sigs, bip32_derivation
-        let common_xpub = (vec![0x04; 78], ([0xAA; 4], vec![44u32]));
+        let common_xpub = test_global_xpub();
         psbt_a.xpub.push(common_xpub.clone());
         psbt_b.xpub.push(common_xpub);
 
@@ -2937,10 +3165,10 @@ mod tests {
 
         psbt_a.outputs[0]
             .bip32_derivation
-            .push((vec![0x03; 33], ([0xBB; 4], vec![0])));
+            .push((test_public_key(3), ([0xBB; 4], vec![0])));
         psbt_b.outputs[0]
             .bip32_derivation
-            .push((vec![0x03; 33], ([0xBB; 4], vec![0])));
+            .push((test_public_key(3), ([0xBB; 4], vec![0])));
 
         psbt_a.merge(&psbt_b).unwrap();
 
@@ -2990,7 +3218,7 @@ mod tests {
         let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
 
         psbt.inputs[0].final_script_sig = Some(ScriptBuf::from_bytes(vec![0x01, 0x02]));
-        psbt.inputs[0].final_script_witness = Some(vec![vec![0x30; 72], vec![0x02; 33]]);
+        psbt.inputs[0].final_script_witness = Some(vec![vec![0x30; 72], test_public_key(2)]);
 
         let finalized = psbt.finalize().unwrap();
         assert_eq!(finalized.inputs[0].script_sig.as_bytes(), &[0x01, 0x02]);
@@ -3114,7 +3342,7 @@ mod tests {
         let tx = make_unsigned_tx();
         let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
         psbt.outputs[0].bip32_derivation.push((
-            vec![0x02; 33],
+            test_public_key(2),
             (
                 [0xCA, 0xFE, 0xBA, 0xBE],
                 vec![44 | 0x80000000, 0x80000000, 1],

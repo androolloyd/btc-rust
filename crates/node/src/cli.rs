@@ -74,6 +74,20 @@ fn parse_psbt_hex(hex_str: &str) -> eyre::Result<btc_primitives::psbt::Psbt> {
     )?)?)
 }
 
+/// Inspect BIP32 key origins without treating them as verified derivations.
+fn key_derivations_json(
+    entries: &[(Vec<u8>, btc_primitives::psbt::KeySource)],
+) -> serde_json::Value {
+    serde_json::json!(entries
+        .iter()
+        .map(|(key, source)| serde_json::json!({
+            "pubkey": hex::encode(key),
+            "master_fingerprint": hex::encode(source.0),
+            "path": source.1,
+        }))
+        .collect::<Vec<_>>())
+}
+
 /// Inspect Taproot key origins without treating them as verified derivations.
 fn tap_derivations_json(
     entries: &[(Vec<u8>, btc_primitives::psbt::TapKeySource)],
@@ -95,6 +109,23 @@ pub fn decode_psbt(hex_str: &str) -> eyre::Result<serde_json::Value> {
     let utxos = (0..psbt.inputs.len())
         .map(|index| psbt.input_utxo(index))
         .collect::<Result<Vec<_>, _>>()?;
+    let xpubs = psbt
+        .xpub
+        .iter()
+        .map(|(data, source)| {
+            let key = btc_primitives::bip32::ExtendedPubKey::deserialize(data)?;
+            Ok(serde_json::json!({
+                "xpub": key.to_base58(),
+                "serialized_xpub": hex::encode(data),
+                "depth": key.depth,
+                "parent_fingerprint": hex::encode(key.parent_fingerprint),
+                "child_number": key.child_number.0,
+                "pubkey": hex::encode(key.public_key.serialize()),
+                "master_fingerprint": hex::encode(source.0),
+                "path": source.1,
+            }))
+        })
+        .collect::<Result<Vec<_>, btc_primitives::bip32::Bip32Error>>()?;
     Ok(serde_json::json!({
         "psbt_version": psbt.version,
         "tx_version": psbt.unsigned_tx.version,
@@ -122,6 +153,7 @@ pub fn decode_psbt(hex_str: &str) -> eyre::Result<serde_json::Value> {
                     "txid_linked": input.non_witness_utxo.is_some(),
                 })),
                 "partial_signatures": input.partial_sigs.len(),
+                "bip32_derivation": key_derivations_json(&input.bip32_derivation),
                 "has_tap_key_signature": input.tap_key_sig.is_some(),
                 "tap_script_signatures": input.tap_script_sigs.len(),
                 "tap_internal_key": input.tap_internal_key.as_ref().map(hex::encode),
@@ -139,6 +171,7 @@ pub fn decode_psbt(hex_str: &str) -> eyre::Result<serde_json::Value> {
         "outputs": psbt.unsigned_tx.outputs.iter().zip(&psbt.outputs).map(|(output, fields)| serde_json::json!({
             "value_sat": output.value.as_sat(),
             "script_pubkey": hex::encode(output.script_pubkey.as_bytes()),
+            "bip32_derivation": key_derivations_json(&fields.bip32_derivation),
             "tap_internal_key": fields.tap_internal_key.as_ref().map(hex::encode),
             "tap_tree": fields.tap_tree.as_ref().map(|tree| tree.iter().map(|leaf| serde_json::json!({
                 "depth": leaf.depth,
@@ -148,6 +181,7 @@ pub fn decode_psbt(hex_str: &str) -> eyre::Result<serde_json::Value> {
             "tap_bip32_derivation": tap_derivations_json(&fields.tap_bip32_derivation),
         })).collect::<Vec<_>>(),
         "global_xpubs": psbt.xpub.len(),
+        "global_xpub_records": xpubs,
         "unknown_global_fields": psbt.unknown.len(),
         "proprietary_global_fields": psbt.proprietary.len(),
     }))

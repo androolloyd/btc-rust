@@ -16,6 +16,10 @@ locktime, prevouts, sequences, output values/scripts, available UTXO/final field
 and signature counts. Taproot inspection also exposes internal keys, input merkle
 roots, leaf scripts/control blocks, output trees and key-origin/leaf-hash records.
 Paths are reported as the original u32 child indices, including hardened bits.
+Input/output `bip32_derivation` arrays also expose legacy public-key origins.
+`global_xpub_records` includes the Base58 and serialized extended public key,
+depth, parent fingerprint, child number, public key and claimed master origin;
+`global_xpubs` retains the existing count.
 Input `utxo` reports the supplied amount/script and its source, or null when absent.
 `txid_linked` means a full parent transaction hashes to the referenced txid; it does
 not mean the output has been confirmed or is currently unspent. Witness-only
@@ -62,6 +66,19 @@ isolated combine result before the receiver changes. These checks apply at the
 tool boundary even to BIP174 examples which are structurally valid but fail the
 Signer role's script checks. This does not implement a signer.
 
+Legacy partial-signature and input/output BIP32 record keys must use compressed
+or uncompressed encodings of actual secp256k1 points. Global xpubs use BIP32's
+78-byte layout, compressed curve keys and standard xpub/tpub version bytes.
+Unsupported custom versions and private-key versions fail explicitly. A master
+extended key must have zero parent fingerprint and child number; the standalone
+BIP32 private/public decoders enforce this as well. A global xpub's origin path
+length must match its depth and its final index must match the header's child
+number. The master fingerprint must agree where directly known: the key's own
+fingerprint at depth zero or the parent fingerprint at depth one. At greater
+depths it remains a claim without the missing master ancestor. These consistency
+checks neither establish the full derivation nor link every input/output origin
+to a global xpub. Compressed/uncompressed keys retain their original encoding.
+
 All BIP371 fields are typed, including input leaf scripts and input/output Taproot
 BIP32 origins and output trees. X-only keys must be actual secp256k1 points. Control
 blocks require `33 + 32*m` bytes with `m <= 128`, an on-curve internal key and a
@@ -88,9 +105,9 @@ data are deferred. These public commitments do not prove signature equations,
 key derivations, confirmation, unspentness or script satisfaction. Sorted branch
 hashing permits exchanging complete sibling subtrees without changing the root.
 
-Parsing does not validate signature equations, sighash semantics, claimed key
+Parsing does not validate signature equations, sighash semantics, full claimed key
 derivations or script satisfactions. Remaining
-BIP174 curve/DER/key-origin checks, witness-only legacy signing restrictions,
+BIP174 DER/sighash and full key-origin verification, witness-only legacy signing restrictions,
 active-chain/unspentness checks, wallet signing/finalization,
 descriptor operations and MuSig2 remain unfinished. Empty v2 creator maps can be
 represented; converting an empty-input creator to v0 is rejected by the legacy
@@ -119,6 +136,19 @@ Full-parent inspection matches Core's active UTXO amounts/scripts; substituted
 parents, conflicting UTXOs and altered input/output scripts are rejected through
 all CLI tools. Valid signed and finalized records keep identical transaction bytes.
 
+`bip32-keys.json` retains all 17 valid public/private key pairs from BIP32 vectors
+1–4 and all 16 invalid extended keys from vector 5, with source hashes. Derivation
+from the published seeds and paths must match the exact extended key bytes,
+including leading zeros. Independently serialized PSBT wrappers carry the public
+keys and origins; these have no UTXOs/signatures and make no spendability claim.
+The fixture also retains three published BIP174 malformed-key cases, for 27 PSBT
+cases in total. The compiled tools reject substituted off-curve keys and altered
+depth/index/fingerprint records. Core independently checks curve/extended-key
+encoding and valid conversion data; its PSBT decoder preserves custom version
+bytes and does not bind origin paths to headers, so those stricter supported-version
+and origin checks are reported separately. Core-signed legacy/witness spends
+also exercise input/output key substitution. The fuzzer includes these envelopes.
+
 `bip341-commitments.json` retains all seven published scriptPubKey commitment cases,
 with exact tweaks, output keys, leaf hashes, roots and twelve control proofs,
 including an even future leaf version. It also contains independently constructed
@@ -131,6 +161,7 @@ fail the actual tools. Tagged commitment hashing is shared with the existing
 consensus verifier through primitives; consensus rules are unchanged.
 
 Primary specifications: [BIP174](https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki),
+[BIP32 and its vectors](https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki),
 [BIP370 and its vectors](https://github.com/bitcoin/bips/blob/master/bip-0370.mediawiki),
 [BIP371](https://github.com/bitcoin/bips/blob/master/bip-0371.mediawiki),
 [BIP341 and wallet vectors](https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki),

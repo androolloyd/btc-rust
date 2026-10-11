@@ -23,6 +23,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features --locked
       - run: cargo build --release --locked --package btc-node
       - run: cargo check --locked --package btc-primitives --no-default-features
+      - run: cargo check --locked --package btc-primitives --no-default-features --features psbt
       - run: cargo check --locked --package btc-network --no-default-features
       - run: cargo check --locked --package btc-storage --no-default-features
   advisories:

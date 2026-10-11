@@ -44,6 +44,8 @@ pub enum Bip32Error {
     Secp256k1(String),
     #[error("invalid child number")]
     InvalidChildNumber,
+    #[error("BIP32 master key must have zero parent fingerprint and child number")]
+    InvalidRootMetadata,
 }
 
 impl From<secp256k1::Error> for Bip32Error {
@@ -64,6 +66,13 @@ const XPRV_VERSION: [u8; 4] = [0x04, 0x88, 0xAD, 0xE4];
 const XPUB_VERSION: [u8; 4] = [0x04, 0x88, 0xB2, 0x1E];
 const TPRV_VERSION: [u8; 4] = [0x04, 0x35, 0x83, 0x94];
 const TPUB_VERSION: [u8; 4] = [0x04, 0x35, 0x87, 0xCF];
+
+fn check_root_metadata(depth: u8, fingerprint: [u8; 4], child: u32) -> Result<(), Bip32Error> {
+    if depth == 0 && (fingerprint != [0; 4] || child != 0) {
+        return Err(Bip32Error::InvalidRootMetadata);
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Base58 (reused from address.rs logic, self-contained here)
@@ -473,6 +482,7 @@ impl ExtendedPrivKey {
         parent_fingerprint.copy_from_slice(&data[5..9]);
 
         let child_number = u32::from_be_bytes([data[9], data[10], data[11], data[12]]);
+        check_root_metadata(depth, parent_fingerprint, child_number)?;
 
         let mut chain_code = [0u8; 32];
         chain_code.copy_from_slice(&data[13..45]);
@@ -641,6 +651,7 @@ impl ExtendedPubKey {
         parent_fingerprint.copy_from_slice(&data[5..9]);
 
         let child_number = u32::from_be_bytes([data[9], data[10], data[11], data[12]]);
+        check_root_metadata(depth, parent_fingerprint, child_number)?;
 
         let mut chain_code = [0u8; 32];
         chain_code.copy_from_slice(&data[13..45]);
@@ -717,6 +728,52 @@ pub fn bip86_path(coin: u32, account: u32, change: u32, index: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_published_extended_key_vectors() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/data/bip32-keys.json")).unwrap();
+        let valid = fixture["valid_keys"].as_array().unwrap();
+        assert_eq!(valid.len(), 17);
+        for vector in valid {
+            let xpub = vector["xpub"].as_str().unwrap();
+            let xprv = vector["xprv"].as_str().unwrap();
+            let public = ExtendedPubKey::from_base58(xpub).unwrap();
+            let private = ExtendedPrivKey::from_base58(xprv).unwrap();
+            assert_eq!(public.to_base58(), xpub);
+            assert_eq!(private.to_base58(), xprv);
+            assert_eq!(
+                public.serialize().to_vec(),
+                hex::decode(vector["serialized_xpub"].as_str().unwrap()).unwrap()
+            );
+            assert_eq!(
+                private.to_extended_pub_key().serialize(),
+                public.serialize()
+            );
+            let seed = hex::decode(vector["seed_hex"].as_str().unwrap()).unwrap();
+            let derived = ExtendedPrivKey::from_seed(&seed, Network::Mainnet)
+                .unwrap()
+                .derive_path(vector["path"].as_str().unwrap())
+                .unwrap();
+            assert_eq!(derived.to_base58(), xprv, "{}", vector["path"]);
+            assert_eq!(derived.to_extended_pub_key().to_base58(), xpub);
+        }
+        let invalid = fixture["invalid_keys"].as_array().unwrap();
+        assert_eq!(invalid.len(), 16);
+        for vector in invalid {
+            let key = vector["key"].as_str().unwrap();
+            assert!(
+                ExtendedPubKey::from_base58(key).is_err(),
+                "{}",
+                vector["case"]
+            );
+            assert!(
+                ExtendedPrivKey::from_base58(key).is_err(),
+                "{}",
+                vector["case"]
+            );
+        }
+    }
 
     // BIP32 Test Vector 1 from the specification
     // Seed: 000102030405060708090a0b0c0d0e0f
