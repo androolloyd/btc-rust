@@ -1,6 +1,8 @@
 use crate::opcode_plugin::{OpcodeExecContext, OpcodeRegistry};
 use crate::sig_verify::SignatureVerifier;
-use crate::sighash::{sighash_legacy, sighash_segwit_v0, sighash_taproot, SighashType};
+use crate::sighash::{
+    sighash_legacy, sighash_segwit_v0, sighash_taproot_with_codeseparator, SighashType,
+};
 use btc_primitives::hash::{hash160, sha256, sha256d};
 use btc_primitives::script::{Instruction, Opcode, Script};
 use btc_primitives::transaction::{Transaction, TxOut};
@@ -91,7 +93,7 @@ pub fn is_op_success(opcode: u8) -> bool {
     )
 }
 
-/// Signature budget cost for a failed signature check in tapscript.
+/// Signature budget cost for every non-empty tapscript signature.
 const TAPSCRIPT_SIG_BUDGET_COST: i64 = 50;
 
 /// Bitcoin Script execution engine
@@ -109,6 +111,8 @@ pub struct ScriptEngine<'a> {
     input_amount: i64,
     /// Byte offset of the last OP_CODESEPARATOR in the currently executing script
     last_codeseparator_pos: Option<usize>,
+    /// BIP342 counts opcode positions rather than the legacy byte offset.
+    tapscript_codeseparator_pos: u32,
     /// Raw bytes of the currently executing script (set during execute())
     script_code_bytes: Vec<u8>,
     /// Optional registry of pluggable opcodes. When set, the engine consults
@@ -137,7 +141,7 @@ pub struct ScriptEngine<'a> {
     /// The annex data (if present in the witness).
     tapscript_annex: Option<Vec<u8>>,
     /// Tapscript signature budget: 50 + total_witness_size.
-    /// Each failed signature check (empty sig) costs 50 from this budget.
+    /// Each non-empty signature check costs 50 from this budget.
     tapscript_sig_budget: i64,
 }
 
@@ -245,6 +249,7 @@ impl<'a> ScriptEngine<'a> {
             input_index,
             input_amount,
             last_codeseparator_pos: None,
+            tapscript_codeseparator_pos: u32::MAX,
             script_code_bytes: Vec::new(),
             opcode_registry: None,
             is_witness_execution: false,
@@ -279,6 +284,7 @@ impl<'a> ScriptEngine<'a> {
             input_index,
             input_amount,
             last_codeseparator_pos: None,
+            tapscript_codeseparator_pos: u32::MAX,
             script_code_bytes: Vec::new(),
             opcode_registry,
             is_witness_execution: false,
@@ -347,6 +353,7 @@ impl<'a> ScriptEngine<'a> {
         // Store the raw script bytes for sighash script_code computation
         self.script_code_bytes = script_bytes.to_vec();
         self.last_codeseparator_pos = None;
+        self.tapscript_codeseparator_pos = u32::MAX;
 
         let mut op_count = 0;
         let mut exec_stack: Vec<bool> = Vec::new(); // for IF/ELSE/ENDIF
@@ -428,7 +435,7 @@ impl<'a> ScriptEngine<'a> {
                     }
 
                     // BIP342: OP_CHECKMULTISIG and OP_CHECKMULTISIGVERIFY are disabled in tapscript
-                    if self.tapscript_mode {
+                    if self.tapscript_mode && executing(&exec_stack) {
                         match op {
                             Opcode::OP_CHECKMULTISIG | Opcode::OP_CHECKMULTISIGVERIFY => {
                                 return Err(ScriptError::TapscriptCheckmultisigDisabled);
@@ -443,13 +450,10 @@ impl<'a> ScriptEngine<'a> {
                             let mut val = false;
                             if executing(&exec_stack) {
                                 let top = self.pop()?;
-                                // MINIMALIF: argument must be empty or exactly 0x01.
-                                // Note: in Bitcoin Core, MINIMALIF is only enforced for
-                                // segwit scripts. The `verify_minimalif_segwit` flag is set
-                                // by the witness execution layer when executing inside a
-                                // witness script context.
-                                if self.flags.verify_minimalif
-                                    && self.is_witness_execution
+                                // BIP342 makes MINIMALIF mandatory in tapscript;
+                                // witness-v0 enforces it only under its policy flag.
+                                if (self.tapscript_mode
+                                    || (self.flags.verify_minimalif && self.is_witness_execution))
                                     && !top.is_empty()
                                     && top != [0x01]
                                 {
@@ -527,6 +531,7 @@ impl<'a> ScriptEngine<'a> {
                     if op == Opcode::OP_CODESEPARATOR {
                         // The script_code starts AFTER the OP_CODESEPARATOR
                         self.last_codeseparator_pos = Some(byte_pos);
+                        self.tapscript_codeseparator_pos = index as u32;
                     }
 
                     self.execute_opcode(op, &mut op_count)?;
@@ -724,7 +729,9 @@ impl<'a> ScriptEngine<'a> {
     /// Uses BIP341 taproot sighash with the leaf hash.
     ///
     /// BIP342 rules:
-    /// - Empty sig = failed check (Ok(false)), costs budget
+    /// - Empty pubkeys always fail, including with an empty signature
+    /// - Empty sig = failed check (Ok(false)), no budget cost
+    /// - Every non-empty sig costs budget, including unknown key types
     /// - Non-empty invalid sig = script failure (Err)
     /// - Valid sig = Ok(true)
     fn verify_tapscript_signature(
@@ -732,23 +739,23 @@ impl<'a> ScriptEngine<'a> {
         sig: &[u8],
         pubkey: &[u8],
     ) -> Result<bool, ScriptError> {
-        // Empty signature = failed check (not an error)
-        if sig.is_empty() {
-            // Deduct from signature budget
+        if !sig.is_empty() {
             self.tapscript_sig_budget -= TAPSCRIPT_SIG_BUDGET_COST;
             if self.tapscript_sig_budget < 0 {
                 return Err(ScriptError::TapscriptSigBudgetExceeded);
             }
+        }
+        if pubkey.is_empty() {
+            return Err(ScriptError::SchnorrSigFailed);
+        }
+        // Empty signatures still check public-key validity, but neither
+        // invoke the equation verifier nor consume the signature budget.
+        if sig.is_empty() {
             return Ok(false);
         }
 
         // Public key must be 32 bytes (x-only) for tapscript
         if pubkey.len() != 32 {
-            // BIP342: unknown pubkey type - if the key is empty, sig must be empty
-            // For unknown pubkey types, non-empty sig succeeds (future extensibility)
-            if pubkey.is_empty() {
-                return Err(ScriptError::SchnorrSigFailed);
-            }
             // Unknown public key type: success for forward compatibility
             return Ok(true);
         }
@@ -793,13 +800,14 @@ impl<'a> ScriptEngine<'a> {
         let annex = self.tapscript_annex.clone();
 
         // Compute BIP341 taproot sighash with leaf hash
-        let sighash = sighash_taproot(
+        let sighash = sighash_taproot_with_codeseparator(
             tx,
             self.input_index,
             &prevouts,
             hash_type,
             annex.as_deref(),
             Some(&leaf_hash),
+            self.tapscript_codeseparator_pos,
         )
         .map_err(|e| ScriptError::SigVerify(e.to_string()))?;
 
@@ -1221,21 +1229,8 @@ impl<'a> ScriptEngine<'a> {
                     let n = self.pop_num()?;
                     let sig = self.pop()?;
 
-                    if sig.is_empty() {
-                        // Empty sig: push n unchanged (no-op on counter)
-                        self.push(encode_num(n))?;
-                    } else {
-                        // Non-empty sig: verify Schnorr signature
-                        // If invalid, script FAILS (not just push n)
-                        let result = self.verify_tapscript_signature(&sig, &pubkey)?;
-                        if result {
-                            self.push(encode_num(n + 1))?;
-                        } else {
-                            // This shouldn't happen because verify_tapscript_signature
-                            // returns Err for non-empty invalid sigs, but just in case:
-                            return Err(ScriptError::SchnorrSigFailed);
-                        }
-                    }
+                    let result = self.verify_tapscript_signature(&sig, &pubkey)?;
+                    self.push(encode_num(n + i64::from(result)))?;
                 }
             }
 
@@ -4547,44 +4542,31 @@ mod tests {
     }
 
     #[test]
-    fn test_tapscript_empty_sig_budget_deduction() {
-        static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
-        let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
-        engine.set_tapscript_mode([0u8; 32], vec![], None, 60); // budget = 50 + 60 = 110
-
-        // verify_tapscript_signature with empty sig should deduct 50 from budget
-        let result = engine.verify_tapscript_signature(&[], &[0u8; 32]);
-        assert!(matches!(result, Ok(false)));
-        assert_eq!(engine.tapscript_sig_budget, 60); // 110 - 50 = 60
-
-        // Another empty sig deduction
-        let result = engine.verify_tapscript_signature(&[], &[0u8; 32]);
-        assert!(matches!(result, Ok(false)));
-        assert_eq!(engine.tapscript_sig_budget, 10); // 60 - 50 = 10
-
-        // Third: budget goes to -40 (below zero) -> should fail
-        let result = engine.verify_tapscript_signature(&[], &[0u8; 32]);
-        assert!(
-            matches!(result, Err(ScriptError::TapscriptSigBudgetExceeded)),
-            "Should fail when budget is exhausted, got: {result:?}"
-        );
+    fn test_tapscript_empty_sig_does_not_spend_budget() {
+        let verifier = Secp256k1Verifier;
+        let mut engine = ScriptEngine::new_without_tx(&verifier, ScriptFlags::none());
+        engine.set_tapscript_mode([0; 32], vec![], None, 0);
+        for _ in 0..1000 {
+            assert!(!engine.verify_tapscript_signature(&[], &[0; 32]).unwrap());
+            assert_eq!(engine.tapscript_sig_budget, 50);
+        }
+        assert!(engine.verify_tapscript_signature(&[], &[]).is_err());
     }
 
     #[test]
     fn test_tapscript_sig_budget_exceeded() {
-        static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
-        let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
-        // Very small witness size: budget = 50 + 0 = 50
-        engine.set_tapscript_mode([0u8; 32], vec![], None, 0);
-
-        // First empty sig: budget goes from 50 to 0 (ok)
-        let result = engine.verify_tapscript_signature(&[], &[0u8; 32]);
-        assert!(matches!(result, Ok(false)));
-
-        // Second empty sig: budget goes from 0 to -50 (fail)
-        let result = engine.verify_tapscript_signature(&[], &[0u8; 32]);
+        let verifier = Secp256k1Verifier;
+        let mut engine = ScriptEngine::new_without_tx(&verifier, ScriptFlags::none());
+        engine.set_tapscript_mode([0; 32], vec![], None, 60);
+        // Unknown nonempty key types do not evaluate an equation, but still
+        // consume exactly 50 units for every nonempty signature.
+        assert!(engine.verify_tapscript_signature(&[1], &[1]).unwrap());
+        assert_eq!(engine.tapscript_sig_budget, 60);
+        assert!(engine.verify_tapscript_signature(&[1], &[1]).unwrap());
+        assert_eq!(engine.tapscript_sig_budget, 10);
+        assert!(!engine.verify_tapscript_signature(&[], &[1]).unwrap());
         assert!(matches!(
-            result,
+            engine.verify_tapscript_signature(&[1], &[1]),
             Err(ScriptError::TapscriptSigBudgetExceeded)
         ));
     }

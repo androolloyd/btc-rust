@@ -537,8 +537,8 @@ mod tests {
     }
 }
 
-/// Strict DER/low-S checks also cover the direct P2WPKH dispatcher, which does
-/// not run the script engine's encoding flags. Only count real successful equations.
+/// Apply the wallet's strict DER/low-S requirements and only count real
+/// successful equations, in addition to the shared script validation rules.
 #[derive(Default)]
 struct WalletVerifier(AtomicUsize);
 

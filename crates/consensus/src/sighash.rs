@@ -521,6 +521,31 @@ pub fn sighash_taproot(
     annex: Option<&[u8]>,
     leaf_hash: Option<&[u8; 32]>,
 ) -> Result<[u8; 32], SighashError> {
+    sighash_taproot_with_codeseparator(
+        tx,
+        input_index,
+        prevouts,
+        hash_type,
+        annex,
+        leaf_hash,
+        u32::MAX,
+    )
+}
+
+/// BIP341/BIP342 digest with the opcode index of the last executed separator.
+/// The ordinary helper retains the no-separator convention for existing callers.
+pub fn sighash_taproot_with_codeseparator(
+    tx: &Transaction,
+    input_index: usize,
+    prevouts: &[btc_primitives::transaction::TxOut],
+    hash_type: SighashType,
+    annex: Option<&[u8]>,
+    leaf_hash: Option<&[u8; 32]>,
+    codeseparator_pos: u32,
+) -> Result<[u8; 32], SighashError> {
+    if !matches!(hash_type.0, 0 | 1 | 2 | 3 | 0x81 | 0x82 | 0x83) {
+        return Err(SighashError::InvalidSighashType(hash_type.0));
+    }
     if input_index >= tx.inputs.len() {
         return Err(SighashError::InputOutOfRange(input_index, tx.inputs.len()));
     }
@@ -611,7 +636,10 @@ pub fn sighash_taproot(
 
     // Annex hash
     if let Some(annex_data) = annex {
-        let annex_hash = sha256(annex_data);
+        let mut serialized = Vec::new();
+        VarInt(annex_data.len() as u64).encode(&mut serialized)?;
+        serialized.extend_from_slice(annex_data);
+        let annex_hash = sha256(&serialized);
         msg.extend_from_slice(&annex_hash);
     }
 
@@ -630,7 +658,7 @@ pub fn sighash_taproot(
     if let Some(lh) = leaf_hash {
         msg.extend_from_slice(lh);
         msg.push(0x00); // key_version
-        msg.write_u32_le(0xffffffff)?; // code_separator_pos (none)
+        msg.write_u32_le(codeseparator_pos)?;
     }
 
     Ok(crate::taproot::tagged_hash(b"TapSighash", &msg))

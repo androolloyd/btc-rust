@@ -9,6 +9,7 @@ does not make acceptance depend on unbounded random wall-clock delays.
 import argparse
 import base64
 import hashlib
+from io import BytesIO
 import json
 from pathlib import Path
 import socket
@@ -389,6 +390,94 @@ def check_witness_runtime(core_port, rust_port, p2p_port, outbound, encrypted, c
     print(f"PASSED: {kind} valid relay/mining and invalid witness transaction/block rejection", flush=True)
 
 
+def check_taproot_execution(core_port, rust_port, p2p_port, clock, address):
+    from core29_tapscript import cases, output, spend, reference
+    _, _, m = reference()
+    tests = cases()
+    addresses = {}
+    for case in tests:
+        info = output(case)
+        descriptor = f"rawtr({info.output_pubkey.hex()})"
+        descriptor += "#" + core_rpc(core_port, "getdescriptorinfo", [descriptor])["checksum"]
+        addresses[case["name"]] = core_rpc(core_port, "deriveaddresses", [descriptor])[0]
+    funding = core_rpc(core_port, "sendmany", ["", {a: 1.0 for a in set(addresses.values())}])
+    wait_for_tx_relay(core_port, rust_port, clock, funding, from_core=True)
+    funded_tip = core_rpc(core_port, "generatetoaddress", [1, address])[-1]
+    wait_until(lambda: rust_rpc(rust_port, "getbestblockhash", []) == funded_tip)
+    funded = core_rpc(core_port, "decoderawtransaction", [core_rpc(core_port, "gettransaction", [funding])["hex"]])
+    coins = {v["scriptPubKey"]["address"]: v for v in funded["vout"] if "address" in v["scriptPubKey"]}
+    destination = bytes.fromhex(core_rpc(core_port, "getaddressinfo", [address])["scriptPubKey"])
+    core_rpc(core_port, "setnetworkactive", [False])
+    wait_until(lambda: not rust_rpc(rust_port, "getpeerinfo", []))
+    # Keep Rust one block ahead: all case bodies are equal-work siblings on
+    # Rust, but win on Core and therefore force Core to execute every script.
+    rust_tip = rust_rpc(rust_port, "generatetoaddress", [1, address])[-1]
+    empty = bytes.fromhex(rust_rpc(rust_port, "getblock", [rust_tip, 0]))
+    assert empty[80] == 1
+    for case_index, case in enumerate(tests):
+        coin = coins[addresses[case["name"]]]
+        amount = round(coin["value"] * 100_000_000)
+        tx, previous, _ = spend(case, funding, coin["n"], amount, destination)
+        assert previous.scriptPubKey.hex() == coin["scriptPubKey"]["hex"]
+        raw = tx.serialize()
+        if not case["allowed"]:
+            assert core_rpc(core_port, "testmempoolaccept", [[raw.hex()]])[0]["allowed"] is False
+            assert rust_rpc(rust_port, "testmempoolaccept", [[raw.hex()]])[0]["allowed"] is False
+            try:
+                rust_rpc(rust_port, "sendrawtransaction", [raw.hex()])
+            except RuntimeError as error:
+                assert error.args[0]["code"] == -26, (case["name"], error)
+            else:
+                raise AssertionError(f"invalid Taproot transaction admitted: {case['name']}")
+            assert rust_rpc(rust_port, "getrawmempool", []) == []
+        coinbase = m.CTransaction()
+        coinbase.deserialize(BytesIO(empty[81:]))
+        coinbase.wit.vtxinwit = [m.CTxInWitness()]
+        coinbase.wit.vtxinwit[0].scriptWitness.stack = [bytes(32)]
+        commitment = sha256d(sha256d(bytes(32) + sha256d(raw)) + bytes(32))
+        coinbase.vout.append(m.CTxOut(0, bytes.fromhex("6a24aa21a9ed") + commitment))
+        header = bytearray(empty[:80])
+        header[36:68] = sha256d(sha256d(coinbase.serialize_without_witness()) + sha256d(tx.serialize_without_witness()))
+        bits = int.from_bytes(header[72:76], "little")
+        target = (bits & 0x7fffff) << (8 * ((bits >> 24) - 3))
+        # Distinct nonce ranges also distinguish intentionally identical
+        # transactions after Core invalidates a previous valid sibling.
+        nonce_start = case_index * 1_000_000
+        for nonce in range(nonce_start, nonce_start + 1_000_000):
+            header[76:80] = nonce.to_bytes(4, "little")
+            if int.from_bytes(sha256d(header), "little") <= target:
+                break
+        else:
+            raise AssertionError("regtest PoW search exhausted")
+        body = (header + b"\x02" + coinbase.serialize() + raw).hex()
+        block_hash = sha256d(header)[::-1].hex()
+        before = rust_rpc(rust_port, "gettxout", [funding, coin["n"], False])
+        result = core_rpc(core_port, "submitblock", [body])
+        if case["allowed"]:
+            assert result is None, (case["name"], result)
+            assert core_rpc(core_port, "getbestblockhash", []) == block_hash
+            assert core_rpc(core_port, "gettxout", [funding, coin["n"], False]) is None
+            core_rpc(core_port, "invalidateblock", [block_hash])
+            assert core_rpc(core_port, "getbestblockhash", []) == funded_tip
+        else:
+            assert isinstance(result, str) and "script" in result.lower(), (case["name"], result)
+            assert core_rpc(core_port, "getbestblockhash", []) == funded_tip
+        actual = rust_rpc(rust_port, "submitblock", [body])
+        if case["allowed"]:
+            assert actual is None, (case["name"], actual)
+            assert rust_rpc(rust_port, "getblock", [block_hash, 0]) == body
+        else:
+            assert isinstance(actual, str) and "script" in actual.lower(), (case["name"], actual)
+        assert rust_rpc(rust_port, "getbestblockhash", []) == rust_tip
+        assert rust_rpc(rust_port, "gettxout", [funding, coin["n"], False]) == before
+        assert rust_rpc(rust_port, "getrawmempool", []) == []
+    core_rpc(core_port, "setnetworkactive", [True])
+    core_rpc(core_port, "addnode", [f"127.0.0.1:{p2p_port}", "onetry", False])
+    wait_until(lambda: core_rpc(core_port, "getbestblockhash", []) == rust_tip, timeout=60)
+    assert core_rpc(core_port, "getblock", [rust_tip, 0]) == empty.hex()
+    print(f"PASSED: {len(tests)} independently signed Core Taproot script/key blocks with exact consensus outcomes", flush=True)
+
+
 def check_reorg_and_mempool(core_port, rust_port, p2p_port, outbound, encrypted, clock):
     core_rpc(core_port, "createwallet", ["interop-wallet"])
     scripts = runtime_script_addresses(core_port)
@@ -447,6 +536,8 @@ def check_reorg_and_mempool(core_port, rust_port, p2p_port, outbound, encrypted,
     check_p2sh_runtime(core_port, rust_port, p2p_port, outbound, encrypted, clock, address, scripts["p2sh"])
     for kind in ["p2wpkh", "p2wsh", "taproot"]:
         check_witness_runtime(core_port, rust_port, p2p_port, outbound, encrypted, clock, address, scripts[kind], kind)
+    if not outbound and not encrypted:
+        check_taproot_execution(core_port, rust_port, p2p_port, clock, address)
     # Separate branches, including a real spend in the branch to be disconnected.
     core_rpc(core_port, "setnetworkactive", [False])
     wait_until(lambda: not rust_rpc(rust_port, "getpeerinfo", []))

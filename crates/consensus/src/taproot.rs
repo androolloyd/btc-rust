@@ -233,12 +233,12 @@ pub fn verify_script_path(
         let script = Script::from_bytes(tapscript);
 
         // Calculate total witness size for signature budget
-        let mut witness_size: usize = 0;
-        for i in 0..witness.len() {
-            if let Some(item) = witness.get(i) {
-                witness_size += item.len();
-            }
-        }
+        use btc_primitives::encode::VarInt;
+        let witness_size = VarInt(witness.len() as u64).encoded_size()
+            + witness
+                .iter()
+                .map(|item| VarInt(item.len() as u64).encoded_size() + item.len())
+                .sum::<usize>();
 
         // Create a ScriptEngine in tapscript mode
         let input_amount = if input_index < prevouts.len() {
