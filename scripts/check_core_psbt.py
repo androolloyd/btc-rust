@@ -284,8 +284,9 @@ def check_final_verification(args, port, raw, expected_tx, signatures=1):
         bad[1][b"\x08"] = encoded_witness(items)
     else:
         script = bytearray(bad[1][b"\x07"])
-        assert 9 <= script[0] <= 73
-        script[script[0] - 1] ^= 1
+        offset = 1 if script[0] == 0 else 0  # legacy multisig dummy
+        assert 9 <= script[offset] <= 73
+        script[offset + script[offset] - 1] ^= 1
         bad[1][b"\x07"] = bytes(script)
     mutated = encode_maps(bad)
     cli(args.node, "decode-psbt", mutated)
@@ -298,7 +299,9 @@ def check_final_verification(args, port, raw, expected_tx, signatures=1):
     if b"\x08" in bad[1]:
         original_sig = next(item for item in witness_items(bad[1][b"\x08"]) if item)
     else:
-        script = bad[1][b"\x07"]; original_sig = script[1:1 + script[0]]
+        script = bad[1][b"\x07"]
+        offset = 1 if script[0] == 0 else 0
+        original_sig = script[offset + 1:offset + 1 + script[offset]]
     taproot = cli(args.node, "decode-psbt", raw)["inputs"][0]["utxo"]["script_pubkey"].startswith("5120")
     original_type = 0 if taproot and len(original_sig) == 64 else original_sig[-1]
     bad[1][b"\x03"] = (2 if original_type != 2 else 1).to_bytes(4,"little")
@@ -689,6 +692,11 @@ def check_legacy_multisig_partials(args, port, addresses):
     finalized = core_rpc(port, "finalizepsbt", [signed])
     assert finalized["complete"] is True
     assert core_rpc(port, "testmempoolaccept", [[finalized["hex"]]])[0]["allowed"] is True
+    final_psbt = core_rpc(port, "finalizepsbt", [signed, False])["psbt"]
+    final_raw = base64.b64decode(final_psbt).hex()
+    check_final_verification(args, port, final_raw, finalized["hex"], signatures=2)
+    v2 = cli(args.node, "convert-psbt", final_raw, "--version", "2")["psbt_hex"]
+    assert cli(args.node, "verify-psbt", v2)["tx_hex"] == finalized["hex"]
     # Bare witness-UTXO claims cannot make a legacy signature authenticate an amount.
     fields = cli(args.node, "decode-psbt", raw)["inputs"][0]["utxo"]
     script = bytes.fromhex(fields["script_pubkey"])

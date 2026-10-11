@@ -8,6 +8,7 @@ does not make acceptance depend on unbounded random wall-clock delays.
 """
 import argparse
 import base64
+import hashlib
 import json
 from pathlib import Path
 import socket
@@ -145,8 +146,124 @@ def signed_wallet_spend(core_port, coin=None, fee=0.00002):
     return signed["hex"], coin
 
 
+def legacy_multisig_address(core_port):
+    root = next(d["desc"] for d in core_rpc(core_port, "listdescriptors", [True])["descriptors"]
+                if d["active"] and not d["internal"] and d["desc"].startswith("wpkh("))
+    key = root.split("#")[0][5:-1]
+    assert key.endswith("/0/*")
+    descriptor = f"sh(multi(2,{key},{key[:-4]}/1/*))"
+    checksum = core_rpc(core_port, "getdescriptorinfo", [descriptor])["checksum"]
+    descriptor += "#" + checksum
+    imported = core_rpc(core_port, "importdescriptors", [[{"desc": descriptor, "timestamp": "now", "range": [0, 1]}]])
+    assert all(item["success"] for item in imported)
+    return core_rpc(core_port, "deriveaddresses", [descriptor, [0, 0]])[0]
+
+
+def compact_size(n):
+    if n < 253:
+        return bytes([n])
+    if n <= 0xffff:
+        return b"\xfd" + n.to_bytes(2, "little")
+    return b"\xfe" + n.to_bytes(4, "little")
+
+
+def replace_legacy_script(raw, replacement):
+    # These independent Core-produced spends have one legacy input. Preserve
+    # every transaction field other than its scriptSig and CompactSize length.
+    data = bytes.fromhex(raw)
+    assert data[4] == 1
+    length_pos = 4 + 1 + 36
+    size = data[length_pos]
+    size_bytes = 1
+    if size == 253:
+        size = int.from_bytes(data[length_pos + 1:length_pos + 3], "little")
+        size_bytes = 3
+    assert size < 0x10000
+    suffix = length_pos + size_bytes + size
+    return (data[:length_pos] + compact_size(len(replacement)) + replacement + data[suffix:]).hex()
+
+
+def sha256d(data):
+    return hashlib.sha256(hashlib.sha256(data).digest()).digest()
+
+
+def check_p2sh_runtime(core_port, rust_port, p2p_port, outbound, encrypted, clock, address, multisig):
+    funding = core_rpc(core_port, "sendtoaddress", [multisig, 1.0])
+    wait_for_tx_relay(core_port, rust_port, clock, funding, from_core=True)
+    funded_tip = core_rpc(core_port, "generatetoaddress", [1, address])[-1]
+    wait_until(lambda: rust_rpc(rust_port, "getbestblockhash", []) == funded_tip)
+    coin = next(coin for coin in core_rpc(core_port, "listunspent", [1]) if coin["txid"] == funding and coin["address"] == multisig)
+    raw, _ = signed_wallet_spend(core_port, coin)
+    decoded = core_rpc(core_port, "decoderawtransaction", [raw])
+    script = bytes.fromhex(decoded["vin"][0]["scriptSig"]["hex"])
+    assert script[0] == 0  # CHECKMULTISIG dummy
+    first_len = script[1]
+    assert 9 <= first_len <= 73
+    second_pos = 2 + first_len
+    second_len = script[second_pos]
+    assert 9 <= second_len <= 73
+    redeem_pos = second_pos + 1 + second_len
+    bad_script = bytearray(script); bad_script[2 + first_len - 2] ^= 1
+    corrupted = replace_legacy_script(raw, bad_script)
+    missing = replace_legacy_script(raw, b"\x00\x00\x00" + script[redeem_pos:])
+    nonpush = replace_legacy_script(raw, b"\x61" + script)
+    for bad in [corrupted, missing, nonpush]:
+        before = rust_rpc(rust_port, "getrawmempool", [])
+        assert core_rpc(core_port, "testmempoolaccept", [[bad]])[0]["allowed"] is False
+        assert rust_rpc(rust_port, "testmempoolaccept", [[bad]])[0]["allowed"] is False
+        try:
+            rust_rpc(rust_port, "sendrawtransaction", [bad])
+        except RuntimeError as error:
+            assert error.args[0]["code"] == -26
+        else:
+            raise AssertionError("Rust accepted an invalid P2SH signature/script")
+        assert rust_rpc(rust_port, "getrawmempool", []) == before
+        assert rust_rpc(rust_port, "gettxout", [coin["txid"], coin["vout"], False])["value"] == coin["amount"]
+    expected = core_rpc(core_port, "testmempoolaccept", [[raw]])[0]
+    actual = rust_rpc(rust_port, "testmempoolaccept", [[raw]])[0]
+    assert expected["allowed"] == actual["allowed"] is True
+    assert expected["vsize"] == actual["vsize"] and expected["fees"]["base"] == actual["fees"]["base"]
+    txid = rust_rpc(rust_port, "sendrawtransaction", [raw])
+    wait_for_tx_relay(core_port, rust_port, clock, txid, from_core=False)
+    # Keep Core at the funded parent while Rust mines the valid spend. An
+    # invalid competing block must exceed Core's current work to trigger its
+    # script checks, rather than merely becoming an unchecked equal-work body.
+    core_rpc(core_port, "setnetworkactive", [False])
+    wait_until(lambda: not rust_rpc(rust_port, "getpeerinfo", []))
+    valid_tip = rust_rpc(rust_port, "generatetoaddress", [1, address])[-1]
+    block = bytes.fromhex(rust_rpc(rust_port, "getblock", [valid_tip, 0]))
+    txids = rust_rpc(rust_port, "getblock", [valid_tip])["tx"]
+    assert len(txids) == 2 and txids[1] == txid and block.endswith(bytes.fromhex(raw))
+    coinbase_hash = bytes.fromhex(txids[0])[::-1]
+    assert block[36:68] == sha256d(coinbase_hash + sha256d(bytes.fromhex(raw)))
+    header = bytearray(block[:80])
+    header[36:68] = sha256d(coinbase_hash + sha256d(bytes.fromhex(corrupted)))
+    bits = int.from_bytes(header[72:76], "little")
+    target = (bits & 0x7fffff) << (8 * ((bits >> 24) - 3))
+    for nonce in range(1_000_000):
+        header[76:80] = nonce.to_bytes(4, "little")
+        if int.from_bytes(sha256d(header), "little") <= target:
+            break
+    else:
+        raise AssertionError("regtest PoW search exhausted")
+    bad_block = (header + block[80:-len(bytes.fromhex(raw))] + bytes.fromhex(corrupted)).hex()
+    for port, rpc, tip in [(core_port, core_rpc, funded_tip), (rust_port, rust_rpc, valid_tip)]:
+        coin_before = rpc(port, "gettxout", [coin["txid"], coin["vout"], False])
+        rejected = rpc(port, "submitblock", [bad_block])
+        assert isinstance(rejected, str) and "script" in rejected.lower(), rejected
+        assert rpc(port, "getbestblockhash", []) == tip
+        assert rpc(port, "gettxout", [coin["txid"], coin["vout"], False]) == coin_before
+    core_rpc(core_port, "setnetworkactive", [True])
+    if not outbound:
+        core_rpc(core_port, "addnode", [f"127.0.0.1:{p2p_port}", "onetry", encrypted])
+    wait_until(lambda: core_rpc(core_port, "getbestblockhash", []) == valid_tip, timeout=60)
+    assert core_rpc(core_port, "getblock", [valid_tip, 0]) == block.hex()
+    assert core_rpc(core_port, "getrawmempool", []) == rust_rpc(rust_port, "getrawmempool", []) == []
+
+
 def check_reorg_and_mempool(core_port, rust_port, p2p_port, outbound, encrypted, clock):
     core_rpc(core_port, "createwallet", ["interop-wallet"])
+    multisig = legacy_multisig_address(core_port)
     address = core_rpc(core_port, "getnewaddress", ["", "bech32"])
     hashes = core_rpc(core_port, "generatetoaddress", [105, address], timeout=30)
     wait_until(lambda: rust_rpc(rust_port, "getbestblockhash", []) == hashes[-1], timeout=60)
@@ -198,6 +315,7 @@ def check_reorg_and_mempool(core_port, rust_port, p2p_port, outbound, encrypted,
     raw_immature = core_rpc(core_port, "signrawtransactionwithwallet", [raw_immature])["hex"]
     assert core_rpc(core_port, "testmempoolaccept", [[raw_immature]])[0]["allowed"] is False
     assert rust_rpc(rust_port, "testmempoolaccept", [[raw_immature]])[0]["allowed"] is False
+    check_p2sh_runtime(core_port, rust_port, p2p_port, outbound, encrypted, clock, address, multisig)
     # Separate branches, including a real spend in the branch to be disconnected.
     core_rpc(core_port, "setnetworkactive", [False])
     wait_until(lambda: not rust_rpc(rust_port, "getpeerinfo", []))

@@ -697,6 +697,44 @@ fn run_script_test_detail(
 
 // ========================== TEST 1: script_tests.json ======================
 
+/// Assert exact released-Core P2SH outcomes through the production dispatcher.
+/// The broad historical harness above implements P2SH itself and cannot catch
+/// a missing redeem-script invocation in the actual mempool/block caller.
+#[test]
+#[cfg(feature = "segwit")]
+fn released_core_p2sh_cases_use_runtime_dispatcher() {
+    let data: serde_json::Value =
+        serde_json::from_str(include_str!("../../../testdata/core29_p2sh.json")).unwrap();
+    let cases = data["vectors"].as_array().unwrap();
+    assert_eq!(cases.len(), 17);
+    for case in cases {
+        let script_sig = parse_core_script(case["script_sig"].as_str().unwrap());
+        let script_pubkey = parse_core_script(case["script_pubkey"].as_str().unwrap());
+        assert!(script_pubkey.is_p2sh());
+        let flags = parse_flags(case["flags"].as_str().unwrap());
+        let tx = build_mock_tx(&script_sig, &script_pubkey, 0);
+        let prevout = TxOut {
+            value: Amount::ZERO,
+            script_pubkey,
+        };
+        let result = btc_consensus::witness::verify_input_with_prevouts(
+            &tx,
+            0,
+            &[prevout],
+            &Secp256k1Verifier,
+            &flags,
+        );
+        assert_eq!(
+            result.is_ok(),
+            case["expected"] == "OK",
+            "Core row {}: {}: {:?}",
+            case["core_row"],
+            case["comment"],
+            result
+        );
+    }
+}
+
 /// Verify our script engine matches Bitcoin Core for every test in script_tests.json.
 ///
 /// Test vector format (two forms):

@@ -1,10 +1,12 @@
 //! BIP325 challenge verification using the two virtual transactions.
+#[cfg(feature = "segwit")]
 use crate::{script_engine::ScriptFlags, sig_verify::Secp256k1Verifier, witness::verify_input};
+#[cfg(feature = "segwit")]
+use btc_primitives::hash::BlockHash;
 use btc_primitives::{
     amount::Amount,
     block::{merkle_root, Block},
     encode::{Decodable, ReadExt, VarInt},
-    hash::BlockHash,
     script::{Instruction, Opcode, ScriptBuf},
     transaction::{OutPoint, Transaction, TxIn, TxOut, Witness},
 };
@@ -12,6 +14,8 @@ use thiserror::Error;
 const SIGNET_HEADER: [u8; 4] = [0xec, 0xc7, 0xda, 0xa2];
 #[derive(Debug, Error)]
 pub enum SignetError {
+    #[error("Signet challenge verification requires the SegWit feature")]
+    MissingSegwitFeature,
     #[error("block has no transactions")]
     NoTransactions,
     #[error("first transaction is not coinbase")]
@@ -147,6 +151,7 @@ pub fn signet_transactions(
     };
     Ok((spend, sign))
 }
+#[cfg(feature = "segwit")]
 pub fn validate_signet_block(
     block: &Block,
     challenge: &SignetChallenge,
@@ -168,7 +173,16 @@ pub fn validate_signet_block(
     verify_input(&sign, 0, &spend.outputs[0], &Secp256k1Verifier, &flags)
         .map_err(|_| SignetError::ChallengeFailed)
 }
-#[cfg(test)]
+
+#[cfg(not(feature = "segwit"))]
+pub fn validate_signet_block(
+    _block: &Block,
+    _challenge: &SignetChallenge,
+) -> Result<(), SignetError> {
+    Err(SignetError::MissingSegwitFeature)
+}
+
+#[cfg(all(test, feature = "segwit"))]
 mod tests {
     use super::*;
     use btc_primitives::hash::TxHash;

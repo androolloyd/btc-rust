@@ -39,10 +39,11 @@ An implicit 64-byte Taproot signature reports type zero (DEFAULT).
 
 `verify-psbt` evaluates the final transaction's spending conditions with the node's
 real ECDSA/Schnorr verifier and all supplied prevouts. It supports P2PKH/P2PK and
-bare canonical multisig, native/wrapped P2WPKH, native/wrapped P2WSH with P2PK,
+bare canonical multisig, legacy P2SH with those known redeem templates,
+native/wrapped P2WPKH, native/wrapped P2WSH with P2PK,
 P2PKH or canonical multisig scripts, Taproot key paths, and version-c0 single-key
 `<32-byte key> CHECKSIG` Taproot leaves. An annex is included in the Taproot digest.
-Legacy P2SH, arbitrary witness/tapscript programs, future witness/leaf/key versions,
+Arbitrary witness/tapscript programs, future witness/leaf/key versions,
 OP_SUCCESS and signature-free scripts return explicit errors. This bounded wallet
 scope prevents consensus forward-compatibility success from becoming a signature
 verification claim; ordinary node consensus rules are unchanged.

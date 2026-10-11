@@ -718,7 +718,14 @@ fn input_signatures(
             );
             return Ok((witness_signatures(witness, script)?, false, true));
         }
-        bail!("unsupported legacy P2SH spending template");
+        return Ok((
+            ecdsa_stack(script, &stack, false)?
+                .into_iter()
+                .map(<[u8]>::to_vec)
+                .collect(),
+            false,
+            false,
+        ));
     }
     Ok((
         ecdsa_stack(program, &stack, false)?

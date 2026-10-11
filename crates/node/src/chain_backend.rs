@@ -1572,6 +1572,111 @@ mod tests {
         tx.inputs[0].script_sig = key.build_p2pkh_script_sig(&tx, 0, prev);
         tx
     }
+
+    #[test]
+    fn p2sh_invalid_signatures_cannot_enter_pool_or_commit_block_coins() {
+        use btc_primitives::hash::hash160;
+        use btc_primitives::script::Opcode;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p2sh.redb");
+        let backend = NodeChainBackend::open(&path, NodeState::new(Network::Regtest)).unwrap();
+        let key = TestKeyPair::from_secret(secp256k1::SecretKey::from_slice(&[16; 32]).unwrap());
+        let mut redeem = ScriptBuf::new();
+        redeem.push_slice(&key.pubkey_bytes());
+        redeem.push_opcode(Opcode::OP_CHECKSIG);
+        let address = Address::P2sh {
+            hash: hash160(redeem.as_bytes()),
+            network: Network::Regtest,
+        }
+        .to_string();
+        let hashes = backend
+            .call("generatetoaddress", json!([100, address]))
+            .unwrap();
+        let first = backend
+            .block(&BlockHash::from_hex(hashes[0].as_str().unwrap()).unwrap())
+            .unwrap()
+            .unwrap();
+        let op = OutPoint::new(first.transactions[0].txid(), 0);
+        let previous = &first.transactions[0].outputs[0];
+        let mut valid = signed_spend(&key, op, previous, 1000);
+        let sig = key.sign_input(
+            &valid,
+            0,
+            &TxOut {
+                value: previous.value,
+                script_pubkey: redeem.clone(),
+            },
+        );
+        valid.inputs[0].script_sig = {
+            let mut s = ScriptBuf::new();
+            s.push_slice(&sig);
+            s.push_slice(redeem.as_bytes());
+            s
+        };
+        let tip = backend.tip().unwrap();
+        let coin = backend
+            .call("gettxout", json!([op.txid.to_hex(), 0, false]))
+            .unwrap();
+        let mut broken = sig.clone();
+        let last = broken.len() - 2;
+        broken[last] ^= 1;
+        for signature in [broken, vec![]] {
+            let mut bad = valid.clone();
+            bad.inputs[0].script_sig = {
+                let mut s = ScriptBuf::new();
+                s.push_slice(&signature);
+                s.push_slice(redeem.as_bytes());
+                s
+            };
+            assert!(backend.submit_transaction(bad.clone()).is_err());
+            let mut block = backend.candidate(key.p2pkh_script()).unwrap();
+            block.transactions.push(bad);
+            mine(&mut block);
+            assert!(backend
+                .submit_block(&block)
+                .unwrap_err()
+                .message
+                .contains("script"));
+            assert_eq!(backend.tip().unwrap(), tip);
+            assert_eq!(
+                backend
+                    .call("gettxout", json!([op.txid.to_hex(), 0, false]))
+                    .unwrap(),
+                coin
+            );
+            assert!(backend.block(&block.block_hash()).unwrap().is_none());
+            assert!(backend.mempool_transactions().unwrap().is_empty());
+        }
+        let mut nonpush = valid.clone();
+        nonpush.inputs[0].script_sig = ScriptBuf::from_bytes(
+            [vec![0x61], valid.inputs[0].script_sig.as_bytes().to_vec()].concat(),
+        );
+        let mut block = backend.candidate(key.p2pkh_script()).unwrap();
+        block.transactions.push(nonpush);
+        mine(&mut block);
+        assert!(backend.submit_block(&block).is_err());
+        assert_eq!(backend.tip().unwrap(), tip);
+        drop(backend);
+        let backend = NodeChainBackend::open(&path, NodeState::new(Network::Regtest)).unwrap();
+        assert_eq!(backend.tip().unwrap(), tip);
+        assert_eq!(
+            backend
+                .call("gettxout", json!([op.txid.to_hex(), 0, false]))
+                .unwrap(),
+            coin
+        );
+        assert!(backend.mempool_transactions().unwrap().is_empty());
+        backend.submit_transaction(valid.clone()).unwrap();
+        let mut block = backend.candidate(key.p2pkh_script()).unwrap();
+        mine(&mut block);
+        assert_eq!(block.transactions[1], valid);
+        assert!(backend.submit_block(&block).unwrap().active);
+        assert!(backend
+            .call("gettxout", json!([op.txid.to_hex(), 0, false]))
+            .unwrap()
+            .is_null());
+        assert!(backend.mempool_transactions().unwrap().is_empty());
+    }
     #[test]
     fn durable_forks_restore_spends_revalidate_pool_and_survive_restart() {
         let dir = tempfile::tempdir().unwrap();

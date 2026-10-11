@@ -390,121 +390,65 @@ pub fn verify_input(
         return Ok(());
     }
 
-    // Check for P2SH (which may wrap segwit)
+    // BIP16 requires execution of the redeem script for every P2SH scriptSig,
+    // including signature/data pushes preceding the script. Never fall through
+    // to hash-only legacy validation just because there is more than one push.
     if script_pubkey.is_p2sh() && flags.verify_p2sh {
-        let script_sig = &tx.inputs[input_index].script_sig;
-        let script_sig_bytes = script_sig.as_bytes();
-
-        // For P2SH-segwit, the scriptSig should be a single push of the witness program.
-        // Parse the scriptSig to extract the redeem script.
-        if let Some(redeem_script) = extract_single_push(script_sig_bytes) {
-            let redeem = Script::from_bytes(redeem_script);
-
-            // Check if the redeem script is a witness program
-            if redeem.is_witness_program() {
-                let rs_bytes = redeem.as_bytes();
-                let version = match rs_bytes[0] {
-                    0x00 => 0u8,
-                    v if (0x51..=0x60).contains(&v) => v - 0x50,
-                    _ => return Err(WitnessError::UnsupportedVersion(rs_bytes[0])),
-                };
-                let program = &rs_bytes[2..];
-
-                // Verify the redeem script hash matches the P2SH hash
-                let spk_bytes = script_pubkey.as_bytes();
-                let expected_hash = &spk_bytes[2..22]; // OP_HASH160 <20 bytes> OP_EQUAL
-                let actual_hash = hash160(redeem_script);
-                if actual_hash[..] != expected_hash[..] {
-                    return Err(WitnessError::P2shRedeemFailed);
-                }
-
-                let witness = if input_index < tx.witness.len() {
-                    tx.witness[input_index].clone()
-                } else {
-                    return Err(WitnessError::EmptyWitness);
-                };
-
-                let mut nested_flags = *flags;
-                nested_flags.verify_taproot = false;
-                return verify_witness_program(
-                    version,
-                    program,
-                    &witness,
-                    tx,
-                    input_index,
-                    input_amount,
-                    sig_verifier,
-                    &nested_flags,
-                );
-            }
-
-            // Non-segwit P2SH: execute scriptSig, then redeem script
-            // First verify HASH160(redeem_script) matches
-            let spk_bytes = script_pubkey.as_bytes();
-            let expected_hash = &spk_bytes[2..22];
-            let actual_hash = hash160(redeem_script);
-            if actual_hash[..] != expected_hash[..] {
-                return Err(WitnessError::P2shRedeemFailed);
-            }
-
-            // Execute the redeem script with the scriptSig stack
-            let mut engine =
-                ScriptEngine::new(sig_verifier, *flags, Some(tx), input_index, input_amount);
-
-            // Push the remaining scriptSig items (everything before the redeem script push)
-            // onto the stack, then execute the redeem script.
-            // For P2SH, we first run scriptSig to get the stack, then run the redeem script.
-            // Since we extracted the redeem script from scriptSig, we need to run the full
-            // scriptSig first (which pushes things including the redeem script), then
-            // pop the redeem script and execute it.
-            engine.execute(script_sig.as_script())?;
-
-            // Pop the top element (the serialized redeem script)
-            // After scriptSig execution, the stack should have data items followed by the
-            // redeem script. But for P2SH, the redeem script was the push on the stack.
-            // We now execute the redeem script against the remaining stack.
-            // Note: In Bitcoin Core, after running scriptSig, the top of stack is the
-            // serialized redeem script (which was just pushed by scriptSig).
-            // We pop it and execute it.
-            let _redeem_on_stack = engine
-                .stack()
-                .last()
-                .ok_or(WitnessError::P2shRedeemFailed)?;
-
-            // Actually, for a clean P2SH implementation, we should:
-            // 1. Run scriptSig (pushes data)
-            // 2. Copy the stack
-            // 3. Run scriptPubKey (OP_HASH160 <hash> OP_EQUAL) against stack from step 1
-            // 4. If that succeeds, deserialize top stack element as script and execute it
-            //    with the remaining stack from step 2
-            //
-            // For simplicity, since we already verified the hash above, we just execute
-            // the redeem script with a fresh engine that has the data items on the stack.
-            let mut redeem_engine =
-                ScriptEngine::new(sig_verifier, *flags, Some(tx), input_index, input_amount);
-
-            // Build a script that pushes all scriptSig items except the last (redeem script)
-            // The scriptSig for P2SH is typically: <sig> <pubkey> <serialized-redeem-script>
-            // We push everything that scriptSig pushes except the redeem script.
-            // Since scriptSig is just pushes, we can parse and take all but last.
-            let pushes = extract_all_pushes(script_sig_bytes);
-            if pushes.len() > 1 {
-                let mut data_script = ScriptBuf::new();
-                for push in &pushes[..pushes.len() - 1] {
-                    data_script.push_slice(push);
-                }
-                redeem_engine.execute(data_script.as_script())?;
-            }
-
-            let redeem_script_obj = Script::from_bytes(redeem_script);
-            redeem_engine.execute(redeem_script_obj)?;
-
-            if !redeem_engine.success() {
-                return Err(WitnessError::P2shRedeemFailed);
-            }
-
-            return Ok(());
+        let script_sig = tx.inputs[input_index].script_sig.as_script();
+        if !crate::script_engine::is_push_only(script_sig) {
+            return Err(crate::script_engine::ScriptError::SigPushOnly.into());
         }
+        let mut engine =
+            ScriptEngine::new(sig_verifier, *flags, Some(tx), input_index, input_amount);
+        engine.execute(script_sig)?;
+        let mut initial_stack = engine.stack().to_vec();
+        engine.clear_altstack();
+        engine.execute(script_pubkey)?;
+        if !engine.success() {
+            return Err(WitnessError::P2shRedeemFailed);
+        }
+        let redeem_script = initial_stack.pop().ok_or(WitnessError::P2shRedeemFailed)?;
+        let redeem = Script::from_bytes(&redeem_script);
+        let mut redeem_engine =
+            ScriptEngine::new(sig_verifier, *flags, Some(tx), input_index, input_amount);
+        for item in initial_stack {
+            redeem_engine.push_item(item)?;
+        }
+        redeem_engine.execute(redeem)?;
+        if !redeem_engine.success() {
+            return Err(WitnessError::P2shRedeemFailed);
+        }
+        // Witness interpretation is activated by its flag. Before activation,
+        // the same redeem bytes are evaluated only as a legacy script.
+        if flags.verify_witness && redeem.is_witness_program() {
+            let mut canonical = ScriptBuf::new();
+            canonical.push_slice(&redeem_script);
+            if tx.inputs[input_index].script_sig != canonical {
+                return Err(WitnessError::P2shSegwitScriptSig);
+            }
+            let bytes = redeem.as_bytes();
+            let version = if bytes[0] == 0 { 0 } else { bytes[0] - 0x50 };
+            let witness = tx.witness.get(input_index).cloned().unwrap_or_default();
+            let mut nested_flags = *flags;
+            // BIP341 applies only to native v1/32-byte outputs. P2SH-wrapped
+            // v1 programs retain the future-version consensus semantics.
+            nested_flags.verify_taproot = false;
+            return verify_witness_program(
+                version,
+                &bytes[2..],
+                &witness,
+                tx,
+                input_index,
+                input_amount,
+                sig_verifier,
+                &nested_flags,
+            );
+        }
+        redeem_engine.check_cleanstack()?;
+        if flags.verify_witness && tx.witness.get(input_index).is_some_and(|w| !w.is_empty()) {
+            return Err(WitnessError::UnexpectedWitness);
+        }
+        return Ok(());
     }
 
     // Legacy script verification: run scriptSig + scriptPubKey
@@ -514,12 +458,15 @@ pub fn verify_input(
     let script_sig = &tx.inputs[input_index].script_sig;
     engine.execute(script_sig.as_script())?;
 
+    // Each script has an independent altstack, as in Core EvalScript.
+    engine.clear_altstack();
     // Then execute scriptPubKey
     engine.execute(script_pubkey)?;
 
     if !engine.success() {
         return Err(WitnessError::LegacyScriptFailed);
     }
+    engine.check_cleanstack()?;
 
     // BIP141: reject non-empty witness for non-witness inputs
     if flags.verify_witness {
@@ -534,6 +481,7 @@ pub fn verify_input(
 
 /// Extract a single push from a script. Returns the pushed data if the script
 /// consists of exactly one push operation, or None otherwise.
+#[cfg(test)]
 fn extract_single_push(script: &[u8]) -> Option<&[u8]> {
     if script.is_empty() {
         return None;
@@ -580,6 +528,7 @@ fn extract_single_push(script: &[u8]) -> Option<&[u8]> {
 }
 
 /// Extract all push data items from a push-only script.
+#[cfg(test)]
 fn extract_all_pushes(script: &[u8]) -> Vec<&[u8]> {
     let mut result = Vec::new();
     let mut pos = 0;
@@ -633,6 +582,231 @@ mod tests {
     use btc_primitives::amount::Amount;
     use btc_primitives::hash::TxHash;
     use btc_primitives::transaction::{OutPoint, TxIn};
+
+    fn p2sh_case(redeem: &[u8], script_sig: ScriptBuf) -> (Transaction, TxOut) {
+        (
+            Transaction {
+                version: 2,
+                inputs: vec![TxIn {
+                    previous_output: OutPoint::new(TxHash::from_bytes([0x16; 32]), 0),
+                    script_sig,
+                    sequence: u32::MAX,
+                }],
+                outputs: vec![TxOut {
+                    value: Amount::from_sat(49_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+                witness: vec![],
+                lock_time: 0,
+            },
+            TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::p2sh(&hash160(redeem)),
+            },
+        )
+    }
+
+    #[test]
+    fn p2sh_multiple_pushes_cannot_skip_false_redeem_scripts_or_push_only() {
+        let redeem = [0x00]; // OP_FALSE: its hash alone is insufficient.
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_1);
+        script.push_slice(&redeem);
+        let (tx, output) = p2sh_case(&redeem, script.clone());
+        assert!(verify_input_with_prevouts(
+            &tx,
+            0,
+            std::slice::from_ref(&output),
+            &Secp256k1Verifier,
+            &ScriptFlags::consensus()
+        )
+        .is_err());
+        let mut old = ScriptFlags::consensus();
+        old.verify_p2sh = false;
+        assert!(verify_input(&tx, 0, &output, &Secp256k1Verifier, &old).is_ok());
+        // Restore the actual scriptSig stack, including small-number opcodes.
+        let redeem = [0x5b, 0x87]; // 11 EQUAL
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_11);
+        script.push_slice(&redeem);
+        let (mut tx, output) = p2sh_case(&redeem, script.clone());
+        assert!(verify_input(
+            &tx,
+            0,
+            &output,
+            &Secp256k1Verifier,
+            &ScriptFlags::consensus()
+        )
+        .is_ok());
+        tx.inputs[0].script_sig = {
+            let mut s = ScriptBuf::new();
+            s.push_opcode(Opcode::OP_12);
+            s.push_slice(&redeem);
+            s
+        };
+        assert!(verify_input(
+            &tx,
+            0,
+            &output,
+            &Secp256k1Verifier,
+            &ScriptFlags::consensus()
+        )
+        .is_err());
+        tx.inputs[0].script_sig =
+            ScriptBuf::from_bytes([vec![0x61], script.as_bytes().to_vec()].concat());
+        // SIGPUSHONLY is a BIP16 requirement even when its policy flag is false.
+        assert!(matches!(
+            verify_input(
+                &tx,
+                0,
+                &output,
+                &Secp256k1Verifier,
+                &ScriptFlags::consensus()
+            ),
+            Err(WitnessError::ScriptExecution(
+                crate::script_engine::ScriptError::SigPushOnly
+            ))
+        ));
+    }
+
+    #[test]
+    fn p2sh_cleanstack_unexpected_witness_and_redeem_size_are_enforced() {
+        let redeem = [0x51];
+        let mut script = ScriptBuf::new();
+        script.push_opcode(Opcode::OP_11);
+        script.push_slice(&redeem);
+        let (mut tx, output) = p2sh_case(&redeem, script);
+        assert!(verify_input(
+            &tx,
+            0,
+            &output,
+            &Secp256k1Verifier,
+            &ScriptFlags::consensus()
+        )
+        .is_ok());
+        assert!(verify_input(&tx, 0, &output, &Secp256k1Verifier, &ScriptFlags::all()).is_err());
+        tx.inputs[0].script_sig = {
+            let mut s = ScriptBuf::new();
+            s.push_slice(&redeem);
+            s
+        };
+        tx.witness = vec![Witness::from_items(vec![vec![1]])];
+        assert!(matches!(
+            verify_input(
+                &tx,
+                0,
+                &output,
+                &Secp256k1Verifier,
+                &ScriptFlags::consensus()
+            ),
+            Err(WitnessError::UnexpectedWitness)
+        ));
+        for len in [520, 521] {
+            let mut redeem = vec![0x4d];
+            redeem.extend_from_slice(&((len - 5) as u16).to_le_bytes());
+            redeem.extend(vec![1; len - 5]);
+            redeem.extend([0x75, 0x51]); // push, DROP, TRUE
+            assert_eq!(redeem.len(), len);
+            let mut script = ScriptBuf::new();
+            script.push_slice(&redeem);
+            let (tx, output) = p2sh_case(&redeem, script);
+            assert_eq!(
+                verify_input(
+                    &tx,
+                    0,
+                    &output,
+                    &Secp256k1Verifier,
+                    &ScriptFlags::consensus()
+                )
+                .is_ok(),
+                len == 520
+            );
+        }
+    }
+
+    #[test]
+    fn nested_witness_requires_exact_push_and_respects_activation() {
+        let witness_script = vec![0x51];
+        let redeem = ScriptBuf::p2wsh(&sha256(&witness_script));
+        let mut canonical = ScriptBuf::new();
+        canonical.push_slice(redeem.as_bytes());
+        let (mut tx, output) = p2sh_case(redeem.as_bytes(), canonical.clone());
+        let mut before = ScriptFlags::consensus();
+        before.verify_witness = false;
+        assert!(verify_input(&tx, 0, &output, &Secp256k1Verifier, &before).is_ok());
+        assert!(verify_input(
+            &tx,
+            0,
+            &output,
+            &Secp256k1Verifier,
+            &ScriptFlags::consensus()
+        )
+        .is_err());
+        tx.witness = vec![Witness::from_items(vec![witness_script])];
+        assert!(verify_input(&tx, 0, &output, &Secp256k1Verifier, &ScriptFlags::all()).is_ok());
+        // Even consensus without MINIMALDATA requires this exact single push.
+        tx.inputs[0].script_sig = ScriptBuf::from_bytes(
+            [vec![0x4c, redeem.len() as u8], redeem.as_bytes().to_vec()].concat(),
+        );
+        assert!(matches!(
+            verify_input(
+                &tx,
+                0,
+                &output,
+                &Secp256k1Verifier,
+                &ScriptFlags::consensus()
+            ),
+            Err(WitnessError::P2shSegwitScriptSig)
+        ));
+        tx.inputs[0].script_sig =
+            ScriptBuf::from_bytes([vec![0x51], canonical.as_bytes().to_vec()].concat());
+        assert!(matches!(
+            verify_input(
+                &tx,
+                0,
+                &output,
+                &Secp256k1Verifier,
+                &ScriptFlags::consensus()
+            ),
+            Err(WitnessError::P2shSegwitScriptSig)
+        ));
+        // Wrapped v1/32-byte is not native Taproot, and future versions can
+        // carry an empty witness. Keep Core's forward-compatible consensus rule.
+        for version in [0x51, 0x52] {
+            let mut redeem = vec![version, 32];
+            redeem.extend([1; 32]);
+            let mut script = ScriptBuf::new();
+            script.push_slice(&redeem);
+            let (tx, output) = p2sh_case(&redeem, script);
+            assert!(verify_input(
+                &tx,
+                0,
+                &output,
+                &Secp256k1Verifier,
+                &ScriptFlags::consensus()
+            )
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn legacy_script_phases_cannot_share_altstack_or_ignore_cleanstack() {
+        let script = ScriptBuf::from_bytes(vec![0x51, 0x6b, 0x51]); // 1 TOALTSTACK 1
+        let (tx, mut output) = p2sh_case(&[0x51], script);
+        output.script_pubkey = ScriptBuf::from_bytes(vec![0x6c]); // FROMALTSTACK
+        assert!(verify_input(&tx, 0, &output, &Secp256k1Verifier, &ScriptFlags::none()).is_err());
+        let (tx, mut output) = p2sh_case(&[0x51], ScriptBuf::from_bytes(vec![0x51]));
+        output.script_pubkey = ScriptBuf::from_bytes(vec![0x51]);
+        assert!(verify_input(
+            &tx,
+            0,
+            &output,
+            &Secp256k1Verifier,
+            &ScriptFlags::consensus()
+        )
+        .is_ok());
+        assert!(verify_input(&tx, 0, &output, &Secp256k1Verifier, &ScriptFlags::all()).is_err());
+    }
 
     /// Helper: create a keypair and return (secret_key, compressed_pubkey_bytes)
     fn generate_keypair() -> (secp256k1::SecretKey, Vec<u8>) {
