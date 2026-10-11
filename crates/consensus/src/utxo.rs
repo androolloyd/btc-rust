@@ -5,7 +5,9 @@ use btc_primitives::transaction::{OutPoint, TxOut};
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
-use crate::validation::{block_subsidy, validate_bip34_coinbase, ChainParams};
+use crate::validation::{
+    block_subsidy, block_subsidy_with_params, validate_bip34_coinbase, ChainParams,
+};
 
 /// Coinbase maturity: outputs of a coinbase tx cannot be spent until
 /// 100 blocks after the block containing the coinbase.
@@ -133,6 +135,15 @@ pub fn connect_block(
     height: u64,
     utxo_view: &dyn UtxoSet,
 ) -> Result<UtxoSetUpdate, UtxoError> {
+    connect_block_with_subsidy(block, height, utxo_view, block_subsidy(height))
+}
+
+fn connect_block_with_subsidy(
+    block: &Block,
+    height: u64,
+    utxo_view: &dyn UtxoSet,
+    subsidy: Amount,
+) -> Result<UtxoSetUpdate, UtxoError> {
     let mut spent: Vec<(OutPoint, UtxoEntry)> = Vec::new();
     let mut created: Vec<(OutPoint, UtxoEntry)> = Vec::new();
 
@@ -230,7 +241,9 @@ pub fn connect_block(
             .outputs
             .iter()
             .try_fold(Amount::ZERO, |acc, o| checked_money_sum(acc, o.value))?;
-        let max_reward = block_subsidy(height) + total_fees;
+        // Fees and subsidy are each bounded well below i64::MAX. The reward
+        // allowance may exceed MAX_MONEY even though actual outputs may not.
+        let max_reward = subsidy + total_fees;
 
         if coinbase_output.as_sat() > max_reward.as_sat() {
             return Err(UtxoError::CoinbaseRewardTooHigh {
@@ -338,7 +351,12 @@ pub fn connect_block_with_context(
     }
 
     // --- Run the base connect_block (UTXO spend/create, maturity, etc.) ---
-    let update = connect_block(block, height, utxo_view)?;
+    let update = connect_block_with_subsidy(
+        block,
+        height,
+        utxo_view,
+        block_subsidy_with_params(height, params),
+    )?;
 
     // --- BIP68: relative lock-time ---
     // We need access to the spent entries that connect_block just recorded,

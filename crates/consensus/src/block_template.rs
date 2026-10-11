@@ -163,6 +163,9 @@ fn build_coinbase(
 ) -> Transaction {
     let mut script_sig_bytes = crate::validation::encode_bip34_height(height);
     script_sig_bytes.extend_from_slice(extra_data);
+    if script_sig_bytes.len() < 2 {
+        script_sig_bytes.push(0x00);
+    }
 
     Transaction {
         version: 2,

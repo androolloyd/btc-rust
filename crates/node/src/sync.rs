@@ -432,6 +432,7 @@ pub struct SyncManager {
     /// Background validation from genesis is a TODO.
     snapshot_height: Option<u64>,
     validated_tip: Option<(u64, BlockHash)>,
+    chain_backend: Option<Arc<crate::chain_backend::NodeChainBackend>>,
 }
 
 impl SyncManager {
@@ -460,6 +461,7 @@ impl SyncManager {
             persistent_utxo: None,
             snapshot_height: None,
             validated_tip: None,
+            chain_backend: None,
         }
     }
 
@@ -501,7 +503,28 @@ impl SyncManager {
             persistent_utxo,
             snapshot_height: None,
             validated_tip: None,
+            chain_backend: None,
         }
+    }
+
+    /// Share the authoritative block backend with RPC, without opening a second DB.
+    pub fn with_backend(
+        network: Network,
+        chain_state: Arc<RwLock<ChainState>>,
+        peer_manager: Arc<RwLock<PeerManager>>,
+        chain_params: ChainParams,
+        datadir: PathBuf,
+        backend: Arc<crate::chain_backend::NodeChainBackend>,
+    ) -> Result<Self, SyncError> {
+        let mut manager = Self::new(network, chain_state, peer_manager, chain_params);
+        manager.validated_tip = Some(
+            backend
+                .tip()
+                .map_err(|e| SyncError::BlockValidation(e.to_string()))?,
+        );
+        manager.datadir = Some(datadir);
+        manager.chain_backend = Some(backend);
+        Ok(manager)
     }
 
     /// Set the ExEx broadcast sender so that block commit events are emitted.
@@ -527,7 +550,7 @@ impl SyncManager {
 
     /// Return `true` if a persistent UTXO set is configured.
     pub fn has_persistent_utxo(&self) -> bool {
-        self.persistent_utxo.is_some()
+        self.persistent_utxo.is_some() || self.chain_backend.is_some()
     }
 
     /// Set the AssumeUTXO snapshot height.  When set, the sync manager will
@@ -650,6 +673,11 @@ impl SyncManager {
             cs.best_height()
         };
         info!(height = final_height, "initial block download complete");
+        if let Some(state) = &self.node_state {
+            state
+                .syncing
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
 
         // Commit UTXOs and the validated tip atomically before publishing a
         // convenience JSON checkpoint. Header progress is never a body checkpoint.
@@ -1091,209 +1119,228 @@ impl SyncManager {
                                 "block received"
                             );
 
-                            // -------------------------------------------------
-                            // Step 1: Context-free block structure validation
-                            // -------------------------------------------------
-                            if let Err(e) = BlockValidator::validate_block(&block) {
-                                warn!(
-                                    height = block_height,
-                                    hash = %block_hash,
-                                    error = %e,
-                                    "block failed structural validation"
-                                );
-                                return Err(SyncError::BlockValidation(format!(
-                                    "block {block_hash} at height {block_height}: {e}"
-                                )));
-                            }
-
-                            if block_height >= self.chain_params.segwit_height {
-                                BlockValidator::verify_witness_commitment(&block)
-                                    .map_err(|e| SyncError::BlockValidation(e.to_string()))?;
-                            }
-
-                            if self.network == Network::Signet {
-                                btc_consensus::signet::validate_signet_block(
-                                    &block,
-                                    &btc_consensus::signet::SignetChallenge::default_signet(),
-                                )
-                                .map_err(|e| SyncError::BlockValidation(e.to_string()))?;
-                            }
-
-                            // -------------------------------------------------
-                            // Step 2: Connect block to UTXO set (contextual
-                            // validation: no double-spends, coinbase maturity,
-                            // value conservation, reward limit).
-                            // -------------------------------------------------
-                            let utxo_update = {
-                                // Use persistent UTXO set if available (for resume),
-                                // otherwise fall back to in-memory set.
-                                let utxo_set = self.utxo_set.read().await;
-                                let chain = self.chain_state.read().await;
-                                let prev = chain
-                                    .get_header(&block.header.prev_blockhash)
-                                    .ok_or_else(|| {
-                                        SyncError::BlockValidation("missing previous header".into())
-                                    })?;
-                                let ancestor_mtp = |h| {
-                                    chain
-                                        .get_header_by_height(h)
-                                        .map(|e| chain.median_time_past(e))
-                                };
-                                let context = LockTimeContext {
-                                    median_time_past: chain.median_time_past(prev),
-                                    ancestor_mtp: &ancestor_mtp,
-                                };
-                                let connect_result =
-                                    if let Some(ref persistent) = self.persistent_utxo {
-                                        // Try persistent first (has data from previous runs)
-                                        connect_block_with_context(
-                                            &block,
-                                            block_height,
-                                            persistent,
-                                            &self.chain_params,
-                                            Some(&context),
-                                        )
-                                    } else {
-                                        connect_block_with_context(
-                                            &block,
-                                            block_height,
-                                            &*utxo_set,
-                                            &self.chain_params,
-                                            Some(&context),
-                                        )
-                                    };
-                                match connect_result {
-                                    Ok(update) => update,
-                                    Err(e) => {
-                                        warn!(
-                                            height = block_height,
-                                            hash = %block_hash,
-                                            error = %e,
-                                            "block failed UTXO validation"
-                                        );
-                                        return Err(SyncError::BlockValidation(format!(
-                                        "UTXO error for block {block_hash} at height {block_height}: {e}"
-                                    )));
-                                    }
+                            let utxo_update = if let Some(ref backend) = self.chain_backend {
+                                let accepted = backend
+                                    .submit_block(&block)
+                                    .map_err(|e| SyncError::BlockValidation(e.message))?;
+                                if accepted.height != block_height {
+                                    return Err(SyncError::BlockValidation(
+                                        "validated/downloaded height mismatch".into(),
+                                    ));
                                 }
-                            };
-
-                            // -------------------------------------------------
-                            // Track assume-valid height: if this block's hash
-                            // matches chain_params.assume_valid, record its
-                            // height so future blocks can skip scripts.
-                            // -------------------------------------------------
-                            if let Some(ref av_hash) = self.chain_params.assume_valid {
-                                if &block_hash == av_hash && self.assume_valid_height.is_none() {
-                                    info!(
-                                        height = block_height,
-                                        hash = %block_hash,
-                                        "assume-valid block found, recording height"
-                                    );
-                                    self.assume_valid_height = Some(block_height);
-                                }
-                            }
-
-                            // -------------------------------------------------
-                            // Step 3: Optionally verify scripts (skip when
-                            // below assume-valid to speed up IBD).
-                            // Must happen BEFORE applying the UTXO update so
-                            // that the spent outputs are still available for
-                            // script verification lookups.
-                            // -------------------------------------------------
-                            if self.chain_params.should_verify_scripts(
-                                block_height,
-                                &block_hash,
-                                self.assume_valid_height,
-                            ) {
-                                let utxo_set = self.utxo_set.read().await;
-                                let validator = ParallelValidator::new(ParallelConfig::default());
-                                // Use persistent UTXO set if available (for resume scenarios
-                                // where in-memory set is empty), otherwise use in-memory.
-                                let validate_result =
-                                    if let Some(ref persistent) = self.persistent_utxo {
-                                        validator.validate_block_scripts(
-                                            &block,
-                                            persistent,
-                                            block_height,
-                                            &self.chain_params,
-                                        )
-                                    } else {
-                                        validator.validate_block_scripts(
-                                            &block,
-                                            &*utxo_set,
-                                            block_height,
-                                            &self.chain_params,
-                                        )
-                                    };
-                                if let Err(errors) = validate_result {
-                                    // During IBD, log script failures as warnings but continue.
-                                    // UTXO validation (Step 2) already passed, so chain state is safe.
-                                    // Script verification issues will be fixed and re-validated.
-                                    let first_err = &errors[0];
+                                self.validated_tip = Some((accepted.height, accepted.hash));
+                                accepted.update
+                            } else {
+                                // -------------------------------------------------
+                                // Step 1: Context-free block structure validation
+                                // -------------------------------------------------
+                                if let Err(e) = BlockValidator::validate_block(&block) {
                                     warn!(
                                         height = block_height,
                                         hash = %block_hash,
-                                        failures = errors.len(),
-                                        first_tx = first_err.0,
-                                        first_input = first_err.1,
-                                        first_error = %first_err.2,
-                                        "script verification warning (continuing sync)"
+                                        error = %e,
+                                        "block failed structural validation"
                                     );
                                     return Err(SyncError::BlockValidation(format!(
+                                        "block {block_hash} at height {block_height}: {e}"
+                                    )));
+                                }
+
+                                if block_height >= self.chain_params.segwit_height {
+                                    BlockValidator::verify_witness_commitment(&block)
+                                        .map_err(|e| SyncError::BlockValidation(e.to_string()))?;
+                                }
+
+                                if self.network == Network::Signet {
+                                    btc_consensus::signet::validate_signet_block(
+                                        &block,
+                                        &btc_consensus::signet::SignetChallenge::default_signet(),
+                                    )
+                                    .map_err(|e| SyncError::BlockValidation(e.to_string()))?;
+                                }
+
+                                // -------------------------------------------------
+                                // Step 2: Connect block to UTXO set (contextual
+                                // validation: no double-spends, coinbase maturity,
+                                // value conservation, reward limit).
+                                // -------------------------------------------------
+                                let utxo_update = {
+                                    // Use persistent UTXO set if available (for resume),
+                                    // otherwise fall back to in-memory set.
+                                    let utxo_set = self.utxo_set.read().await;
+                                    let chain = self.chain_state.read().await;
+                                    let prev = chain
+                                        .get_header(&block.header.prev_blockhash)
+                                        .ok_or_else(|| {
+                                            SyncError::BlockValidation(
+                                                "missing previous header".into(),
+                                            )
+                                        })?;
+                                    let ancestor_mtp = |h| {
+                                        chain
+                                            .get_header_by_height(h)
+                                            .map(|e| chain.median_time_past(e))
+                                    };
+                                    let context = LockTimeContext {
+                                        median_time_past: chain.median_time_past(prev),
+                                        ancestor_mtp: &ancestor_mtp,
+                                    };
+                                    let connect_result =
+                                        if let Some(ref persistent) = self.persistent_utxo {
+                                            // Try persistent first (has data from previous runs)
+                                            connect_block_with_context(
+                                                &block,
+                                                block_height,
+                                                persistent,
+                                                &self.chain_params,
+                                                Some(&context),
+                                            )
+                                        } else {
+                                            connect_block_with_context(
+                                                &block,
+                                                block_height,
+                                                &*utxo_set,
+                                                &self.chain_params,
+                                                Some(&context),
+                                            )
+                                        };
+                                    match connect_result {
+                                        Ok(update) => update,
+                                        Err(e) => {
+                                            warn!(
+                                                height = block_height,
+                                                hash = %block_hash,
+                                                error = %e,
+                                                "block failed UTXO validation"
+                                            );
+                                            return Err(SyncError::BlockValidation(format!(
+                                        "UTXO error for block {block_hash} at height {block_height}: {e}"
+                                    )));
+                                        }
+                                    }
+                                };
+
+                                // -------------------------------------------------
+                                // Track assume-valid height: if this block's hash
+                                // matches chain_params.assume_valid, record its
+                                // height so future blocks can skip scripts.
+                                // -------------------------------------------------
+                                if let Some(ref av_hash) = self.chain_params.assume_valid {
+                                    if &block_hash == av_hash && self.assume_valid_height.is_none()
+                                    {
+                                        info!(
+                                            height = block_height,
+                                            hash = %block_hash,
+                                            "assume-valid block found, recording height"
+                                        );
+                                        self.assume_valid_height = Some(block_height);
+                                    }
+                                }
+
+                                // -------------------------------------------------
+                                // Step 3: Optionally verify scripts (skip when
+                                // below assume-valid to speed up IBD).
+                                // Must happen BEFORE applying the UTXO update so
+                                // that the spent outputs are still available for
+                                // script verification lookups.
+                                // -------------------------------------------------
+                                if self.chain_params.should_verify_scripts(
+                                    block_height,
+                                    &block_hash,
+                                    self.assume_valid_height,
+                                ) {
+                                    let utxo_set = self.utxo_set.read().await;
+                                    let validator =
+                                        ParallelValidator::new(ParallelConfig::default());
+                                    // Use persistent UTXO set if available (for resume scenarios
+                                    // where in-memory set is empty), otherwise use in-memory.
+                                    let validate_result =
+                                        if let Some(ref persistent) = self.persistent_utxo {
+                                            validator.validate_block_scripts(
+                                                &block,
+                                                persistent,
+                                                block_height,
+                                                &self.chain_params,
+                                            )
+                                        } else {
+                                            validator.validate_block_scripts(
+                                                &block,
+                                                &*utxo_set,
+                                                block_height,
+                                                &self.chain_params,
+                                            )
+                                        };
+                                    if let Err(errors) = validate_result {
+                                        // During IBD, log script failures as warnings but continue.
+                                        // UTXO validation (Step 2) already passed, so chain state is safe.
+                                        // Script verification issues will be fixed and re-validated.
+                                        let first_err = &errors[0];
+                                        warn!(
+                                            height = block_height,
+                                            hash = %block_hash,
+                                            failures = errors.len(),
+                                            first_tx = first_err.0,
+                                            first_input = first_err.1,
+                                            first_error = %first_err.2,
+                                            "script verification warning (continuing sync)"
+                                        );
+                                        return Err(SyncError::BlockValidation(format!(
                                     "script verification failed for block {} at height {}: {} error(s), first: tx {} input {}: {}",
                                     block_hash, block_height, errors.len(),
                                     first_err.0, first_err.1, first_err.2
                                 )));
+                                    }
                                 }
-                            }
 
-                            // -------------------------------------------------
-                            // Step 4: Apply UTXO updates to the in-memory set
-                            // -------------------------------------------------
-                            {
-                                let mut utxo_set = self.utxo_set.write().await;
-                                utxo_set.apply_update(&utxo_update);
+                                // -------------------------------------------------
+                                // Step 4: Apply UTXO updates to the in-memory set
+                                // -------------------------------------------------
+                                {
+                                    let mut utxo_set = self.utxo_set.write().await;
+                                    utxo_set.apply_update(&utxo_update);
 
-                                if block_height % 500 == 0 {
-                                    info!(
-                                        height = block_height,
-                                        utxo_count = utxo_set.len(),
-                                        created = utxo_update.created.len(),
-                                        spent = utxo_update.spent.len(),
-                                        "UTXO set status"
-                                    );
+                                    if block_height % 500 == 0 {
+                                        info!(
+                                            height = block_height,
+                                            utxo_count = utxo_set.len(),
+                                            created = utxo_update.created.len(),
+                                            spent = utxo_update.spent.len(),
+                                            "UTXO set status"
+                                        );
+                                    }
                                 }
-                            }
 
-                            // -------------------------------------------------
-                            // Step 4b: Persist UTXO updates in batches of 500 blocks
-                            // The in-memory UTXO set (Step 4) has the authoritative
-                            // state; we only persist periodically for crash recovery.
-                            // -------------------------------------------------
-                            self.validated_tip = Some((block_height, block_hash));
-                            if let Some(ref mut persistent) = self.persistent_utxo {
-                                // Always apply (updates the in-memory cache inside PersistentUtxoSet)
-                                persistent.apply_update_cached(&utxo_update);
+                                // -------------------------------------------------
+                                // Step 4b: Persist UTXO updates in batches of 500 blocks
+                                // The in-memory UTXO set (Step 4) has the authoritative
+                                // state; we only persist periodically for crash recovery.
+                                // -------------------------------------------------
+                                self.validated_tip = Some((block_height, block_hash));
+                                if let Some(ref mut persistent) = self.persistent_utxo {
+                                    // Always apply (updates the in-memory cache inside PersistentUtxoSet)
+                                    persistent.apply_update_cached(&utxo_update);
 
-                                // Flush to disk every 500 blocks + save checkpoint
-                                if block_height % 500 == 0 {
-                                    persistent
-                                        .flush_cache_with_tip(block_height, block_hash)
-                                        .map_err(|e| {
+                                    // Flush to disk every 500 blocks + save checkpoint
+                                    if block_height % 500 == 0 {
+                                        persistent
+                                            .flush_cache_with_tip(block_height, block_hash)
+                                            .map_err(|e| {
                                             SyncError::BlockValidation(format!(
                                                 "UTXO persistence failed: {e}"
                                             ))
                                         })?;
-                                    // Save checkpoint so restarts skip these blocks
-                                    if let Some(ref datadir) = self.datadir {
-                                        let cp = Checkpoint::new(block_height, block_hash);
-                                        save_checkpoint(datadir, &cp).map_err(|e| {
-                                            SyncError::BlockValidation(e.to_string())
-                                        })?;
+                                        // Save checkpoint so restarts skip these blocks
+                                        if let Some(ref datadir) = self.datadir {
+                                            let cp = Checkpoint::new(block_height, block_hash);
+                                            save_checkpoint(datadir, &cp).map_err(|e| {
+                                                SyncError::BlockValidation(e.to_string())
+                                            })?;
+                                        }
                                     }
                                 }
-                            }
+
+                                utxo_update
+                            };
 
                             // -------------------------------------------------
                             // Step 5: Store undo data for reorg protection and
@@ -1323,10 +1370,11 @@ impl SyncManager {
                                 ns.update_chain_tip(block_height, &block_hash.to_string());
                             }
 
+                            let in_memory_utxo_count = self.utxo_set.read().await.len();
                             debug!(
                                 height = block_height,
                                 hash = %block_hash,
-                                utxos = self.utxo_set.read().await.len(),
+                                utxos = in_memory_utxo_count,
                                 "block validated and connected"
                             );
 
@@ -1398,6 +1446,11 @@ impl SyncManager {
         new_tip: BlockHash,
         new_blocks: &[btc_primitives::block::Block],
     ) -> Result<ReorgResult, SyncError> {
+        if self.chain_backend.is_some() {
+            return Err(SyncError::Aborted(
+                "persistent chain reorganization is not yet supported".into(),
+            ));
+        }
         info!(%old_tip, %new_tip, "handling chain reorganization");
 
         let mut cs = self.chain_state.write().await;
@@ -1436,7 +1489,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     #[tokio::test]
-    async fn reversed_peer_blocks_are_validated_in_chain_order() {
+    async fn reversed_peer_blocks_share_validated_rpc_state() {
         use btc_test::TestNode;
         let mut miner = TestNode::new();
         let blocks = miner.mine_blocks(3);
@@ -1448,7 +1501,25 @@ mod tests {
         let expected = blocks[2].block_hash();
         let chain = Arc::new(RwLock::new(chain));
         let peers = Arc::new(RwLock::new(PeerManager::new(Network::Regtest)));
-        let mut sync = SyncManager::new(Network::Regtest, chain, peers, params);
+        let dir = tempfile::tempdir().unwrap();
+        let state = NodeState::new(Network::Regtest);
+        let backend = Arc::new(
+            crate::chain_backend::NodeChainBackend::open(
+                &dir.path().join("utxo.redb"),
+                state.clone(),
+            )
+            .unwrap(),
+        );
+        let rpc = btc_rpc::handler::RpcHandler::new().with_chain_backend(backend.clone());
+        let mut sync = SyncManager::with_backend(
+            Network::Regtest,
+            chain,
+            peers,
+            params,
+            dir.path().to_path_buf(),
+            backend.clone(),
+        )
+        .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let peer = tokio::spawn(async move {
@@ -1482,7 +1553,18 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(sync.validated_tip, Some((3, expected)));
-        assert_eq!(sync.utxo_set.read().await.len(), 3);
+        assert_eq!(backend.tip().unwrap(), (3, expected));
+        let response = rpc.handle(&btc_rpc::handler::RpcRequest {
+            jsonrpc: "2.0".into(),
+            method: "getblockhash".into(),
+            params: serde_json::json!([3]),
+            id: serde_json::json!(1),
+        });
+        assert_eq!(response.result.unwrap(), expected.to_string());
+        assert_eq!(
+            state.chain_height.load(std::sync::atomic::Ordering::SeqCst),
+            3
+        );
         peer.await.unwrap();
     }
 

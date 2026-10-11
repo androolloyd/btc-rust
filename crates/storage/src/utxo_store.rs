@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use btc_consensus::utxo::{UtxoEntry, UtxoSet, UtxoSetUpdate};
 use btc_primitives::amount::Amount;
+use btc_primitives::block::Block;
 use btc_primitives::hash::BlockHash;
 use btc_primitives::script::ScriptBuf;
 use btc_primitives::transaction::{OutPoint, TxOut};
@@ -78,6 +79,25 @@ impl<DB: Database> PersistentUtxoSet<DB> {
     /// This writes through to the database in a single transaction and updates
     /// the in-memory cache accordingly.
     pub fn apply_update(&mut self, update: &UtxoSetUpdate) -> Result<(), StorageError> {
+        self.apply_update_inner(update, None)
+    }
+
+    /// Commit a validated block's body, header, indices, UTXOs and tip atomically.
+    /// Cache changes become visible only after the database commit succeeds.
+    pub fn apply_block_update(
+        &mut self,
+        block: &Block,
+        height: u64,
+        update: &UtxoSetUpdate,
+    ) -> Result<(), StorageError> {
+        self.apply_update_inner(update, Some((block, height)))
+    }
+
+    fn apply_update_inner(
+        &mut self,
+        update: &UtxoSetUpdate,
+        block: Option<(&Block, u64)>,
+    ) -> Result<(), StorageError> {
         self.flush_cache()?;
         let tx = self.db.tx_mut()?;
         let spent: HashSet<_> = update.spent.iter().map(|(op, _)| *op).collect();
@@ -101,6 +121,18 @@ impl<DB: Database> PersistentUtxoSet<DB> {
             self.put_utxo_meta(&tx, outpoint, entry)?;
         }
 
+        if let Some((block, height)) = block {
+            let hash = block.block_hash();
+            tx.put_block_header(&hash, &block.header)?;
+            tx.put_block_hash_by_height(height, &hash)?;
+            tx.put_block(&hash, block)?;
+            for (position, transaction) in block.transactions.iter().enumerate() {
+                let txid = transaction.txid();
+                tx.put_transaction(&txid, transaction)?;
+                tx.put_tx_block_index(&txid, &hash, position as u32)?;
+            }
+            tx.set_best_block(height, &hash)?;
+        }
         tx.commit()?;
         for (outpoint, _) in &update.spent {
             self.cache.get_mut().remove(outpoint);
@@ -309,6 +341,11 @@ impl<DB: Database> PersistentUtxoSet<DB> {
 
 impl<DB: Database> UtxoSet for PersistentUtxoSet<DB> {
     fn get_utxo(&self, outpoint: &OutPoint) -> Option<UtxoEntry> {
+        // The upper vout bit is reserved for local metadata. No valid block
+        // can contain 2^31 outputs, and metadata must never appear as a coin.
+        if outpoint.vout & 0x8000_0000 != 0 {
+            return None;
+        }
         if self.pending_deletes.contains(outpoint) {
             return None;
         }
@@ -338,6 +375,187 @@ mod tests {
     use btc_primitives::hash::TxHash;
     use btc_primitives::script::ScriptBuf;
     use btc_primitives::transaction::{OutPoint, TxOut};
+
+    struct FailCommitDb {
+        inner: Arc<RedbDatabase>,
+        fail: Arc<std::sync::atomic::AtomicBool>,
+    }
+    struct FailCommitTx {
+        inner: crate::redb_backend::RedbTxMut,
+        fail: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl Database for FailCommitDb {
+        type TX = crate::redb_backend::RedbTx;
+        type TXMut = FailCommitTx;
+        fn tx(&self) -> Result<Self::TX, StorageError> {
+            self.inner.tx()
+        }
+        fn tx_mut(&self) -> Result<Self::TXMut, StorageError> {
+            Ok(FailCommitTx {
+                inner: self.inner.tx_mut()?,
+                fail: self.fail.clone(),
+            })
+        }
+    }
+    impl DbTx for FailCommitTx {
+        fn get_block(&self, hash: &BlockHash) -> Result<Option<Block>, StorageError> {
+            self.inner.get_block(hash)
+        }
+        fn get_block_header(
+            &self,
+            hash: &BlockHash,
+        ) -> Result<Option<btc_primitives::block::BlockHeader>, StorageError> {
+            self.inner.get_block_header(hash)
+        }
+        fn get_block_hash_by_height(&self, height: u64) -> Result<Option<BlockHash>, StorageError> {
+            self.inner.get_block_hash_by_height(height)
+        }
+        fn get_transaction(
+            &self,
+            txid: &btc_primitives::hash::TxHash,
+        ) -> Result<Option<btc_primitives::transaction::Transaction>, StorageError> {
+            self.inner.get_transaction(txid)
+        }
+        fn get_utxo(&self, outpoint: &OutPoint) -> Result<Option<TxOut>, StorageError> {
+            self.inner.get_utxo(outpoint)
+        }
+        fn get_best_block_height(&self) -> Result<u64, StorageError> {
+            self.inner.get_best_block_height()
+        }
+        fn get_best_block_hash(&self) -> Result<BlockHash, StorageError> {
+            self.inner.get_best_block_hash()
+        }
+        fn get_tx_block_index(
+            &self,
+            txid: &btc_primitives::hash::TxHash,
+        ) -> Result<Option<crate::traits::TxBlockLocation>, StorageError> {
+            self.inner.get_tx_block_index(txid)
+        }
+        fn get_address_txs(
+            &self,
+            script_hash: &[u8; 32],
+        ) -> Result<Vec<crate::traits::AddressIndexValue>, StorageError> {
+            self.inner.get_address_txs(script_hash)
+        }
+    }
+    impl DbTxMut for FailCommitTx {
+        fn put_block(&self, hash: &BlockHash, block: &Block) -> Result<(), StorageError> {
+            self.inner.put_block(hash, block)
+        }
+        fn put_block_header(
+            &self,
+            hash: &BlockHash,
+            header: &btc_primitives::block::BlockHeader,
+        ) -> Result<(), StorageError> {
+            self.inner.put_block_header(hash, header)
+        }
+        fn put_block_hash_by_height(
+            &self,
+            height: u64,
+            hash: &BlockHash,
+        ) -> Result<(), StorageError> {
+            self.inner.put_block_hash_by_height(height, hash)
+        }
+        fn put_transaction(
+            &self,
+            txid: &btc_primitives::hash::TxHash,
+            transaction: &btc_primitives::transaction::Transaction,
+        ) -> Result<(), StorageError> {
+            self.inner.put_transaction(txid, transaction)
+        }
+        fn put_utxo(&self, outpoint: &OutPoint, output: &TxOut) -> Result<(), StorageError> {
+            self.inner.put_utxo(outpoint, output)
+        }
+        fn delete_utxo(&self, outpoint: &OutPoint) -> Result<(), StorageError> {
+            self.inner.delete_utxo(outpoint)
+        }
+        fn set_best_block(&self, height: u64, hash: &BlockHash) -> Result<(), StorageError> {
+            self.inner.set_best_block(height, hash)
+        }
+        fn put_tx_block_index(
+            &self,
+            txid: &btc_primitives::hash::TxHash,
+            hash: &BlockHash,
+            position: u32,
+        ) -> Result<(), StorageError> {
+            self.inner.put_tx_block_index(txid, hash, position)
+        }
+        fn put_address_tx(
+            &self,
+            script_hash: &[u8; 32],
+            entry: &crate::traits::AddressIndexValue,
+        ) -> Result<(), StorageError> {
+            self.inner.put_address_tx(script_hash, entry)
+        }
+        fn commit(self) -> Result<(), StorageError> {
+            if self.fail.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                Err(StorageError::Database("injected commit failure".into()))
+            } else {
+                self.inner.commit()
+            }
+        }
+    }
+
+    #[test]
+    fn block_commit_failure_preserves_tip_body_and_coins_until_retry() {
+        let (db, _dir) = temp_db();
+        let mut initial = PersistentUtxoSet::new(db.clone());
+        let old_coin = make_outpoint(0x41, 0);
+        let old_entry = make_entry(500, 1, false);
+        initial.apply_update_cached(&UtxoSetUpdate {
+            spent: vec![],
+            created: vec![(old_coin, old_entry.clone())],
+        });
+        let old_tip = BlockHash::from_bytes([0x42; 32]);
+        initial.flush_cache_with_tip(1, old_tip).unwrap();
+        let block = Block {
+            header: btc_primitives::block::BlockHeader {
+                version: 4,
+                prev_blockhash: old_tip,
+                merkle_root: btc_primitives::hash::TxHash::ZERO,
+                time: 2,
+                bits: btc_primitives::compact::CompactTarget(0x207fffff),
+                nonce: 0,
+            },
+            transactions: vec![],
+        };
+        let new_coin = make_outpoint(0x43, 0);
+        let update = UtxoSetUpdate {
+            spent: vec![(old_coin, old_entry.clone())],
+            created: vec![(new_coin, make_entry(400, 2, false))],
+        };
+        let mut set = PersistentUtxoSet::new(Arc::new(FailCommitDb {
+            inner: db.clone(),
+            fail: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }));
+        assert_eq!(set.get_utxo(&old_coin), Some(old_entry.clone()));
+        assert!(set.apply_block_update(&block, 2, &update).is_err());
+        assert_eq!(set.get_utxo(&old_coin), Some(old_entry));
+        assert!(!set.contains(&new_coin));
+        let reader = PersistentUtxoSet::new(db.clone());
+        assert_eq!(reader.validated_tip().unwrap(), Some((1, old_tip)));
+        assert!(reader.contains(&old_coin));
+        assert!(!reader.contains(&new_coin));
+        assert!(db
+            .tx()
+            .unwrap()
+            .get_block(&block.block_hash())
+            .unwrap()
+            .is_none());
+        set.apply_block_update(&block, 2, &update).unwrap();
+        let reader = PersistentUtxoSet::new(db.clone());
+        assert_eq!(
+            reader.validated_tip().unwrap(),
+            Some((2, block.block_hash()))
+        );
+        assert!(!reader.contains(&old_coin));
+        assert!(reader.contains(&new_coin));
+        assert!(!reader.contains(&OutPoint::new(new_coin.txid, new_coin.vout | 0x8000_0000)));
+        assert_eq!(
+            db.tx().unwrap().get_block(&block.block_hash()).unwrap(),
+            Some(block)
+        );
+    }
 
     #[test]
     fn validated_tip_is_committed_with_utxo_changes() {

@@ -36,6 +36,8 @@ pub enum ChainError {
     BadDifficultyBits { expected: u32, got: u32 },
     #[error("duplicate header {0}")]
     DuplicateHeader(BlockHash),
+    #[error("header persistence failed: {0}")]
+    CommitFailed(String),
     #[error("checkpoint mismatch at height {height}: expected {expected}, got {got}")]
     CheckpointMismatch {
         height: u64,
@@ -63,6 +65,7 @@ pub struct HeaderEntry {
 // ---------------------------------------------------------------------------
 
 /// Tracks the header chain, selecting the best tip by cumulative work.
+#[derive(Clone)]
 pub struct ChainState {
     /// Hash of the best (most-work) known header.
     best_header: BlockHash,
@@ -122,6 +125,19 @@ impl ChainState {
 
     /// Validate and accept a new block header, returning its hash on success.
     pub fn accept_header(&mut self, header: BlockHeader) -> Result<BlockHash, ChainError> {
+        self.accept_header_with_commit(header, || Ok(()))
+    }
+
+    /// Validate first, persist through `commit`, then publish the new header.
+    /// A failed commit leaves the header chain unchanged.
+    pub fn accept_header_with_commit<F>(
+        &mut self,
+        header: BlockHeader,
+        commit: F,
+    ) -> Result<BlockHash, ChainError>
+    where
+        F: FnOnce() -> Result<(), String>,
+    {
         let hash = header.block_hash();
 
         // Reject duplicates.
@@ -198,17 +214,32 @@ impl ChainState {
             cumulative_work,
         };
 
+        commit().map_err(ChainError::CommitFailed)?;
         self.headers.insert(hash, entry);
 
         // Update best tip if more cumulative work.
         if compare_u256(&cumulative_work, &self.best_entry().cumulative_work)
             == std::cmp::Ordering::Greater
         {
+            let old_height = self.best_height;
             self.best_header = hash;
             self.best_height = new_height;
-            // Incrementally update the height index instead of rebuilding from scratch.
-            // This avoids O(chain_height) HashMap insertions per new header.
-            self.height_index.insert(new_height, hash);
+            // Replace the fork's height mappings as well as its tip.
+            let mut current = hash;
+            loop {
+                let entry = &self.headers[&current];
+                if self.height_index.get(&entry.height) == Some(&current) {
+                    break;
+                }
+                self.height_index.insert(entry.height, current);
+                if entry.height == 0 {
+                    break;
+                }
+                current = entry.header.prev_blockhash;
+            }
+            if new_height < old_height {
+                self.height_index.retain(|height, _| *height <= new_height);
+            }
         }
 
         Ok(hash)
@@ -250,6 +281,15 @@ impl ChainState {
     /// Access the chain parameters.
     pub fn params(&self) -> &ChainParams {
         &self.params
+    }
+
+    /// Difficulty required for a block extending the current tip at `time`.
+    pub fn next_work_required(&self, time: u32) -> CompactTarget {
+        let prev = self.best_header();
+        let mut candidate = prev.header.clone();
+        candidate.prev_blockhash = prev.header.block_hash();
+        candidate.time = time;
+        self.get_next_work_required(prev.height + 1, &candidate, prev)
     }
 
     /// Build a set of block locator hashes for the `getheaders` P2P message.
@@ -772,6 +812,53 @@ mod tests {
         assert_eq!(chain.best_height(), 1);
         assert_eq!(chain.best_header().header.block_hash(), hash);
         assert!(chain.get_header(&hash).is_some());
+    }
+
+    #[test]
+    fn failed_persistence_does_not_publish_a_header() {
+        let mut chain = regtest_chain();
+        let genesis = chain.best_header().header.block_hash();
+        let header = mine_header(chain.best_header(), chain.params.pow_limit);
+        let hash = header.block_hash();
+        let error = chain
+            .accept_header_with_commit(header, || Err("injected commit failure".into()))
+            .unwrap_err();
+        assert!(matches!(error, ChainError::CommitFailed(_)));
+        assert_eq!(chain.best_height(), 0);
+        assert_eq!(chain.best_header().header.block_hash(), genesis);
+        assert!(chain.get_header(&hash).is_none());
+        chain.accept_header(header).unwrap();
+        assert_eq!(chain.best_height(), 1);
+    }
+
+    #[test]
+    fn heavier_fork_replaces_every_affected_height_mapping() {
+        let mut chain = regtest_chain();
+        let genesis = chain.best_header().clone();
+        let bits = chain.params.pow_limit;
+        let first = mine_header(&genesis, bits);
+        chain.accept_header(first).unwrap();
+        let second = mine_header(chain.best_header(), bits);
+        chain.accept_header(second).unwrap();
+        let mut fork_first = mine_header(&genesis, bits);
+        fork_first.merkle_root = TxHash::from_bytes([42; 32]);
+        while !fork_first.check_proof_of_work() {
+            fork_first.nonce += 1;
+        }
+        let first_hash = chain.accept_header(fork_first).unwrap();
+        let fork_second = mine_header(chain.get_header(&first_hash).unwrap(), bits);
+        let second_hash = chain.accept_header(fork_second).unwrap();
+        let fork_third = mine_header(chain.get_header(&second_hash).unwrap(), bits);
+        chain.accept_header(fork_third).unwrap();
+        assert_eq!(
+            chain.get_header_by_height(1).unwrap().header.block_hash(),
+            first_hash
+        );
+        assert_eq!(
+            chain.get_header_by_height(2).unwrap().header.block_hash(),
+            second_hash
+        );
+        assert_eq!(chain.best_height(), 3);
     }
 
     // ---- Test: reject header with unknown prev_blockhash ----

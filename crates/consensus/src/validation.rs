@@ -47,7 +47,15 @@ pub const MAX_BLOCK_WEIGHT: usize = 4_000_000;
 
 /// Block subsidy schedule
 pub fn block_subsidy(height: u64) -> Amount {
-    let halvings = height / 210_000;
+    subsidy_for_interval(height, 210_000)
+}
+
+pub fn block_subsidy_with_params(height: u64, params: &ChainParams) -> Amount {
+    subsidy_for_interval(height, params.subsidy_halving_interval)
+}
+
+fn subsidy_for_interval(height: u64, interval: u64) -> Amount {
+    let halvings = height / interval;
     if halvings >= 64 {
         return Amount::ZERO;
     }
@@ -222,6 +230,9 @@ pub fn encode_bip34_height(height: u64) -> Vec<u8> {
         // OP_0 — push empty byte vector (CScriptNum for 0)
         return vec![0x00];
     }
+    if height <= 16 {
+        return vec![0x50 + height as u8];
+    }
 
     // Encode the height as a minimal little-endian signed integer
     // (CScriptNum encoding).
@@ -253,6 +264,10 @@ pub fn decode_bip34_height(script_sig: &[u8]) -> Option<u64> {
     }
 
     let push_len = script_sig[0] as usize;
+
+    if (0x51..=0x60).contains(&script_sig[0]) {
+        return Some((script_sig[0] - 0x50) as u64);
+    }
 
     // OP_0 encodes height 0
     if push_len == 0 {
@@ -332,6 +347,7 @@ pub struct AssumeUtxoParams {
 }
 
 /// Chain parameters — network-specific consensus rules
+#[derive(Clone)]
 pub struct ChainParams {
     pub network: btc_primitives::network::Network,
     pub genesis_hash: BlockHash,
@@ -516,10 +532,10 @@ impl ChainParams {
             pow_target_timespan: 14 * 24 * 60 * 60,
             pow_target_spacing: 10 * 60,
             subsidy_halving_interval: 150,
-            bip34_height: 500,
-            bip65_height: 1351,
-            bip66_height: 1251,
-            bip68_height: 0,
+            bip34_height: 1,
+            bip65_height: 1,
+            bip66_height: 1,
+            bip68_height: 1,
             segwit_height: 0,
             taproot_height: 0,
             assume_valid: None,
@@ -1036,16 +1052,16 @@ mod tests {
 
     #[test]
     fn test_encode_bip34_height_1() {
-        // Height 1 => [0x01, 0x01]
+        // CScript's integer overload emits OP_1 for height 1.
         let encoded = encode_bip34_height(1);
-        assert_eq!(encoded, vec![0x01, 0x01]);
+        assert_eq!(encoded, vec![0x51]);
     }
 
     #[test]
     fn test_encode_bip34_height_16() {
-        // Height 16 => [0x01, 0x10]
+        // Height 16 => OP_16.
         let encoded = encode_bip34_height(16);
-        assert_eq!(encoded, vec![0x01, 0x10]);
+        assert_eq!(encoded, vec![0x60]);
     }
 
     #[test]

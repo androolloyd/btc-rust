@@ -3,14 +3,14 @@ use std::sync::Arc;
 
 use redb::{ReadableTable, TableDefinition};
 
-use btc_primitives::block::BlockHeader;
+use btc_primitives::block::{Block, BlockHeader};
 use btc_primitives::encode::{decode, encode};
 use btc_primitives::hash::{BlockHash, TxHash};
 use btc_primitives::transaction::{OutPoint, Transaction, TxOut};
 
 use crate::tables::{
-    META_BEST_HASH, META_BEST_HEIGHT, TABLE_ADDRESS_INDEX, TABLE_BLOCK_INDEX, TABLE_HEADERS,
-    TABLE_META, TABLE_TRANSACTIONS, TABLE_TX_BLOCK_INDEX, TABLE_UTXOS,
+    META_BEST_HASH, META_BEST_HEIGHT, TABLE_ADDRESS_INDEX, TABLE_BLOCKS, TABLE_BLOCK_INDEX,
+    TABLE_HEADERS, TABLE_META, TABLE_TRANSACTIONS, TABLE_TX_BLOCK_INDEX, TABLE_UTXOS,
 };
 use crate::traits::{AddressIndexValue, Database, DbTx, DbTxMut, StorageError, TxBlockLocation};
 
@@ -18,6 +18,7 @@ use crate::traits::{AddressIndexValue, Database, DbTx, DbTxMut, StorageError, Tx
 /// All tables use `&[u8]` keys and `&[u8]` values — serialization is handled
 /// in the trait implementations using btc_primitives::encode.
 const HEADERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new(TABLE_HEADERS);
+const BLOCKS: TableDefinition<&[u8], &[u8]> = TableDefinition::new(TABLE_BLOCKS);
 const BLOCK_INDEX: TableDefinition<&[u8], &[u8]> = TableDefinition::new(TABLE_BLOCK_INDEX);
 const TRANSACTIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new(TABLE_TRANSACTIONS);
 const UTXOS: TableDefinition<&[u8], &[u8]> = TableDefinition::new(TABLE_UTXOS);
@@ -44,6 +45,9 @@ impl RedbDatabase {
             .begin_write()
             .map_err(|e| StorageError::Database(e.to_string()))?;
         // Opening a table inside a write-transaction creates it if missing.
+        write_txn
+            .open_table(BLOCKS)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
         write_txn
             .open_table(HEADERS)
             .map_err(|e| StorageError::Database(e.to_string()))?;
@@ -228,6 +232,18 @@ pub struct RedbTx {
 unsafe impl Sync for RedbTx {}
 
 impl DbTx for RedbTx {
+    fn get_block(&self, hash: &BlockHash) -> Result<Option<Block>, StorageError> {
+        let table = self
+            .inner
+            .open_table(BLOCKS)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let value = table
+            .get(hash.as_bytes().as_slice())
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        value
+            .map(|v| decode(v.value()).map_err(|e| StorageError::Corruption(e.to_string())))
+            .transpose()
+    }
     fn get_block_header(&self, hash: &BlockHash) -> Result<Option<BlockHeader>, StorageError> {
         let table = self
             .inner
@@ -446,6 +462,18 @@ pub struct RedbTxMut {
 unsafe impl Sync for RedbTxMut {}
 
 impl DbTx for RedbTxMut {
+    fn get_block(&self, hash: &BlockHash) -> Result<Option<Block>, StorageError> {
+        let table = self
+            .inner
+            .open_table(BLOCKS)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let value = table
+            .get(hash.as_bytes().as_slice())
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        value
+            .map(|v| decode(v.value()).map_err(|e| StorageError::Corruption(e.to_string())))
+            .transpose()
+    }
     fn get_block_header(&self, hash: &BlockHash) -> Result<Option<BlockHeader>, StorageError> {
         let table = self
             .inner
@@ -643,6 +671,17 @@ impl DbTx for RedbTxMut {
 }
 
 impl DbTxMut for RedbTxMut {
+    fn put_block(&self, hash: &BlockHash, block: &Block) -> Result<(), StorageError> {
+        let mut table = self
+            .inner
+            .open_table(BLOCKS)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let bytes = encode(block);
+        table
+            .insert(hash.as_bytes().as_slice(), bytes.as_slice())
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(())
+    }
     fn put_block_header(&self, hash: &BlockHash, header: &BlockHeader) -> Result<(), StorageError> {
         let mut table = self
             .inner

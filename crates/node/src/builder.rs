@@ -228,6 +228,11 @@ impl Node {
             .syncing
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
+        let chain_backend = Arc::new(crate::chain_backend::NodeChainBackend::open(
+            &self.config.datadir.join("utxo.redb"),
+            node_state.clone(),
+        )?);
+
         // -----------------------------------------------------------------
         // 2. Create ExExManager for chain event notifications
         // -----------------------------------------------------------------
@@ -273,31 +278,28 @@ impl Node {
         // -----------------------------------------------------------------
         // 6. Initialize RPC server with shared state from NodeState
         // -----------------------------------------------------------------
-        let rpc_handler = Arc::new(btc_rpc::handler::RpcHandler::new_with_state(
-            Arc::clone(&node_state.chain_height),
-            Arc::clone(&node_state.best_hash),
-            node_state.rpc_network_name(),
-            Arc::clone(&node_state.peer_count),
-            Arc::clone(&node_state.mempool_size),
-            Arc::clone(&node_state.mempool_bytes),
-        ));
+        let rpc_handler = Arc::new(
+            btc_rpc::handler::RpcHandler::new_with_state(
+                Arc::clone(&node_state.chain_height),
+                Arc::clone(&node_state.best_hash),
+                node_state.rpc_network_name(),
+                Arc::clone(&node_state.peer_count),
+                Arc::clone(&node_state.mempool_size),
+                Arc::clone(&node_state.mempool_bytes),
+            )
+            .with_chain_backend(chain_backend.clone()),
+        );
         let rpc = RpcServer::new(self.config.rpc_port);
         let rpc_handler_clone = rpc_handler.clone();
 
         // Spawn RPC server
-        let rpc_handle = tokio::spawn(async move {
-            if let Err(e) = rpc.run(rpc_handler_clone).await {
-                tracing::error!(error = %e, "RPC server error");
-            }
-        });
+        let mut rpc_handle = tokio::spawn(async move { rpc.run(rpc_handler_clone).await });
 
         // -----------------------------------------------------------------
         // 7. Initialize consensus chain state
         // -----------------------------------------------------------------
-        let params = btc_consensus::validation::ChainParams::from_network(self.config.network);
-        let chain_state = std::sync::Arc::new(tokio::sync::RwLock::new(
-            btc_consensus::ChainState::new(params),
-        ));
+        let chain_state =
+            std::sync::Arc::new(tokio::sync::RwLock::new(chain_backend.header_chain()?));
 
         // Initialize peer manager
         let peer_manager = std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -308,42 +310,46 @@ impl Node {
         // 8. Start sync manager with ExEx sender for notifications
         // -----------------------------------------------------------------
         let sync_params = btc_consensus::validation::ChainParams::from_network(self.config.network);
-        let mut sync_mgr = crate::sync::SyncManager::with_datadir(
+        let mut sync_mgr = crate::sync::SyncManager::with_backend(
             self.config.network,
             chain_state.clone(),
             peer_manager.clone(),
             sync_params,
             self.config.datadir.clone(),
-        );
+            chain_backend,
+        )?;
         sync_mgr.set_exex_sender(exex_manager.sender().clone());
         sync_mgr.set_node_state(node_state.clone());
 
         info!("starting initial block download");
 
-        match sync_mgr.start().await {
-            Ok(()) => {
-                info!(state = %sync_mgr.state(), "sync complete");
+        let sync_handle = tokio::spawn(async move {
+            match sync_mgr.start().await {
+                Ok(()) => info!(state = %sync_mgr.state(), "sync connection ended"),
+                Err(e) => tracing::error!(error = %e, "sync failed"),
             }
-            Err(e) => {
-                tracing::error!(error = %e, "sync failed");
-                // Don't exit — the node can still serve RPC
-            }
-        }
+        });
 
-        node_state
-            .syncing
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-
-        // Keep running (serve RPC, listen for new blocks)
-        info!("btc-node running — press Ctrl+C to stop");
-        tokio::signal::ctrl_c().await?;
+        info!("btc-node running — press Ctrl+C or use stop RPC to stop");
+        let result = tokio::select! {
+            result = tokio::signal::ctrl_c() => result.map_err(Into::into),
+            _ = rpc_handler.wait_for_shutdown() => Ok(()),
+            result = &mut rpc_handle => match result {
+                Ok(result) => result,
+                Err(error) => Err(error.into()),
+            },
+        };
         info!("shutting down");
-
+        sync_handle.abort();
+        rpc_handler.request_shutdown();
+        if !rpc_handle.is_finished() {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut rpc_handle).await;
+        }
         rpc_handle.abort();
         http_handle.abort();
         explorer_handle.abort();
         zmq_handle.abort();
-        Ok(())
+        result
     }
 }
 

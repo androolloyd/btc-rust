@@ -7,7 +7,9 @@
 use std::collections::HashMap;
 
 use btc_consensus::utxo::{connect_block, InMemoryUtxoSet, UtxoSet, UtxoSetUpdate};
-use btc_consensus::validation::{block_subsidy, ChainParams};
+#[cfg(test)]
+use btc_consensus::validation::block_subsidy;
+use btc_consensus::validation::{block_subsidy_with_params, encode_bip34_height, ChainParams};
 use btc_mempool::pool::Mempool;
 use btc_primitives::amount::Amount;
 use btc_primitives::block::{Block, BlockHeader};
@@ -87,12 +89,13 @@ impl TestNode {
     /// next-block height.
     pub fn create_coinbase(&self, output_script: ScriptBuf) -> Transaction {
         let next_height = self.height + 1;
-        let subsidy = block_subsidy(next_height);
+        let subsidy = block_subsidy_with_params(next_height, &self.params);
 
         // Coinbase script_sig must include the block height (BIP 34).
-        let height_bytes = (next_height as u32).to_le_bytes();
-        let mut sig = vec![height_bytes.len() as u8];
-        sig.extend_from_slice(&height_bytes);
+        let mut sig = encode_bip34_height(next_height);
+        if sig.len() < 2 {
+            sig.push(0);
+        }
 
         Transaction {
             version: 2,
@@ -148,12 +151,13 @@ impl TestNode {
         }
 
         // Build coinbase claiming subsidy + fees.
-        let subsidy = block_subsidy(next_height);
+        let subsidy = block_subsidy_with_params(next_height, &self.params);
         let reward = subsidy + total_fees;
 
-        let height_bytes = (next_height as u32).to_le_bytes();
-        let mut sig = vec![height_bytes.len() as u8];
-        sig.extend_from_slice(&height_bytes);
+        let mut sig = encode_bip34_height(next_height);
+        if sig.len() < 2 {
+            sig.push(0);
+        }
 
         let coinbase_tx = Transaction {
             version: 2,

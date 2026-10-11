@@ -7,6 +7,7 @@ use btc_primitives::network::Network;
 ///
 /// During IBD, if a header's hash at a checkpoint height doesn't match, reject it.
 /// This prevents an attacker from feeding a long, low-work alternative chain.
+#[derive(Clone)]
 pub struct Checkpoints {
     points: BTreeMap<u64, BlockHash>,
 }

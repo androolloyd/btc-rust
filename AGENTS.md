@@ -13,8 +13,10 @@ then the remaining runtime backends. Resolve routine choices without asking.
   that only resembles a curve key. Report unsupported behavior explicitly.
 - Proposed consensus rules remain explicit experiments; do not activate them
   on ordinary networks merely because a BIP is marked Complete.
-- Use `./scripts/check.sh` as the final local gate. Run focused tests while
-  iterating, and keep `Cargo.lock` synchronized with dependency changes.
+- Batch each coherent set of changes before running tests, as the user requested
+  to save time. Use `./scripts/check.sh` as the final local gate, with focused
+  follow-up checks only for failures or unresolved concerns. Keep `Cargo.lock`
+  synchronized with dependency changes.
 - Update the build plan with actual acceptance results and remaining work.
 - The user authorized keeping the repository updated without pull requests.
   Review changes yourself and commit verified milestones to

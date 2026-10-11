@@ -1,4 +1,4 @@
-use btc_primitives::block::BlockHeader;
+use btc_primitives::block::{Block, BlockHeader};
 use btc_primitives::hash::{BlockHash, TxHash};
 use btc_primitives::transaction::{OutPoint, Transaction, TxOut};
 use thiserror::Error;
@@ -55,6 +55,11 @@ pub struct AddressIndexValue {
 
 /// Read-only database transaction
 pub trait DbTx: Send + Sync {
+    fn get_block(&self, _hash: &BlockHash) -> Result<Option<Block>, StorageError> {
+        Err(StorageError::Database(
+            "block bodies unsupported by this backend".into(),
+        ))
+    }
     fn get_block_header(&self, hash: &BlockHash) -> Result<Option<BlockHeader>, StorageError>;
     fn get_block_hash_by_height(&self, height: u64) -> Result<Option<BlockHash>, StorageError>;
     fn get_transaction(&self, txid: &TxHash) -> Result<Option<Transaction>, StorageError>;
@@ -74,6 +79,11 @@ pub trait DbTx: Send + Sync {
 
 /// Read-write database transaction
 pub trait DbTxMut: DbTx {
+    fn put_block(&self, _hash: &BlockHash, _block: &Block) -> Result<(), StorageError> {
+        Err(StorageError::Database(
+            "block bodies unsupported by this backend".into(),
+        ))
+    }
     fn put_block_header(&self, hash: &BlockHash, header: &BlockHeader) -> Result<(), StorageError>;
     fn put_block_hash_by_height(&self, height: u64, hash: &BlockHash) -> Result<(), StorageError>;
     fn put_transaction(&self, txid: &TxHash, tx: &Transaction) -> Result<(), StorageError>;
