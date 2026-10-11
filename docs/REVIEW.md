@@ -4,6 +4,8 @@ This is an experimental implementation. A green unit suite does not establish Bi
 
 ## Fixed findings
 
+- **Tooling — nondeterministic BIP39 rejection test:** an Ubuntu CI run exposed a test that randomly changed the final mnemonic word and assumed its checksum must fail. That word also contains entropy; the replacement can be another valid mnemonic. Rejection now flips each checksum bit without changing entropy, deterministically across all five word counts and three entropy patterns. A fixed valid-replacement pair proves the former assumption false. All 24 English reference vectors linked from BIP39 now check complete phrases, restored entropy, exact 64-byte seeds and BIP32 master extended private keys. No production checksum rule is relaxed.
+
 - **P1 — false PSBT v2 support and unsafe wallet parsing:** the former parser always required a global unsigned transaction and its serializer emitted that field even for v2. BIP370 now reconstructs the actual transaction from required v2 map fields, excludes v0/v2-incompatible fields and resolves input locktime requirements. Canonical CompactSize key types, raw-key uniqueness, singleton/fixed lengths and full consumption are checked. Lengths/counts are bounded before allocation; corrupted model counts cannot panic extraction. Combining validates an isolated result before mutation and uses linear key unions. Compiled CLI inspection/conversion/extraction has all published BIP370 cases plus real Core v29 signed/finalized SegWit/Taproot acceptance. These tools do not claim to verify signatures or sign wallet transactions; complete BIP174/371 semantics remain tracked.
 
 - **P0 — Taproot signature bypass:** the generic witness dispatcher returned success for any nonempty Taproot witness. It now runs the real key/script-path verifier. Parallel block verification supplies every prevout required by BIP341; the regression proves a valid two-input signature fails when another prevout amount changes.
@@ -64,4 +66,4 @@ PSBT exposes optional BIP370 construction fields and a checked `try_serialize` A
 - [BIP324](https://github.com/bitcoin/bips/blob/master/bip-0324.mediawiki) and [packet vectors](https://github.com/bitcoin/bips/blob/master/bip-0324/packet_encoding_test_vectors.csv)
 - [BIP352](https://github.com/bitcoin/bips/blob/master/bip-0352.mediawiki) and [send/receive vectors](https://github.com/bitcoin/bips/blob/master/bip-0352/send_and_receive_test_vectors.json)
 - [BIP325](https://github.com/bitcoin/bips/blob/master/bip-0325.mediawiki) and [Core Signet implementation](https://github.com/bitcoin/bitcoin/blob/master/src/signet.cpp)
-- [BIP39](https://github.com/bitcoin/bips/blob/master/bip-0039.mediawiki)
+- [BIP39](https://github.com/bitcoin/bips/blob/master/bip-0039.mediawiki) and its [reference entropy/mnemonic/seed/master-key vectors](https://github.com/trezor/python-mnemonic/blob/master/vectors.json)
