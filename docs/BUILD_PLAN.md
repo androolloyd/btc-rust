@@ -56,4 +56,4 @@ Final local verification on 2026-10-11:
 - Every fuzz target builds. Initial transaction-parser fuzz smoke completed 1,613,391 executions without a crash. The standalone fuzz lockfile was also updated to patched rand.
 - Root RustSec audit reports zero vulnerabilities and zero unsound warnings; QMDB's unmaintained bincode warning remains.
 - Hourly local repair is active in this chat as `btc-rust autonomous build and repair`. It follows the acceptance tasks above and stops when they are complete. Local execution requires the desktop app and computer to remain running.
-- CI files are ready; GitHub workflows have not run because these changes have not been committed/pushed.
+- The verified baseline is published on `codex/review-bip-runtime-fixes` in [draft PR #1](https://github.com/androolloyd/btc-rust/pull/1). GitHub build/verify and fuzz workflows are running; their outcome is pending. The hourly repair job is authorized to commit and push verified milestones to this branch and keep the PR current.
