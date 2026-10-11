@@ -74,7 +74,22 @@ fn parse_psbt_hex(hex_str: &str) -> eyre::Result<btc_primitives::psbt::Psbt> {
     )?)?)
 }
 
-/// Inspect an actual PSBT. Neither decoding nor extraction verifies signatures.
+/// Inspect Taproot key origins without treating them as verified derivations.
+fn tap_derivations_json(
+    entries: &[(Vec<u8>, btc_primitives::psbt::TapKeySource)],
+) -> serde_json::Value {
+    serde_json::json!(entries
+        .iter()
+        .map(|(key, source)| serde_json::json!({
+            "pubkey": hex::encode(key),
+            "leaf_hashes": source.leaf_hashes.iter().map(hex::encode).collect::<Vec<_>>(),
+            "master_fingerprint": hex::encode(source.key_source.0),
+            "path": source.key_source.1,
+        }))
+        .collect::<Vec<_>>())
+}
+
+/// Inspect actual PSBT fields. Signatures, derivation claims and commitments remain unverified.
 pub fn decode_psbt(hex_str: &str) -> eyre::Result<serde_json::Value> {
     let psbt = parse_psbt_hex(hex_str)?;
     Ok(serde_json::json!({
@@ -98,13 +113,30 @@ pub fn decode_psbt(hex_str: &str) -> eyre::Result<serde_json::Value> {
                 "has_non_witness_utxo": input.non_witness_utxo.is_some(),
                 "has_witness_utxo": input.witness_utxo.is_some(),
                 "partial_signatures": input.partial_sigs.len(),
+                "has_tap_key_signature": input.tap_key_sig.is_some(),
+                "tap_script_signatures": input.tap_script_sigs.len(),
+                "tap_internal_key": input.tap_internal_key.as_ref().map(hex::encode),
+                "tap_merkle_root": input.tap_merkle_root.map(hex::encode),
+                "tap_leaf_scripts": input.tap_leaf_scripts.iter().map(|(control, leaf)| serde_json::json!({
+                    "control_block": hex::encode(control),
+                    "leaf_version": leaf.leaf_version,
+                    "script": hex::encode(leaf.script.as_bytes()),
+                })).collect::<Vec<_>>(),
+                "tap_bip32_derivation": tap_derivations_json(&input.tap_bip32_derivation),
                 "has_final_fields": input.final_script_sig.is_some() || input.final_script_witness.is_some(),
                 "unknown_fields": input.unknown.len(),
             })
         }).collect::<Vec<_>>(),
-        "outputs": psbt.unsigned_tx.outputs.iter().map(|output| serde_json::json!({
+        "outputs": psbt.unsigned_tx.outputs.iter().zip(&psbt.outputs).map(|(output, fields)| serde_json::json!({
             "value_sat": output.value.as_sat(),
             "script_pubkey": hex::encode(output.script_pubkey.as_bytes()),
+            "tap_internal_key": fields.tap_internal_key.as_ref().map(hex::encode),
+            "tap_tree": fields.tap_tree.as_ref().map(|tree| tree.iter().map(|leaf| serde_json::json!({
+                "depth": leaf.depth,
+                "leaf_version": leaf.leaf_version,
+                "script": hex::encode(leaf.script.as_bytes()),
+            })).collect::<Vec<_>>()),
+            "tap_bip32_derivation": tap_derivations_json(&fields.tap_bip32_derivation),
         })).collect::<Vec<_>>(),
         "global_xpubs": psbt.xpub.len(),
         "unknown_global_fields": psbt.unknown.len(),
@@ -677,6 +709,50 @@ mod tests {
         assert_eq!(v0["psbt_version"], 0);
         assert!(convert_psbt(original, 1).is_err());
         assert!(decode_psbt("70736274ff010000").is_err());
+    }
+
+    #[test]
+    fn psbt_cli_reports_published_taproot_structures() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../primitives/tests/data/bip371.json")).unwrap();
+        let vectors = fixture["vectors"].as_array().unwrap();
+        let vector = vectors
+            .iter()
+            .find(|v| {
+                v["case"]
+                    .as_str()
+                    .unwrap()
+                    .contains("script path only output")
+            })
+            .unwrap();
+        let raw = vector["hex"].as_str().unwrap();
+        let before = decode_psbt(raw).unwrap();
+        let output = &before["outputs"][0];
+        assert_eq!(output["tap_tree"].as_array().unwrap().len(), 3);
+        assert_eq!(output["tap_tree"][0]["depth"], 2);
+        assert_eq!(output["tap_tree"][2]["depth"], 1);
+        assert_eq!(output["tap_bip32_derivation"].as_array().unwrap().len(), 4);
+        assert_eq!(
+            output["tap_bip32_derivation"][0]["leaf_hashes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(before["signatures_verified"], false);
+        let converted = convert_psbt(raw, 2).unwrap();
+        let after = decode_psbt(converted["psbt_hex"].as_str().unwrap()).unwrap();
+        assert_eq!(before["outputs"], after["outputs"]);
+        let invalid = vectors
+            .iter()
+            .find(|v| {
+                v["case"]
+                    .as_str()
+                    .unwrap()
+                    .contains("PSBT_IN_TAP_LEAF_SCRIPT")
+            })
+            .unwrap();
+        assert!(decode_psbt(invalid["hex"].as_str().unwrap()).is_err());
     }
 
     #[test]

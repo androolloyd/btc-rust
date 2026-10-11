@@ -24,11 +24,12 @@ jobs:
         shell: python
         run: |
           import json, pathlib
-          source = pathlib.Path("crates/primitives/tests/data/bip370.json")
           corpus = pathlib.Path("fuzz/corpus/fuzz_psbt_decode")
           corpus.mkdir(parents=True, exist_ok=True)
-          for i, vector in enumerate(json.loads(source.read_text())["vectors"]):
-              (corpus / str(i)).write_bytes(bytes.fromhex(vector["hex"]))
+          for name in ["bip370", "bip371"]:
+              source = pathlib.Path(f"crates/primitives/tests/data/{name}.json")
+              for i, vector in enumerate(json.loads(source.read_text())["vectors"]):
+                  (corpus / f"{name}-{i}").write_bytes(bytes.fromhex(vector["hex"]))
       - run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=30 -rss_limit_mb=2048
       - uses: actions/upload-artifact@v4
         if: failure()

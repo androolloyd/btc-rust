@@ -52,6 +52,8 @@ const PSBT_IN_FINAL_SCRIPTSIG: u64 = 0x07;
 const PSBT_IN_FINAL_SCRIPTWITNESS: u64 = 0x08;
 const PSBT_IN_TAP_KEY_SIG: u64 = 0x13;
 const PSBT_IN_TAP_SCRIPT_SIG: u64 = 0x14;
+const PSBT_IN_TAP_LEAF_SCRIPT: u64 = 0x15;
+const PSBT_IN_TAP_BIP32_DERIVATION: u64 = 0x16;
 const PSBT_IN_TAP_INTERNAL_KEY: u64 = 0x17;
 const PSBT_IN_TAP_MERKLE_ROOT: u64 = 0x18;
 
@@ -63,6 +65,8 @@ const PSBT_OUT_REDEEM_SCRIPT: u64 = 0x00;
 const PSBT_OUT_WITNESS_SCRIPT: u64 = 0x01;
 const PSBT_OUT_BIP32_DERIVATION: u64 = 0x02;
 const PSBT_OUT_TAP_INTERNAL_KEY: u64 = 0x05;
+const PSBT_OUT_TAP_TREE: u64 = 0x06;
+const PSBT_OUT_TAP_BIP32_DERIVATION: u64 = 0x07;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -101,6 +105,29 @@ pub enum PsbtError {
 /// A BIP32 key source: master fingerprint (4 bytes) + derivation path indices.
 pub type KeySource = ([u8; 4], Vec<u32>);
 
+/// BIP371 leaf hashes involving a key, followed by its BIP32 origin.
+/// An internal key has no leaf hashes. The origin is metadata, not proof of derivation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TapKeySource {
+    pub leaf_hashes: Vec<[u8; 32]>,
+    pub key_source: KeySource,
+}
+
+/// BIP371 input leaf script; the associated map key is its BIP341 control block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TapLeafScript {
+    pub script: ScriptBuf,
+    pub leaf_version: u8,
+}
+
+/// One leaf of a complete output Taproot tree, serialized in depth-first order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TapTreeLeaf {
+    pub depth: u8,
+    pub leaf_version: u8,
+    pub script: ScriptBuf,
+}
+
 // ---------------------------------------------------------------------------
 // PsbtInput
 // ---------------------------------------------------------------------------
@@ -124,6 +151,8 @@ pub struct PsbtInput {
     // Taproot fields (BIP371)
     pub tap_key_sig: Option<Vec<u8>>,
     pub tap_script_sigs: Vec<(Vec<u8>, Vec<u8>)>,
+    pub tap_leaf_scripts: Vec<(Vec<u8>, TapLeafScript)>,
+    pub tap_bip32_derivation: Vec<(Vec<u8>, TapKeySource)>,
     pub tap_internal_key: Option<Vec<u8>>,
     pub tap_merkle_root: Option<[u8; 32]>,
     /// Unknown key-value pairs.
@@ -141,6 +170,8 @@ pub struct PsbtOutput {
     pub witness_script: Option<ScriptBuf>,
     pub bip32_derivation: Vec<(Vec<u8>, KeySource)>,
     pub tap_internal_key: Option<Vec<u8>>,
+    pub tap_tree: Option<Vec<TapTreeLeaf>>,
+    pub tap_bip32_derivation: Vec<(Vec<u8>, TapKeySource)>,
     /// Unknown key-value pairs.
     pub unknown: Vec<(Vec<u8>, Vec<u8>)>,
 }
@@ -289,6 +320,121 @@ fn tap_signature_shape(signature: &[u8]) -> Result<(), PsbtError> {
         ));
     }
     Ok(())
+}
+
+fn xonly_public_key(key: &[u8]) -> Result<(), PsbtError> {
+    fixed::<32>(key)?;
+    secp256k1::XOnlyPublicKey::from_slice(key)
+        .map_err(|_| PsbtError::Other("invalid PSBT x-only curve key".into()))?;
+    Ok(())
+}
+
+fn decode_tap_leaf(control: &[u8], value: &[u8]) -> Result<TapLeafScript, PsbtError> {
+    // BIP341: 33 + 32*m bytes, with 0 <= m <= 128. Check before slicing.
+    if control.len() < 33 || control.len() > 33 + 32 * 128 || (control.len() - 33) % 32 != 0 {
+        return Err(PsbtError::Other(
+            "invalid Taproot control block length".into(),
+        ));
+    }
+    xonly_public_key(&control[1..33])?;
+    let (&leaf_version, script) = value
+        .split_last()
+        .ok_or_else(|| PsbtError::Other("missing Taproot leaf version".into()))?;
+    if leaf_version != control[0] & 0xfe {
+        return Err(PsbtError::Other(
+            "Taproot leaf/control versions differ".into(),
+        ));
+    }
+    Ok(TapLeafScript {
+        script: ScriptBuf::from_bytes(script.to_vec()),
+        leaf_version,
+    })
+}
+
+fn encode_tap_key_source(source: &TapKeySource) -> Vec<u8> {
+    let mut value = Vec::new();
+    write_compact_size(&mut value, source.leaf_hashes.len() as u64).expect("Vec write");
+    for hash in &source.leaf_hashes {
+        value.extend_from_slice(hash);
+    }
+    value.extend_from_slice(&encode_key_source(&source.key_source));
+    value
+}
+
+fn decode_tap_key_source(value: &[u8]) -> Result<TapKeySource, PsbtError> {
+    let mut cursor = Cursor::new(value);
+    let count = read_compact_size(&mut cursor)?;
+    // Leave the required fingerprint and bound the count before allocating or multiplying.
+    let available = remaining(&cursor);
+    if available < 4 || count > ((available - 4) / 32) as u64 || count > MAX_PSBT_MAPS as u64 {
+        return Err(PsbtError::Other(
+            "invalid Taproot derivation hash count".into(),
+        ));
+    }
+    let mut leaf_hashes = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let mut hash = [0; 32];
+        cursor.read_exact(&mut hash)?;
+        leaf_hashes.push(hash);
+    }
+    let key_source = decode_key_source(&value[cursor.position() as usize..])?;
+    Ok(TapKeySource {
+        leaf_hashes,
+        key_source,
+    })
+}
+
+fn encode_tap_tree(tree: &[TapTreeLeaf]) -> Vec<u8> {
+    let mut value = Vec::new();
+    for leaf in tree {
+        value.extend_from_slice(&[leaf.depth, leaf.leaf_version]);
+        write_compact_size(&mut value, leaf.script.len() as u64).expect("Vec write");
+        value.extend_from_slice(leaf.script.as_bytes());
+    }
+    value
+}
+
+fn decode_tap_tree(value: &[u8]) -> Result<Vec<TapTreeLeaf>, PsbtError> {
+    let mut cursor = Cursor::new(value);
+    let mut tree = Vec::new();
+    // Reduce adjacent completed subtrees. A shallower new leaf cannot precede
+    // completion of a deeper left subtree in depth-first order (Core TaprootBuilder).
+    let mut depths = Vec::new();
+    while remaining(&cursor) > 0 {
+        if tree.len() >= MAX_PSBT_MAPS {
+            return Err(PsbtError::Other("too many Taproot tree leaves".into()));
+        }
+        let mut header = [0; 2];
+        cursor.read_exact(&mut header)?;
+        let [mut depth, leaf_version] = header;
+        if depth > 128 || leaf_version & 1 != 0 {
+            return Err(PsbtError::Other(
+                "invalid Taproot tree depth/version".into(),
+            ));
+        }
+        if depths.last().is_some_and(|previous| *previous > depth) {
+            return Err(PsbtError::Other(
+                "Taproot tree is not in depth-first order".into(),
+            ));
+        }
+        while depths.last() == Some(&depth) {
+            depths.pop();
+            depth = depth
+                .checked_sub(1)
+                .ok_or_else(|| PsbtError::Other("Taproot tree has multiple roots".into()))?;
+        }
+        depths.push(depth);
+        let len = read_compact_size(&mut cursor)?;
+        tree.push(TapTreeLeaf {
+            depth: header[0],
+            leaf_version,
+            script: ScriptBuf::from_bytes(read_blob(&mut cursor, len)?),
+        });
+    }
+    if depths != [0] {
+        return Err(PsbtError::Other("incomplete Taproot tree".into()));
+    }
+    Ok(tree)
 }
 
 fn determine_lock_time(inputs: &[PsbtInput], fallback: Option<u32>) -> Result<u32, PsbtError> {
@@ -582,6 +728,18 @@ impl Psbt {
             let key = make_key(PSBT_IN_TAP_SCRIPT_SIG, key_data);
             write_kv(w, &key, sig)?;
         }
+        for (control, leaf) in &inp.tap_leaf_scripts {
+            let mut value = leaf.script.as_bytes().to_vec();
+            value.push(leaf.leaf_version);
+            write_kv(w, &make_key(PSBT_IN_TAP_LEAF_SCRIPT, control), &value)?;
+        }
+        for (key, source) in &inp.tap_bip32_derivation {
+            write_kv(
+                w,
+                &make_key(PSBT_IN_TAP_BIP32_DERIVATION, key),
+                &encode_tap_key_source(source),
+            )?;
+        }
         if let Some(ref tik) = inp.tap_internal_key {
             write_kv(w, &[PSBT_IN_TAP_INTERNAL_KEY as u8], tik)?;
         }
@@ -608,6 +766,16 @@ impl Psbt {
         }
         if let Some(ref tik) = out.tap_internal_key {
             write_kv(w, &[PSBT_OUT_TAP_INTERNAL_KEY as u8], tik)?;
+        }
+        if let Some(ref tree) = out.tap_tree {
+            write_kv(w, &[PSBT_OUT_TAP_TREE as u8], &encode_tap_tree(tree))?;
+        }
+        for (key, source) in &out.tap_bip32_derivation {
+            write_kv(
+                w,
+                &make_key(PSBT_OUT_TAP_BIP32_DERIVATION, key),
+                &encode_tap_key_source(source),
+            )?;
         }
         // Unknown
         for (key, val) in &out.unknown {
@@ -840,11 +1008,21 @@ impl Psbt {
                 }
                 PSBT_IN_TAP_SCRIPT_SIG => {
                     fixed::<64>(key_data)?;
+                    xonly_public_key(&key_data[..32])?;
                     tap_signature_shape(&value)?;
                     inp.tap_script_sigs.push((key_data.to_vec(), value));
                 }
+                PSBT_IN_TAP_LEAF_SCRIPT => {
+                    inp.tap_leaf_scripts
+                        .push((key_data.to_vec(), decode_tap_leaf(key_data, &value)?));
+                }
+                PSBT_IN_TAP_BIP32_DERIVATION => {
+                    xonly_public_key(key_data)?;
+                    inp.tap_bip32_derivation
+                        .push((key_data.to_vec(), decode_tap_key_source(&value)?));
+                }
                 PSBT_IN_TAP_INTERNAL_KEY => {
-                    fixed::<32>(&value)?;
+                    xonly_public_key(&value)?;
                     inp.tap_internal_key = Some(value);
                 }
                 PSBT_IN_TAP_MERKLE_ROOT => inp.tap_merkle_root = Some(fixed(&value)?),
@@ -878,7 +1056,7 @@ impl Psbt {
         let mut script = None;
         for (key, value) in read_map(r, pair_budget)? {
             let (kind, key_data) = split_key(&key)?;
-            if matches!(kind, 0x00 | 0x01 | 0x03..=0x05) {
+            if matches!(kind, 0x00 | 0x01 | 0x03..=0x06) {
                 singleton(key_data)?;
             }
             match kind {
@@ -898,8 +1076,14 @@ impl Psbt {
                     script = Some(ScriptBuf::from_bytes(value));
                 }
                 PSBT_OUT_TAP_INTERNAL_KEY => {
-                    fixed::<32>(&value)?;
+                    xonly_public_key(&value)?;
                     out.tap_internal_key = Some(value);
+                }
+                PSBT_OUT_TAP_TREE => out.tap_tree = Some(decode_tap_tree(&value)?),
+                PSBT_OUT_TAP_BIP32_DERIVATION => {
+                    xonly_public_key(key_data)?;
+                    out.tap_bip32_derivation
+                        .push((key_data.to_vec(), decode_tap_key_source(&value)?));
                 }
                 _ => out.unknown.push((key, value)),
             }
@@ -1196,6 +1380,8 @@ fn merge_input(mine: &mut PsbtInput, theirs: &PsbtInput) {
         mine.tap_key_sig = theirs.tap_key_sig.clone();
     }
     merge_keyed(&mut mine.tap_script_sigs, &theirs.tap_script_sigs);
+    merge_keyed(&mut mine.tap_leaf_scripts, &theirs.tap_leaf_scripts);
+    merge_keyed(&mut mine.tap_bip32_derivation, &theirs.tap_bip32_derivation);
     if mine.tap_internal_key.is_none() {
         mine.tap_internal_key = theirs.tap_internal_key.clone();
     }
@@ -1217,6 +1403,10 @@ fn merge_output(mine: &mut PsbtOutput, theirs: &PsbtOutput) {
     if mine.tap_internal_key.is_none() {
         mine.tap_internal_key = theirs.tap_internal_key.clone();
     }
+    if mine.tap_tree.is_none() {
+        mine.tap_tree = theirs.tap_tree.clone();
+    }
+    merge_keyed(&mut mine.tap_bip32_derivation, &theirs.tap_bip32_derivation);
     // Unknown
     merge_keyed(&mut mine.unknown, &theirs.unknown);
 }
@@ -1228,6 +1418,174 @@ fn merge_output(mine: &mut PsbtOutput, theirs: &PsbtOutput) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_xonly_key() -> Vec<u8> {
+        // Generator point, a real x-only key (secret scalar 1).
+        hex::decode("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798").unwrap()
+    }
+
+    fn test_tap_sig_key() -> Vec<u8> {
+        let mut key = test_xonly_key();
+        key.extend_from_slice(&[0x01; 32]);
+        key
+    }
+
+    #[test]
+    fn published_bip371_vectors() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/data/bip371.json")).unwrap();
+        let vectors = fixture["vectors"].as_array().unwrap();
+        assert_eq!(vectors.len(), 17);
+        for vector in vectors {
+            let name = vector["case"].as_str().unwrap();
+            let bytes = hex::decode(vector["hex"].as_str().unwrap()).unwrap();
+            let parsed = Psbt::deserialize(&bytes);
+            if vector["status"] == "invalid" {
+                assert!(parsed.is_err(), "accepted {name}");
+                continue;
+            }
+            let psbt = parsed.unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(
+                Psbt::deserialize(&psbt.try_serialize().unwrap()).unwrap(),
+                psbt,
+                "{name}"
+            );
+            let v2 = psbt.convert_version(2).unwrap();
+            let restored = v2.convert_version(0).unwrap();
+            assert_eq!(restored, psbt, "{name}");
+        }
+        // Published script-path input/output examples must be typed, not unknown.
+        let valid: Vec<_> = vectors
+            .iter()
+            .filter(|v| v["status"] == "valid")
+            .map(|v| Psbt::deserialize(&hex::decode(v["hex"].as_str().unwrap()).unwrap()).unwrap())
+            .collect();
+        assert!(valid[0].inputs[0].tap_bip32_derivation[0]
+            .1
+            .leaf_hashes
+            .is_empty());
+        assert_eq!(valid[3].inputs[0].tap_leaf_scripts.len(), 3);
+        assert_eq!(valid[3].inputs[0].tap_bip32_derivation.len(), 4);
+        assert!(valid[3].inputs[0].unknown.is_empty());
+        assert_eq!(
+            valid[4].outputs[0]
+                .tap_tree
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|l| l.depth)
+                .collect::<Vec<_>>(),
+            [2, 2, 1]
+        );
+        assert_eq!(valid[4].outputs[0].tap_bip32_derivation.len(), 4);
+        assert!(valid[4].outputs[0].unknown.is_empty());
+        assert_eq!(valid[5].inputs[0].tap_script_sigs.len(), 3);
+    }
+
+    #[test]
+    fn hostile_taproot_records_fail_at_psbt_boundary() {
+        let globals = vec![(vec![0], tx_to_bytes(&make_unsigned_tx()))];
+        let mut control = vec![0xc0];
+        control.extend_from_slice(&test_xonly_key());
+        let check_input = |key, value| Psbt::deserialize(&raw_maps(&globals, &[(key, value)], &[]));
+        for len in [0, 1, 32, 34, 64, 33 + 32 * 129] {
+            let mut bad = control.clone();
+            bad.resize(len, 0);
+            assert!(check_input(make_key(0x15, &bad), vec![0x51, 0xc0]).is_err());
+        }
+        assert!(check_input(make_key(0x15, &control), vec![]).is_err());
+        for version in [0xc1, 0xc2] {
+            assert!(check_input(make_key(0x15, &control), vec![version]).is_err());
+        }
+        let mut maximum = control.clone();
+        maximum.resize(33 + 32 * 128, 0);
+        assert!(check_input(make_key(0x15, &maximum), vec![0xc0]).is_ok()); // empty script, valid version
+        for kind in [0x14, 0x16] {
+            let bad = if kind == 0x14 {
+                vec![0xff; 64]
+            } else {
+                vec![0xff; 32]
+            };
+            assert!(check_input(make_key(kind, &bad), vec![0; 64]).is_err());
+        }
+        for value in [vec![0xff; 32], vec![0; 32]] {
+            assert!(check_input(vec![0x17], value.clone()).is_err());
+            assert!(Psbt::deserialize(&raw_maps(&globals, &[], &[(vec![5], value)])).is_err());
+        }
+        let mut invalid_control = control.clone();
+        invalid_control[1..33].fill(0xff);
+        assert!(check_input(make_key(0x15, &invalid_control), vec![0xc0]).is_err());
+        let huge = crate::encode::encode(&VarInt(u64::MAX));
+        for value in [
+            vec![],
+            vec![0],
+            vec![1, 0, 0, 0, 0],
+            vec![0, 0, 0, 0, 0, 0],
+            vec![0xfd, 0, 0, 0, 0, 0, 0],
+            huge,
+        ] {
+            assert!(check_input(make_key(0x16, &test_xonly_key()), value.clone()).is_err());
+            assert!(Psbt::deserialize(&raw_maps(
+                &globals,
+                &[],
+                &[(make_key(7, &test_xonly_key()), value)]
+            ))
+            .is_err());
+        }
+        // Keyed input/output derivations and singleton tree reject duplicates/key data.
+        let entry = (make_key(0x16, &test_xonly_key()), vec![0; 5]);
+        assert!(Psbt::deserialize(&raw_maps(&globals, &[entry.clone(), entry], &[])).is_err());
+        assert!(
+            Psbt::deserialize(&raw_maps(&globals, &[], &[(vec![6, 0], vec![0, 0xc0, 0])])).is_err()
+        );
+        for kind in [0x15, 0x16] {
+            let mut model = Psbt::from_unsigned_tx(make_unsigned_tx()).unwrap();
+            model.inputs[0].unknown.push((vec![kind], vec![]));
+            assert!(model.try_serialize().is_err());
+            let mut recipient = Psbt::from_unsigned_tx(make_unsigned_tx()).unwrap();
+            let before = recipient.clone();
+            assert!(recipient.merge(&model).is_err());
+            assert_eq!(recipient, before);
+        }
+    }
+
+    #[test]
+    fn taproot_tree_requires_complete_depth_first_topology() {
+        let globals = vec![(vec![0], tx_to_bytes(&make_unsigned_tx()))];
+        for depths in [
+            vec![],
+            vec![1],
+            vec![0, 0],
+            vec![2, 1, 2],
+            vec![1, 1, 1],
+            vec![129],
+            vec![2, 2],
+        ] {
+            let value: Vec<_> = depths.iter().flat_map(|d| [*d, 0xc0, 0]).collect();
+            assert!(
+                Psbt::deserialize(&raw_maps(&globals, &[], &[(vec![6], value)])).is_err(),
+                "{depths:?}"
+            );
+        }
+        for value in [
+            vec![0],
+            vec![0, 0xc0],
+            vec![0, 0xc0, 2, 0x51],
+            vec![0, 0xc1, 0],
+            vec![0, 0xc0, 0xfd, 0, 0],
+        ] {
+            assert!(Psbt::deserialize(&raw_maps(&globals, &[], &[(vec![6], value)])).is_err());
+        }
+        let mut deepest = (1..128).collect::<Vec<u8>>();
+        deepest.extend([128, 128]);
+        for depths in [vec![0], vec![1, 1], vec![1, 2, 2], vec![2, 2, 1], deepest] {
+            let value: Vec<_> = depths.iter().flat_map(|d| [*d, 0xc0, 0]).collect();
+            assert!(
+                Psbt::deserialize(&raw_maps(&globals, &[], &[(vec![6], value)])).is_ok(),
+                "{depths:?}"
+            );
+        }
+    }
     use crate::amount::Amount;
     use crate::hash::TxHash;
     use crate::transaction::{OutPoint, TxIn};
@@ -1638,11 +1996,11 @@ mod tests {
         let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
 
         psbt.inputs[0].tap_key_sig = Some(vec![0xAB; 64]);
-        psbt.inputs[0].tap_internal_key = Some(vec![0xCD; 32]);
+        psbt.inputs[0].tap_internal_key = Some(test_xonly_key());
         psbt.inputs[0].tap_merkle_root = Some([0xEF; 32]);
         psbt.inputs[0]
             .tap_script_sigs
-            .push((vec![0x01; 64], vec![0x02; 65]));
+            .push((test_tap_sig_key(), vec![0x02; 65]));
 
         let bytes = psbt.serialize();
         let psbt2 = Psbt::deserialize(&bytes).unwrap();
@@ -1773,7 +2131,7 @@ mod tests {
     fn test_output_tap_internal_key_roundtrip() {
         let tx = make_unsigned_tx();
         let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
-        psbt.outputs[0].tap_internal_key = Some(vec![0xAA; 32]);
+        psbt.outputs[0].tap_internal_key = Some(test_xonly_key());
 
         let bytes = psbt.serialize();
         let psbt2 = Psbt::deserialize(&bytes).unwrap();
@@ -1902,17 +2260,41 @@ mod tests {
         psbt_b.inputs[0].final_script_sig = Some(ScriptBuf::from_bytes(vec![0x53]));
         psbt_b.inputs[0].final_script_witness = Some(vec![vec![0x54]]);
         psbt_b.inputs[0].tap_key_sig = Some(vec![0x55; 64]);
-        psbt_b.inputs[0].tap_internal_key = Some(vec![0x56; 32]);
+        psbt_b.inputs[0].tap_internal_key = Some(test_xonly_key());
         psbt_b.inputs[0].tap_merkle_root = Some([0x57; 32]);
         psbt_b.inputs[0]
             .tap_script_sigs
-            .push((vec![0x58; 64], vec![0x59; 65]));
+            .push((test_tap_sig_key(), vec![0x59; 65]));
+        let source = TapKeySource {
+            leaf_hashes: vec![[0x11; 32]],
+            key_source: ([0x12; 4], vec![0x80000056, 0]),
+        };
+        let mut control = vec![0xc0];
+        control.extend(test_xonly_key());
+        psbt_b.inputs[0].tap_leaf_scripts.push((
+            control,
+            TapLeafScript {
+                script: ScriptBuf::new(),
+                leaf_version: 0xc0,
+            },
+        ));
+        psbt_b.inputs[0]
+            .tap_bip32_derivation
+            .push((test_xonly_key(), source.clone()));
         psbt_b.inputs[0]
             .unknown
             .push((vec![0xFD, 0x01, 0x01], vec![0x60]));
         psbt_b.outputs[0].redeem_script = Some(ScriptBuf::from_bytes(vec![0x61]));
         psbt_b.outputs[0].witness_script = Some(ScriptBuf::from_bytes(vec![0x62]));
-        psbt_b.outputs[0].tap_internal_key = Some(vec![0x63; 32]);
+        psbt_b.outputs[0].tap_internal_key = Some(test_xonly_key());
+        psbt_b.outputs[0].tap_tree = Some(vec![TapTreeLeaf {
+            depth: 0,
+            leaf_version: 0xc0,
+            script: ScriptBuf::new(),
+        }]);
+        psbt_b.outputs[0]
+            .tap_bip32_derivation
+            .push((test_xonly_key(), source));
         psbt_b.outputs[0]
             .unknown
             .push((vec![0xFD, 0x02, 0x01], vec![0x64]));
@@ -1934,14 +2316,30 @@ mod tests {
         assert!(psbt_a.inputs[0].tap_internal_key.is_some());
         assert!(psbt_a.inputs[0].tap_merkle_root.is_some());
         assert_eq!(psbt_a.inputs[0].tap_script_sigs.len(), 1);
+        assert_eq!(
+            psbt_a.inputs[0].tap_leaf_scripts,
+            psbt_b.inputs[0].tap_leaf_scripts
+        );
+        assert_eq!(
+            psbt_a.inputs[0].tap_bip32_derivation,
+            psbt_b.inputs[0].tap_bip32_derivation
+        );
         assert_eq!(psbt_a.inputs[0].unknown.len(), 1);
         assert!(psbt_a.outputs[0].redeem_script.is_some());
         assert!(psbt_a.outputs[0].witness_script.is_some());
         assert!(psbt_a.outputs[0].tap_internal_key.is_some());
+        assert_eq!(psbt_a.outputs[0].tap_tree, psbt_b.outputs[0].tap_tree);
+        assert_eq!(
+            psbt_a.outputs[0].tap_bip32_derivation,
+            psbt_b.outputs[0].tap_bip32_derivation
+        );
         assert_eq!(psbt_a.outputs[0].unknown.len(), 1);
         assert_eq!(psbt_a.xpub.len(), 1);
         assert_eq!(psbt_a.proprietary.len(), 1);
         assert_eq!(psbt_a.unknown.len(), 1);
+        let once = psbt_a.clone();
+        psbt_a.merge(&psbt_b).unwrap();
+        assert_eq!(psbt_a, once);
     }
 
     #[test]
@@ -1965,10 +2363,10 @@ mod tests {
 
         psbt_a.inputs[0]
             .tap_script_sigs
-            .push((vec![0x01; 64], vec![0x02; 65]));
+            .push((test_tap_sig_key(), vec![0x02; 65]));
         psbt_b.inputs[0]
             .tap_script_sigs
-            .push((vec![0x01; 64], vec![0x02; 65]));
+            .push((test_tap_sig_key(), vec![0x02; 65]));
 
         psbt_a.outputs[0]
             .bip32_derivation
