@@ -207,6 +207,57 @@ def check_published_spending_vectors(args, port):
     print("PASSED: 8 published BIP174 spends preserve Core data; 3 signer-script failures rejected", flush=True)
 
 
+def check_taproot_substitutions(args, raw):
+    maps = psbt_maps(raw)
+    generator = bytes.fromhex("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+    variants = []
+    if b"\x18" in maps[1] and b"\x17" in maps[1]:
+        bad = psbt_maps(raw)
+        root = bad[1][b"\x18"]
+        bad[1][b"\x18"] = bytes([root[0] ^ 1]) + root[1:]
+        variants.append(bad)
+        bad = psbt_maps(raw)
+        bad[1][b"\x17"] = generator
+        variants.append(bad)
+    for key in [key for key in maps[1] if key[0] == 0x15]:
+        bad = psbt_maps(raw)
+        leaf = bad[1][key]
+        bad[1][key] = leaf[:-1] + b"\x00" + leaf[-1:]
+        variants.append(bad)
+        bad = psbt_maps(raw)
+        value = bad[1].pop(key)
+        bad[1][key[:1] + bytes([key[1] ^ 1]) + key[2:]] = value
+        variants.append(bad)
+        if len(key) > 34:
+            bad = psbt_maps(raw)
+            value = bad[1].pop(key)
+            bad[1][key[:34] + bytes([key[34] ^ 1]) + key[35:]] = value
+            variants.append(bad)
+    if b"\x06" in maps[2] and b"\x05" in maps[2]:
+        bad = psbt_maps(raw)
+        bad[2][b"\x05"] = generator
+        variants.append(bad)
+        bad = psbt_maps(raw)
+        tree = bad[2][b"\x06"]
+        bad[2][b"\x06"] = tree[:-1] + bytes([tree[-1] ^ 1])
+        variants.append(bad)
+    for bad in variants:
+        reject_spending_data(args, encode_maps(bad), "Taproot")
+
+
+def check_published_commitment_vectors(args, port):
+    fixture = Path(__file__).resolve().parents[1] / "crates/primitives/tests/data/bip341-commitments.json"
+    for vector in json.loads(fixture.read_text())["psbt_vectors"]:
+        raw = vector["hex"]
+        before = core_rpc(port, "decodepsbt", [encode64(raw)])
+        check_taproot_metadata(cli(args.node, "decode-psbt", raw), before)
+        converted = cli(args.node, "convert-psbt", raw, "--version", "2")
+        restored = cli(args.node, "convert-psbt", converted["psbt_hex"], "--version", "0")
+        assert core_rpc(port, "decodepsbt", [encode64(restored["psbt_hex"])]) == before
+        check_taproot_substitutions(args, raw)
+    print("PASSED: 7 published BIP341 commitment wrappers and altered-proof rejections", flush=True)
+
+
 def check_wallet(args, port, kind, script_pair=None):
     if kind in ["taproot-script", "wsh", "sh-wsh"]:
         assert script_pair is not None
@@ -214,7 +265,7 @@ def check_wallet(args, port, kind, script_pair=None):
     else:
         address = core_rpc(port, "getnewaddress", ["", kind])
         destination = core_rpc(port, "getnewaddress", ["", kind])
-    core_rpc(port, "generatetoaddress", [101, address])
+    core_rpc(port, "generatetoaddress", [101, address], timeout=30)
     coins = [coin for coin in core_rpc(port, "listunspent", [100]) if coin["address"] == address]
     assert coins, f"no mature {kind} coin"
     coin = coins[0]
@@ -241,6 +292,7 @@ def check_wallet(args, port, kind, script_pair=None):
         assert fields["has_tap_key_signature"] is False
         assert [leaf["depth"] for leaf in decoded["outputs"][0]["tap_tree"]] == [1, 1]
         assert sum(bool(source["leaf_hashes"]) for source in decoded["outputs"][0]["tap_bip32_derivation"]) == 2
+        check_taproot_substitutions(args, original_hex)
     expected = core_rpc(port, "finalizepsbt", [signed])
     assert expected["complete"] is True
     v2 = cli(args.node, "convert-psbt", original_hex, "--version", "2")
@@ -305,6 +357,7 @@ def main():
                                 for kind in ["wsh", "sh-wsh", "taproot-script"]}
                 check_published_taproot_vectors(args, port)
                 check_published_spending_vectors(args, port)
+                check_published_commitment_vectors(args, port)
                 for kind in ["legacy", "p2sh-segwit", "bech32", "wsh", "sh-wsh", "bech32m", "taproot-script"]:
                     check_wallet(args, port, kind, script_pairs.get(kind))
                 core_rpc(port, "stop", [])

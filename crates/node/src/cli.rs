@@ -89,7 +89,7 @@ fn tap_derivations_json(
         .collect::<Vec<_>>())
 }
 
-/// Inspect PSBT spending data. Signatures, derivations and Taproot commitments remain unverified.
+/// Inspect PSBT spending data. Signatures, key derivations and active-chain status remain unverified.
 pub fn decode_psbt(hex_str: &str) -> eyre::Result<serde_json::Value> {
     let psbt = parse_psbt_hex(hex_str)?;
     let utxos = (0..psbt.inputs.len())

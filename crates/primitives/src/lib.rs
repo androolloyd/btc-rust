@@ -7,6 +7,7 @@ pub mod encode;
 pub mod hash;
 pub mod network;
 pub mod script;
+pub mod taproot;
 pub mod transaction;
 
 #[cfg(feature = "descriptor")]

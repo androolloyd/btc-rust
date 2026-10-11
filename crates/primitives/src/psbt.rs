@@ -422,46 +422,152 @@ fn encode_tap_tree(tree: &[TapTreeLeaf]) -> Vec<u8> {
     value
 }
 
+fn tap_tree_root(tree: &[TapTreeLeaf]) -> Result<[u8; 32], &'static str> {
+    if tree.is_empty() || tree.len() > MAX_PSBT_MAPS {
+        return Err("empty or oversized Taproot tree");
+    }
+    let mut stack: Vec<(u8, [u8; 32])> = Vec::new();
+    for leaf in tree {
+        let mut depth = leaf.depth;
+        if depth > 128 || leaf.leaf_version & 1 != 0 {
+            return Err("invalid Taproot tree depth/version");
+        }
+        if stack.last().is_some_and(|(previous, _)| *previous > depth) {
+            return Err("Taproot tree is not in depth-first order");
+        }
+        let mut hash = crate::taproot::tap_leaf_hash(leaf.leaf_version, leaf.script.as_bytes());
+        while stack.last().is_some_and(|(previous, _)| *previous == depth) {
+            let (_, left) = stack.pop().expect("checked nonempty");
+            depth = depth
+                .checked_sub(1)
+                .ok_or("Taproot tree has multiple roots")?;
+            hash = crate::taproot::tap_branch_hash(&left, &hash);
+        }
+        stack.push((depth, hash));
+    }
+    if stack.len() != 1 || stack[0].0 != 0 {
+        return Err("incomplete Taproot tree");
+    }
+    Ok(stack[0].1)
+}
+
+fn tap_leaf_root(
+    control: &[u8],
+    leaf: &TapLeafScript,
+) -> Result<([u8; 32], [u8; 32]), &'static str> {
+    if control.len() < 33 || control.len() > 33 + 32 * 128 || (control.len() - 33) % 32 != 0 {
+        return Err("invalid Taproot control block length");
+    }
+    if control[0] & 0xfe != leaf.leaf_version {
+        return Err("Taproot leaf/control versions differ");
+    }
+    let internal = fixed::<32>(&control[1..33]).map_err(|_| "invalid Taproot control key")?;
+    let mut root = crate::taproot::tap_leaf_hash(leaf.leaf_version, leaf.script.as_bytes());
+    for sibling in control[33..].chunks_exact(32) {
+        root = crate::taproot::tap_branch_hash(&root, &fixed(sibling).expect("32-byte chunk"));
+    }
+    Ok((internal, root))
+}
+
+fn check_taproot_input(input: &PsbtInput, script: Option<&ScriptBuf>) -> Result<(), &'static str> {
+    let has_fields = input.tap_internal_key.is_some()
+        || input.tap_merkle_root.is_some()
+        || input.tap_key_sig.is_some()
+        || !input.tap_script_sigs.is_empty()
+        || !input.tap_leaf_scripts.is_empty()
+        || !input.tap_bip32_derivation.is_empty();
+    if has_fields && script.is_some_and(|script| !script.is_p2tr()) {
+        return Err("Taproot fields attached to a non-Taproot prevout");
+    }
+    let internal = input
+        .tap_internal_key
+        .as_ref()
+        .map(|key| fixed::<32>(key).map_err(|_| "invalid Taproot internal key length"))
+        .transpose()?;
+    let mut inferred = None;
+    // All leaf proofs for an input must identify the same internal key and root.
+    // Compute the curve tweak once for that pair, then check every control parity.
+    for (control, leaf) in &input.tap_leaf_scripts {
+        let (key, root) = tap_leaf_root(control, leaf)?;
+        if internal.is_some_and(|internal| internal != key) {
+            return Err("Taproot control/internal keys differ");
+        }
+        if input.tap_merkle_root.is_some_and(|claimed| claimed != root) {
+            return Err("Taproot control proof differs from merkle root");
+        }
+        let (output, parity) = if let Some((previous_key, previous_root, output, parity)) = inferred
+        {
+            if previous_key != key || previous_root != root {
+                return Err("Taproot leaf proofs disagree on internal key/root");
+            }
+            (output, parity)
+        } else {
+            let (output, parity) = crate::taproot::output_key(&key, Some(&root))
+                .map_err(|_| "invalid Taproot output tweak")?;
+            inferred = Some((key, root, output, parity));
+            (output, parity)
+        };
+        if control[0] & 1 != parity {
+            return Err("Taproot control output parity differs");
+        }
+        if script.is_some_and(|script| *script != ScriptBuf::p2tr(&output)) {
+            return Err("Taproot leaf proof does not match prevout key");
+        }
+    }
+    if inferred.is_none() {
+        if let (Some(internal), Some(root), Some(script)) =
+            (internal, input.tap_merkle_root, script)
+        {
+            let (output, _) = crate::taproot::output_key(&internal, Some(&root))
+                .map_err(|_| "invalid Taproot output tweak")?;
+            if *script != ScriptBuf::p2tr(&output) {
+                return Err("Taproot internal key/root does not match prevout key");
+            }
+        }
+    }
+    // An omitted root can mean missing updater data, not necessarily no tree.
+    Ok(())
+}
+
+fn check_taproot_output(output: &PsbtOutput, script: &ScriptBuf) -> Result<(), &'static str> {
+    let has_fields = output.tap_internal_key.is_some()
+        || output.tap_tree.is_some()
+        || !output.tap_bip32_derivation.is_empty();
+    if has_fields && !script.is_p2tr() {
+        return Err("Taproot fields attached to a non-Taproot output");
+    }
+    if let Some(tree) = &output.tap_tree {
+        let root = tap_tree_root(tree)?;
+        if let Some(internal) = &output.tap_internal_key {
+            let internal = fixed(internal).map_err(|_| "invalid Taproot internal key length")?;
+            let (key, _) = crate::taproot::output_key(&internal, Some(&root))
+                .map_err(|_| "invalid Taproot output tweak")?;
+            if *script != ScriptBuf::p2tr(&key) {
+                return Err("Taproot tree/internal key does not match output key");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn decode_tap_tree(value: &[u8]) -> Result<Vec<TapTreeLeaf>, PsbtError> {
     let mut cursor = Cursor::new(value);
     let mut tree = Vec::new();
-    // Reduce adjacent completed subtrees. A shallower new leaf cannot precede
-    // completion of a deeper left subtree in depth-first order (Core TaprootBuilder).
-    let mut depths = Vec::new();
     while remaining(&cursor) > 0 {
         if tree.len() >= MAX_PSBT_MAPS {
             return Err(PsbtError::Other("too many Taproot tree leaves".into()));
         }
         let mut header = [0; 2];
         cursor.read_exact(&mut header)?;
-        let [mut depth, leaf_version] = header;
-        if depth > 128 || leaf_version & 1 != 0 {
-            return Err(PsbtError::Other(
-                "invalid Taproot tree depth/version".into(),
-            ));
-        }
-        if depths.last().is_some_and(|previous| *previous > depth) {
-            return Err(PsbtError::Other(
-                "Taproot tree is not in depth-first order".into(),
-            ));
-        }
-        while depths.last() == Some(&depth) {
-            depths.pop();
-            depth = depth
-                .checked_sub(1)
-                .ok_or_else(|| PsbtError::Other("Taproot tree has multiple roots".into()))?;
-        }
-        depths.push(depth);
+        let [depth, leaf_version] = header;
         let len = read_compact_size(&mut cursor)?;
         tree.push(TapTreeLeaf {
-            depth: header[0],
+            depth,
             leaf_version,
             script: ScriptBuf::from_bytes(read_blob(&mut cursor, len)?),
         });
     }
-    if depths != [0] {
-        return Err(PsbtError::Other("incomplete Taproot tree".into()));
-    }
+    tap_tree_root(&tree).map_err(|reason| PsbtError::Other(reason.into()))?;
     Ok(tree)
 }
 
@@ -1205,6 +1311,8 @@ impl Psbt {
                 input.witness_script.as_ref(),
             )
             .map_err(|reason| PsbtError::InconsistentInput { index, reason })?;
+            check_taproot_input(input, utxo.map(|output| &output.script_pubkey))
+                .map_err(|reason| PsbtError::InconsistentInput { index, reason })?;
         }
         for (index, output) in self.outputs.iter().enumerate() {
             check_script_commitments(
@@ -1215,6 +1323,9 @@ impl Psbt {
             .map_err(|reason| {
                 PsbtError::Other(format!("inconsistent PSBT output {index}: {reason}"))
             })?;
+            check_taproot_output(output, &self.unsigned_tx.outputs[index].script_pubkey).map_err(
+                |reason| PsbtError::Other(format!("inconsistent PSBT output {index}: {reason}")),
+            )?;
         }
         match self.version {
             0 => {
@@ -1507,6 +1618,198 @@ fn merge_output(mine: &mut PsbtOutput, theirs: &PsbtOutput) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn commitment_vectors() -> serde_json::Value {
+        serde_json::from_str(include_str!("../tests/data/bip341-commitments.json")).unwrap()
+    }
+
+    fn vector_tree(node: &serde_json::Value, depth: u8, leaves: &mut Vec<TapTreeLeaf>) {
+        if let Some(branch) = node.as_array() {
+            assert_eq!(branch.len(), 2);
+            for child in branch {
+                vector_tree(child, depth + 1, leaves);
+            }
+        } else {
+            leaves.push(TapTreeLeaf {
+                depth,
+                leaf_version: node["leafVersion"].as_u64().unwrap() as u8,
+                script: ScriptBuf::from_bytes(
+                    hex::decode(node["script"].as_str().unwrap()).unwrap(),
+                ),
+            });
+        }
+    }
+
+    fn vector_psbt(vector: &serde_json::Value) -> Psbt {
+        let mut tx = make_unsigned_tx();
+        tx.outputs[0].script_pubkey = ScriptBuf::from_bytes(
+            hex::decode(vector["expected"]["scriptPubKey"].as_str().unwrap()).unwrap(),
+        );
+        let script = tx.outputs[0].script_pubkey.clone();
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        let internal = hex::decode(vector["given"]["internalPubkey"].as_str().unwrap()).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: script,
+        });
+        psbt.inputs[0].tap_internal_key = Some(internal.clone());
+        psbt.outputs[0].tap_internal_key = Some(internal);
+        psbt.inputs[0].tap_merkle_root = vector["intermediary"]["merkleRoot"]
+            .as_str()
+            .map(|root| hex::decode(root).unwrap().try_into().unwrap());
+        if !vector["given"]["scriptTree"].is_null() {
+            let mut leaves = Vec::new();
+            vector_tree(&vector["given"]["scriptTree"], 0, &mut leaves);
+            for (leaf, control) in leaves.iter().zip(
+                vector["expected"]["scriptPathControlBlocks"]
+                    .as_array()
+                    .unwrap(),
+            ) {
+                psbt.inputs[0].tap_leaf_scripts.push((
+                    hex::decode(control.as_str().unwrap()).unwrap(),
+                    TapLeafScript {
+                        script: leaf.script.clone(),
+                        leaf_version: leaf.leaf_version,
+                    },
+                ));
+            }
+            psbt.outputs[0].tap_tree = Some(leaves);
+        }
+        psbt
+    }
+
+    #[test]
+    fn published_bip341_trees_and_control_proofs_reach_psbt_tools() {
+        let fixture = commitment_vectors();
+        let vectors = fixture["scriptPubKey"].as_array().unwrap();
+        assert_eq!(vectors.len(), 7);
+        let mut proof_count = 0;
+        for (index, vector) in vectors.iter().enumerate() {
+            let psbt = vector_psbt(vector);
+            let independent = &fixture["psbt_vectors"][index]["hex"];
+            assert_eq!(
+                Psbt::deserialize(&hex::decode(independent.as_str().unwrap()).unwrap()).unwrap(),
+                psbt
+            );
+            if let Some(tree) = &psbt.outputs[0].tap_tree {
+                assert_eq!(
+                    Some(tap_tree_root(tree).unwrap()),
+                    psbt.inputs[0].tap_merkle_root
+                );
+                for (i, (control, leaf)) in psbt.inputs[0].tap_leaf_scripts.iter().enumerate() {
+                    let (internal, root) = tap_leaf_root(control, leaf).unwrap();
+                    assert_eq!(Some(root), psbt.inputs[0].tap_merkle_root);
+                    assert_eq!(
+                        internal.as_slice(),
+                        psbt.inputs[0].tap_internal_key.as_ref().unwrap()
+                    );
+                    assert_eq!(
+                        hex::encode(crate::taproot::tap_leaf_hash(
+                            leaf.leaf_version,
+                            leaf.script.as_bytes()
+                        )),
+                        vector["intermediary"]["leafHashes"][i]
+                    );
+                    proof_count += 1;
+                }
+            }
+            for version in [0, 2] {
+                let converted = psbt.convert_version(version).unwrap();
+                assert_eq!(
+                    Psbt::deserialize(&converted.try_serialize().unwrap()).unwrap(),
+                    converted
+                );
+                assert_eq!(converted.convert_version(0).unwrap(), psbt);
+            }
+        }
+        assert_eq!(proof_count, 12);
+    }
+
+    #[test]
+    fn taproot_commitment_substitutions_fail_all_library_boundaries() {
+        let fixture = commitment_vectors();
+        let base = vector_psbt(&fixture["scriptPubKey"][5]);
+        for version in [0, 2] {
+            let base = base.convert_version(version).unwrap();
+            let mut variants = Vec::new();
+            let mut bad = base.clone();
+            bad.inputs[0].tap_merkle_root.as_mut().unwrap()[0] ^= 1;
+            variants.push(bad);
+            let mut bad = base.clone();
+            bad.inputs[0].tap_internal_key = Some(test_xonly_key());
+            variants.push(bad);
+            let mut bad = base.clone();
+            bad.inputs[0].tap_leaf_scripts[0].0[0] ^= 1;
+            variants.push(bad);
+            let mut bad = base.clone();
+            bad.inputs[0].tap_leaf_scripts[0].0[33] ^= 1;
+            variants.push(bad);
+            let mut bad = base.clone();
+            bad.inputs[0].tap_leaf_scripts[0].1.script = ScriptBuf::new();
+            variants.push(bad);
+            let mut bad = base.clone();
+            bad.inputs[0].witness_utxo.as_mut().unwrap().script_pubkey =
+                ScriptBuf::p2tr(&fixed(&test_xonly_key()).unwrap());
+            variants.push(bad);
+            let mut bad = base.clone();
+            bad.inputs[0].witness_utxo.as_mut().unwrap().script_pubkey =
+                ScriptBuf::p2wpkh(&[1; 20]);
+            variants.push(bad);
+            // No explicit root/internal metadata: the control still binds the leaf to the UTXO.
+            let mut bad = base.clone();
+            bad.inputs[0].tap_merkle_root = None;
+            bad.inputs[0].tap_internal_key = None;
+            bad.inputs[0].tap_leaf_scripts.truncate(1);
+            bad.inputs[0].tap_leaf_scripts[0].0[33] ^= 1;
+            variants.push(bad);
+            for bad in variants {
+                assert_inconsistent_input(&bad);
+            }
+            for mutate in 0..3 {
+                let mut bad = base.clone();
+                match mutate {
+                    0 => bad.outputs[0].tap_internal_key = Some(test_xonly_key()),
+                    1 => bad.outputs[0].tap_tree.as_mut().unwrap()[0].script = ScriptBuf::new(),
+                    _ => bad.unsigned_tx.outputs[0].script_pubkey = ScriptBuf::p2wpkh(&[1; 20]),
+                }
+                assert!(bad.try_serialize().is_err());
+                assert!(Psbt::deserialize(&unchecked_wire(&bad)).is_err());
+                assert!(bad.clone().finalize().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn missing_taproot_data_is_deferred_and_conflicting_combine_is_atomic() {
+        let fixture = commitment_vectors();
+        let base = vector_psbt(&fixture["scriptPubKey"][5]);
+        let mut left = base.clone();
+        left.inputs[0].tap_leaf_scripts.clear();
+        left.inputs[0].tap_merkle_root = None;
+        left.inputs[0].tap_internal_key = Some(test_xonly_key());
+        left.outputs[0].tap_tree = None;
+        left.outputs[0].tap_internal_key = Some(test_xonly_key());
+        let mut right = base.clone();
+        right.inputs[0].tap_leaf_scripts.clear();
+        right.inputs[0].tap_internal_key = None;
+        right.outputs[0].tap_internal_key = None;
+        assert!(left.try_serialize().is_ok());
+        assert!(right.try_serialize().is_ok());
+        let before = left.clone();
+        assert!(left.merge(&right).is_err());
+        assert_eq!(left, before);
+        let mut target = Psbt::from_unsigned_tx(base.unsigned_tx.clone()).unwrap();
+        target.merge(&base).unwrap();
+        assert_eq!(target, base);
+        target.merge(&base).unwrap();
+        assert_eq!(target, base);
+        let mut reversed = base.clone();
+        reversed.outputs[0].tap_tree.as_mut().unwrap().reverse();
+        assert!(reversed.try_serialize().is_ok()); // exchanging complete sibling subtrees preserves BIP341's sorted root
+        let mut absent = base;
+        absent.inputs[0].witness_utxo = None;
+        assert!(absent.try_serialize().is_ok()); // internally consistent proofs, unknown active spending data
+    }
 
     fn script_psbt() -> Psbt {
         let witness = ScriptBuf::from_bytes(vec![0x51]);
@@ -1819,6 +2122,15 @@ mod tests {
         }
         let mut maximum = control.clone();
         maximum.resize(33 + 32 * 128, 0);
+        let (key, root) = tap_leaf_root(
+            &maximum,
+            &TapLeafScript {
+                script: ScriptBuf::new(),
+                leaf_version: 0xc0,
+            },
+        )
+        .unwrap();
+        maximum[0] |= crate::taproot::output_key(&key, Some(&root)).unwrap().1;
         assert!(check_input(make_key(0x15, &maximum), vec![0xc0]).is_ok()); // empty script, valid version
         for kind in [0x14, 0x16] {
             let bad = if kind == 0x14 {
@@ -1871,7 +2183,9 @@ mod tests {
 
     #[test]
     fn taproot_tree_requires_complete_depth_first_topology() {
-        let globals = vec![(vec![0], tx_to_bytes(&make_unsigned_tx()))];
+        let mut tx = make_unsigned_tx();
+        tx.outputs[0].script_pubkey = ScriptBuf::p2tr(&fixed(&test_xonly_key()).unwrap());
+        let globals = vec![(vec![0], tx_to_bytes(&tx))];
         for depths in [
             vec![],
             vec![1],
@@ -2440,7 +2754,8 @@ mod tests {
 
     #[test]
     fn test_output_tap_internal_key_roundtrip() {
-        let tx = make_unsigned_tx();
+        let mut tx = make_unsigned_tx();
+        tx.outputs[0].script_pubkey = ScriptBuf::p2tr(&fixed(&test_xonly_key()).unwrap());
         let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
         psbt.outputs[0].tap_internal_key = Some(test_xonly_key());
 
@@ -2554,7 +2869,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_with_all_fields_populated() {
+    fn test_merge_with_legacy_fields_populated() {
         let mut psbt_b = script_psbt();
         let mut psbt_a = Psbt::from_unsigned_tx(psbt_b.unsigned_tx.clone()).unwrap();
 
@@ -2562,40 +2877,9 @@ mod tests {
         psbt_b.inputs[0].sighash_type = Some(1);
         psbt_b.inputs[0].final_script_sig = Some(ScriptBuf::from_bytes(vec![0x53]));
         psbt_b.inputs[0].final_script_witness = Some(vec![vec![0x54]]);
-        psbt_b.inputs[0].tap_key_sig = Some(vec![0x55; 64]);
-        psbt_b.inputs[0].tap_internal_key = Some(test_xonly_key());
-        psbt_b.inputs[0].tap_merkle_root = Some([0x57; 32]);
-        psbt_b.inputs[0]
-            .tap_script_sigs
-            .push((test_tap_sig_key(), vec![0x59; 65]));
-        let source = TapKeySource {
-            leaf_hashes: vec![[0x11; 32]],
-            key_source: ([0x12; 4], vec![0x80000056, 0]),
-        };
-        let mut control = vec![0xc0];
-        control.extend(test_xonly_key());
-        psbt_b.inputs[0].tap_leaf_scripts.push((
-            control,
-            TapLeafScript {
-                script: ScriptBuf::new(),
-                leaf_version: 0xc0,
-            },
-        ));
-        psbt_b.inputs[0]
-            .tap_bip32_derivation
-            .push((test_xonly_key(), source.clone()));
         psbt_b.inputs[0]
             .unknown
             .push((vec![0xFD, 0x01, 0x01], vec![0x60]));
-        psbt_b.outputs[0].tap_internal_key = Some(test_xonly_key());
-        psbt_b.outputs[0].tap_tree = Some(vec![TapTreeLeaf {
-            depth: 0,
-            leaf_version: 0xc0,
-            script: ScriptBuf::new(),
-        }]);
-        psbt_b.outputs[0]
-            .tap_bip32_derivation
-            .push((test_xonly_key(), source));
         psbt_b.outputs[0]
             .unknown
             .push((vec![0xFD, 0x02, 0x01], vec![0x64]));
@@ -2613,27 +2897,9 @@ mod tests {
         assert!(psbt_a.inputs[0].witness_script.is_some());
         assert!(psbt_a.inputs[0].final_script_sig.is_some());
         assert!(psbt_a.inputs[0].final_script_witness.is_some());
-        assert!(psbt_a.inputs[0].tap_key_sig.is_some());
-        assert!(psbt_a.inputs[0].tap_internal_key.is_some());
-        assert!(psbt_a.inputs[0].tap_merkle_root.is_some());
-        assert_eq!(psbt_a.inputs[0].tap_script_sigs.len(), 1);
-        assert_eq!(
-            psbt_a.inputs[0].tap_leaf_scripts,
-            psbt_b.inputs[0].tap_leaf_scripts
-        );
-        assert_eq!(
-            psbt_a.inputs[0].tap_bip32_derivation,
-            psbt_b.inputs[0].tap_bip32_derivation
-        );
         assert_eq!(psbt_a.inputs[0].unknown.len(), 1);
         assert!(psbt_a.outputs[0].redeem_script.is_some());
         assert!(psbt_a.outputs[0].witness_script.is_some());
-        assert!(psbt_a.outputs[0].tap_internal_key.is_some());
-        assert_eq!(psbt_a.outputs[0].tap_tree, psbt_b.outputs[0].tap_tree);
-        assert_eq!(
-            psbt_a.outputs[0].tap_bip32_derivation,
-            psbt_b.outputs[0].tap_bip32_derivation
-        );
         assert_eq!(psbt_a.outputs[0].unknown.len(), 1);
         assert_eq!(psbt_a.xpub.len(), 1);
         assert_eq!(psbt_a.proprietary.len(), 1);

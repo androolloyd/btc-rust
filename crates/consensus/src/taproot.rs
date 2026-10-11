@@ -8,8 +8,6 @@
 use crate::script_engine::{ScriptEngine, ScriptError, ScriptFlags};
 use crate::sig_verify::SignatureVerifier;
 use crate::sighash::{sighash_taproot, SighashType};
-use btc_primitives::encode::{Encodable, VarInt};
-use btc_primitives::hash::sha256;
 use btc_primitives::script::Script;
 use btc_primitives::transaction::{Transaction, TxOut, Witness};
 use secp256k1::{Parity, Scalar, Secp256k1, XOnlyPublicKey};
@@ -45,25 +43,7 @@ pub enum TaprootError {
     ScriptFailed(#[from] ScriptError),
 }
 
-/// BIP340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || msg)
-pub fn tagged_hash(tag: &[u8], msg: &[u8]) -> [u8; 32] {
-    let tag_hash = sha256(tag);
-    let mut preimage = Vec::with_capacity(64 + msg.len());
-    preimage.extend_from_slice(&tag_hash);
-    preimage.extend_from_slice(&tag_hash);
-    preimage.extend_from_slice(msg);
-    sha256(&preimage)
-}
-
-/// Compute the TapTweak hash: tagged_hash("TapTweak", pubkey || merkle_root)
-pub fn tap_tweak_hash(pubkey: &[u8; 32], merkle_root: Option<&[u8; 32]>) -> [u8; 32] {
-    let mut msg = Vec::with_capacity(64);
-    msg.extend_from_slice(pubkey);
-    if let Some(root) = merkle_root {
-        msg.extend_from_slice(root);
-    }
-    tagged_hash(b"TapTweak", &msg)
-}
+pub use btc_primitives::taproot::{tagged_hash, tap_branch_hash, tap_leaf_hash, tap_tweak_hash};
 
 /// Verify that an output key is the correct tweak of an internal key.
 ///
@@ -138,30 +118,6 @@ pub fn compute_taprootoutput_key(
     };
 
     Ok((tweaked_key.serialize(), parity_byte))
-}
-
-/// Compute the TapLeaf hash: tagged_hash("TapLeaf", leaf_version || compact_size(script) || script)
-pub fn tap_leaf_hash(leaf_version: u8, script: &[u8]) -> [u8; 32] {
-    let mut msg = Vec::with_capacity(1 + 5 + script.len());
-    msg.push(leaf_version);
-    // compact_size encoding of script length
-    VarInt(script.len() as u64).encode(&mut msg).unwrap();
-    msg.extend_from_slice(script);
-    tagged_hash(b"TapLeaf", &msg)
-}
-
-/// Compute the TapBranch hash: tagged_hash("TapBranch", sorted(left, right))
-pub fn tap_branch_hash(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
-    let mut msg = [0u8; 64];
-    // Lexicographic sort
-    if a <= b {
-        msg[..32].copy_from_slice(a);
-        msg[32..].copy_from_slice(b);
-    } else {
-        msg[..32].copy_from_slice(b);
-        msg[32..].copy_from_slice(a);
-    }
-    tagged_hash(b"TapBranch", &msg)
 }
 
 /// Default tapscript leaf version (0xc0)

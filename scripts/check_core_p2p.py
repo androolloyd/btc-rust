@@ -53,12 +53,12 @@ def free_port(span=1, excluded=()):
     raise RuntimeError("no available port range")
 
 
-def core_rpc(port, method, params):
+def core_rpc(port, method, params, timeout=10):
     payload = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
     request = urllib.request.Request(f"http://127.0.0.1:{port}/", data=payload)
     request.add_header("Authorization", "Basic " + base64.b64encode(b"interop:regtest-only").decode())
     try:
-        response = urllib.request.urlopen(request, timeout=10)
+        response = urllib.request.urlopen(request, timeout=timeout)
     except urllib.error.HTTPError as error:
         response = error
     with response:
@@ -95,7 +95,7 @@ def signed_wallet_spend(core_port, coin=None, fee=0.00002):
 def check_reorg_and_mempool(core_port, rust_port, p2p_port, outbound, encrypted):
     core_rpc(core_port, "createwallet", ["interop-wallet"])
     address = core_rpc(core_port, "getnewaddress", ["", "bech32"])
-    hashes = core_rpc(core_port, "generatetoaddress", [105, address])
+    hashes = core_rpc(core_port, "generatetoaddress", [105, address], timeout=30)
     wait_until(lambda: rust_rpc(rust_port, "getbestblockhash", []) == hashes[-1], timeout=60)
     # Core -> Rust wtxid announcement and actual signature-checked admission.
     parent_id = core_rpc(core_port, "sendtoaddress", ["mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn", 0.25])

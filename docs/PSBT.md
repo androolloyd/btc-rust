@@ -72,8 +72,24 @@ one complete root. Empty scripts and even future leaf versions remain metadata.
 These records survive serialization, conversion and combining; known Taproot
 records cannot bypass parsing through the unknown-field collection.
 
+Taproot leaves use BIP341 tagged TapLeaf/TapBranch hashing, lift the control's
+internal key on secp256k1 and apply the actual TapTweak scalar. Every supplied
+control must agree on internal key/root and declare the resulting output parity.
+Supplied internal-key/root fields must agree with those proofs. When a UTXO is
+available, the computed output key must match its native P2TR program. An explicit
+internal-key/root pair is also checked without leaf scripts. Complete output trees
+are reconstructed and, with an internal key, checked against the transaction's
+output key. Taproot fields on known non-Taproot inputs/outputs are rejected.
+
+Missing data remains incomplete: an omitted root/tree can describe unrevealed
+scripts, and an omitted UTXO cannot establish which output is spent. An internal
+key alone is not assumed to mean a key-only output. Commitment checks needing that
+data are deferred. These public commitments do not prove signature equations,
+key derivations, confirmation, unspentness or script satisfaction. Sorted branch
+hashing permits exchanging complete sibling subtrees without changing the root.
+
 Parsing does not validate signature equations, sighash semantics, claimed key
-derivations, merkle commitments against UTXOs or script satisfactions. Remaining
+derivations or script satisfactions. Remaining
 BIP174 curve/DER/key-origin checks, witness-only legacy signing restrictions,
 active-chain/unspentness checks, wallet signing/finalization,
 descriptor operations and MuSig2 remain unfinished. Empty v2 creator maps can be
@@ -98,12 +114,24 @@ through the CLI. Core also decodes every published BIP371 case independently,
 compares the CLI's controls, trees, leaf hashes, fingerprints and paths against
 Core's inspection, and compares valid PSBTs before/after conversion. CI runs this with the checksum-verified
 Core binary. The PSBT fuzz target checks arbitrary decoding plus canonical
-serialization/conversion invariants, seeded with BIP174, BIP370 and BIP371 cases.
+serialization/conversion invariants, seeded with BIP174, BIP370, BIP371 and BIP341-wrapper cases.
 Full-parent inspection matches Core's active UTXO amounts/scripts; substituted
 parents, conflicting UTXOs and altered input/output scripts are rejected through
 all CLI tools. Valid signed and finalized records keep identical transaction bytes.
 
+`bip341-commitments.json` retains all seven published scriptPubKey commitment cases,
+with exact tweaks, output keys, leaf hashes, roots and twelve control proofs,
+including an even future leaf version. It also contains independently constructed
+PSBT wrappers used by the compiled CLI, Core decoding/conversion comparison and
+the fuzzer. These wrappers have test-only witness UTXO claims and no signatures;
+they do not claim a spendable or active-chain transaction. Real Core script-path
+spends provide independent signature/finalization/acceptance evidence. Mutated
+roots, internal keys, control parities, leaf scripts, merkle paths and output trees
+fail the actual tools. Tagged commitment hashing is shared with the existing
+consensus verifier through primitives; consensus rules are unchanged.
+
 Primary specifications: [BIP174](https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki),
 [BIP370 and its vectors](https://github.com/bitcoin/bips/blob/master/bip-0370.mediawiki),
 [BIP371](https://github.com/bitcoin/bips/blob/master/bip-0371.mediawiki),
+[BIP341 and wallet vectors](https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki),
 and [Core v29 PSBT RPCs](https://github.com/bitcoin/bitcoin/blob/v29.0/src/rpc/rawtransaction.cpp).
