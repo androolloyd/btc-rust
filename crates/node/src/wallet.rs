@@ -2,13 +2,17 @@
 
 use btc_consensus::script_engine::ScriptFlags;
 use btc_consensus::sig_verify::{Secp256k1Verifier, SigError, SignatureVerifier};
+use btc_consensus::sighash::{
+    p2wpkh_script_code, sighash_legacy, sighash_segwit_v0, sighash_taproot, SighashType,
+};
 use btc_consensus::witness::verify_input_with_prevouts;
 use btc_primitives::amount::Amount;
-use btc_primitives::psbt::Psbt;
-use btc_primitives::script::{Instruction, Opcode, Script};
-use btc_primitives::transaction::{Transaction, Witness};
+use btc_primitives::hash::hash160;
+use btc_primitives::psbt::{Psbt, PsbtInput};
+use btc_primitives::script::{Instruction, Opcode, Script, ScriptBuf};
+use btc_primitives::transaction::{Transaction, TxOut, Witness};
 use eyre::{bail, ensure, WrapErr};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Debug)]
@@ -17,6 +21,15 @@ pub struct VerifiedPsbt {
     /// Difference of supplied input and output values; not a chain lookup.
     pub fee_sat: i64,
     pub signatures_checked: usize,
+    pub txid_linked_prevouts: Vec<bool>,
+}
+
+#[derive(Debug)]
+pub struct VerifiedPartialSignatures {
+    pub unsigned_transaction: Transaction,
+    pub fee_sat: i64,
+    pub signatures_checked: usize,
+    pub signatures_per_input: Vec<usize>,
     pub txid_linked_prevouts: Vec<bool>,
 }
 
@@ -284,7 +297,13 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("non-witness UTXO"));
+        let mut partial = psbt.clone();
+        partial.inputs[0].final_script_sig = None;
+        partial.inputs[0].partial_sigs = vec![(pubkey.to_vec(), signature)];
+        assert!(verify_partial_signatures(&partial).is_err());
         psbt.inputs[0].non_witness_utxo = Some(parent);
+        partial.inputs[0].non_witness_utxo = psbt.inputs[0].non_witness_utxo.clone();
+        assert_eq!(partial_cli(&partial)["signatures_checked"], 1);
         assert_eq!(
             verify_cli(&psbt)["txid_linked_prevouts"],
             serde_json::json!([true])
@@ -314,6 +333,207 @@ mod tests {
             psbt.inputs[0].final_script_witness = Some(vec![vec![1; 64], script, control]);
             assert!(verify_finalized_psbt(&psbt).is_err());
         }
+    }
+
+    fn partial_wpkh(hash_type: u8) -> Psbt {
+        let mut psbt = signed_wpkh(hash_type);
+        let witness = psbt.inputs[0].final_script_witness.take().unwrap();
+        psbt.inputs[0].partial_sigs = vec![(witness[1].clone(), witness[0].clone())];
+        psbt
+    }
+
+    fn partial_cli(psbt: &Psbt) -> serde_json::Value {
+        crate::cli::verify_psbt_partials(&hex::encode(psbt.try_serialize().unwrap())).unwrap()
+    }
+
+    #[test]
+    fn published_bip143_signature_verifies_without_local_signing() {
+        // BIP143 P2SH-P2WPKH example (public domain), copied as published:
+        // https://github.com/bitcoin/bips/blob/master/bip-0143.mediawiki#p2sh-p2wpkh
+        let tx = btc_primitives::decode(&hex::decode("0100000001db6b1b20aa0fd7b23880be2ecbd4a98130974cf4748fb66092ac4d3ceb1a54770100000000feffffff02b8b4eb0b000000001976a914a457b684d7f0d539a46a45bbc043f35b59d0d96388ac0008af2f000000001976a914fd270b1ee6abcaea97fea7ad0402e8bd8ad6d77c88ac92040000").unwrap()).unwrap();
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(1_000_000_000),
+            script_pubkey: ScriptBuf::from_bytes(
+                hex::decode("a9144733f37cf4db86fbc2efed2500b4f4e49f31202387").unwrap(),
+            ),
+        });
+        psbt.inputs[0].redeem_script = Some(ScriptBuf::from_bytes(
+            hex::decode("001479091972186c449eb1ded22b78e40d009bdf0089").unwrap(),
+        ));
+        psbt.inputs[0].partial_sigs = vec![(
+            hex::decode("03ad1d8e89212f0b92c74d23bb710c00662ad1470198ac48c43f7d6f93a2a26873").unwrap(),
+            hex::decode("3044022047ac8e878352d3ebbde1c94ce3a10d057c24175747116f8288e5d794d12d482f0220217f36a485cae903c713331d877c1f64677e3622ad4010726870540656fe9dcb01").unwrap(),
+        )];
+        let hash = sighash_segwit_v0(
+            &psbt.unsigned_tx,
+            0,
+            &p2wpkh_script_code(
+                &hex::decode("79091972186c449eb1ded22b78e40d009bdf0089")
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            ),
+            1_000_000_000,
+            SighashType::ALL,
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(hash),
+            "64f3b0f4dd2bb3aa1ce8566d220cc74dda9df97d8490cc81d89d735c92e59fb6"
+        );
+        let before = psbt.clone();
+        let checked = partial_cli(&psbt);
+        assert_eq!(checked, partial_cli(&psbt.convert_version(2).unwrap()));
+        assert_eq!(checked["signatures_checked"], 1);
+        assert_eq!(checked["partial_signatures_verified"], true);
+        assert_eq!(checked["spending_conditions_verified"], false);
+        assert_eq!(checked["active_chain_verified"], false);
+        assert_eq!(checked["key_origins_verified"], false);
+        assert!(checked.get("tx_hex").is_none());
+        assert_eq!(psbt, before);
+        for mutate in 0..4 {
+            let mut bad = psbt.clone();
+            match mutate {
+                0 => bad.inputs[0].partial_sigs[0].1[10] ^= 1,
+                1 => bad.unsigned_tx.inputs[0].previous_output.vout ^= 1,
+                2 => bad.unsigned_tx.inputs[0].sequence ^= 1,
+                _ => {
+                    bad.inputs[0].witness_utxo.as_mut().unwrap().value =
+                        Amount::from_sat(1_000_000_001)
+                }
+            }
+            assert!(verify_partial_signatures(&bad).is_err());
+        }
+    }
+
+    #[test]
+    fn partial_hash_modes_preserve_commitment_semantics_and_input_models() {
+        for hash_type in [1, 2, 3, 0x81, 0x82, 0x83] {
+            let psbt = partial_wpkh(hash_type);
+            let checked = partial_cli(&psbt);
+            assert_eq!(checked, partial_cli(&psbt.convert_version(2).unwrap()));
+            assert_eq!(checked["signatures_per_input"], serde_json::json!([1]));
+            let mut outputs = psbt.clone();
+            outputs.unsigned_tx.outputs[0].value = Amount::from_sat(48_999);
+            assert_eq!(
+                verify_partial_signatures(&outputs).is_ok(),
+                hash_type & 0x7f == 2
+            );
+            let mut key = psbt.clone();
+            key.inputs[0].partial_sigs[0].0 = PublicKey::from_secret_key(
+                &Secp256k1::new(),
+                &SecretKey::from_slice(&[2; 32]).unwrap(),
+            )
+            .serialize()
+            .to_vec();
+            assert!(verify_partial_signatures(&key).is_err());
+            let mut missing = psbt.clone();
+            missing.inputs[0].partial_sigs.clear();
+            assert!(verify_partial_signatures(&missing).is_err());
+            let mut missing = psbt.clone();
+            missing.inputs[0].witness_utxo = None;
+            assert!(verify_partial_signatures(&missing).is_err());
+            let mut missing = psbt.clone();
+            missing.inputs[0].final_script_witness = Some(vec![]);
+            assert!(verify_partial_signatures(&missing).is_err());
+            let mut contradiction = psbt.clone();
+            contradiction.inputs[0].sighash_type = Some(if hash_type == 2 { 1 } else { 2 });
+            assert!(verify_partial_signatures(&contradiction).is_err());
+            let mut malformed = psbt.clone();
+            malformed.inputs.clear();
+            assert!(verify_partial_signatures(&malformed).is_err());
+            assert!(crate::cli::verify_psbt(&hex::encode(psbt.try_serialize().unwrap())).is_err());
+        }
+    }
+
+    #[test]
+    fn partial_taproot_requires_all_prevouts_and_the_committed_leaf_key() {
+        use btc_primitives::psbt::TapLeafScript;
+        let secp = Secp256k1::new();
+        let key = Keypair::from_secret_key(&secp, &SecretKey::from_slice(&[5; 32]).unwrap());
+        let (public, _) = key.x_only_public_key();
+        let internal = Keypair::from_secret_key(&secp, &SecretKey::from_slice(&[6; 32]).unwrap())
+            .x_only_public_key()
+            .0;
+        let mut script = ScriptBuf::new();
+        script.push_slice(&public.serialize());
+        script.push_opcode(Opcode::OP_CHECKSIG);
+        let leaf_hash = btc_primitives::taproot::tap_leaf_hash(0xc0, script.as_bytes());
+        let (output, parity) =
+            btc_primitives::taproot::output_key(&internal.serialize(), Some(&leaf_hash)).unwrap();
+        let mut control = vec![0xc0 | parity];
+        control.extend(internal.serialize());
+        let mut psbt = Psbt::from_unsigned_tx(transaction(2)).unwrap();
+        let prevouts = vec![
+            TxOut {
+                value: Amount::from_sat(25_000),
+                script_pubkey: ScriptBuf::p2tr(&output),
+            },
+            TxOut {
+                value: Amount::from_sat(25_000),
+                script_pubkey: ScriptBuf::p2tr(&public.serialize()),
+            },
+        ];
+        for (i, out) in prevouts.iter().enumerate() {
+            psbt.inputs[i].witness_utxo = Some(out.clone());
+        }
+        psbt.inputs[0].tap_leaf_scripts.push((
+            control,
+            TapLeafScript {
+                script,
+                leaf_version: 0xc0,
+            },
+        ));
+        let digest = sighash_taproot(
+            &psbt.unsigned_tx,
+            0,
+            &prevouts,
+            SighashType(0),
+            None,
+            Some(&leaf_hash),
+        )
+        .unwrap();
+        let sig = secp
+            .sign_schnorr_no_aux_rand(&Message::from_digest(digest), &key)
+            .as_ref()
+            .to_vec();
+        let mut record = public.serialize().to_vec();
+        record.extend(leaf_hash);
+        psbt.inputs[0].tap_script_sigs.push((record, sig));
+        let digest =
+            sighash_taproot(&psbt.unsigned_tx, 1, &prevouts, SighashType(0), None, None).unwrap();
+        psbt.inputs[1].tap_key_sig = Some(
+            secp.sign_schnorr_no_aux_rand(&Message::from_digest(digest), &key)
+                .as_ref()
+                .to_vec(),
+        );
+        assert_eq!(
+            partial_cli(&psbt)["signatures_per_input"],
+            serde_json::json!([1, 1])
+        );
+        assert_eq!(
+            partial_cli(&psbt),
+            partial_cli(&psbt.convert_version(2).unwrap())
+        );
+        let mut bad = psbt.clone();
+        bad.inputs[1].witness_utxo.as_mut().unwrap().value = Amount::from_sat(25_001);
+        assert!(verify_partial_signatures(&bad)
+            .unwrap_err()
+            .to_string()
+            .contains("input 0"));
+        let mut bad = psbt.clone();
+        bad.inputs[0].tap_leaf_scripts.clear();
+        assert!(verify_partial_signatures(&bad).is_err());
+        let mut bad = psbt.clone();
+        bad.inputs[0].tap_script_sigs[0].0[63] ^= 1;
+        assert!(verify_partial_signatures(&bad).is_err());
+        let mut bad = psbt.clone();
+        bad.inputs[0].tap_script_sigs[0].0[..32].copy_from_slice(&internal.serialize());
+        assert!(verify_partial_signatures(&bad).is_err());
+        let mut bad = psbt.clone();
+        bad.inputs[1].tap_key_sig.as_mut().unwrap()[63] ^= 1;
+        assert!(verify_partial_signatures(&bad).is_err());
     }
 }
 
@@ -363,6 +583,48 @@ fn valid_key(key: &[u8], witness: bool) -> bool {
     shape && secp256k1::PublicKey::from_slice(key).is_ok()
 }
 
+enum EcdsaTemplate<'a> {
+    KeyHash(&'a [u8]),
+    Key(&'a [u8]),
+    Multisig {
+        required: usize,
+        keys: Vec<&'a [u8]>,
+    },
+}
+
+fn ecdsa_template(script: &Script, witness: bool) -> eyre::Result<EcdsaTemplate<'_>> {
+    let code = script.as_bytes();
+    if script.is_p2pkh() {
+        return Ok(EcdsaTemplate::KeyHash(&code[3..23]));
+    }
+    if matches!(code.first(), Some(33 | 65))
+        && code.len() == code[0] as usize + 2
+        && code.last() == Some(&(Opcode::OP_CHECKSIG as u8))
+        && valid_key(&code[1..code.len() - 1], witness)
+    {
+        return Ok(EcdsaTemplate::Key(&code[1..code.len() - 1]));
+    }
+    if code.len() >= 3 && (0x51..=0x60).contains(&code[0]) && code.last() == Some(&0xae) {
+        let required = (code[0] - 0x50) as usize;
+        let n = code[code.len() - 2].wrapping_sub(0x50) as usize;
+        ensure!(n <= 16 && required <= n, "unsupported multisig script");
+        let mut pos = 1;
+        let mut keys = Vec::with_capacity(n);
+        while pos < code.len() - 2 {
+            ensure!(keys.len() < n, "unsupported multisig script");
+            let end = pos + 1 + code[pos] as usize;
+            ensure!(end <= code.len() - 2, "unsupported multisig script");
+            let key = &code[pos + 1..end];
+            ensure!(valid_key(key, witness), "unsupported multisig key");
+            keys.push(key);
+            pos = end;
+        }
+        ensure!(keys.len() == n, "unsupported multisig script");
+        return Ok(EcdsaTemplate::Multisig { required, keys });
+    }
+    bail!("unsupported spending script template")
+}
+
 /// Only fully understood signature-bearing templates are accepted. In particular
 /// OP_SUCCESS, future leaf/key versions and arbitrary scripts cannot imply verified signatures.
 fn ecdsa_stack<'a>(
@@ -370,50 +632,26 @@ fn ecdsa_stack<'a>(
     stack: &[&'a [u8]],
     witness: bool,
 ) -> eyre::Result<Vec<&'a [u8]>> {
-    if script.is_p2pkh() {
-        ensure!(
-            stack.len() == 2 && valid_key(stack[1], witness),
-            "invalid P2PKH stack"
-        );
-        return Ok(vec![stack[0]]);
-    }
-    let code = script.as_bytes();
-    if matches!(code.first(), Some(33 | 65))
-        && code.len() == code[0] as usize + 2
-        && code.last() == Some(&(Opcode::OP_CHECKSIG as u8))
-        && valid_key(&code[1..code.len() - 1], witness)
-    {
-        ensure!(stack.len() == 1, "invalid P2PK stack");
-        return Ok(vec![stack[0]]);
-    }
-    // Canonical m-of-n CHECKMULTISIG with actual compressed/uncompressed keys.
-    if code.len() >= 3 && (0x51..=0x60).contains(&code[0]) && code.last() == Some(&0xae) {
-        let m = (code[0] - 0x50) as usize;
-        let n = code[code.len() - 2].wrapping_sub(0x50) as usize;
-        let mut pos = 1;
-        let mut keys = 0;
-        while pos < code.len() - 2 {
-            let len = code[pos] as usize;
-            let end = pos + 1 + len;
-            ensure!(end <= code.len() - 2, "unsupported multisig script");
+    match ecdsa_template(script, witness)? {
+        EcdsaTemplate::KeyHash(_) => {
             ensure!(
-                valid_key(&code[pos + 1..end], witness),
-                "unsupported multisig key"
+                stack.len() == 2 && valid_key(stack[1], witness),
+                "invalid P2PKH stack"
             );
-            keys += 1;
-            pos = end;
+            Ok(vec![stack[0]])
         }
-        ensure!(
-            n <= 16 && m <= n && keys == n,
-            "unsupported multisig script"
-        );
-        ensure!(
-            stack.len() == m + 1 && stack[0].is_empty(),
-            "invalid multisig stack"
-        );
-        return Ok(stack[1..].to_vec());
+        EcdsaTemplate::Key(_) => {
+            ensure!(stack.len() == 1, "invalid P2PK stack");
+            Ok(vec![stack[0]])
+        }
+        EcdsaTemplate::Multisig { required, .. } => {
+            ensure!(
+                stack.len() == required + 1 && stack[0].is_empty(),
+                "invalid multisig stack"
+            );
+            Ok(stack[1..].to_vec())
+        }
     }
-    bail!("unsupported spending script template")
 }
 
 fn witness_signatures(witness: &Witness, program: &Script) -> eyre::Result<Vec<Vec<u8>>> {
@@ -492,29 +730,29 @@ fn input_signatures(
     ))
 }
 
-fn check_sighash(sig: &[u8], taproot: bool, declared: Option<u32>) -> eyre::Result<()> {
+fn check_sighash(sig: &[u8], taproot: bool, declared: Option<u32>) -> eyre::Result<SighashType> {
     let hash_type = if taproot {
         match sig.len() {
             64 => 0,
             65 if sig[64] != 0 => sig[64] as u32,
-            _ => bail!("invalid finalized Taproot signature encoding"),
+            _ => bail!("invalid Taproot signature encoding"),
         }
     } else {
         ensure!(
             (9..=73).contains(&sig.len()),
-            "invalid finalized ECDSA signature encoding"
+            "invalid ECDSA signature encoding"
         );
         sig[sig.len() - 1] as u32
     };
     ensure!(
         taproot && hash_type == 0 || matches!(hash_type, 1 | 2 | 3 | 0x81 | 0x82 | 0x83),
-        "unsupported finalized signature sighash type"
+        "unsupported signature sighash type"
     );
     ensure!(
         declared.is_none_or(|value| value == hash_type),
-        "finalized signature differs from declared sighash type"
+        "signature differs from declared sighash type"
     );
-    Ok(())
+    Ok(SighashType(hash_type))
 }
 
 fn value_sum(mut values: impl Iterator<Item = i64>) -> eyre::Result<i64> {
@@ -529,11 +767,8 @@ fn value_sum(mut values: impl Iterator<Item = i64>) -> eyre::Result<i64> {
     })
 }
 
-/// Verify final spending conditions using real ECDSA/Schnorr equations and every
-/// supplied prevout. Known templates only; no chain lookup, maturity/finality,
-/// fee policy, key-origin or unused partial-signature claim is made.
-pub fn verify_finalized_psbt(psbt: &Psbt) -> eyre::Result<VerifiedPsbt> {
-    let tx = psbt.clone().finalize()?;
+/// Check transaction shape/value conservation and resolve all supplied prevouts.
+fn verification_context(psbt: &Psbt, tx: &Transaction) -> eyre::Result<(Vec<TxOut>, i64)> {
     ensure!(
         !tx.inputs.is_empty() && !tx.outputs.is_empty(),
         "empty transaction"
@@ -562,6 +797,15 @@ pub fn verify_finalized_psbt(psbt: &Psbt) -> eyre::Result<VerifiedPsbt> {
         input_value >= output_value,
         "outputs exceed supplied input values"
     );
+    Ok((prevouts, input_value - output_value))
+}
+
+/// Verify final spending conditions using real ECDSA/Schnorr equations and every
+/// supplied prevout. Known templates only; no chain lookup, maturity/finality,
+/// fee policy, key-origin or unused partial-signature claim is made.
+pub fn verify_finalized_psbt(psbt: &Psbt) -> eyre::Result<VerifiedPsbt> {
+    let tx = psbt.clone().finalize()?;
+    let (prevouts, fee_sat) = verification_context(psbt, &tx)?;
     let verifier = WalletVerifier::default();
     for (index, output) in prevouts.iter().enumerate() {
         let (signatures, taproot, witness) =
@@ -585,8 +829,177 @@ pub fn verify_finalized_psbt(psbt: &Psbt) -> eyre::Result<VerifiedPsbt> {
     }
     Ok(VerifiedPsbt {
         transaction: tx,
-        fee_sat: input_value - output_value,
+        fee_sat,
         signatures_checked: verifier.0.load(Ordering::Relaxed),
+        txid_linked_prevouts: psbt
+            .inputs
+            .iter()
+            .map(|input| input.non_witness_utxo.is_some())
+            .collect(),
+    })
+}
+
+/// Resolve the exact scriptCode and BIP143/legacy mode. PSBT serialization has
+/// already checked the supplied redeem/witness scripts against their commitments.
+fn partial_script_code(output: &Script, input: &PsbtInput) -> eyre::Result<(ScriptBuf, bool)> {
+    let program = if output.is_p2sh() {
+        input
+            .redeem_script
+            .as_ref()
+            .ok_or_else(|| eyre::eyre!("missing redeem script"))?
+            .as_script()
+    } else {
+        output
+    };
+    if program.is_p2wpkh() {
+        return Ok((
+            ScriptBuf::from_bytes(p2wpkh_script_code(&program.as_bytes()[2..].try_into()?)),
+            true,
+        ));
+    }
+    if program.is_p2wsh() {
+        return Ok((
+            input
+                .witness_script
+                .clone()
+                .ok_or_else(|| eyre::eyre!("missing witness script"))?,
+            true,
+        ));
+    }
+    ensure!(!program.is_witness_program(), "unsupported witness program");
+    Ok((program.to_owned(), false))
+}
+
+fn verify_partial_input(
+    psbt: &Psbt,
+    index: usize,
+    prevouts: &[TxOut],
+    verifier: &WalletVerifier,
+) -> eyre::Result<usize> {
+    let input = &psbt.inputs[index];
+    ensure!(
+        input.final_script_sig.is_none() && input.final_script_witness.is_none(),
+        "partial verification requires an unfinalized input"
+    );
+    let count = input.partial_sigs.len()
+        + usize::from(input.tap_key_sig.is_some())
+        + input.tap_script_sigs.len();
+    ensure!(count > 0, "missing partial signatures");
+    let output = &prevouts[index];
+    let tx = &psbt.unsigned_tx;
+    if output.script_pubkey.is_p2tr() {
+        // BIP371 binds key signatures directly to Q, not the internal key.
+        let q = &output.script_pubkey.as_bytes()[2..];
+        if let Some(sig) = &input.tap_key_sig {
+            let hash_type = check_sighash(sig, true, input.sighash_type)?;
+            let hash = sighash_taproot(tx, index, prevouts, hash_type, None, None)?;
+            ensure!(
+                verifier.verify_schnorr(&hash, &sig[..64], q)?,
+                "partial signature equation failed"
+            );
+        }
+        // Leaf/control proofs are bound to Q by try_serialize; indexing their
+        // actual hashes avoids trusting a signature's leaf-hash label or doing
+        // quadratic scans across many supplied leaves.
+        let leaves: HashMap<_, _> = input
+            .tap_leaf_scripts
+            .iter()
+            .map(|(_, leaf)| {
+                (
+                    btc_primitives::taproot::tap_leaf_hash(
+                        leaf.leaf_version,
+                        leaf.script.as_bytes(),
+                    ),
+                    leaf,
+                )
+            })
+            .collect();
+        for (record, sig) in &input.tap_script_sigs {
+            let leaf_hash: [u8; 32] = record[32..].try_into()?;
+            let leaf = leaves
+                .get(&leaf_hash)
+                .ok_or_else(|| eyre::eyre!("missing committed Taproot leaf for signature"))?;
+            let code = leaf.script.as_bytes();
+            ensure!(
+                leaf.leaf_version == 0xc0 && code.len() == 34 && code[0] == 32 && code[33] == 0xac,
+                "unsupported tapscript template"
+            );
+            ensure!(
+                code[1..33] == record[..32],
+                "partial signature key does not belong to Taproot leaf"
+            );
+            let hash_type = check_sighash(sig, true, input.sighash_type)?;
+            let hash = sighash_taproot(tx, index, prevouts, hash_type, None, Some(&leaf_hash))?;
+            ensure!(
+                verifier.verify_schnorr(&hash, &sig[..64], &record[..32])?,
+                "partial signature equation failed"
+            );
+        }
+        ensure!(
+            input.partial_sigs.is_empty(),
+            "ECDSA partial signature on Taproot input"
+        );
+    } else {
+        ensure!(
+            input.tap_key_sig.is_none() && input.tap_script_sigs.is_empty(),
+            "Taproot signature on non-Taproot input"
+        );
+        let (code, witness) = partial_script_code(output.script_pubkey.as_script(), input)?;
+        ensure!(
+            witness || input.non_witness_utxo.is_some(),
+            "legacy verification requires non-witness UTXO"
+        );
+        let template = ecdsa_template(code.as_script(), witness)?;
+        for (key, sig) in &input.partial_sigs {
+            ensure!(valid_key(key, witness), "unsupported partial signature key");
+            let belongs = match &template {
+                EcdsaTemplate::KeyHash(expected) => hash160(key).as_slice() == *expected,
+                EcdsaTemplate::Key(expected) => key.as_slice() == *expected,
+                EcdsaTemplate::Multisig { keys, .. } => keys.contains(&key.as_slice()),
+            };
+            ensure!(
+                belongs,
+                "partial signature key does not belong to spending script"
+            );
+            let hash_type = check_sighash(sig, false, input.sighash_type)?;
+            let hash = if witness {
+                sighash_segwit_v0(tx, index, code.as_bytes(), output.value.as_sat(), hash_type)?
+            } else {
+                sighash_legacy(tx, index, code.as_bytes(), hash_type)?
+            };
+            ensure!(
+                verifier.verify_ecdsa(&hash, &sig[..sig.len() - 1], key)?,
+                "partial signature equation failed"
+            );
+        }
+    }
+    Ok(count)
+}
+
+/// Verify every supplied partial record for each unfinalized input. This does not
+/// establish a sufficient set of signatures, final spending conditions, origins
+/// or chain admission. Taproot context is no annex, with known single-key leaves
+/// (no OP_CODESEPARATOR); unsupported or missing context returns an error.
+pub fn verify_partial_signatures(psbt: &Psbt) -> eyre::Result<VerifiedPartialSignatures> {
+    psbt.try_serialize()?;
+    let (prevouts, fee_sat) = verification_context(psbt, &psbt.unsigned_tx)?;
+    let verifier = WalletVerifier::default();
+    let signatures_per_input = (0..psbt.inputs.len())
+        .map(|index| {
+            verify_partial_input(psbt, index, &prevouts, &verifier)
+                .wrap_err_with(|| format!("input {index}: partial verification failed"))
+        })
+        .collect::<eyre::Result<Vec<_>>>()?;
+    let signatures_checked = verifier.0.load(Ordering::Relaxed);
+    ensure!(
+        signatures_checked == signatures_per_input.iter().sum::<usize>(),
+        "partial signature verification count differs"
+    );
+    Ok(VerifiedPartialSignatures {
+        unsigned_transaction: psbt.unsigned_tx.clone(),
+        fee_sat,
+        signatures_checked,
+        signatures_per_input,
         txid_linked_prevouts: psbt
             .inputs
             .iter()

@@ -244,6 +244,27 @@ pub fn verify_psbt(hex_str: &str) -> eyre::Result<serde_json::Value> {
     }))
 }
 
+/// Verify present partial records, without claiming final script satisfaction.
+pub fn verify_psbt_partials(hex_str: &str) -> eyre::Result<serde_json::Value> {
+    let verified = crate::wallet::verify_partial_signatures(&parse_psbt_hex(hex_str)?)?;
+    Ok(serde_json::json!({
+        "unsigned_tx_hex": hex::encode(btc_primitives::encode(&verified.unsigned_transaction)),
+        "unsigned_txid": verified.unsigned_transaction.txid().to_hex(),
+        "verification_scope": "partial_signatures_against_supplied_prevouts",
+        "signatures_verified": true,
+        "partial_signatures_verified": true,
+        "signatures_checked": verified.signatures_checked,
+        "signatures_per_input": verified.signatures_per_input,
+        "spending_conditions_verified": false,
+        "final_fields_verified": false,
+        "key_origins_verified": false,
+        "active_chain_verified": false,
+        "taproot_annex_present": false,
+        "txid_linked_prevouts": verified.txid_linked_prevouts,
+        "fee_sat": verified.fee_sat,
+    }))
+}
+
 /// Decode a raw transaction hex string and return a JSON representation.
 pub fn decode_tx(hex_str: &str) -> eyre::Result<serde_json::Value> {
     let bytes = hex::decode(hex_str)?;

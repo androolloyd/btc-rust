@@ -10,6 +10,7 @@ btc-node --json convert-psbt "$PSBT_HEX" --version 2
 btc-node --json convert-psbt "$PSBT_V2_HEX" --version 0
 btc-node --json extract-psbt "$FINALIZED_PSBT_HEX"
 btc-node --json verify-psbt "$FINALIZED_PSBT_HEX"
+btc-node --json verify-psbt "$PARTIALLY_SIGNED_PSBT_HEX" --partial
 ```
 
 Inspection reports the actual unsigned transaction, PSBT version, resolved
@@ -66,6 +67,33 @@ partial records and key origins are not verified, and this offline command does
 not establish confirmation, unspentness, maturity, chain finality, activation at
 a historical height, mempool fee/standardness policy or full Core consensus parity.
 Submit the verified transaction through a validating node for chain admission.
+
+`verify-psbt --partial` checks every supplied partial ECDSA, Taproot key and
+Taproot script signature before finalization. Each input must be unfinalized,
+have a resolved UTXO and contain at least one partial signature. It binds ECDSA
+keys to the known P2PKH/P2PK/multisig script, using the exact legacy or BIP143
+scriptCode and supplied amount. Native/wrapped witness-v0 templates and legacy
+P2SH with known key/multisig redeem scripts are supported. Legacy inputs still
+require full parent transactions; the witness-only amount attack is rejected.
+Missing redeem/witness scripts, unrelated keys and unsupported templates fail.
+Taproot key signatures verify against the actual output key Q. Each script
+signature must name a supplied, committed version-c0 single-key CHECKSIG leaf
+and its actual key; unknown leaf hashes or missing controls/scripts fail.
+All prevouts enter the BIP341 digest where required. This mode uses no annex and
+no OP_CODESEPARATOR, because its supported partial-record context has neither.
+Finalized inputs are rejected; annex-bearing final witnesses belong to the
+separate final-spend verification path.
+
+On success, partial mode sets `partial_signatures_verified` and
+`signatures_verified` to true, reports `signatures_checked` and
+`signatures_per_input`, and returns `unsigned_tx_hex`/`unsigned_txid`.
+It never returns broadcast transaction bytes. The scope is
+`partial_signatures_against_supplied_prevouts`; `spending_conditions_verified`,
+`final_fields_verified`, `key_origins_verified` and `active_chain_verified` remain
+false. One valid signature in a 2-of-2 multisig verifies successfully while the
+transaction remains incomplete. This operation is read-only: it neither signs
+nor finalizes inputs. Full key-origin proofs, arbitrary script satisfaction,
+wallet signing and chain admission remain separate work.
 
 V2 serialization excludes the global unsigned transaction and includes transaction
 version, counts, per-input prevouts, and per-output amounts/scripts. Optional
@@ -159,7 +187,7 @@ records validates these relationships before changing the receiver.
 These checks validate encoding and metadata consistency. Parsing does not
 validate signature equations, complete sighash context, full claimed key
 derivations or script satisfactions. Remaining
-BIP174/371 partial-signature/general-script context and full key-origin verification, witness-only legacy signing restrictions,
+BIP174/371 general-script/annex context and full key-origin verification, witness-only legacy signing restrictions,
 active-chain/unspentness checks, wallet signing/finalization,
 descriptor operations and MuSig2 remain unfinished. Empty v2 creator maps can be
 represented; converting an empty-input creator to v0 is rejected by the legacy

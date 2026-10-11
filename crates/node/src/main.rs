@@ -168,8 +168,13 @@ enum Commands {
     /// Extract externally finalized PSBT fields (does not verify signatures)
     ExtractPsbt { hex: String },
 
-    /// Verify supported finalized PSBT spends against supplied prevouts (offline)
-    VerifyPsbt { hex: String },
+    /// Verify supported PSBT signatures against supplied prevouts (offline)
+    VerifyPsbt {
+        hex: String,
+        /// Check partial signatures on unfinalized inputs instead of final spends
+        #[arg(long)]
+        partial: bool,
+    },
 
     /// Decode a raw script hex
     DecodeScript {
@@ -313,8 +318,13 @@ async fn main() -> eyre::Result<()> {
             output::emit(format, &cli::extract_psbt(&hex)?);
             Ok(())
         }
-        Some(Commands::VerifyPsbt { hex }) => {
-            output::emit(format, &cli::verify_psbt(&hex)?);
+        Some(Commands::VerifyPsbt { hex, partial }) => {
+            let verified = if partial {
+                cli::verify_psbt_partials(&hex)?
+            } else {
+                cli::verify_psbt(&hex)?
+            };
+            output::emit(format, &verified);
             Ok(())
         }
         Some(Commands::DecodeScript { hex }) => cmd_decode_script(&hex, format),
