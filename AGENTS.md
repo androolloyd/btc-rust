@@ -16,10 +16,14 @@ then the remaining runtime backends. Resolve routine choices without asking.
 - Use `./scripts/check.sh` as the final local gate. Run focused tests while
   iterating, and keep `Cargo.lock` synchronized with dependency changes.
 - Update the build plan with actual acceptance results and remaining work.
-- The user authorized keeping the repository updated: commit verified changes
-  and push them to `codex/review-bip-runtime-fixes`, maintaining its draft PR.
+- The user authorized keeping the repository updated without pull requests.
+  Review changes yourself and commit verified milestones to
+  `codex/review-bip-runtime-fixes`. Do not create PRs or require user review.
+  Direct updates to `main` and closing the existing draft are pending explicit
+  authorization after automatic approval review rejected those actions.
   Preserve unrelated user changes. Use normal pushes; do not force-push.
-  Merging, releases, deployment and external messages need separate authorization.
+  Main integration, releases, deployment and external messages need separate
+  authorization.
 - When SSH authentication is unavailable, use authenticated HTTPS with the
   GitHub CLI credential helper; never print or embed raw access tokens.
 

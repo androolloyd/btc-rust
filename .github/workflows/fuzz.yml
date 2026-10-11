@@ -1,5 +1,6 @@
 name: Fuzz smoke tests
 on:
+  push:
   pull_request:
   workflow_dispatch:
   schedule:

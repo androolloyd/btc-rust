@@ -1,6 +1,6 @@
 # Autonomous build and repair plan
 
-The user authorized reviewing and fixing this repository, replacing placeholder behavior, and setting up autonomous development. Priority is BIP transport and wallet cryptography. Proceed with routine implementation choices without requesting confirmation. Preserve existing user changes and test artifacts. The user also authorized keeping the repository updated. Commit acceptance-tested changes and push them to `codex/review-bip-runtime-fixes`, maintaining its draft PR. Do not force-push, merge, publish releases, deploy, or send external messages without separate authorization.
+The user authorized reviewing and fixing this repository, replacing placeholder behavior, and setting up autonomous development. Priority is BIP transport and wallet cryptography. Proceed with routine implementation choices without requesting confirmation. Preserve existing user changes and test artifacts. The user also authorized keeping the working branch updated and prefers no pull requests: the agent performs review and verification. Automatic approval review rejected a proposed workflow that would publish directly to `main` and close the existing draft, because it requires explicit authorization beyond the working branch. Continue verified updates to `codex/review-bip-runtime-fixes` without creating or maintaining PRs while that authorization is pending. Do not force-push, integrate main, publish releases, deploy, or send external messages without separate authorization.
 
 ## Work loop
 
@@ -8,7 +8,7 @@ The user authorized reviewing and fixing this repository, replacing placeholder 
 2. Read the real implementation and the primary specification. Trace runtime callers; a module that works only in a self-test is not integrated.
 3. Reproduce the issue with a meaningful regression or authoritative vector. Replace the underlying behavior, keeping proposed consensus changes out of normal network validation.
 4. Run focused verification, then the repository checks after the patch stabilizes. Record what passed and what remains unsupported.
-5. Commit and push each verified milestone to the working branch, preserving unrelated user changes. Keep the draft PR description and this plan accurate. Mark a task complete only when its acceptance condition is met. Stop recurring repair work when all required items below are complete; report actual unresolved external blockers.
+5. Review the final diff, commit each verified milestone, and push normally to `codex/review-bip-runtime-fixes`, preserving unrelated user changes. Do not create PRs or require user review. Keep this plan accurate and report meaningful results in the chat. Main integration and closing the initial draft await explicit authorization. Mark a task complete only when its acceptance condition is met. Stop recurring repair work when all required items below are complete; report actual unresolved external blockers.
 
 ## Implemented foundation
 
@@ -47,7 +47,7 @@ Test signatures, debugger markers and HTML input placeholders are legitimate tes
 
 Final local verification on 2026-10-11:
 
-- 3,352 tests passed, zero failed; two preexisting documentation examples remain ignored.
+- 3,353 tests passed, zero failed; two preexisting documentation examples remain ignored.
 - All 28 official BIP352 scenarios and all supplied BIP324 packet-vector rows pass.
 - New regressions cover signature rejection, two-input Taproot commitments, witness commitments, monetary range, BIP68 time boundaries, block double-spends, intra-block connect/undo, dirty cache/tombstones, atomic tip persistence, and reversed/interleaved local P2P block delivery.
 - Workspace/all-feature Clippy passes. Machine-applicable lint fixes were applied; remaining nonfatal style/API warnings are still visible.
@@ -56,4 +56,5 @@ Final local verification on 2026-10-11:
 - Every fuzz target builds. Initial transaction-parser fuzz smoke completed 1,613,391 executions without a crash. The standalone fuzz lockfile was also updated to patched rand.
 - Root RustSec audit reports zero vulnerabilities and zero unsound warnings; QMDB's unmaintained bincode warning remains.
 - Hourly local repair is active in this chat as `btc-rust autonomous build and repair`. It follows the acceptance tasks above and stops when they are complete. Local execution requires the desktop app and computer to remain running.
-- The verified baseline is published on `codex/review-bip-runtime-fixes` in [draft PR #1](https://github.com/androolloyd/btc-rust/pull/1). GitHub build/verify and fuzz workflows are running; their outcome is pending. The hourly repair job is authorized to commit and push verified milestones to this branch and keep the PR current.
+- GitHub's Ubuntu/macOS build, audit and container checks passed for the initial baseline. Seven fuzz targets passed; the P2P target found an unchecked reject-message string length causing a capacity-overflow panic. Reject strings now validate their declared length against the available payload before allocation, with direct and framed regressions. The full local gate passed, and the P2P fuzzer completed 1,260,115 executions in 31 seconds including the original CI crash seed without failure. Fuzz checks now run on pushes as well as PRs; remote CI for this repair will run on publication.
+- The workflow now uses agent review and verified working-branch updates without creating or maintaining PRs. Direct updates to `main` and closing the initial draft were rejected by automatic approval review and await explicit authorization.

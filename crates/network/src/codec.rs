@@ -239,6 +239,19 @@ fn decode_addr_vec<R: Read>(r: &mut R) -> Result<Vec<NetAddress>, EncodeError> {
     Ok(addrs)
 }
 
+/// Check a var_str against the complete payload before converting or allocating.
+fn decode_payload_string(cursor: &mut Cursor<&[u8]>) -> Result<String, EncodeError> {
+    let len = VarInt::decode(cursor)?.0;
+    let remaining = cursor.get_ref().len() as u64 - cursor.position();
+    if len > remaining {
+        return Err(EncodeError::InvalidData(
+            "string length exceeds remaining payload".into(),
+        ));
+    }
+    let bytes = cursor.read_bytes(len as usize)?;
+    String::from_utf8(bytes).map_err(|e| EncodeError::InvalidData(e.to_string()))
+}
+
 // ---------------------------------------------------------------------------
 // Serialize a NetworkMessage to its payload bytes
 // ---------------------------------------------------------------------------
@@ -323,6 +336,9 @@ pub fn encode_payload(msg: &NetworkMessage) -> Result<Vec<u8>, EncodeError> {
 
 /// Deserialize a NetworkMessage payload given the command string.
 pub fn decode_payload(command: &str, payload: &[u8]) -> Result<NetworkMessage, EncodeError> {
+    if payload.len() > MAX_PAYLOAD_SIZE as usize {
+        return Err(EncodeError::InvalidData("payload too large".into()));
+    }
     let mut cursor = Cursor::new(payload);
     match command {
         "version" => Ok(NetworkMessage::Version(decode_version(&mut cursor)?)),
@@ -356,17 +372,11 @@ pub fn decode_payload(command: &str, payload: &[u8]) -> Result<NetworkMessage, E
         "notfound" => Ok(NetworkMessage::NotFound(decode_inv_vec(&mut cursor)?)),
         "reject" => {
             // var_str message
-            let msg_len = VarInt::decode(&mut cursor)?.0 as usize;
-            let msg_bytes = cursor.read_bytes(msg_len)?;
-            let message = String::from_utf8(msg_bytes)
-                .map_err(|e| EncodeError::InvalidData(e.to_string()))?;
+            let message = decode_payload_string(&mut cursor)?;
             // u8 code
             let code = cursor.read_u8()?;
             // var_str reason
-            let reason_len = VarInt::decode(&mut cursor)?.0 as usize;
-            let reason_bytes = cursor.read_bytes(reason_len)?;
-            let reason = String::from_utf8(reason_bytes)
-                .map_err(|e| EncodeError::InvalidData(e.to_string()))?;
+            let reason = decode_payload_string(&mut cursor)?;
             // remaining bytes are extra data (e.g. txid/block hash)
             let pos = cursor.position() as usize;
             let data = payload[pos..].to_vec();
@@ -1547,6 +1557,32 @@ mod tests {
                 assert_eq!(data.len(), 32);
             }
             other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_reject_lengths_are_bounded_by_payload() {
+        // The CI fuzzer found a capacity-overflow panic with an 0xff prefix
+        // followed by u64::MAX. Both strings must be checked before allocation.
+        for len in [1, 256, u32::MAX as u64 + 1, u64::MAX] {
+            for prefix in [vec![], vec![2, b't', b'x', 0x10]] {
+                let mut payload = prefix;
+                VarInt(len).encode(&mut payload).unwrap();
+                assert!(matches!(
+                    decode_payload("reject", &payload),
+                    Err(EncodeError::InvalidData(_))
+                ));
+
+                // Exercise the real framed network path with a valid checksum.
+                let header = MessageHeader::new(Network::Mainnet.magic(), "reject", &payload);
+                let mut frame = Vec::new();
+                header.encode(&mut frame).unwrap();
+                frame.extend_from_slice(&payload);
+                let error = mainnet_codec()
+                    .decode(&mut BytesMut::from(frame.as_slice()))
+                    .unwrap_err();
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            }
         }
     }
 

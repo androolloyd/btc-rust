@@ -17,6 +17,7 @@ This is an experimental implementation. A green unit suite does not establish Bi
 - **P1 — fake Signet validation:** solution parsing now reads optional data from the selected coinbase commitment, constructs the two BIP325 virtual transactions, and executes the actual challenge. Corrected the default operator key; its derived network magic matches Core.
 - **P1 — BIP39 Unicode seed mismatch:** passphrases and mnemonic text are normalized with NFKD before PBKDF2.
 - **P1 — permissive decoding:** full-buffer decoding rejects trailing bytes, CompactSize rejects nonminimal forms, and transactions reject a superfluous witness record. Stream decoding remains composable. Two preexisting transaction fixtures contained an extra byte and were corrected.
+- **P1 — remotely triggered reject parser panic:** CI fuzzing found that a reject string declaring `u64::MAX` bytes caused a capacity-overflow panic. Both string lengths are now checked against the remaining payload before allocation; direct and correctly checksummed framed regressions cover oversized and truncated lengths.
 - **P1 — monetary arithmetic:** block connection rejects invalid values and checked totals beyond MAX_MONEY rather than risking signed overflow or negative-output inflation.
 - **Tooling:** fixed the all-feature FFI build, marked raw-pointer exports unsafe for Rust callers, routed legacy FFI through the input verifier, fixed fatal Clippy diagnostics, corrected the CLI RPC client, pinned Rust 1.88, included lockfiles, made the normal root build include btc-node, fixed the container build, and added CI and fuzz workflows.
 - **Dependencies:** updated crossbeam-epoch, anyhow, and both rand release lines to patched compatible versions. QMDB still uses unmaintained bincode 1.3; replacing that serialization is a separate migration.
@@ -32,6 +33,7 @@ The full workspace suite, official crypto vectors, feature-minimal checks, Clipp
 ## Primary references
 
 - [Bitcoin Core serialization](https://github.com/bitcoin/bitcoin/blob/master/src/serialize.h)
+- [BIP61 reject message format](https://github.com/bitcoin/bips/blob/master/bip-0061.mediawiki)
 - [BIP141](https://github.com/bitcoin/bips/blob/master/bip-0141.mediawiki), [BIP341](https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki), [BIP68](https://github.com/bitcoin/bips/blob/master/bip-0068.mediawiki), [BIP113](https://github.com/bitcoin/bips/blob/master/bip-0113.mediawiki)
 - [BIP324](https://github.com/bitcoin/bips/blob/master/bip-0324.mediawiki) and [packet vectors](https://github.com/bitcoin/bips/blob/master/bip-0324/packet_encoding_test_vectors.csv)
 - [BIP352](https://github.com/bitcoin/bips/blob/master/bip-0352.mediawiki) and [send/receive vectors](https://github.com/bitcoin/bips/blob/master/bip-0352/send_and_receive_test_vectors.json)
