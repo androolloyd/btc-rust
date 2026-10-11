@@ -5,10 +5,10 @@
 //! magic bytes `0x70736274ff` ("psbt" + 0xff separator) followed by key-value
 //! maps: one global map, then per-input and per-output maps separated by 0x00.
 
-use crate::encode::{Encodable, Decodable, EncodeError, VarInt};
+use crate::encode::{Decodable, Encodable, EncodeError, VarInt};
 use crate::script::ScriptBuf;
 use crate::transaction::{Transaction, TxOut, Witness};
-use std::io::{self, Read, Write, Cursor};
+use std::io::{self, Cursor, Read, Write};
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
@@ -291,7 +291,8 @@ impl Psbt {
     /// Serialize the PSBT to its binary representation.
     pub fn serialize(&self) -> Vec<u8> {
         let mut buf = Vec::new();
-        self.serialize_to(&mut buf).expect("serializing to Vec should not fail");
+        self.serialize_to(&mut buf)
+            .expect("serializing to Vec should not fail");
         buf
     }
 
@@ -542,9 +543,8 @@ impl Psbt {
                     if value.len() != 4 {
                         return Err(PsbtError::Other("invalid sighash_type length".into()));
                     }
-                    inp.sighash_type = Some(u32::from_le_bytes([
-                        value[0], value[1], value[2], value[3],
-                    ]));
+                    inp.sighash_type =
+                        Some(u32::from_le_bytes([value[0], value[1], value[2], value[3]]));
                 }
                 PSBT_IN_REDEEM_SCRIPT => {
                     inp.redeem_script = Some(ScriptBuf::from_bytes(value));
@@ -899,11 +899,17 @@ mod tests {
         ));
         psbt.inputs[0].bip32_derivation.push((
             vec![0x02; 33],
-            ([0xDE, 0xAD, 0xBE, 0xEF], vec![44 | 0x80000000, 0 | 0x80000000, 0]),
+            (
+                [0xDE, 0xAD, 0xBE, 0xEF],
+                vec![44 | 0x80000000, 0x80000000, 0],
+            ),
         ));
         psbt.outputs[0].bip32_derivation.push((
             vec![0x03; 33],
-            ([0xCA, 0xFE, 0xBA, 0xBE], vec![44 | 0x80000000, 0 | 0x80000000, 1]),
+            (
+                [0xCA, 0xFE, 0xBA, 0xBE],
+                vec![44 | 0x80000000, 0x80000000, 1],
+            ),
         ));
 
         let bytes = psbt.serialize();
@@ -978,8 +984,14 @@ mod tests {
         psbt_a.merge(&psbt_b).unwrap();
 
         assert_eq!(psbt_a.inputs[0].partial_sigs.len(), 2);
-        assert!(psbt_a.inputs[0].partial_sigs.iter().any(|(k, v)| k == &pubkey_a && v == &sig_a));
-        assert!(psbt_a.inputs[0].partial_sigs.iter().any(|(k, v)| k == &pubkey_b && v == &sig_b));
+        assert!(psbt_a.inputs[0]
+            .partial_sigs
+            .iter()
+            .any(|(k, v)| k == &pubkey_a && v == &sig_a));
+        assert!(psbt_a.inputs[0]
+            .partial_sigs
+            .iter()
+            .any(|(k, v)| k == &pubkey_b && v == &sig_b));
     }
 
     #[test]
@@ -1175,14 +1187,12 @@ mod tests {
         let mut psbt_a = Psbt::from_unsigned_tx(tx.clone()).unwrap();
         let mut psbt_b = Psbt::from_unsigned_tx(tx).unwrap();
 
-        psbt_a.inputs[0].bip32_derivation.push((
-            vec![0x02; 33],
-            ([0xAA; 4], vec![44 | 0x80000000, 0]),
-        ));
-        psbt_b.inputs[0].bip32_derivation.push((
-            vec![0x03; 33],
-            ([0xBB; 4], vec![44 | 0x80000000, 1]),
-        ));
+        psbt_a.inputs[0]
+            .bip32_derivation
+            .push((vec![0x02; 33], ([0xAA; 4], vec![44 | 0x80000000, 0])));
+        psbt_b.inputs[0]
+            .bip32_derivation
+            .push((vec![0x03; 33], ([0xBB; 4], vec![44 | 0x80000000, 1])));
 
         psbt_a.merge(&psbt_b).unwrap();
         assert_eq!(psbt_a.inputs[0].bip32_derivation.len(), 2);
@@ -1207,23 +1217,23 @@ mod tests {
     #[test]
     fn test_psbt_error_display() {
         let e1 = PsbtError::InvalidMagic;
-        assert!(format!("{}", e1).contains("magic"));
+        assert!(format!("{e1}").contains("magic"));
         let e2 = PsbtError::MissingUnsignedTx;
-        assert!(format!("{}", e2).contains("missing"));
+        assert!(format!("{e2}").contains("missing"));
         let e3 = PsbtError::InputCountMismatch { psbt: 1, tx: 2 };
-        assert!(format!("{}", e3).contains("1"));
+        assert!(format!("{e3}").contains("1"));
         let e4 = PsbtError::OutputCountMismatch { psbt: 3, tx: 4 };
-        assert!(format!("{}", e4).contains("3"));
+        assert!(format!("{e4}").contains("3"));
         let e5 = PsbtError::NonEmptyScriptSig;
-        assert!(format!("{}", e5).contains("empty"));
+        assert!(format!("{e5}").contains("empty"));
         let e6 = PsbtError::TxMismatch;
-        assert!(format!("{}", e6).contains("mismatch"));
+        assert!(format!("{e6}").contains("mismatch"));
         let e7 = PsbtError::NotFinalized { index: 0 };
-        assert!(format!("{}", e7).contains("0"));
+        assert!(format!("{e7}").contains("0"));
         let e8 = PsbtError::DuplicateKey(vec![0x01]);
-        assert!(format!("{}", e8).contains("duplicate"));
+        assert!(format!("{e8}").contains("duplicate"));
         let e9 = PsbtError::Other("custom".into());
-        assert!(format!("{}", e9).contains("custom"));
+        assert!(format!("{e9}").contains("custom"));
     }
 
     #[test]
@@ -1239,7 +1249,10 @@ mod tests {
                 value: Amount::from_sat(50_000),
                 script_pubkey: ScriptBuf::p2wpkh(&[0u8; 20]),
             }],
-            witness: vec![crate::transaction::Witness::from_items(vec![vec![0x30; 72]])],
+            witness: vec![crate::transaction::Witness::from_items(vec![vec![
+                0x30;
+                72
+            ]])],
             lock_time: 0,
         };
         assert!(Psbt::from_unsigned_tx(tx).is_err());
@@ -1320,12 +1333,18 @@ mod tests {
         psbt_b.inputs[0].tap_key_sig = Some(vec![0x55; 64]);
         psbt_b.inputs[0].tap_internal_key = Some(vec![0x56; 32]);
         psbt_b.inputs[0].tap_merkle_root = Some([0x57; 32]);
-        psbt_b.inputs[0].tap_script_sigs.push((vec![0x58; 64], vec![0x59; 65]));
-        psbt_b.inputs[0].unknown.push((vec![0xFE, 0x01], vec![0x60]));
+        psbt_b.inputs[0]
+            .tap_script_sigs
+            .push((vec![0x58; 64], vec![0x59; 65]));
+        psbt_b.inputs[0]
+            .unknown
+            .push((vec![0xFE, 0x01], vec![0x60]));
         psbt_b.outputs[0].redeem_script = Some(ScriptBuf::from_bytes(vec![0x61]));
         psbt_b.outputs[0].witness_script = Some(ScriptBuf::from_bytes(vec![0x62]));
         psbt_b.outputs[0].tap_internal_key = Some(vec![0x63; 32]);
-        psbt_b.outputs[0].unknown.push((vec![0xFE, 0x02], vec![0x64]));
+        psbt_b.outputs[0]
+            .unknown
+            .push((vec![0xFE, 0x02], vec![0x64]));
         psbt_b.xpub.push((vec![0x04; 78], ([0xAA; 4], vec![44])));
         psbt_b.proprietary.push((vec![0xFC, 0x01], vec![0x70]));
         psbt_b.unknown.push((vec![0xFD, 0x01], vec![0x80]));
@@ -1373,11 +1392,19 @@ mod tests {
         psbt_a.unknown.push(common_unknown.clone());
         psbt_b.unknown.push(common_unknown);
 
-        psbt_a.inputs[0].tap_script_sigs.push((vec![0x01; 64], vec![0x02; 65]));
-        psbt_b.inputs[0].tap_script_sigs.push((vec![0x01; 64], vec![0x02; 65]));
+        psbt_a.inputs[0]
+            .tap_script_sigs
+            .push((vec![0x01; 64], vec![0x02; 65]));
+        psbt_b.inputs[0]
+            .tap_script_sigs
+            .push((vec![0x01; 64], vec![0x02; 65]));
 
-        psbt_a.outputs[0].bip32_derivation.push((vec![0x03; 33], ([0xBB; 4], vec![0])));
-        psbt_b.outputs[0].bip32_derivation.push((vec![0x03; 33], ([0xBB; 4], vec![0])));
+        psbt_a.outputs[0]
+            .bip32_derivation
+            .push((vec![0x03; 33], ([0xBB; 4], vec![0])));
+        psbt_b.outputs[0]
+            .bip32_derivation
+            .push((vec![0x03; 33], ([0xBB; 4], vec![0])));
 
         psbt_a.merge(&psbt_b).unwrap();
 
@@ -1448,10 +1475,10 @@ mod tests {
         let tx_bytes = crate::encode::encode(&psbt.unsigned_tx);
         write_kv(&mut buf, &[PSBT_GLOBAL_UNSIGNED_TX], &tx_bytes).unwrap();
         buf.push(0x00); // global separator
-        // Write input map with bad sighash
+                        // Write input map with bad sighash
         write_kv(&mut buf, &[PSBT_IN_SIGHASH_TYPE], &bad_data).unwrap();
         buf.push(0x00); // input separator
-        // Output separator
+                        // Output separator
         buf.push(0x00);
 
         let result = Psbt::deserialize(&buf);
@@ -1536,8 +1563,14 @@ mod tests {
 
         let bytes = psbt.serialize();
         let psbt2 = Psbt::deserialize(&bytes).unwrap();
-        assert_eq!(psbt.outputs[0].redeem_script, psbt2.outputs[0].redeem_script);
-        assert_eq!(psbt.outputs[0].witness_script, psbt2.outputs[0].witness_script);
+        assert_eq!(
+            psbt.outputs[0].redeem_script,
+            psbt2.outputs[0].redeem_script
+        );
+        assert_eq!(
+            psbt.outputs[0].witness_script,
+            psbt2.outputs[0].witness_script
+        );
     }
 
     #[test]
@@ -1546,12 +1579,18 @@ mod tests {
         let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
         psbt.outputs[0].bip32_derivation.push((
             vec![0x02; 33],
-            ([0xCA, 0xFE, 0xBA, 0xBE], vec![44 | 0x80000000, 0 | 0x80000000, 1]),
+            (
+                [0xCA, 0xFE, 0xBA, 0xBE],
+                vec![44 | 0x80000000, 0x80000000, 1],
+            ),
         ));
 
         let bytes = psbt.serialize();
         let psbt2 = Psbt::deserialize(&bytes).unwrap();
-        assert_eq!(psbt.outputs[0].bip32_derivation, psbt2.outputs[0].bip32_derivation);
+        assert_eq!(
+            psbt.outputs[0].bip32_derivation,
+            psbt2.outputs[0].bip32_derivation
+        );
     }
 
     #[test]

@@ -122,11 +122,11 @@
 
 use std::path::{Path, PathBuf};
 
+use btc_consensus::utxo::UtxoEntry;
 use btc_primitives::amount::Amount;
 use btc_primitives::hash::TxHash;
 use btc_primitives::script::ScriptBuf;
 use btc_primitives::transaction::{OutPoint, TxOut};
-use btc_consensus::utxo::UtxoEntry;
 
 use crate::traits::{Database, StorageError};
 
@@ -279,7 +279,9 @@ pub fn decompress_script(data: &[u8]) -> Result<(ScriptBuf, usize), StorageError
         0x02 | 0x03 => {
             // Compressed public key (P2PK)
             if data.len() < 33 {
-                return Err(StorageError::Corruption("truncated compressed pubkey".into()));
+                return Err(StorageError::Corruption(
+                    "truncated compressed pubkey".into(),
+                ));
             }
             let mut pubkey = vec![script_type];
             pubkey.extend_from_slice(&data[1..33]);
@@ -294,7 +296,9 @@ pub fn decompress_script(data: &[u8]) -> Result<(ScriptBuf, usize), StorageError
             // The x-coordinate is stored; the parity is encoded in the type byte
             // (0x04 = even y, 0x05 = odd y, matching 0x02/0x03 convention)
             if data.len() < 33 {
-                return Err(StorageError::Corruption("truncated uncompressed pubkey".into()));
+                return Err(StorageError::Corruption(
+                    "truncated uncompressed pubkey".into(),
+                ));
             }
             // Store as compressed form for our purposes
             let parity = if script_type == 0x04 { 0x02 } else { 0x03 };
@@ -309,7 +313,7 @@ pub fn decompress_script(data: &[u8]) -> Result<(ScriptBuf, usize), StorageError
         n => {
             // Raw script: length = n - 6
             let len = (n as usize).checked_sub(6).ok_or_else(|| {
-                StorageError::Corruption(format!("invalid script compression type: {}", n))
+                StorageError::Corruption(format!("invalid script compression type: {n}"))
             })?;
             if data.len() < 1 + len {
                 return Err(StorageError::Corruption("truncated raw script".into()));
@@ -539,14 +543,27 @@ mod tests {
     #[test]
     fn test_core_varint_roundtrip() {
         let test_values: &[u64] = &[
-            0, 1, 127, 128, 255, 256, 16383, 16384, 16511, 16512,
-            65535, 65536, 1_000_000, u32::MAX as u64, u64::MAX,
+            0,
+            1,
+            127,
+            128,
+            255,
+            256,
+            16383,
+            16384,
+            16511,
+            16512,
+            65535,
+            65536,
+            1_000_000,
+            u32::MAX as u64,
+            u64::MAX,
         ];
         for &val in test_values {
             let encoded = encode_core_varint(val);
             let (decoded, len) = decode_core_varint(&encoded).unwrap();
-            assert_eq!(decoded, val, "roundtrip failed for {}", val);
-            assert_eq!(len, encoded.len(), "length mismatch for {}", val);
+            assert_eq!(decoded, val, "roundtrip failed for {val}");
+            assert_eq!(len, encoded.len(), "length mismatch for {val}");
         }
     }
 
@@ -578,15 +595,15 @@ mod tests {
             500_000,
             1_000_000,
             10_000_000,
-            50_000_000,       // 0.5 BTC
-            100_000_000,      // 1 BTC
-            500_000_000,      // 5 BTC
+            50_000_000,            // 0.5 BTC
+            100_000_000,           // 1 BTC
+            500_000_000,           // 5 BTC
             2_100_000_000_000_000, // 21M BTC
         ];
         for &amount in test_amounts {
             let compressed = compress_amount(amount);
             let decompressed = decompress_amount(compressed);
-            assert_eq!(decompressed, amount, "amount roundtrip failed for {}", amount);
+            assert_eq!(decompressed, amount, "amount roundtrip failed for {amount}");
         }
     }
 
@@ -808,11 +825,7 @@ mod tests {
             let amount: u64 = 10u64.pow(exp);
             let compressed = compress_amount(amount);
             let decompressed = decompress_amount(compressed);
-            assert_eq!(
-                decompressed, amount,
-                "roundtrip failed for 10^{}",
-                exp
-            );
+            assert_eq!(decompressed, amount, "roundtrip failed for 10^{exp}");
         }
     }
 
@@ -823,7 +836,7 @@ mod tests {
         for &v in &test_values {
             let c = compress_amount(v);
             let d = decompress_amount(c);
-            assert_eq!(d, v, "roundtrip failed for {}", v);
+            assert_eq!(d, v, "roundtrip failed for {v}");
         }
     }
 
@@ -991,7 +1004,7 @@ mod tests {
     fn test_decode_utxo_value_truncated_amount() {
         // Valid code but no amount.
         let data = encode_core_varint(201); // code only
-        // No amount varint follows.
+                                            // No amount varint follows.
         let result = decode_utxo_value(&data);
         assert!(result.is_err());
     }

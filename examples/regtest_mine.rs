@@ -2,7 +2,7 @@
 //!
 //! Usage: cargo run --example regtest_mine
 
-use btc_test::{TestNode, TestKeyPair};
+use btc_test::{TestKeyPair, TestNode};
 
 fn main() {
     let mut node = TestNode::new();
@@ -12,9 +12,18 @@ fn main() {
     let blocks = node.mine_blocks(10);
     println!("Chain height: {}", node.height());
     println!("Blocks mined: {}", blocks.len());
-    println!("Key (compressed): {}", hex::encode(key.public_key.serialize()));
-    println!("P2PKH script: {}", hex::encode(key.p2pkh_script().as_bytes()));
-    println!("P2WPKH script: {}", hex::encode(key.p2wpkh_script().as_bytes()));
+    println!(
+        "Key (compressed): {}",
+        hex::encode(key.public_key.serialize())
+    );
+    println!(
+        "P2PKH script: {}",
+        hex::encode(key.p2pkh_script().as_bytes())
+    );
+    println!(
+        "P2WPKH script: {}",
+        hex::encode(key.p2wpkh_script().as_bytes())
+    );
 
     // Mine a block paying the key
     let block = node.mine_block_to(key.p2pkh_script(), vec![]);

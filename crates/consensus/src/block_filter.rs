@@ -8,7 +8,7 @@
 //! Reference: https://github.com/bitcoin/bips/blob/master/bip-0158.mediawiki
 
 use btc_primitives::block::Block;
-use btc_primitives::encode::{VarInt, Encodable, Decodable};
+use btc_primitives::encode::{Decodable, Encodable, VarInt};
 use btc_primitives::hash::{sha256d, BlockHash};
 use btc_primitives::script::Script;
 
@@ -283,11 +283,7 @@ impl GcsBuilder {
         let f = n * self.m;
 
         // Map hashes into [0, F) using fast range reduction
-        let mut mapped: Vec<u64> = self
-            .items
-            .iter()
-            .map(|&h| fast_range(h, f))
-            .collect();
+        let mut mapped: Vec<u64> = self.items.iter().map(|&h| fast_range(h, f)).collect();
         mapped.sort_unstable();
         mapped.dedup();
 
@@ -454,7 +450,7 @@ impl BasicFilter {
         let offset = cursor.position() as usize;
         let filter_data = data[offset..].to_vec();
 
-        let filter_bytes = &data[..]; // full serialization for hashing
+        let filter_bytes = data; // full serialization for hashing
         let filter_hash = sha256d(filter_bytes);
         let filter_header = compute_filter_header(&filter_hash, prev_filter_header);
 
@@ -560,10 +556,7 @@ fn serialize_filter(n: u32, filter_data: &[u8]) -> Vec<u8> {
 ///
 /// This creates a hash chain over filter headers, allowing SPV clients to
 /// verify filter integrity by checking against a trusted header chain.
-pub fn compute_filter_header(
-    filter_hash: &[u8; 32],
-    prev_filter_header: &[u8; 32],
-) -> [u8; 32] {
+pub fn compute_filter_header(filter_hash: &[u8; 32], prev_filter_header: &[u8; 32]) -> [u8; 32] {
     let mut data = [0u8; 64];
     data[..32].copy_from_slice(filter_hash);
     data[32..].copy_from_slice(prev_filter_header);
@@ -579,12 +572,12 @@ pub fn compute_filter_header(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use btc_primitives::block::{Block, BlockHeader};
-    use btc_primitives::hash::{BlockHash, TxHash};
-    use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint};
-    use btc_primitives::script::ScriptBuf;
     use btc_primitives::amount::Amount;
+    use btc_primitives::block::{Block, BlockHeader};
     use btc_primitives::compact::CompactTarget;
+    use btc_primitives::hash::{BlockHash, TxHash};
+    use btc_primitives::script::ScriptBuf;
+    use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
 
     #[test]
     fn test_golomb_encode_decode_roundtrip() {
@@ -597,11 +590,7 @@ mod tests {
 
                 let mut reader = BitReader::new(&data);
                 let decoded = golomb_decode(&mut reader, p).unwrap();
-                assert_eq!(
-                    value, decoded,
-                    "roundtrip failed for value={} p={}",
-                    value, p
-                );
+                assert_eq!(value, decoded, "roundtrip failed for value={value} p={p}");
             }
         }
     }
@@ -773,9 +762,7 @@ mod tests {
         };
 
         // Previous scriptPubKeys for the spending tx's inputs
-        let prev_spks = vec![vec![
-            ScriptBuf::p2pkh(&[0x33; 20]).as_bytes().to_vec(),
-        ]];
+        let prev_spks = vec![vec![ScriptBuf::p2pkh(&[0x33; 20]).as_bytes().to_vec()]];
 
         let prev_header = [0u8; 32];
         let filter = build_basic_filter(&block, &prev_spks, &prev_header);
@@ -910,11 +897,20 @@ mod tests {
 
     #[test]
     fn test_compact_size_roundtrip() {
-        for &n in &[0u64, 1, 0xfc, 0xfd, 0xffff, 0x10000, 0xffff_ffff, 0x1_0000_0000] {
+        for &n in &[
+            0u64,
+            1,
+            0xfc,
+            0xfd,
+            0xffff,
+            0x10000,
+            0xffff_ffff,
+            0x1_0000_0000,
+        ] {
             let mut buf = Vec::new();
             VarInt(n).encode(&mut buf).unwrap();
             let decoded = VarInt::decode(&mut std::io::Cursor::new(&buf)).unwrap().0;
-            assert_eq!(n, decoded, "compact size roundtrip failed for {}", n);
+            assert_eq!(n, decoded, "compact size roundtrip failed for {n}");
         }
     }
 
@@ -925,7 +921,7 @@ mod tests {
         assert_eq!(fast_range(u64::MAX, 100), 99);
         // Midpoint should be roughly range/2
         let mid = fast_range(u64::MAX / 2, 1000);
-        assert!(mid >= 450 && mid <= 550, "midpoint was {}", mid);
+        assert!((450..=550).contains(&mid), "midpoint was {mid}");
     }
 
     // -----------------------------------------------------------------------
@@ -934,9 +930,10 @@ mod tests {
 
     #[test]
     fn test_bip158_vectors() {
-        let test_data = std::fs::read_to_string(
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/blockfilters.json")
-        )
+        let test_data = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/blockfilters.json"
+        ))
         .expect("failed to read blockfilters.json");
 
         let parsed: serde_json::Value =
@@ -964,8 +961,7 @@ mod tests {
             assert_eq!(
                 block_hash.to_hex(),
                 block_hash_hex,
-                "block hash mismatch at test {}",
-                test_idx
+                "block hash mismatch at test {test_idx}"
             );
 
             // Decode previous scriptPubKeys
@@ -1003,9 +999,7 @@ mod tests {
             assert_eq!(
                 hex::encode(&filter_serialized),
                 expected_filter_hex,
-                "filter mismatch at test {} (block {})",
-                test_idx,
-                block_hash_hex,
+                "filter mismatch at test {test_idx} (block {block_hash_hex})",
             );
 
             // Compare filter header (hex is in display/reversed byte order)
@@ -1015,8 +1009,7 @@ mod tests {
 
             assert_eq!(
                 filter.filter_header, expected_header,
-                "filter header mismatch at test {} (block {})",
-                test_idx, block_hash_hex,
+                "filter header mismatch at test {test_idx} (block {block_hash_hex})",
             );
         }
     }
@@ -1136,11 +1129,32 @@ mod tests {
     fn test_gcs_match_any_empty_cases() {
         let key = [0u8; 16];
         // n == 0
-        assert!(!gcs_match_any(&key, 0, BASIC_FILTER_M, BASIC_FILTER_P, &[1, 2], &[b"item".as_slice()]));
+        assert!(!gcs_match_any(
+            &key,
+            0,
+            BASIC_FILTER_M,
+            BASIC_FILTER_P,
+            &[1, 2],
+            &[b"item".as_slice()]
+        ));
         // empty query
-        assert!(!gcs_match_any(&key, 1, BASIC_FILTER_M, BASIC_FILTER_P, &[1, 2], &[]));
+        assert!(!gcs_match_any(
+            &key,
+            1,
+            BASIC_FILTER_M,
+            BASIC_FILTER_P,
+            &[1, 2],
+            &[]
+        ));
         // empty filter data
-        assert!(!gcs_match_any(&key, 1, BASIC_FILTER_M, BASIC_FILTER_P, &[], &[b"item".as_slice()]));
+        assert!(!gcs_match_any(
+            &key,
+            1,
+            BASIC_FILTER_M,
+            BASIC_FILTER_P,
+            &[],
+            &[b"item".as_slice()]
+        ));
     }
 
     // ---- Coverage: gcs_match_any query not in filter ----
@@ -1155,7 +1169,14 @@ mod tests {
         let n = 2u64;
 
         // Query for something not in the filter
-        let result = gcs_match_any(&key, n, BASIC_FILTER_M, BASIC_FILTER_P, &filter_data, &[b"not_present".as_slice()]);
+        let result = gcs_match_any(
+            &key,
+            n,
+            BASIC_FILTER_M,
+            BASIC_FILTER_P,
+            &filter_data,
+            &[b"not_present".as_slice()],
+        );
         assert!(!result);
     }
 
@@ -1172,7 +1193,14 @@ mod tests {
         let filter_data = builder.build();
 
         // Query for items that ARE in the filter
-        let result = gcs_match_any(&key, 3, BASIC_FILTER_M, BASIC_FILTER_P, &filter_data, &[b"hello".as_slice()]);
+        let result = gcs_match_any(
+            &key,
+            3,
+            BASIC_FILTER_M,
+            BASIC_FILTER_P,
+            &filter_data,
+            &[b"hello".as_slice()],
+        );
         assert!(result);
     }
 
@@ -1263,12 +1291,10 @@ mod tests {
                 script_sig: ScriptBuf::from_bytes(vec![0x04, 0x01]),
                 sequence: 0xffffffff,
             }],
-            outputs: vec![
-                TxOut {
-                    value: Amount::from_sat(5_000_000_000),
-                    script_pubkey: op_return_script,
-                },
-            ],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                script_pubkey: op_return_script,
+            }],
             witness: Vec::new(),
             lock_time: 0,
         };
@@ -1288,6 +1314,9 @@ mod tests {
         let prev_header = [0u8; 32];
         let filter = build_basic_filter(&block, &[], &prev_header);
         // OP_RETURN outputs should be excluded, so n should be 0
-        assert_eq!(filter.n, 0, "OP_RETURN outputs should be excluded from the filter");
+        assert_eq!(
+            filter.n, 0,
+            "OP_RETURN outputs should be excluded from the filter"
+        );
     }
 }

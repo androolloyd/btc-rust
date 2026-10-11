@@ -2,10 +2,10 @@ use btc_primitives::amount::Amount;
 use btc_primitives::block::Block;
 use btc_primitives::hash::TxHash;
 use btc_primitives::transaction::{OutPoint, TxOut};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
-use crate::validation::{block_subsidy, ChainParams, validate_bip34_coinbase};
+use crate::validation::{block_subsidy, validate_bip34_coinbase, ChainParams};
 
 /// Coinbase maturity: outputs of a coinbase tx cannot be spent until
 /// 100 blocks after the block containing the coinbase.
@@ -50,7 +50,9 @@ pub enum UtxoError {
         spend_height: u64,
     },
 
-    #[error("output value exceeds input value for non-coinbase tx: inputs={inputs}, outputs={outputs}")]
+    #[error(
+        "output value exceeds input value for non-coinbase tx: inputs={inputs}, outputs={outputs}"
+    )]
     OutputExceedsInput { inputs: Amount, outputs: Amount },
 
     #[error("coinbase reward too high: got {got}, max allowed {max}")]
@@ -65,7 +67,13 @@ pub enum UtxoError {
     #[error("BIP34: {0}")]
     Bip34(#[from] crate::validation::ValidationError),
 
-    #[error("BIP68: relative lock-time not satisfied for input spending {outpoint:?} (need {required_depth} blocks, have {actual_depth})")]
+    #[error("BIP68 time lock or BIP113 finality requires median-time-past context")]
+    MissingLockTimeContext,
+    #[error("transaction is not final for this block")]
+    NonFinalTransaction,
+    #[error("BIP68 relative time lock is not satisfied")]
+    Bip68RelativeTimeLock,
+    #[error("BIP68: relative height lock not satisfied for {outpoint:?}: need {required_depth}, have {actual_depth}")]
     Bip68RelativeLockTime {
         outpoint: OutPoint,
         required_depth: u64,
@@ -90,7 +98,8 @@ pub struct UtxoEntry {
 
 /// Abstract read-only view of the current UTXO set.
 pub trait UtxoSet {
-    fn get_utxo(&self, outpoint: &OutPoint) -> Option<&UtxoEntry>;
+    /// Return an owned entry so database caches can safely grow during reads.
+    fn get_utxo(&self, outpoint: &OutPoint) -> Option<UtxoEntry>;
 
     fn contains(&self, outpoint: &OutPoint) -> bool {
         self.get_utxo(outpoint).is_some()
@@ -131,13 +140,19 @@ pub fn connect_block(
     // by later transactions in the same block (intra-block spends). Build an
     // auxiliary map of outputs created so far keyed by outpoint.
     let mut intra_block: HashMap<OutPoint, UtxoEntry> = HashMap::new();
+    let mut spent_outpoints = HashSet::new();
 
     // Track total fees for coinbase reward validation.
     let mut total_fees = Amount::ZERO;
 
-    for (_tx_idx, tx) in block.transactions.iter().enumerate() {
+    for tx in block.transactions.iter() {
         let is_coinbase = tx.is_coinbase();
         let txid = tx.txid();
+        if tx.outputs.is_empty() {
+            return Err(UtxoError::InvalidTransaction(
+                "transaction has no outputs".into(),
+            ));
+        }
 
         // --- Process inputs (skip for coinbase) ---
         let mut input_sum = Amount::ZERO;
@@ -150,28 +165,29 @@ pub fn connect_block(
             }
             for input in &tx.inputs {
                 let outpoint = &input.previous_output;
+                if !spent_outpoints.insert(*outpoint) {
+                    return Err(UtxoError::UtxoNotFound(*outpoint));
+                }
 
                 // Look up the UTXO being spent.  First check intra-block map,
                 // then fall back to the external UTXO view.
                 let entry = if let Some(e) = intra_block.remove(outpoint) {
                     e
                 } else if let Some(e) = utxo_view.get_utxo(outpoint) {
-                    e.clone()
+                    e
                 } else {
                     return Err(UtxoError::UtxoNotFound(*outpoint));
                 };
 
                 // Coinbase maturity check.
-                if entry.is_coinbase
-                    && height.saturating_sub(entry.height) < COINBASE_MATURITY
-                {
+                if entry.is_coinbase && height.saturating_sub(entry.height) < COINBASE_MATURITY {
                     return Err(UtxoError::CoinbaseNotMature {
                         created_height: entry.height,
                         spend_height: height,
                     });
                 }
 
-                input_sum = input_sum + entry.txout.value;
+                input_sum = checked_money_sum(input_sum, entry.txout.value)?;
                 spent.push((*outpoint, entry));
             }
         }
@@ -187,7 +203,7 @@ pub fn connect_block(
                 is_coinbase,
             };
 
-            output_sum = output_sum + txout.value;
+            output_sum = checked_money_sum(output_sum, txout.value)?;
 
             // Store in intra-block map so later txs in this block can spend it.
             intra_block.insert(outpoint, entry.clone());
@@ -202,7 +218,7 @@ pub fn connect_block(
                     outputs: output_sum,
                 });
             }
-            total_fees = total_fees + (input_sum - output_sum);
+            total_fees = checked_money_sum(total_fees, input_sum - output_sum)?;
         }
     }
 
@@ -213,7 +229,7 @@ pub fn connect_block(
         let coinbase_output: Amount = coinbase_tx
             .outputs
             .iter()
-            .fold(Amount::ZERO, |acc, o| acc + o.value);
+            .try_fold(Amount::ZERO, |acc, o| checked_money_sum(acc, o.value))?;
         let max_reward = block_subsidy(height) + total_fees;
 
         if coinbase_output.as_sat() > max_reward.as_sat() {
@@ -225,6 +241,20 @@ pub fn connect_block(
     }
 
     Ok(UtxoSetUpdate { spent, created })
+}
+
+fn checked_money_sum(left: Amount, right: Amount) -> Result<Amount, UtxoError> {
+    let sum = left
+        .as_sat()
+        .checked_add(right.as_sat())
+        .ok_or_else(|| UtxoError::InvalidTransaction("amount overflow".into()))?;
+    let total = Amount::from_sat(sum);
+    if !left.is_valid() || !right.is_valid() || !total.is_valid() {
+        return Err(UtxoError::InvalidTransaction(
+            "amount out of money range".into(),
+        ));
+    }
+    Ok(total)
 }
 
 /// Apply a block to the UTXO set with full BIP30/BIP34/BIP68 validation.
@@ -245,15 +275,46 @@ pub fn connect_block(
 /// - **BIP68**: For non-coinbase transactions with version >= 2, each input
 ///   whose sequence number does NOT have bit 31 set is subject to a
 ///   relative lock-time constraint. Height-based relative lock-times (bit 22
-///   not set) are fully enforced. Time-based relative lock-times (bit 22
-///   set) require median-time-past access and are currently not enforced
-///   (TODO).
+///   not set) are enforced. Time-based relative lock-times require the
+///   explicit median-time-past context provided by connect_block_with_context;
+///   this wrapper reports missing context instead of skipping validation.
 pub fn connect_block_with_params(
     block: &Block,
     height: u64,
     utxo_view: &dyn UtxoSet,
     params: &ChainParams,
 ) -> Result<UtxoSetUpdate, UtxoError> {
+    connect_block_with_context(block, height, utxo_view, params, None)
+}
+/// Median time of the previous block, plus ancestor MTP at a UTXO's creation
+/// height minus one. Required by deployed BIP68/BIP113 time locks.
+pub struct LockTimeContext<'a> {
+    pub median_time_past: u32,
+    pub ancestor_mtp: &'a dyn Fn(u64) -> Option<u32>,
+}
+pub fn connect_block_with_context(
+    block: &Block,
+    height: u64,
+    utxo_view: &dyn UtxoSet,
+    params: &ChainParams,
+    context: Option<&LockTimeContext<'_>>,
+) -> Result<UtxoSetUpdate, UtxoError> {
+    for tx in &block.transactions {
+        if tx.lock_time != 0 && tx.inputs.iter().any(|i| i.sequence != u32::MAX) {
+            let endpoint = if tx.lock_time < 500_000_000 {
+                height
+            } else if height >= params.bip68_height {
+                context
+                    .ok_or(UtxoError::MissingLockTimeContext)?
+                    .median_time_past as u64
+            } else {
+                block.header.time as u64
+            };
+            if tx.lock_time as u64 >= endpoint {
+                return Err(UtxoError::NonFinalTransaction);
+            }
+        }
+    }
     // --- BIP34: height in coinbase ---
     validate_bip34_coinbase(block, height, params.bip34_height)?;
 
@@ -261,8 +322,7 @@ pub fn connect_block_with_params(
     // After BIP34 activation, coinbase txids include the height so they are
     // unique; we can skip the (expensive) scan in that case. The two
     // historical exception blocks are also skipped.
-    let bip30_active = height < params.bip34_height
-        && !BIP30_EXEMPT_HEIGHTS.contains(&height);
+    let bip30_active = height < params.bip34_height && !BIP30_EXEMPT_HEIGHTS.contains(&height);
 
     if bip30_active {
         for tx in &block.transactions {
@@ -288,7 +348,7 @@ pub fn connect_block_with_params(
             continue;
         }
         // BIP68 only applies to transactions with version >= 2.
-        if tx.version < 2 {
+        if tx.version < 2 || height < params.bip68_height {
             continue;
         }
 
@@ -301,14 +361,6 @@ pub fn connect_block_with_params(
             }
 
             let masked = (seq & SEQUENCE_LOCKTIME_MASK) as u64;
-
-            if seq & SEQUENCE_LOCKTIME_TYPE_FLAG != 0 {
-                // Time-based relative lock-time (512-second granularity).
-                // Requires median-time-past of the block at the UTXO
-                // creation height, which we don't currently have access to.
-                // TODO: implement time-based BIP68 once MTP is available.
-                continue;
-            }
 
             // Height-based relative lock-time: the input's UTXO must be
             // at least `masked` blocks old.
@@ -329,6 +381,22 @@ pub fn connect_block_with_params(
             // Note: the "+1" is because block N spending a UTXO created in
             // block N has depth 0 (same block), and a sequence value of 1
             // means "at least 1 block apart".
+            if seq & SEQUENCE_LOCKTIME_TYPE_FLAG != 0 {
+                if masked == 0 {
+                    continue;
+                }
+                let context = context.ok_or(UtxoError::MissingLockTimeContext)?;
+                let creation_mtp = if entry_height == height {
+                    context.median_time_past
+                } else {
+                    (context.ancestor_mtp)(entry_height.saturating_sub(1))
+                        .ok_or(UtxoError::MissingLockTimeContext)?
+                };
+                if (context.median_time_past as u64) < creation_mtp as u64 + (masked << 9) {
+                    return Err(UtxoError::Bip68RelativeTimeLock);
+                }
+                continue;
+            }
             let actual_depth = height.saturating_sub(entry_height);
             if actual_depth < masked {
                 return Err(UtxoError::Bip68RelativeLockTime {
@@ -350,13 +418,16 @@ pub fn connect_block_with_params(
 /// 1. Removes every UTXO that was *created* by the block.
 /// 2. Re-inserts every UTXO that was *spent* by the block.
 pub fn disconnect_block(utxo_set: &mut InMemoryUtxoSet, update: &UtxoSetUpdate) {
+    let created: HashSet<_> = update.created.iter().map(|(op, _)| *op).collect();
     // Remove created UTXOs.
     for (outpoint, _) in &update.created {
         utxo_set.remove(outpoint);
     }
     // Restore spent UTXOs.
     for (outpoint, entry) in &update.spent {
-        utxo_set.insert(*outpoint, entry.clone());
+        if !created.contains(outpoint) {
+            utxo_set.insert(*outpoint, entry.clone());
+        }
     }
 }
 
@@ -406,11 +477,14 @@ impl InMemoryUtxoSet {
 
     /// Apply a `UtxoSetUpdate` forward (connect): remove spent, add created.
     pub fn apply_update(&mut self, update: &UtxoSetUpdate) {
+        let spent: HashSet<_> = update.spent.iter().map(|(op, _)| *op).collect();
         for (outpoint, _) in &update.spent {
             self.map.remove(outpoint);
         }
         for (outpoint, entry) in &update.created {
-            self.map.insert(*outpoint, entry.clone());
+            if !spent.contains(outpoint) {
+                self.map.insert(*outpoint, entry.clone());
+            }
         }
     }
 
@@ -431,8 +505,8 @@ impl InMemoryUtxoSet {
 }
 
 impl UtxoSet for InMemoryUtxoSet {
-    fn get_utxo(&self, outpoint: &OutPoint) -> Option<&UtxoEntry> {
-        self.map.get(outpoint)
+    fn get_utxo(&self, outpoint: &OutPoint) -> Option<UtxoEntry> {
+        self.map.get(outpoint).cloned()
     }
 }
 
@@ -474,10 +548,7 @@ mod tests {
 
     /// Build a normal (non-coinbase) transaction that spends the given
     /// outpoints and produces `output_values`.
-    fn make_spend_tx(
-        inputs: Vec<OutPoint>,
-        output_values: Vec<Amount>,
-    ) -> Transaction {
+    fn make_spend_tx(inputs: Vec<OutPoint>, output_values: Vec<Amount>) -> Transaction {
         let tx_inputs = inputs
             .into_iter()
             .map(|op| TxIn {
@@ -636,10 +707,7 @@ mod tests {
         let spend_height: u64 = 109;
         let subsidy = crate::validation::block_subsidy(spend_height);
         let coinbase = make_coinbase_tx(subsidy);
-        let spend = make_spend_tx(
-            vec![cb_outpoint],
-            vec![Amount::from_sat(49_0000_0000)],
-        );
+        let spend = make_spend_tx(vec![cb_outpoint], vec![Amount::from_sat(49_0000_0000)]);
 
         let block = make_block(vec![coinbase, spend]);
         let result = connect_block(&block, spend_height, &utxo_set);
@@ -679,10 +747,7 @@ mod tests {
         let spend_height: u64 = 110;
         let subsidy = crate::validation::block_subsidy(spend_height);
         let coinbase = make_coinbase_tx(subsidy);
-        let spend = make_spend_tx(
-            vec![cb_outpoint],
-            vec![Amount::from_sat(49_0000_0000)],
-        );
+        let spend = make_spend_tx(vec![cb_outpoint], vec![Amount::from_sat(49_0000_0000)]);
 
         let block = make_block(vec![coinbase, spend]);
         let result = connect_block(&block, spend_height, &utxo_set);
@@ -713,10 +778,7 @@ mod tests {
         let subsidy = crate::validation::block_subsidy(1);
         let coinbase = make_coinbase_tx(subsidy);
         // Output exceeds input.
-        let spend = make_spend_tx(
-            vec![prev_outpoint],
-            vec![Amount::from_sat(10_000)],
-        );
+        let spend = make_spend_tx(vec![prev_outpoint], vec![Amount::from_sat(10_000)]);
 
         let block = make_block(vec![coinbase, spend]);
         let result = connect_block(&block, 1, &utxo_set);
@@ -894,7 +956,10 @@ mod tests {
         let block = make_block(vec![coinbase, bad_tx]);
         let result = connect_block(&block, 0, &utxo_set);
 
-        assert!(result.is_err(), "should reject non-coinbase tx with no inputs");
+        assert!(
+            result.is_err(),
+            "should reject non-coinbase tx with no inputs"
+        );
         match result.unwrap_err() {
             UtxoError::InvalidTransaction(msg) => {
                 assert!(
@@ -998,7 +1063,10 @@ mod tests {
 
         // Should succeed at exempt height 91842.
         let result = connect_block_with_params(&block, 91842, &utxo_set, &params);
-        assert!(result.is_ok(), "BIP30 exempt block 91842 should be accepted");
+        assert!(
+            result.is_ok(),
+            "BIP30 exempt block 91842 should be accepted"
+        );
     }
 
     #[test]
@@ -1054,10 +1122,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Helper: build a v2 spend tx with a specific sequence number.
-    fn make_v2_spend_tx(
-        inputs: Vec<(OutPoint, u32)>,
-        output_values: Vec<Amount>,
-    ) -> Transaction {
+    fn make_v2_spend_tx(inputs: Vec<(OutPoint, u32)>, output_values: Vec<Amount>) -> Transaction {
         let tx_inputs = inputs
             .into_iter()
             .map(|(op, seq)| TxIn {
@@ -1117,10 +1182,14 @@ mod tests {
         let block = make_block(vec![coinbase, spend]);
 
         let mut params = ChainParams::mainnet();
-        params.bip34_height = 1_000_000; // disable BIP34 for simplicity
+        params.bip34_height = 1_000_000;
+        params.bip68_height = 0; // disable BIP34 for simplicity
 
         let result = connect_block_with_params(&block, spend_height, &utxo_set, &params);
-        assert!(result.is_ok(), "BIP68: lock should be satisfied (depth=10, required=10)");
+        assert!(
+            result.is_ok(),
+            "BIP68: lock should be satisfied (depth=10, required=10)"
+        );
     }
 
     #[test]
@@ -1156,6 +1225,7 @@ mod tests {
 
         let mut params = ChainParams::mainnet();
         params.bip34_height = 1_000_000;
+        params.bip68_height = 0;
 
         let result = connect_block_with_params(&block, spend_height, &utxo_set, &params);
         assert!(result.is_err());
@@ -1207,9 +1277,13 @@ mod tests {
 
         let mut params = ChainParams::mainnet();
         params.bip34_height = 1_000_000;
+        params.bip68_height = 0;
 
         let result = connect_block_with_params(&block, spend_height, &utxo_set, &params);
-        assert!(result.is_ok(), "BIP68 should be disabled when bit 31 is set");
+        assert!(
+            result.is_ok(),
+            "BIP68 should be disabled when bit 31 is set"
+        );
     }
 
     #[test]
@@ -1255,15 +1329,16 @@ mod tests {
 
         let mut params = ChainParams::mainnet();
         params.bip34_height = 1_000_000;
+        params.bip68_height = 0;
 
         let result = connect_block_with_params(&block, spend_height, &utxo_set, &params);
         assert!(result.is_ok(), "BIP68 should not apply to v1 transactions");
     }
 
     #[test]
-    fn test_bip68_time_based_lock_skipped() {
-        // Time-based relative lock-time (bit 22 set) should be skipped
-        // (not enforced) for now, with a TODO for MTP support.
+    fn test_bip68_time_based_lock_requires_context() {
+        // Time-based relative locks must not be silently skipped when MTP
+        // context is unavailable.
         let mut utxo_set = InMemoryUtxoSet::new();
         let prev_txid = TxHash::from_bytes([0xee; 32]);
         let prev_outpoint = OutPoint::new(prev_txid, 0);
@@ -1294,10 +1369,14 @@ mod tests {
 
         let mut params = ChainParams::mainnet();
         params.bip34_height = 1_000_000;
+        params.bip68_height = 0;
 
-        // Should pass because time-based locks are not yet enforced.
+        // Validation must require the missing MTP context.
         let result = connect_block_with_params(&block, spend_height, &utxo_set, &params);
-        assert!(result.is_ok(), "time-based BIP68 should be skipped (not enforced yet)");
+        assert!(
+            matches!(result, Err(UtxoError::MissingLockTimeContext)),
+            "time-based BIP68 requires MTP"
+        );
     }
 
     #[test]
@@ -1326,6 +1405,7 @@ mod tests {
 
         let mut params = ChainParams::mainnet();
         params.bip34_height = 1_000_000;
+        params.bip68_height = 0;
 
         let result = connect_block_with_params(&block, 0, &utxo_set, &params);
         assert!(result.is_ok(), "coinbase should be exempt from BIP68");
@@ -1415,14 +1495,17 @@ mod tests {
 
         // Insert a coinbase UTXO at height 1
         let cb_outpoint = OutPoint::new(TxHash::from_bytes([0xcc; 32]), 0);
-        utxo_set.insert(cb_outpoint, UtxoEntry {
-            txout: TxOut {
-                value: Amount::from_sat(5_000_000_000),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x76, 0xa9]),
+        utxo_set.insert(
+            cb_outpoint,
+            UtxoEntry {
+                txout: TxOut {
+                    value: Amount::from_sat(5_000_000_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x76, 0xa9]),
+                },
+                height: 1,
+                is_coinbase: true,
             },
-            height: 1,
-            is_coinbase: true,
-        });
+        );
 
         let subsidy = crate::validation::block_subsidy(50);
         let coinbase = Transaction {

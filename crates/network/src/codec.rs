@@ -1,7 +1,5 @@
+use btc_primitives::encode::{Decodable, Encodable, EncodeError, ReadExt, VarInt, WriteExt};
 use bytes::{Buf, BufMut, BytesMut};
-use btc_primitives::encode::{
-    Decodable, Encodable, EncodeError, ReadExt, VarInt, WriteExt,
-};
 use std::io::{Cursor, Read, Write};
 use tokio_util::codec::{Decoder, Encoder};
 
@@ -56,18 +54,18 @@ fn decode_net_address<R: Read>(r: &mut R) -> Result<NetAddress, EncodeError> {
 /// Encode a VersionMessage payload
 fn encode_version<W: Write>(msg: &VersionMessage, w: &mut W) -> Result<usize, EncodeError> {
     let mut written = 0;
-    written += w.write_u32_le(msg.version)?;        // 4
-    written += w.write_u64_le(msg.services)?;        // 8
-    written += w.write_i64_le(msg.timestamp)?;       // 8
+    written += w.write_u32_le(msg.version)?; // 4
+    written += w.write_u64_le(msg.services)?; // 8
+    written += w.write_i64_le(msg.timestamp)?; // 8
     written += encode_net_address(&msg.receiver, w)?; // 26
-    written += encode_net_address(&msg.sender, w)?;   // 26
-    written += w.write_u64_le(msg.nonce)?;           // 8
-    // user_agent as var_str
+    written += encode_net_address(&msg.sender, w)?; // 26
+    written += w.write_u64_le(msg.nonce)?; // 8
+                                           // user_agent as var_str
     let ua_bytes = msg.user_agent.as_bytes();
     written += VarInt(ua_bytes.len() as u64).encode(w)?;
     w.write_all(ua_bytes)?;
     written += ua_bytes.len();
-    written += w.write_i32_le(msg.start_height)?;    // 4
+    written += w.write_i32_le(msg.start_height)?; // 4
     written += w.write_u8(if msg.relay { 1 } else { 0 })?; // 1
     Ok(written)
 }
@@ -154,10 +152,7 @@ fn decode_inv_vec<R: Read>(r: &mut R) -> Result<Vec<InvItem>, EncodeError> {
     Ok(items)
 }
 
-fn encode_getheaders<W: Write>(
-    msg: &GetHeadersMessage,
-    w: &mut W,
-) -> Result<usize, EncodeError> {
+fn encode_getheaders<W: Write>(msg: &GetHeadersMessage, w: &mut W) -> Result<usize, EncodeError> {
     let mut written = 0;
     written += w.write_u32_le(msg.version)?;
     written += VarInt(msg.locator_hashes.len() as u64).encode(w)?;
@@ -345,9 +340,9 @@ pub fn decode_payload(command: &str, payload: &[u8]) -> Result<NetworkMessage, E
         "getheaders" => Ok(NetworkMessage::GetHeaders(decode_getheaders(&mut cursor)?)),
         "getblocks" => Ok(NetworkMessage::GetBlocks(decode_getheaders(&mut cursor)?)),
         "headers" => Ok(NetworkMessage::Headers(decode_headers(&mut cursor)?)),
-        "block" => Ok(NetworkMessage::Block(
-            btc_primitives::block::Block::decode(&mut cursor)?,
-        )),
+        "block" => Ok(NetworkMessage::Block(btc_primitives::block::Block::decode(
+            &mut cursor,
+        )?)),
         "tx" => Ok(NetworkMessage::Tx(
             btc_primitives::transaction::Transaction::decode(&mut cursor)?,
         )),
@@ -389,10 +384,7 @@ pub fn decode_payload(command: &str, payload: &[u8]) -> Result<NetworkMessage, E
             let version = cursor.read_u64_le()?;
             Ok(NetworkMessage::SendCmpct { announce, version })
         }
-        other => Ok(NetworkMessage::Unknown(
-            other.to_string(),
-            payload.to_vec(),
-        )),
+        other => Ok(NetworkMessage::Unknown(other.to_string(), payload.to_vec())),
     }
 }
 
@@ -413,9 +405,8 @@ impl Decoder for BitcoinCodec {
         // Parse the header without consuming bytes yet
         let header: MessageHeader = {
             let header_bytes = &src[..MessageHeader::SIZE];
-            btc_primitives::encode::decode(header_bytes).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-            })?
+            btc_primitives::encode::decode(header_bytes)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?
         };
 
         // Verify magic bytes
@@ -462,9 +453,8 @@ impl Decoder for BitcoinCodec {
 
         let command = header.command_str().to_string();
 
-        let msg = decode_payload(&command, &payload).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-        })?;
+        let msg = decode_payload(&command, &payload)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
 
         Ok(Some(msg))
     }
@@ -505,13 +495,13 @@ impl Encoder<NetworkMessage> for BitcoinCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use btc_primitives::amount::Amount;
     use btc_primitives::block::BlockHeader;
     use btc_primitives::compact::CompactTarget;
     use btc_primitives::hash::{BlockHash, Hash256, TxHash};
     use btc_primitives::network::Network;
-    use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
     use btc_primitives::script::ScriptBuf;
-    use btc_primitives::amount::Amount;
+    use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
     use bytes::BytesMut;
     use tokio_util::codec::{Decoder, Encoder};
 
@@ -524,7 +514,10 @@ mod tests {
         let mut codec = mainnet_codec();
         let mut buf = BytesMut::new();
         codec.encode(msg, &mut buf).expect("encode failed");
-        codec.decode(&mut buf).expect("decode failed").expect("incomplete")
+        codec
+            .decode(&mut buf)
+            .expect("decode failed")
+            .expect("incomplete")
     }
 
     fn sample_version() -> VersionMessage {
@@ -567,7 +560,7 @@ mod tests {
                 assert_eq!(v.receiver.port, orig.receiver.port);
                 assert_eq!(v.sender.ip, orig.sender.ip);
             }
-            other => panic!("expected Version, got {:?}", other),
+            other => panic!("expected Version, got {other:?}"),
         }
     }
 
@@ -575,7 +568,7 @@ mod tests {
     fn test_verack_roundtrip() {
         match roundtrip(NetworkMessage::Verack) {
             NetworkMessage::Verack => {}
-            other => panic!("expected Verack, got {:?}", other),
+            other => panic!("expected Verack, got {other:?}"),
         }
     }
 
@@ -584,7 +577,7 @@ mod tests {
         let nonce = 0x1234567890abcdef_u64;
         match roundtrip(NetworkMessage::Ping(nonce)) {
             NetworkMessage::Ping(n) => assert_eq!(n, nonce),
-            other => panic!("expected Ping, got {:?}", other),
+            other => panic!("expected Ping, got {other:?}"),
         }
     }
 
@@ -593,7 +586,7 @@ mod tests {
         let nonce = 42u64;
         match roundtrip(NetworkMessage::Pong(nonce)) {
             NetworkMessage::Pong(n) => assert_eq!(n, nonce),
-            other => panic!("expected Pong, got {:?}", other),
+            other => panic!("expected Pong, got {other:?}"),
         }
     }
 
@@ -615,7 +608,7 @@ mod tests {
         ];
         match roundtrip(NetworkMessage::Inv(items.clone())) {
             NetworkMessage::Inv(decoded) => assert_eq!(decoded, items),
-            other => panic!("expected Inv, got {:?}", other),
+            other => panic!("expected Inv, got {other:?}"),
         }
     }
 
@@ -627,7 +620,7 @@ mod tests {
         }];
         match roundtrip(NetworkMessage::GetData(items.clone())) {
             NetworkMessage::GetData(decoded) => assert_eq!(decoded, items),
-            other => panic!("expected GetData, got {:?}", other),
+            other => panic!("expected GetData, got {other:?}"),
         }
     }
 
@@ -651,7 +644,7 @@ mod tests {
                 );
                 assert_eq!(decoded.stop_hash.as_bytes(), msg.stop_hash.as_bytes());
             }
-            other => panic!("expected GetHeaders, got {:?}", other),
+            other => panic!("expected GetHeaders, got {other:?}"),
         }
     }
 
@@ -667,7 +660,7 @@ mod tests {
                 assert_eq!(decoded.version, msg.version);
                 assert_eq!(decoded.locator_hashes.len(), 1);
             }
-            other => panic!("expected GetBlocks, got {:?}", other),
+            other => panic!("expected GetBlocks, got {other:?}"),
         }
     }
 
@@ -697,7 +690,7 @@ mod tests {
                 assert_eq!(decoded[0], headers[0]);
                 assert_eq!(decoded[1], headers[1]);
             }
-            other => panic!("expected Headers, got {:?}", other),
+            other => panic!("expected Headers, got {other:?}"),
         }
     }
 
@@ -732,7 +725,7 @@ mod tests {
                 assert_eq!(decoded.header, block.header);
                 assert_eq!(decoded.transactions.len(), 1);
             }
-            other => panic!("expected Block, got {:?}", other),
+            other => panic!("expected Block, got {other:?}"),
         }
     }
 
@@ -756,7 +749,7 @@ mod tests {
             NetworkMessage::Tx(decoded) => {
                 assert_eq!(decoded, tx);
             }
-            other => panic!("expected Tx, got {:?}", other),
+            other => panic!("expected Tx, got {other:?}"),
         }
     }
 
@@ -781,7 +774,7 @@ mod tests {
                 assert_eq!(decoded[1].port, 18333);
                 assert_eq!(decoded[0].services, 1);
             }
-            other => panic!("expected Addr, got {:?}", other),
+            other => panic!("expected Addr, got {other:?}"),
         }
     }
 
@@ -789,7 +782,7 @@ mod tests {
     fn test_sendheaders_roundtrip() {
         match roundtrip(NetworkMessage::SendHeaders) {
             NetworkMessage::SendHeaders => {}
-            other => panic!("expected SendHeaders, got {:?}", other),
+            other => panic!("expected SendHeaders, got {other:?}"),
         }
     }
 
@@ -798,7 +791,7 @@ mod tests {
         let rate = 1000_u64;
         match roundtrip(NetworkMessage::FeeFilter(rate)) {
             NetworkMessage::FeeFilter(r) => assert_eq!(r, rate),
-            other => panic!("expected FeeFilter, got {:?}", other),
+            other => panic!("expected FeeFilter, got {other:?}"),
         }
     }
 
@@ -810,7 +803,7 @@ mod tests {
                 assert_eq!(cmd, "notreal");
                 assert_eq!(d, data);
             }
-            other => panic!("expected Unknown, got {:?}", other),
+            other => panic!("expected Unknown, got {other:?}"),
         }
     }
 
@@ -851,7 +844,7 @@ mod tests {
                 assert_eq!(v.start_height, ver.start_height);
                 assert_eq!(v.relay, ver.relay);
             }
-            other => panic!("expected Version, got {:?}", other),
+            other => panic!("expected Version, got {other:?}"),
         }
     }
 
@@ -902,7 +895,7 @@ mod tests {
     fn test_wtxidrelay_roundtrip() {
         match roundtrip(NetworkMessage::WtxidRelay) {
             NetworkMessage::WtxidRelay => {}
-            other => panic!("expected WtxidRelay, got {:?}", other),
+            other => panic!("expected WtxidRelay, got {other:?}"),
         }
     }
 
@@ -920,7 +913,7 @@ mod tests {
         ];
         match roundtrip(NetworkMessage::NotFound(items.clone())) {
             NetworkMessage::NotFound(decoded) => assert_eq!(decoded, items),
-            other => panic!("expected NotFound, got {:?}", other),
+            other => panic!("expected NotFound, got {other:?}"),
         }
     }
 
@@ -928,7 +921,7 @@ mod tests {
     fn test_notfound_empty_roundtrip() {
         match roundtrip(NetworkMessage::NotFound(vec![])) {
             NetworkMessage::NotFound(decoded) => assert!(decoded.is_empty()),
-            other => panic!("expected NotFound, got {:?}", other),
+            other => panic!("expected NotFound, got {other:?}"),
         }
     }
 
@@ -952,7 +945,7 @@ mod tests {
                 assert_eq!(reason, "mandatory-script-verify-flag-failed");
                 assert_eq!(data, vec![0xab; 32]);
             }
-            other => panic!("expected Reject, got {:?}", other),
+            other => panic!("expected Reject, got {other:?}"),
         }
     }
 
@@ -976,7 +969,7 @@ mod tests {
                 assert_eq!(reason, "obsolete");
                 assert!(data.is_empty());
             }
-            other => panic!("expected Reject, got {:?}", other),
+            other => panic!("expected Reject, got {other:?}"),
         }
     }
 
@@ -984,7 +977,7 @@ mod tests {
     fn test_mempool_roundtrip() {
         match roundtrip(NetworkMessage::MemPool) {
             NetworkMessage::MemPool => {}
-            other => panic!("expected MemPool, got {:?}", other),
+            other => panic!("expected MemPool, got {other:?}"),
         }
     }
 
@@ -992,7 +985,7 @@ mod tests {
     fn test_getaddr_roundtrip() {
         match roundtrip(NetworkMessage::GetAddr) {
             NetworkMessage::GetAddr => {}
-            other => panic!("expected GetAddr, got {:?}", other),
+            other => panic!("expected GetAddr, got {other:?}"),
         }
     }
 
@@ -1007,7 +1000,7 @@ mod tests {
                 assert!(announce);
                 assert_eq!(version, 2);
             }
-            other => panic!("expected SendCmpct, got {:?}", other),
+            other => panic!("expected SendCmpct, got {other:?}"),
         }
     }
 
@@ -1022,7 +1015,7 @@ mod tests {
                 assert!(!announce);
                 assert_eq!(version, 1);
             }
-            other => panic!("expected SendCmpct, got {:?}", other),
+            other => panic!("expected SendCmpct, got {other:?}"),
         }
     }
 
@@ -1042,11 +1035,11 @@ mod tests {
 
         match msg1 {
             NetworkMessage::Ping(n) => assert_eq!(n, 1),
-            other => panic!("expected Ping, got {:?}", other),
+            other => panic!("expected Ping, got {other:?}"),
         }
         match msg2 {
             NetworkMessage::Pong(n) => assert_eq!(n, 2),
-            other => panic!("expected Pong, got {:?}", other),
+            other => panic!("expected Pong, got {other:?}"),
         }
     }
 
@@ -1055,27 +1048,33 @@ mod tests {
         // Build a raw version message payload with a user agent > 256 bytes
         let mut payload = Vec::new();
         payload.extend_from_slice(&70016u32.to_le_bytes()); // version
-        payload.extend_from_slice(&1u64.to_le_bytes());     // services
-        payload.extend_from_slice(&1_700_000_000i64.to_le_bytes()); // timestamp
-        // receiver net_address (26 bytes)
         payload.extend_from_slice(&1u64.to_le_bytes()); // services
-        payload.extend_from_slice(&[0u8; 16]);           // ip
+        payload.extend_from_slice(&1_700_000_000i64.to_le_bytes()); // timestamp
+                                                                    // receiver net_address (26 bytes)
+        payload.extend_from_slice(&1u64.to_le_bytes()); // services
+        payload.extend_from_slice(&[0u8; 16]); // ip
         payload.extend_from_slice(&8333u16.to_be_bytes()); // port
-        // sender net_address (26 bytes)
+                                                           // sender net_address (26 bytes)
         payload.extend_from_slice(&1u64.to_le_bytes());
         payload.extend_from_slice(&[0u8; 16]);
         payload.extend_from_slice(&8333u16.to_be_bytes());
         payload.extend_from_slice(&42u64.to_le_bytes()); // nonce
-        // user_agent: varint length 257 followed by bytes
+                                                         // user_agent: varint length 257 followed by bytes
         VarInt(5000).encode(&mut payload).unwrap();
         payload.extend_from_slice(&vec![b'A'; 5000]);
         payload.extend_from_slice(&0i32.to_le_bytes()); // start_height
         payload.push(1); // relay
 
         let result = decode_version(&mut std::io::Cursor::new(&payload));
-        assert!(result.is_err(), "Version message with user agent > 4096 bytes should be rejected");
+        assert!(
+            result.is_err(),
+            "Version message with user agent > 4096 bytes should be rejected"
+        );
         let err_msg = format!("{}", result.unwrap_err());
-        assert!(err_msg.contains("user agent too long"), "Error should mention user agent too long, got: {}", err_msg);
+        assert!(
+            err_msg.contains("user agent too long"),
+            "Error should mention user agent too long, got: {err_msg}"
+        );
     }
 
     #[test]
@@ -1098,7 +1097,10 @@ mod tests {
         payload.push(1);
 
         let result = decode_version(&mut std::io::Cursor::new(&payload));
-        assert!(result.is_ok(), "Version message with valid user agent should succeed");
+        assert!(
+            result.is_ok(),
+            "Version message with valid user agent should succeed"
+        );
         assert_eq!(result.unwrap().user_agent, "btc-rust/1");
     }
 
@@ -1232,7 +1234,7 @@ mod tests {
     fn test_empty_inv_roundtrip() {
         match roundtrip(NetworkMessage::Inv(vec![])) {
             NetworkMessage::Inv(items) => assert!(items.is_empty()),
-            other => panic!("expected Inv, got {:?}", other),
+            other => panic!("expected Inv, got {other:?}"),
         }
     }
 
@@ -1273,7 +1275,7 @@ mod tests {
     fn test_empty_addr_roundtrip() {
         match roundtrip(NetworkMessage::Addr(vec![])) {
             NetworkMessage::Addr(decoded) => assert!(decoded.is_empty()),
-            other => panic!("expected Addr, got {:?}", other),
+            other => panic!("expected Addr, got {other:?}"),
         }
     }
 
@@ -1322,7 +1324,7 @@ mod tests {
         let decoded = roundtrip(NetworkMessage::Version(ver));
         match decoded {
             NetworkMessage::Version(v) => assert!(!v.relay),
-            other => panic!("expected Version, got {:?}", other),
+            other => panic!("expected Version, got {other:?}"),
         }
     }
 
@@ -1375,7 +1377,7 @@ mod tests {
         let decoded = decode_payload("ping", &payload).unwrap();
         match decoded {
             NetworkMessage::Ping(n) => assert_eq!(n, 0xdeadbeef),
-            other => panic!("expected Ping, got {:?}", other),
+            other => panic!("expected Ping, got {other:?}"),
         }
     }
 
@@ -1386,7 +1388,7 @@ mod tests {
         let decoded = decode_payload("pong", &payload).unwrap();
         match decoded {
             NetworkMessage::Pong(n) => assert_eq!(n, 0xcafebabe),
-            other => panic!("expected Pong, got {:?}", other),
+            other => panic!("expected Pong, got {other:?}"),
         }
     }
 
@@ -1397,7 +1399,7 @@ mod tests {
         let decoded = decode_payload("feefilter", &payload).unwrap();
         match decoded {
             NetworkMessage::FeeFilter(r) => assert_eq!(r, 1234),
-            other => panic!("expected FeeFilter, got {:?}", other),
+            other => panic!("expected FeeFilter, got {other:?}"),
         }
     }
 
@@ -1415,14 +1417,15 @@ mod tests {
                 assert!(announce);
                 assert_eq!(version, 2);
             }
-            other => panic!("expected SendCmpct, got {:?}", other),
+            other => panic!("expected SendCmpct, got {other:?}"),
         }
     }
 
     #[test]
     fn test_encode_decode_payload_unknown() {
         let data = vec![0x01, 0x02, 0x03];
-        let payload = encode_payload(&NetworkMessage::Unknown("foobar".into(), data.clone())).unwrap();
+        let payload =
+            encode_payload(&NetworkMessage::Unknown("foobar".into(), data.clone())).unwrap();
         assert_eq!(payload, data);
         let decoded = decode_payload("foobar", &payload).unwrap();
         match decoded {
@@ -1430,7 +1433,7 @@ mod tests {
                 assert_eq!(cmd, "foobar");
                 assert_eq!(d, data);
             }
-            other => panic!("expected Unknown, got {:?}", other),
+            other => panic!("expected Unknown, got {other:?}"),
         }
     }
 
@@ -1471,7 +1474,7 @@ mod tests {
                 assert_eq!(gh.version, 70015);
                 assert_eq!(gh.locator_hashes.len(), 1);
             }
-            other => panic!("expected GetBlocks, got {:?}", other),
+            other => panic!("expected GetBlocks, got {other:?}"),
         }
     }
 
@@ -1480,14 +1483,38 @@ mod tests {
     #[test]
     fn test_inv_vec_encode_decode_multiple_types() {
         let items = vec![
-            InvItem { inv_type: InvType::Error, hash: Hash256::from_bytes([0; 32]) },
-            InvItem { inv_type: InvType::Tx, hash: Hash256::from_bytes([1; 32]) },
-            InvItem { inv_type: InvType::Block, hash: Hash256::from_bytes([2; 32]) },
-            InvItem { inv_type: InvType::FilteredBlock, hash: Hash256::from_bytes([3; 32]) },
-            InvItem { inv_type: InvType::CompactBlock, hash: Hash256::from_bytes([4; 32]) },
-            InvItem { inv_type: InvType::WtxId, hash: Hash256::from_bytes([5; 32]) },
-            InvItem { inv_type: InvType::WitnessTx, hash: Hash256::from_bytes([6; 32]) },
-            InvItem { inv_type: InvType::WitnessBlock, hash: Hash256::from_bytes([7; 32]) },
+            InvItem {
+                inv_type: InvType::Error,
+                hash: Hash256::from_bytes([0; 32]),
+            },
+            InvItem {
+                inv_type: InvType::Tx,
+                hash: Hash256::from_bytes([1; 32]),
+            },
+            InvItem {
+                inv_type: InvType::Block,
+                hash: Hash256::from_bytes([2; 32]),
+            },
+            InvItem {
+                inv_type: InvType::FilteredBlock,
+                hash: Hash256::from_bytes([3; 32]),
+            },
+            InvItem {
+                inv_type: InvType::CompactBlock,
+                hash: Hash256::from_bytes([4; 32]),
+            },
+            InvItem {
+                inv_type: InvType::WtxId,
+                hash: Hash256::from_bytes([5; 32]),
+            },
+            InvItem {
+                inv_type: InvType::WitnessTx,
+                hash: Hash256::from_bytes([6; 32]),
+            },
+            InvItem {
+                inv_type: InvType::WitnessBlock,
+                hash: Hash256::from_bytes([7; 32]),
+            },
         ];
         let mut buf = Vec::new();
         encode_inv_vec(&items, &mut buf).unwrap();
@@ -1508,13 +1535,18 @@ mod tests {
         let payload = encode_payload(&msg).unwrap();
         let decoded = decode_payload("reject", &payload).unwrap();
         match decoded {
-            NetworkMessage::Reject { message, code, reason, data } => {
+            NetworkMessage::Reject {
+                message,
+                code,
+                reason,
+                data,
+            } => {
                 assert_eq!(message, "block");
                 assert_eq!(code, 0x43);
                 assert_eq!(reason, "duplicate");
                 assert_eq!(data.len(), 32);
             }
-            other => panic!("expected Reject, got {:?}", other),
+            other => panic!("expected Reject, got {other:?}"),
         }
     }
 
@@ -1537,7 +1569,7 @@ mod tests {
                 assert_eq!(h.len(), 1);
                 assert_eq!(h[0], headers[0]);
             }
-            other => panic!("expected Headers, got {:?}", other),
+            other => panic!("expected Headers, got {other:?}"),
         }
     }
 
@@ -1546,8 +1578,16 @@ mod tests {
     #[test]
     fn test_addr_encode_decode_payload() {
         let addrs = vec![
-            NetAddress { services: 0x0d, ip: [0; 16], port: 8333 },
-            NetAddress { services: 0x01, ip: [0; 16], port: 18333 },
+            NetAddress {
+                services: 0x0d,
+                ip: [0; 16],
+                port: 8333,
+            },
+            NetAddress {
+                services: 0x01,
+                ip: [0; 16],
+                port: 18333,
+            },
         ];
         let payload = encode_payload(&NetworkMessage::Addr(addrs.clone())).unwrap();
         let decoded = decode_payload("addr", &payload).unwrap();
@@ -1558,7 +1598,7 @@ mod tests {
                 assert_eq!(a[0].port, 8333);
                 assert_eq!(a[1].port, 18333);
             }
-            other => panic!("expected Addr, got {:?}", other),
+            other => panic!("expected Addr, got {other:?}"),
         }
     }
 
@@ -1572,7 +1612,7 @@ mod tests {
         let decoded = codec.decode(&mut buf).unwrap().unwrap();
         match decoded {
             NetworkMessage::Ping(n) => assert_eq!(n, 42),
-            other => panic!("expected Ping, got {:?}", other),
+            other => panic!("expected Ping, got {other:?}"),
         }
     }
 
@@ -1606,7 +1646,9 @@ mod tests {
         let mut testnet_codec = BitcoinCodec::new(Network::Testnet.magic());
         let mut buf = BytesMut::new();
         // Encode with testnet
-        testnet_codec.encode(NetworkMessage::Verack, &mut buf).unwrap();
+        testnet_codec
+            .encode(NetworkMessage::Verack, &mut buf)
+            .unwrap();
         // Decode with mainnet -- should fail
         let err = mainnet_codec.decode(&mut buf).unwrap_err();
         assert!(err.to_string().contains("invalid magic"));
@@ -1652,14 +1694,20 @@ mod tests {
     #[test]
     fn test_notfound_payload_roundtrip() {
         let items = vec![
-            InvItem { inv_type: InvType::Tx, hash: Hash256::from_bytes([0x11; 32]) },
-            InvItem { inv_type: InvType::Block, hash: Hash256::from_bytes([0x22; 32]) },
+            InvItem {
+                inv_type: InvType::Tx,
+                hash: Hash256::from_bytes([0x11; 32]),
+            },
+            InvItem {
+                inv_type: InvType::Block,
+                hash: Hash256::from_bytes([0x22; 32]),
+            },
         ];
         let payload = encode_payload(&NetworkMessage::NotFound(items.clone())).unwrap();
         let decoded = decode_payload("notfound", &payload).unwrap();
         match decoded {
             NetworkMessage::NotFound(d) => assert_eq!(d, items),
-            other => panic!("expected NotFound, got {:?}", other),
+            other => panic!("expected NotFound, got {other:?}"),
         }
     }
 
@@ -1675,7 +1723,7 @@ mod tests {
         let decoded = decode_payload("getdata", &payload).unwrap();
         match decoded {
             NetworkMessage::GetData(d) => assert_eq!(d, items),
-            other => panic!("expected GetData, got {:?}", other),
+            other => panic!("expected GetData, got {other:?}"),
         }
     }
 
@@ -1697,7 +1745,7 @@ mod tests {
         let decoded = roundtrip(NetworkMessage::Version(ver));
         match decoded {
             NetworkMessage::Version(v) => assert_eq!(v.user_agent, ""),
-            other => panic!("expected Version, got {:?}", other),
+            other => panic!("expected Version, got {other:?}"),
         }
     }
 
@@ -1712,7 +1760,7 @@ mod tests {
                 assert_eq!(cmd, "weirdcommand");
                 assert_eq!(d, data);
             }
-            other => panic!("expected Unknown, got {:?}", other),
+            other => panic!("expected Unknown, got {other:?}"),
         }
     }
 
@@ -1746,7 +1794,7 @@ mod tests {
         }];
         match roundtrip(NetworkMessage::Inv(items.clone())) {
             NetworkMessage::Inv(decoded) => assert_eq!(decoded, items),
-            other => panic!("expected Inv, got {:?}", other),
+            other => panic!("expected Inv, got {other:?}"),
         }
     }
 
@@ -1798,7 +1846,7 @@ mod tests {
                 assert_eq!(decoded.header, block.header);
                 assert_eq!(decoded.transactions.len(), 2);
             }
-            other => panic!("expected Block, got {:?}", other),
+            other => panic!("expected Block, got {other:?}"),
         }
     }
 
@@ -1808,7 +1856,7 @@ mod tests {
     fn test_feefilter_zero_roundtrip() {
         match roundtrip(NetworkMessage::FeeFilter(0)) {
             NetworkMessage::FeeFilter(r) => assert_eq!(r, 0),
-            other => panic!("expected FeeFilter, got {:?}", other),
+            other => panic!("expected FeeFilter, got {other:?}"),
         }
     }
 
@@ -1818,7 +1866,7 @@ mod tests {
     fn test_feefilter_max_roundtrip() {
         match roundtrip(NetworkMessage::FeeFilter(u64::MAX)) {
             NetworkMessage::FeeFilter(r) => assert_eq!(r, u64::MAX),
-            other => panic!("expected FeeFilter, got {:?}", other),
+            other => panic!("expected FeeFilter, got {other:?}"),
         }
     }
 
@@ -1833,13 +1881,18 @@ mod tests {
             data: vec![],
         };
         match roundtrip(msg) {
-            NetworkMessage::Reject { message, code, reason, data } => {
+            NetworkMessage::Reject {
+                message,
+                code,
+                reason,
+                data,
+            } => {
                 assert_eq!(message, "");
                 assert_eq!(code, 0);
                 assert_eq!(reason, "");
                 assert!(data.is_empty());
             }
-            other => panic!("expected Reject, got {:?}", other),
+            other => panic!("expected Reject, got {other:?}"),
         }
     }
 
@@ -1856,7 +1909,7 @@ mod tests {
             NetworkMessage::GetHeaders(decoded) => {
                 assert!(decoded.locator_hashes.is_empty());
             }
-            other => panic!("expected GetHeaders, got {:?}", other),
+            other => panic!("expected GetHeaders, got {other:?}"),
         }
     }
 
@@ -1866,7 +1919,7 @@ mod tests {
     fn test_headers_empty_list_roundtrip() {
         match roundtrip(NetworkMessage::Headers(vec![])) {
             NetworkMessage::Headers(decoded) => assert!(decoded.is_empty()),
-            other => panic!("expected Headers, got {:?}", other),
+            other => panic!("expected Headers, got {other:?}"),
         }
     }
 }

@@ -8,11 +8,10 @@
 use btc_primitives::block::Block;
 use btc_primitives::transaction::TxOut;
 
-use crate::script_engine::ScriptFlags;
 use crate::sig_verify::Secp256k1Verifier;
 use crate::utxo::UtxoSet;
 use crate::validation::ChainParams;
-use crate::witness::verify_input;
+use crate::witness::verify_input_with_prevouts;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -105,15 +104,15 @@ impl ParallelValidator {
         // threads only need shared, immutable references.
         // Use consensus flags for block validation — policy flags (MINIMALDATA,
         // SIGPUSHONLY, etc.) only apply to mempool relay, not historical blocks.
-        let flags = ScriptFlags::consensus();
+        let flags = params.script_flags(height);
 
         struct WorkItem {
             tx_idx: usize,
             input_idx: usize,
-            prev_output: TxOut,
         }
 
         let mut work: Vec<WorkItem> = Vec::new();
+        let mut prevouts_by_tx = vec![Vec::<TxOut>::new(); block.transactions.len()];
 
         // Build an intra-block output map for outputs created earlier in this
         // block that may be spent by later transactions (same-block spends).
@@ -136,18 +135,12 @@ impl ParallelValidator {
                         return Err(vec![(
                             tx_idx,
                             input_idx,
-                            format!(
-                                "missing UTXO for outpoint {:?}",
-                                input.previous_output
-                            ),
+                            format!("missing UTXO for outpoint {:?}", input.previous_output),
                         )]);
                     };
 
-                    work.push(WorkItem {
-                        tx_idx,
-                        input_idx,
-                        prev_output,
-                    });
+                    prevouts_by_tx[tx_idx].push(prev_output.clone());
+                    work.push(WorkItem { tx_idx, input_idx });
                 }
             }
 
@@ -177,6 +170,7 @@ impl ParallelValidator {
                 .map(|slice| {
                     let txs = &block.transactions;
                     let flags = &flags;
+                    let prevouts = &prevouts_by_tx;
                     s.spawn(move || {
                         let verifier = Secp256k1Verifier;
                         let mut local_errors: Vec<(usize, usize, String)> = Vec::new();
@@ -184,18 +178,14 @@ impl ParallelValidator {
                         for batch in slice {
                             for item in *batch {
                                 let tx = &txs[item.tx_idx];
-                                if let Err(e) = verify_input(
+                                if let Err(e) = verify_input_with_prevouts(
                                     tx,
                                     item.input_idx,
-                                    &item.prev_output,
+                                    &prevouts[item.tx_idx],
                                     &verifier,
                                     flags,
                                 ) {
-                                    local_errors.push((
-                                        item.tx_idx,
-                                        item.input_idx,
-                                        e.to_string(),
-                                    ));
+                                    local_errors.push((item.tx_idx, item.input_idx, e.to_string()));
                                 }
                             }
                         }
@@ -257,14 +247,14 @@ fn distribute<T>(items: &[T], n: usize) -> Vec<&[T]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utxo::{InMemoryUtxoSet, UtxoEntry};
+    use crate::validation::ChainParams;
     use btc_primitives::amount::Amount;
     use btc_primitives::block::{Block, BlockHeader};
     use btc_primitives::compact::CompactTarget;
     use btc_primitives::hash::{BlockHash, TxHash};
     use btc_primitives::script::ScriptBuf;
     use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
-    use crate::utxo::{InMemoryUtxoSet, UtxoEntry};
-    use crate::validation::ChainParams;
 
     // -----------------------------------------------------------------------
     // Test helpers
@@ -364,10 +354,7 @@ mod tests {
         let op2 = OutPoint::new(TxHash::from_bytes([0x02; 32]), 0);
         let op3 = OutPoint::new(TxHash::from_bytes([0x03; 32]), 0);
 
-        let utxo_set = utxo_set_with_entries(
-            &[op1, op2, op3],
-            Amount::from_sat(10_000),
-        );
+        let utxo_set = utxo_set_with_entries(&[op1, op2, op3], Amount::from_sat(10_000));
 
         let coinbase = make_coinbase_tx(Amount::from_sat(50 * 100_000_000));
         let tx1 = make_spend_tx(vec![op1], vec![Amount::from_sat(9_000)]);
@@ -379,7 +366,7 @@ mod tests {
         let validator = ParallelValidator::default();
 
         let result = validator.validate_block_scripts(&block, &utxo_set, 1, &params);
-        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
     }
 
     // -----------------------------------------------------------------------
@@ -402,7 +389,7 @@ mod tests {
         });
 
         let result = validator.validate_block_scripts(&block, &utxo_set, 1, &params);
-        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
     }
 
     // -----------------------------------------------------------------------
@@ -436,8 +423,7 @@ mod tests {
         let result = validator.validate_block_scripts(&block, &utxo_set, 100, &params);
         assert!(
             result.is_ok(),
-            "assume-valid block should skip verification, got: {:?}",
-            result
+            "assume-valid block should skip verification, got: {result:?}"
         );
     }
 
@@ -514,7 +500,10 @@ mod tests {
         let validator = ParallelValidator::default();
 
         let result = validator.validate_block_scripts(&block, &utxo_set, 0, &params);
-        assert!(result.is_ok(), "coinbase-only block should pass, got: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "coinbase-only block should pass, got: {result:?}"
+        );
     }
 
     // -----------------------------------------------------------------------

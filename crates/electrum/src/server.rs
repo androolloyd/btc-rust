@@ -151,7 +151,7 @@ mod tests {
         });
 
         // Connect as a client
-        let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
+        let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
             .await
             .unwrap();
         let (reader, mut writer) = client.split();
@@ -159,7 +159,7 @@ mod tests {
         // Send a server.version request
         let req = r#"{"id":1,"method":"server.version","params":["test","1.4"]}"#;
         writer
-            .write_all(format!("{}\n", req).as_bytes())
+            .write_all(format!("{req}\n").as_bytes())
             .await
             .unwrap();
 
@@ -203,7 +203,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Connect as a client and send a request
-        let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
+        let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
             .await
             .unwrap();
         let (reader, mut writer) = client.split();
@@ -211,7 +211,7 @@ mod tests {
         // Send server.ping
         let req = r#"{"id":1,"method":"server.ping","params":[]}"#;
         writer
-            .write_all(format!("{}\n", req).as_bytes())
+            .write_all(format!("{req}\n").as_bytes())
             .await
             .unwrap();
 
@@ -241,11 +241,8 @@ mod tests {
 
         // Use tokio::select! to add a timeout - the run method should return
         // immediately with Ok(()) when the port is in use
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            server.run(handler),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(2), server.run(handler)).await;
 
         // It should complete quickly (not timeout) and return Ok(())
         match result {
@@ -287,7 +284,7 @@ mod tests {
             }
         });
 
-        let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
+        let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
             .await
             .unwrap();
         let (reader, mut writer) = client.split();
@@ -296,7 +293,7 @@ mod tests {
         writer.write_all(b"\n\n").await.unwrap();
         let req = r#"{"id":42,"method":"server.ping","params":[]}"#;
         writer
-            .write_all(format!("{}\n", req).as_bytes())
+            .write_all(format!("{req}\n").as_bytes())
             .await
             .unwrap();
 
@@ -336,19 +333,16 @@ mod tests {
             }
         });
 
-        let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
+        let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
             .await
             .unwrap();
         let (reader, mut writer) = client.split();
 
         // Send multiple requests
         for i in 1..=3 {
-            let req = format!(
-                r#"{{"id":{},"method":"server.ping","params":[]}}"#,
-                i
-            );
+            let req = format!(r#"{{"id":{i},"method":"server.ping","params":[]}}"#);
             writer
-                .write_all(format!("{}\n", req).as_bytes())
+                .write_all(format!("{req}\n").as_bytes())
                 .await
                 .unwrap();
         }
@@ -391,7 +385,7 @@ mod tests {
             }
         });
 
-        let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
+        let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
             .await
             .unwrap();
         let (reader, mut writer) = client.split();

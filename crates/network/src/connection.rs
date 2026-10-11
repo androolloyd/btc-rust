@@ -23,7 +23,13 @@ pub enum ConnectionError {
 
 /// A Bitcoin P2P connection wrapping a framed TCP stream.
 pub struct Connection {
-    framed: Framed<TcpStream, BitcoinCodec>,
+    framed: Transport,
+}
+
+enum Transport {
+    V1(Framed<TcpStream, BitcoinCodec>),
+    #[cfg(feature = "v2")]
+    V2(Framed<TcpStream, crate::v2codec::V2Codec>),
 }
 
 impl Connection {
@@ -35,26 +41,81 @@ impl Connection {
         let stream = TcpStream::connect(addr).await?;
         let codec = BitcoinCodec::new(network.magic());
         let framed = Framed::new(stream, codec);
-        Ok(Connection { framed })
+        Ok(Connection {
+            framed: Transport::V1(framed),
+        })
+    }
+
+    /// Prefer BIP324, reconnecting with v1 when the peer does not support it.
+    pub async fn connect_outbound_negotiated(
+        addr: SocketAddr,
+        network: Network,
+    ) -> Result<Self, ConnectionError> {
+        #[cfg(feature = "v2")]
+        if let Ok(Ok(connection)) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            Self::connect_outbound_v2(addr, network),
+        )
+        .await
+        {
+            return Ok(connection);
+        }
+        Self::connect_outbound(addr, network).await
+    }
+    #[cfg(feature = "v2")]
+    pub async fn connect_outbound_v2(
+        addr: SocketAddr,
+        network: Network,
+    ) -> Result<Self, ConnectionError> {
+        Self::from_stream_v2(TcpStream::connect(addr).await?, network, true).await
+    }
+    #[cfg(feature = "v2")]
+    pub async fn from_stream_v2(
+        mut stream: TcpStream,
+        network: Network,
+        initiating: bool,
+    ) -> Result<Self, ConnectionError> {
+        let codec = crate::v2codec::handshake(&mut stream, network, initiating).await?;
+        Ok(Self {
+            framed: Transport::V2(Framed::new(stream, codec)),
+        })
+    }
+    pub fn is_encrypted(&self) -> bool {
+        match &self.framed {
+            Transport::V1(_) => false,
+            #[cfg(feature = "v2")]
+            Transport::V2(_) => true,
+        }
     }
 
     /// Wrap an existing TcpStream (e.g., from an accepted inbound connection).
     pub fn from_stream(stream: TcpStream, network: Network) -> Self {
         let codec = BitcoinCodec::new(network.magic());
         let framed = Framed::new(stream, codec);
-        Connection { framed }
+        Connection {
+            framed: Transport::V1(framed),
+        }
     }
 
     /// Send a single message to the peer.
     pub async fn send_message(&mut self, msg: NetworkMessage) -> Result<(), ConnectionError> {
-        self.framed.send(msg).await?;
+        match &mut self.framed {
+            Transport::V1(framed) => framed.send(msg).await?,
+            #[cfg(feature = "v2")]
+            Transport::V2(framed) => framed.send(msg).await?,
+        }
         Ok(())
     }
 
     /// Receive a single message from the peer.
     /// Returns `ConnectionError::ConnectionClosed` if the stream ends.
     pub async fn recv_message(&mut self) -> Result<NetworkMessage, ConnectionError> {
-        match self.framed.next().await {
+        let next = match &mut self.framed {
+            Transport::V1(framed) => framed.next().await,
+            #[cfg(feature = "v2")]
+            Transport::V2(framed) => framed.next().await,
+        };
+        match next {
             Some(Ok(msg)) => Ok(msg),
             Some(Err(e)) => {
                 tracing::debug!(error = %e, "message decode/io error");
@@ -156,7 +217,7 @@ mod tests {
             let msg = conn.recv_message().await.unwrap();
             match msg {
                 NetworkMessage::Ping(n) => assert_eq!(n, 42),
-                other => panic!("expected Ping, got {:?}", other),
+                other => panic!("expected Ping, got {other:?}"),
             }
             conn.send_message(NetworkMessage::Pong(42)).await.unwrap();
         });
@@ -167,7 +228,7 @@ mod tests {
         let response = conn.recv_message().await.unwrap();
         match response {
             NetworkMessage::Pong(n) => assert_eq!(n, 42),
-            other => panic!("expected Pong, got {:?}", other),
+            other => panic!("expected Pong, got {other:?}"),
         }
 
         server.await.unwrap();
@@ -207,14 +268,16 @@ mod tests {
             assert!(matches!(msg2, NetworkMessage::SendHeaders));
             match msg3 {
                 NetworkMessage::Ping(n) => assert_eq!(n, 123),
-                other => panic!("expected Ping, got {:?}", other),
+                other => panic!("expected Ping, got {other:?}"),
             }
         });
 
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let mut conn = Connection::from_stream(stream, Network::Mainnet);
         conn.send_message(NetworkMessage::Verack).await.unwrap();
-        conn.send_message(NetworkMessage::SendHeaders).await.unwrap();
+        conn.send_message(NetworkMessage::SendHeaders)
+            .await
+            .unwrap();
         conn.send_message(NetworkMessage::Ping(123)).await.unwrap();
 
         server.await.unwrap();
@@ -246,7 +309,9 @@ mod tests {
                 start_height: 800_000,
                 relay: true,
             };
-            conn.send_message(NetworkMessage::Version(ver)).await.unwrap();
+            conn.send_message(NetworkMessage::Version(ver))
+                .await
+                .unwrap();
 
             // Receive wtxidrelay and verack from client
             let msg1 = conn.recv_message().await.unwrap();
@@ -260,7 +325,10 @@ mod tests {
 
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let mut conn = Connection::from_stream(stream, Network::Mainnet);
-        let hs = conn.perform_handshake(Network::Mainnet, 800_000).await.unwrap();
+        let hs = conn
+            .perform_handshake(Network::Mainnet, 800_000)
+            .await
+            .unwrap();
         assert!(hs.is_ready());
         assert!(hs.peer_version().is_some());
         assert_eq!(hs.peer_version().unwrap().user_agent, "/test-peer/");
@@ -271,11 +339,8 @@ mod tests {
     #[tokio::test]
     async fn test_connect_outbound_refused() {
         // Try to connect to a port that's not listening
-        let result = Connection::connect_outbound(
-            "127.0.0.1:1".parse().unwrap(),
-            Network::Mainnet,
-        )
-        .await;
+        let result =
+            Connection::connect_outbound("127.0.0.1:1".parse().unwrap(), Network::Mainnet).await;
         assert!(result.is_err());
     }
 }

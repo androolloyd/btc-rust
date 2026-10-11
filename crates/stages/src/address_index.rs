@@ -98,8 +98,7 @@ impl AddressIndexStage {
         // Collect spent (txid, output_index) pairs. The spend entry stores
         // the *original* output's txid (the outpoint being consumed), so we
         // can match receives to spends directly.
-        let mut spent: std::collections::HashSet<(TxHash, u32)> =
-            std::collections::HashSet::new();
+        let mut spent: std::collections::HashSet<(TxHash, u32)> = std::collections::HashSet::new();
         for entry in entries {
             if entry.value < 0 {
                 spent.insert((entry.txid, entry.output_index));
@@ -173,7 +172,7 @@ impl AddressIndexStage {
         self.add_entry(
             script_hash,
             AddressIndexEntry {
-                txid: txid.clone(),
+                txid,
                 height,
                 tx_index: 0,
                 value: 50_0000_0000, // 50 BTC coinbase reward
@@ -314,9 +313,7 @@ impl Stage for AddressIndexStage {
 
         self.checkpoint = target;
 
-        Ok(UnwindOutput {
-            checkpoint: target,
-        })
+        Ok(UnwindOutput { checkpoint: target })
     }
 }
 
@@ -546,7 +543,7 @@ mod tests {
         stage.add_entry(
             script_hash,
             AddressIndexEntry {
-                txid: txid.clone(),
+                txid: txid,
                 height: 42,
                 tx_index: 0,
                 value: 100_000,

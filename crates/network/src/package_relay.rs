@@ -348,9 +348,7 @@ mod tests {
             ..PackagePolicy::default()
         };
 
-        let txs: Vec<PackageTxInfo> = (0..4u8)
-            .map(|i| make_tx_info(i + 1, 1_000, 400))
-            .collect();
+        let txs: Vec<PackageTxInfo> = (0..4u8).map(|i| make_tx_info(i + 1, 1_000, 400)).collect();
 
         let package = PackageInfo::new(txs);
         let err = validate_package(&package, &policy).unwrap_err();
@@ -360,7 +358,7 @@ mod tests {
                 assert_eq!(count, 4);
                 assert_eq!(max, 3);
             }
-            other => panic!("expected TooManyTransactions, got: {:?}", other),
+            other => panic!("expected TooManyTransactions, got: {other:?}"),
         }
     }
 
@@ -384,7 +382,7 @@ mod tests {
                 assert_eq!(weight, 1_200);
                 assert_eq!(max, 1_000);
             }
-            other => panic!("expected TooHeavy, got: {:?}", other),
+            other => panic!("expected TooHeavy, got: {other:?}"),
         }
     }
 
@@ -406,7 +404,7 @@ mod tests {
 
         match err {
             PackageError::FeerateTooLow { .. } => {} // expected
-            other => panic!("expected FeerateTooLow, got: {:?}", other),
+            other => panic!("expected FeerateTooLow, got: {other:?}"),
         }
     }
 
@@ -500,9 +498,7 @@ mod tests {
     #[test]
     fn test_max_count_package_accepted() {
         let policy = PackagePolicy::default();
-        let txs: Vec<PackageTxInfo> = (0..25u8)
-            .map(|i| make_tx_info(i + 1, 1_000, 400))
-            .collect();
+        let txs: Vec<PackageTxInfo> = (0..25u8).map(|i| make_tx_info(i + 1, 1_000, 400)).collect();
 
         let package = PackageInfo::new(txs);
         let result = validate_package(&package, &policy);
@@ -512,12 +508,13 @@ mod tests {
     #[test]
     fn test_26_tx_package_rejected() {
         let policy = PackagePolicy::default();
-        let txs: Vec<PackageTxInfo> = (0..26u8)
-            .map(|i| make_tx_info(i + 1, 1_000, 400))
-            .collect();
+        let txs: Vec<PackageTxInfo> = (0..26u8).map(|i| make_tx_info(i + 1, 1_000, 400)).collect();
 
         let package = PackageInfo::new(txs);
         let err = validate_package(&package, &policy).unwrap_err();
-        assert!(matches!(err, PackageError::TooManyTransactions { count: 26, max: 25 }));
+        assert!(matches!(
+            err,
+            PackageError::TooManyTransactions { count: 26, max: 25 }
+        ));
     }
 }

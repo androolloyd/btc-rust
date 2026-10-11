@@ -69,8 +69,7 @@ const TPUB_VERSION: [u8; 4] = [0x04, 0x35, 0x87, 0xCF];
 // Base58 (reused from address.rs logic, self-contained here)
 // ---------------------------------------------------------------------------
 
-const BASE58_ALPHABET: &[u8; 58] =
-    b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+const BASE58_ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 fn base58_encode(data: &[u8]) -> String {
     if data.is_empty() {
@@ -235,8 +234,7 @@ impl DerivationPath {
             &path[2..]
         } else {
             return Err(Bip32Error::InvalidPath(format!(
-                "path must start with 'm/', got: {}",
-                path
+                "path must start with 'm/', got: {path}"
             )));
         };
 
@@ -253,9 +251,9 @@ impl DerivationPath {
                 (part, false)
             };
 
-            let index: u32 = num_str.parse().map_err(|_| {
-                Bip32Error::InvalidPath(format!("invalid index: {}", part))
-            })?;
+            let index: u32 = num_str
+                .parse()
+                .map_err(|_| Bip32Error::InvalidPath(format!("invalid index: {part}")))?;
 
             let child = if hardened {
                 ChildNumber::hardened(index)?
@@ -274,7 +272,7 @@ impl std::fmt::Display for DerivationPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "m")?;
         for c in &self.components {
-            write!(f, "/{}", c)?;
+            write!(f, "/{c}")?;
         }
         Ok(())
     }
@@ -330,8 +328,7 @@ impl ExtendedPrivKey {
 
         let (il, ir) = result.split_at(32);
 
-        let secret_key =
-            SecretKey::from_slice(il).map_err(|_| Bip32Error::InvalidKey)?;
+        let secret_key = SecretKey::from_slice(il).map_err(|_| Bip32Error::InvalidKey)?;
 
         let mut chain_code = [0u8; 32];
         chain_code.copy_from_slice(ir);
@@ -383,7 +380,8 @@ impl ExtendedPrivKey {
         // child_key = parse256(IL) + kpar (mod n)
         let tweak = Scalar::from_be_bytes(il.try_into().expect("IL is 32 bytes"))
             .map_err(|_| Bip32Error::InvalidKey)?;
-        let child_key = self.secret_key
+        let child_key = self
+            .secret_key
             .add_tweak(&tweak)
             .map_err(|_| Bip32Error::InvalidKey)?;
 
@@ -392,9 +390,10 @@ impl ExtendedPrivKey {
 
         Ok(ExtendedPrivKey {
             network: self.network,
-            depth: self.depth.checked_add(1).ok_or_else(|| {
-                Bip32Error::InvalidPath("depth overflow".to_string())
-            })?,
+            depth: self
+                .depth
+                .checked_add(1)
+                .ok_or_else(|| Bip32Error::InvalidPath("depth overflow".to_string()))?,
             parent_fingerprint: self.fingerprint(),
             child_number: child,
             chain_code,
@@ -558,8 +557,7 @@ impl ExtendedPubKey {
         let (il, ir) = result.split_at(32);
 
         // Parse IL as a secret key, then compute IL*G + parent_pubkey
-        let il_key =
-            SecretKey::from_slice(il).map_err(|_| Bip32Error::InvalidKey)?;
+        let il_key = SecretKey::from_slice(il).map_err(|_| Bip32Error::InvalidKey)?;
 
         let mut child_pubkey = self.public_key;
         child_pubkey = child_pubkey
@@ -571,9 +569,10 @@ impl ExtendedPubKey {
 
         Ok(ExtendedPubKey {
             network: self.network,
-            depth: self.depth.checked_add(1).ok_or_else(|| {
-                Bip32Error::InvalidPath("depth overflow".to_string())
-            })?,
+            depth: self
+                .depth
+                .checked_add(1)
+                .ok_or_else(|| Bip32Error::InvalidPath("depth overflow".to_string()))?,
             parent_fingerprint: self.fingerprint(),
             child_number: child,
             chain_code,
@@ -698,17 +697,17 @@ pub fn purpose_86() -> &'static str {
 
 /// Build a full BIP44 derivation path: m/44'/coin'/account'/change/index
 pub fn bip44_path(coin: u32, account: u32, change: u32, index: u32) -> String {
-    format!("m/44'/{}'/{}'/{}/{}", coin, account, change, index)
+    format!("m/44'/{coin}'/{account}'/{change}/{index}")
 }
 
 /// Build a full BIP84 derivation path: m/84'/coin'/account'/change/index
 pub fn bip84_path(coin: u32, account: u32, change: u32, index: u32) -> String {
-    format!("m/84'/{}'/{}'/{}/{}", coin, account, change, index)
+    format!("m/84'/{coin}'/{account}'/{change}/{index}")
 }
 
 /// Build a full BIP86 derivation path: m/86'/coin'/account'/change/index
 pub fn bip86_path(coin: u32, account: u32, change: u32, index: u32) -> String {
-    format!("m/86'/{}'/{}'/{}/{}", coin, account, change, index)
+    format!("m/86'/{coin}'/{account}'/{change}/{index}")
 }
 
 // ---------------------------------------------------------------------------
@@ -755,7 +754,9 @@ mod tests {
     fn test_vector_1_chain_m_0h() {
         let seed = test_seed_1();
         let master = ExtendedPrivKey::from_seed(&seed, Network::Mainnet).unwrap();
-        let child = master.derive_child(ChildNumber::hardened(0).unwrap()).unwrap();
+        let child = master
+            .derive_child(ChildNumber::hardened(0).unwrap())
+            .unwrap();
         assert_eq!(
             child.to_base58(),
             "xprv9uHRZZhk6KAJC1avXpDAp4MDc3sQKNxDiPvvkX8Br5ngLNv1TxvUxt4cV1rGL5hj6KCesnDYUhd7oWgT11eZG7XnxHrnYeSvkzY7d2bhkJ7"
@@ -853,7 +854,9 @@ mod tests {
     fn test_vector_2_chain_m_0() {
         let seed = test_seed_2();
         let master = ExtendedPrivKey::from_seed(&seed, Network::Mainnet).unwrap();
-        let child = master.derive_child(ChildNumber::normal(0).unwrap()).unwrap();
+        let child = master
+            .derive_child(ChildNumber::normal(0).unwrap())
+            .unwrap();
         assert_eq!(
             child.to_base58(),
             "xprv9vHkqa6EV4sPZHYqZznhT2NPtPCjKuDKGY38FBWLvgaDx45zo9WQRUT3dKYnjwih2yJD9mkrocEZXo1ex8G81dwSM1fwqWpWkeS3v86pgKt"
@@ -902,7 +905,9 @@ mod tests {
     fn test_vector_2_chain_m_0_2147483647h_1_2147483646h_2() {
         let seed = test_seed_2();
         let master = ExtendedPrivKey::from_seed(&seed, Network::Mainnet).unwrap();
-        let child = master.derive_path("m/0/2147483647'/1/2147483646'/2").unwrap();
+        let child = master
+            .derive_path("m/0/2147483647'/1/2147483646'/2")
+            .unwrap();
         assert_eq!(
             child.to_base58(),
             "xprvA2nrNbFZABcdryreWet9Ea4LvTJcGsqrMzxHx98MMrotbir7yrKCEXw7nadnHM8Dq38EGfSh6dqA9QWTyefMLEcBYJUuekgW4BYPJcr9E7j"
@@ -917,12 +922,16 @@ mod tests {
         let master = ExtendedPrivKey::from_seed(&seed, Network::Mainnet).unwrap();
 
         // Derive m/0' first (hardened, must use private)
-        let m_0h = master.derive_child(ChildNumber::hardened(0).unwrap()).unwrap();
+        let m_0h = master
+            .derive_child(ChildNumber::hardened(0).unwrap())
+            .unwrap();
 
         // Then derive m/0'/1 via private and via public
         let m_0h_1_priv = m_0h.derive_child(ChildNumber::normal(1).unwrap()).unwrap();
         let m_0h_pub = m_0h.to_extended_pub_key();
-        let m_0h_1_pub = m_0h_pub.derive_child(ChildNumber::normal(1).unwrap()).unwrap();
+        let m_0h_1_pub = m_0h_pub
+            .derive_child(ChildNumber::normal(1).unwrap())
+            .unwrap();
 
         // The public keys should match
         assert_eq!(
@@ -1113,7 +1122,9 @@ mod tests {
         assert_ne!(fp, [0; 4]);
 
         // Child should have parent's fingerprint
-        let child = master.derive_child(ChildNumber::hardened(0).unwrap()).unwrap();
+        let child = master
+            .derive_child(ChildNumber::hardened(0).unwrap())
+            .unwrap();
         assert_eq!(child.parent_fingerprint, fp);
     }
 
@@ -1135,10 +1146,10 @@ mod tests {
     #[test]
     fn test_child_number_display() {
         let normal = ChildNumber::normal(42).unwrap();
-        assert_eq!(format!("{}", normal), "42");
+        assert_eq!(format!("{normal}"), "42");
 
         let hardened = ChildNumber::hardened(42).unwrap();
-        assert_eq!(format!("{}", hardened), "42'");
+        assert_eq!(format!("{hardened}"), "42'");
     }
 
     #[test]
@@ -1232,8 +1243,7 @@ mod tests {
             assert_eq!(
                 child_priv.public_key().serialize(),
                 child_pub.public_key.serialize(),
-                "public keys should match for index {}",
-                i
+                "public keys should match for index {i}"
             );
         }
     }
@@ -1256,7 +1266,7 @@ mod tests {
             Bip32Error::InvalidChildNumber,
         ];
         for e in errors {
-            let s = format!("{}", e);
+            let s = format!("{e}");
             assert!(!s.is_empty());
         }
     }
@@ -1267,7 +1277,7 @@ mod tests {
     fn test_extended_priv_key_debug_redacts_secret() {
         let seed = test_seed_1();
         let master = ExtendedPrivKey::from_seed(&seed, Network::Mainnet).unwrap();
-        let debug = format!("{:?}", master);
+        let debug = format!("{master:?}");
         assert!(debug.contains("[redacted]"));
         // Should not leak the actual secret key bytes
         let secret_hex = hex::encode(&master.secret_key[..]);

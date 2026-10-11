@@ -1,6 +1,6 @@
 use btc_primitives::block::BlockHeader;
 use btc_primitives::hash::{BlockHash, TxHash};
-use btc_primitives::transaction::{Transaction, TxOut, OutPoint};
+use btc_primitives::transaction::{OutPoint, Transaction, TxOut};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -66,7 +66,10 @@ pub trait DbTx: Send + Sync {
     fn get_tx_block_index(&self, txid: &TxHash) -> Result<Option<TxBlockLocation>, StorageError>;
 
     /// Get all transaction entries for a given script hash (address index).
-    fn get_address_txs(&self, script_hash: &[u8; 32]) -> Result<Vec<AddressIndexValue>, StorageError>;
+    fn get_address_txs(
+        &self,
+        script_hash: &[u8; 32],
+    ) -> Result<Vec<AddressIndexValue>, StorageError>;
 }
 
 /// Read-write database transaction
@@ -129,7 +132,7 @@ mod tests {
     #[test]
     fn test_storage_error_debug() {
         let err = StorageError::Database("debug test".into());
-        let debug_str = format!("{:?}", err);
+        let debug_str = format!("{err:?}");
         assert!(debug_str.contains("Database"));
         assert!(debug_str.contains("debug test"));
     }

@@ -7,9 +7,10 @@
 mod bip39_wordlist;
 pub use bip39_wordlist::ENGLISH_WORDLIST;
 
-use sha2::{Sha256, Sha512, Digest};
 use pbkdf2::pbkdf2_hmac;
+use sha2::{Digest, Sha256, Sha512};
 use thiserror::Error;
+use unicode_normalization::UnicodeNormalization;
 
 /// Errors from BIP39 mnemonic operations.
 #[derive(Debug, Error)]
@@ -147,16 +148,11 @@ impl Mnemonic {
 
     /// Derive a 64-byte seed from the mnemonic using PBKDF2-HMAC-SHA512.
     pub fn to_seed(&self, passphrase: &str) -> [u8; 64] {
-        let mnemonic_str = self.words.join(" ");
-        let salt = format!("mnemonic{}", passphrase);
+        let mnemonic_str: String = self.words.join(" ").nfkd().collect();
+        let salt: String = format!("mnemonic{passphrase}").nfkd().collect();
 
         let mut seed = [0u8; 64];
-        pbkdf2_hmac::<Sha512>(
-            mnemonic_str.as_bytes(),
-            salt.as_bytes(),
-            2048,
-            &mut seed,
-        );
+        pbkdf2_hmac::<Sha512>(mnemonic_str.as_bytes(), salt.as_bytes(), 2048, &mut seed);
         seed
     }
 
@@ -260,14 +256,20 @@ mod tests {
         let m = Mnemonic::generate(12).unwrap();
         let mut words: Vec<String> = m.words().to_vec();
         // Change last word to something that breaks checksum
-        words[11] = if words[11] == "abandon" { "zoo".into() } else { "abandon".into() };
+        words[11] = if words[11] == "abandon" {
+            "zoo".into()
+        } else {
+            "abandon".into()
+        };
         let phrase = words.join(" ");
         assert!(Mnemonic::from_phrase(&phrase).is_err());
     }
 
     #[test]
     fn test_unknown_word() {
-        let result = Mnemonic::from_phrase("abandon ability able about above absent absorb abstract absurd abuse access notaword");
+        let result = Mnemonic::from_phrase(
+            "abandon ability able about above absent absorb abstract absurd abuse access notaword",
+        );
         assert!(matches!(result, Err(Bip39Error::UnknownWord(_))));
     }
 
@@ -275,6 +277,13 @@ mod tests {
     fn test_wrong_word_count_phrase() {
         let result = Mnemonic::from_phrase("abandon ability able");
         assert!(matches!(result, Err(Bip39Error::InvalidWordCount(3))));
+    }
+
+    #[test]
+    fn seed_passphrase_uses_nfkd() {
+        let m = Mnemonic::from_entropy(&[0; 16]).unwrap();
+        assert_eq!(m.to_seed("\u{00e9}"), m.to_seed("e\u{0301}"));
+        assert_eq!(m.to_seed("\u{ff21}"), m.to_seed("A"));
     }
 
     #[test]
@@ -297,7 +306,7 @@ mod tests {
     #[test]
     fn test_display_and_from_str() {
         let m1 = Mnemonic::generate(12).unwrap();
-        let display = format!("{}", m1);
+        let display = format!("{m1}");
         let m2: Mnemonic = display.parse().unwrap();
         assert_eq!(m1, m2);
     }

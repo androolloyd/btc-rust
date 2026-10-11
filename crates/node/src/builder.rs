@@ -224,7 +224,9 @@ impl Node {
         // 1. Create shared NodeState (single source of truth)
         // -----------------------------------------------------------------
         let node_state = NodeState::new(self.config.network);
-        node_state.syncing.store(true, std::sync::atomic::Ordering::SeqCst);
+        node_state
+            .syncing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
 
         // -----------------------------------------------------------------
         // 2. Create ExExManager for chain event notifications
@@ -328,7 +330,9 @@ impl Node {
             }
         }
 
-        node_state.syncing.store(false, std::sync::atomic::Ordering::SeqCst);
+        node_state
+            .syncing
+            .store(false, std::sync::atomic::Ordering::SeqCst);
 
         // Keep running (serve RPC, listen for new blocks)
         info!("btc-node running — press Ctrl+C to stop");
@@ -436,7 +440,7 @@ mod tests {
     #[test]
     fn test_node_config_debug() {
         let config = NodeConfig::new(Network::Mainnet);
-        let debug = format!("{:?}", config);
+        let debug = format!("{config:?}");
         assert!(debug.contains("NodeConfig"));
     }
 
@@ -445,14 +449,14 @@ mod tests {
         let db = DatabaseHandle {
             path: PathBuf::from("/tmp/test"),
         };
-        let debug = format!("{:?}", db);
+        let debug = format!("{db:?}");
         assert!(debug.contains("DatabaseHandle"));
     }
 
     #[test]
     fn test_network_handle_debug() {
         let net = NetworkHandle { port: 8333 };
-        let debug = format!("{:?}", net);
+        let debug = format!("{net:?}");
         assert!(debug.contains("NetworkHandle"));
     }
 
@@ -467,10 +471,9 @@ mod tests {
     #[test]
     fn test_builder_config_accessor_after_partial() {
         let config = NodeConfig::new(Network::Testnet);
-        let builder = NodeBuilder::new(config)
-            .with_database(DatabaseHandle {
-                path: PathBuf::from("/tmp"),
-            });
+        let builder = NodeBuilder::new(config).with_database(DatabaseHandle {
+            path: PathBuf::from("/tmp"),
+        });
         assert_eq!(builder.config().network, Network::Testnet);
     }
 
@@ -519,7 +522,9 @@ mod tests {
         // Verify all 6 permutations of component attachment order
         let node = NodeBuilder::new(NodeConfig::new(Network::Regtest))
             .with_pipeline(Pipeline::new())
-            .with_database(DatabaseHandle { path: PathBuf::from("/tmp") })
+            .with_database(DatabaseHandle {
+                path: PathBuf::from("/tmp"),
+            })
             .with_network(NetworkHandle { port: 18444 })
             .build()
             .unwrap();
@@ -531,7 +536,9 @@ mod tests {
         let node = NodeBuilder::new(NodeConfig::new(Network::Regtest))
             .with_network(NetworkHandle { port: 18444 })
             .with_pipeline(Pipeline::new())
-            .with_database(DatabaseHandle { path: PathBuf::from("/tmp") })
+            .with_database(DatabaseHandle {
+                path: PathBuf::from("/tmp"),
+            })
             .build()
             .unwrap();
         assert_eq!(node.config.network, Network::Regtest);
@@ -541,7 +548,9 @@ mod tests {
     fn test_builder_network_then_database_then_pipeline() {
         let node = NodeBuilder::new(NodeConfig::new(Network::Regtest))
             .with_network(NetworkHandle { port: 18444 })
-            .with_database(DatabaseHandle { path: PathBuf::from("/tmp") })
+            .with_database(DatabaseHandle {
+                path: PathBuf::from("/tmp"),
+            })
             .with_pipeline(Pipeline::new())
             .build()
             .unwrap();
@@ -551,7 +560,9 @@ mod tests {
     #[test]
     fn test_builder_database_then_pipeline_then_network() {
         let node = NodeBuilder::new(NodeConfig::new(Network::Regtest))
-            .with_database(DatabaseHandle { path: PathBuf::from("/tmp") })
+            .with_database(DatabaseHandle {
+                path: PathBuf::from("/tmp"),
+            })
             .with_pipeline(Pipeline::new())
             .with_network(NetworkHandle { port: 18444 })
             .build()
@@ -566,7 +577,9 @@ mod tests {
         assert_eq!(b0.config().network, Network::Mainnet);
 
         // One component
-        let b1 = b0.with_database(DatabaseHandle { path: PathBuf::from("/tmp") });
+        let b1 = b0.with_database(DatabaseHandle {
+            path: PathBuf::from("/tmp"),
+        });
         assert_eq!(b1.config().network, Network::Mainnet);
 
         // Two components
@@ -580,7 +593,12 @@ mod tests {
 
     #[test]
     fn test_node_config_all_networks() {
-        for network in [Network::Mainnet, Network::Testnet, Network::Signet, Network::Regtest] {
+        for network in [
+            Network::Mainnet,
+            Network::Testnet,
+            Network::Signet,
+            Network::Regtest,
+        ] {
             let config = NodeConfig::new(network);
             assert_eq!(config.network, network);
             // Ports should differ from 0
@@ -607,29 +625,26 @@ mod tests {
 
     #[test]
     fn test_node_config_datadir_string() {
-        let config = NodeConfig::new(Network::Mainnet)
-            .with_datadir("/home/user/.btc-rust");
+        let config = NodeConfig::new(Network::Mainnet).with_datadir("/home/user/.btc-rust");
         assert_eq!(config.datadir, PathBuf::from("/home/user/.btc-rust"));
     }
 
     #[test]
     fn test_node_config_datadir_pathbuf() {
-        let config = NodeConfig::new(Network::Mainnet)
-            .with_datadir(PathBuf::from("/home/user/data"));
+        let config =
+            NodeConfig::new(Network::Mainnet).with_datadir(PathBuf::from("/home/user/data"));
         assert_eq!(config.datadir, PathBuf::from("/home/user/data"));
     }
 
     #[test]
     fn test_node_config_log_level_string() {
-        let config = NodeConfig::new(Network::Mainnet)
-            .with_log_level(String::from("warn"));
+        let config = NodeConfig::new(Network::Mainnet).with_log_level(String::from("warn"));
         assert_eq!(config.log_level, "warn");
     }
 
     #[test]
     fn test_node_config_log_level_str() {
-        let config = NodeConfig::new(Network::Mainnet)
-            .with_log_level("error");
+        let config = NodeConfig::new(Network::Mainnet).with_log_level("error");
         assert_eq!(config.log_level, "error");
     }
 
@@ -642,7 +657,9 @@ mod tests {
             .with_log_level("trace");
 
         let node = NodeBuilder::new(config)
-            .with_database(DatabaseHandle { path: PathBuf::from("/db/path") })
+            .with_database(DatabaseHandle {
+                path: PathBuf::from("/db/path"),
+            })
             .with_network(NetworkHandle { port: 2222 })
             .with_pipeline(Pipeline::new())
             .build()

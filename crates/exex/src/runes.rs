@@ -239,7 +239,7 @@ fn parse_runestone_payload(payload: &[u8]) -> Vec<RuneOperation> {
             };
             pos += c3;
 
-            let rune_id = format!("{}:{}", block, tx_idx);
+            let rune_id = format!("{block}:{tx_idx}");
             ops.push(RuneOperation::Transfer { rune_id, amount });
             continue;
         }
@@ -258,7 +258,7 @@ fn parse_runestone_payload(payload: &[u8]) -> Vec<RuneOperation> {
                 None => break,
             };
             pos += c2;
-            let rune_id = format!("{}:{}", block, tx_idx);
+            let rune_id = format!("{block}:{tx_idx}");
             ops.push(RuneOperation::Transfer { rune_id, amount });
             continue;
         }
@@ -278,7 +278,7 @@ fn parse_runestone_payload(payload: &[u8]) -> Vec<RuneOperation> {
                 // value encodes the rune ID as a single integer: block * 1000 + tx_index
                 let block = value / 1000;
                 let tx = value % 1000;
-                mint_id = Some(format!("{}:{}", block, tx));
+                mint_id = Some(format!("{block}:{tx}"));
             }
             _ => {
                 // Unknown tag; skip
@@ -621,7 +621,7 @@ mod tests {
         for value in [0u128, 1, 127, 128, 255, 256, 16384, u128::MAX / 2] {
             let encoded = encode_leb128(value);
             let (decoded, consumed) = decode_leb128(&encoded).unwrap();
-            assert_eq!(decoded, value, "LEB128 roundtrip failed for {}", value);
+            assert_eq!(decoded, value, "LEB128 roundtrip failed for {value}");
             assert_eq!(consumed, encoded.len());
         }
     }
@@ -631,7 +631,7 @@ mod tests {
         for name in ["A", "B", "Z", "AA", "AB", "ZZ", "TEST", "UNCOMMONGOODS"] {
             let encoded = encode_rune_name(name);
             let decoded = decode_rune_name(encoded);
-            assert_eq!(decoded, name, "Name roundtrip failed for {}", name);
+            assert_eq!(decoded, name, "Name roundtrip failed for {name}");
         }
     }
 
@@ -935,9 +935,9 @@ mod tests {
         // The 19th byte (shift=126) is valid. The 20th (shift=133) would overflow.
         let mut data = vec![0x80; 19]; // 19 continuation bytes
         data.push(0x01); // terminator at shift=133 -- but shift check happens before
-        // Actually the check is shift >= 128, which triggers at byte index 19 (shift=133)
-        // The 18th byte is index 18, shift = 18*7 = 126. Still ok.
-        // The 19th byte is index 19, shift = 19*7 = 133 >= 128 -> None
+                         // Actually the check is shift >= 128, which triggers at byte index 19 (shift=133)
+                         // The 18th byte is index 18, shift = 18*7 = 126. Still ok.
+                         // The 19th byte is index 19, shift = 19*7 = 133 >= 128 -> None
         assert!(decode_leb128(&data).is_none());
     }
 
@@ -984,7 +984,7 @@ mod tests {
         let mut payload = Vec::new();
         payload.extend_from_slice(&encode_leb128(99)); // unknown tag
         payload.extend_from_slice(&encode_leb128(42)); // value
-        // Also add a known tag so the ops list isn't empty
+                                                       // Also add a known tag so the ops list isn't empty
         payload.extend_from_slice(&encode_leb128(tags::RUNE_NAME));
         payload.extend_from_slice(&encode_leb128(encode_rune_name("TEST")));
         payload.extend_from_slice(&encode_leb128(tags::AMOUNT));
@@ -1057,7 +1057,7 @@ mod tests {
         let mut payload = Vec::new();
         payload.extend_from_slice(&encode_leb128(tags::BODY));
         payload.extend_from_slice(&encode_leb128(100)); // block value
-        // Missing tx_idx, amount, output -> should break out
+                                                        // Missing tx_idx, amount, output -> should break out
 
         let ops = parse_runestone_payload(&payload);
         assert!(ops.is_empty());
@@ -1069,9 +1069,9 @@ mod tests {
         payload.extend_from_slice(&encode_leb128(tags::BODY));
         payload.extend_from_slice(&encode_leb128(100)); // block
         payload.extend_from_slice(&encode_leb128(5)); // tx_idx (consumed as first value)
-        // Actually, looking at the code: tag=BODY, value=block=100. Then it reads tx_idx.
-        // Wait, let me re-read: tag=0 (BODY), value is consumed. value = block (100).
-        // Then reads tx_idx (5). Then needs amount -> truncated.
+                                                      // Actually, looking at the code: tag=BODY, value=block=100. Then it reads tx_idx.
+                                                      // Wait, let me re-read: tag=0 (BODY), value is consumed. value = block (100).
+                                                      // Then reads tx_idx (5). Then needs amount -> truncated.
 
         let ops = parse_runestone_payload(&payload);
         assert!(ops.is_empty());
@@ -1084,7 +1084,7 @@ mod tests {
         payload.extend_from_slice(&encode_leb128(100)); // block
         payload.extend_from_slice(&encode_leb128(5)); // tx_idx
         payload.extend_from_slice(&encode_leb128(1000)); // amount
-        // Missing output -> should break out
+                                                         // Missing output -> should break out
 
         let ops = parse_runestone_payload(&payload);
         assert!(ops.is_empty());
@@ -1179,7 +1179,7 @@ mod tests {
         // Add unknown tags to pad
         while big_payload.len() <= 75 {
             big_payload.extend_from_slice(&encode_leb128(99)); // unknown tag
-            big_payload.extend_from_slice(&encode_leb128(0));  // value
+            big_payload.extend_from_slice(&encode_leb128(0)); // value
         }
 
         let mut script = Vec::new();
@@ -1205,7 +1205,9 @@ mod tests {
         };
 
         let ops = parse_runestone(&tx).expect("should find runestone");
-        assert!(ops.iter().any(|op| matches!(op, RuneOperation::Etch { name, .. } if name == "BIGNAME")));
+        assert!(ops
+            .iter()
+            .any(|op| matches!(op, RuneOperation::Etch { name, .. } if name == "BIGNAME")));
     }
 
     // -------------------------------------------------------------------

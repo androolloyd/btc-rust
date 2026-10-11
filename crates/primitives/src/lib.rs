@@ -1,13 +1,13 @@
-pub mod hash;
-pub mod encode;
-pub mod script;
-pub mod transaction;
-pub mod block;
 pub mod address;
 pub mod amount;
-pub mod compact;
-pub mod network;
 pub mod bech32;
+pub mod block;
+pub mod compact;
+pub mod encode;
+pub mod hash;
+pub mod network;
+pub mod script;
+pub mod transaction;
 
 #[cfg(feature = "descriptor")]
 pub mod descriptor;
@@ -27,15 +27,15 @@ pub mod bip32;
 #[cfg(feature = "bip39")]
 pub mod bip39;
 
-pub use hash::{BlockHash, TxHash, Hash256, Hash160, sha256d, sha256, hash160};
-pub use encode::{Encodable, Decodable, encode, decode, VarInt, ReadExt, WriteExt};
-pub use script::{Script, ScriptBuf, Opcode};
-pub use transaction::{Transaction, TxIn, TxOut, OutPoint, Witness};
-pub use block::{Block, BlockHeader};
 pub use address::Address;
 pub use amount::Amount;
+pub use block::{Block, BlockHeader};
 pub use compact::CompactTarget;
+pub use encode::{decode, encode, Decodable, Encodable, ReadExt, VarInt, WriteExt};
+pub use hash::{hash160, sha256, sha256d, BlockHash, Hash160, Hash256, TxHash};
 pub use network::Network;
+pub use script::{Opcode, Script, ScriptBuf};
+pub use transaction::{OutPoint, Transaction, TxIn, TxOut, Witness};
 
 #[cfg(feature = "silent-payments")]
 pub use silent_payments::SilentPaymentAddress;

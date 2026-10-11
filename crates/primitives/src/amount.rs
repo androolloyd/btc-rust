@@ -54,7 +54,7 @@ impl fmt::Display for Amount {
         if self.0 < 0 {
             write!(f, "-{}.{:08} BTC", btc.abs(), sat)
         } else {
-            write!(f, "{}.{:08} BTC", btc, sat)
+            write!(f, "{btc}.{sat:08} BTC")
         }
     }
 }
@@ -94,7 +94,10 @@ mod tests {
 
     #[test]
     fn test_amount_display_negative() {
-        assert_eq!(Amount::from_sat(-100_000_000).to_string(), "-1.00000000 BTC");
+        assert_eq!(
+            Amount::from_sat(-100_000_000).to_string(),
+            "-1.00000000 BTC"
+        );
         assert_eq!(Amount::from_sat(-50_000_000).to_string(), "-0.50000000 BTC");
     }
 

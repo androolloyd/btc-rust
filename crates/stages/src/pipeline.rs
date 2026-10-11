@@ -1,5 +1,5 @@
-use crate::stage::{Stage, StageId, StageError};
-use tracing::{info, error};
+use crate::stage::{Stage, StageError, StageId};
+use tracing::{error, info};
 
 /// Reth-style pipeline — executes stages serially, unwinds on failure
 pub struct Pipeline {
@@ -81,13 +81,18 @@ mod tests {
     }
 
     impl Stage for TestStage {
-        fn id(&self) -> StageId { self.id }
+        fn id(&self) -> StageId {
+            self.id
+        }
 
         fn execute(&mut self, target: u64) -> Result<ExecOutput, StageError> {
             if self.should_fail {
                 Err(StageError::StageFailed(self.id, "test failure".into()))
             } else {
-                Ok(ExecOutput { checkpoint: target, done: true })
+                Ok(ExecOutput {
+                    checkpoint: target,
+                    done: true,
+                })
             }
         }
 

@@ -1,0 +1,7 @@
+.git
+target
+fuzz/target
+fuzz/corpus
+fuzz/artifacts
+*.profraw
+tarpaulin-report.json

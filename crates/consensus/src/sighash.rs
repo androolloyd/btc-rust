@@ -1,8 +1,8 @@
-use std::borrow::Cow;
-use btc_primitives::encode::{Encodable, WriteExt, VarInt};
-use btc_primitives::hash::{sha256d, sha256};
+use btc_primitives::encode::{Encodable, VarInt, WriteExt};
+use btc_primitives::hash::{sha256, sha256d};
 use btc_primitives::script::ScriptBuf;
 use btc_primitives::transaction::Transaction;
+use std::borrow::Cow;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -65,7 +65,10 @@ pub fn sighash_anyprevout(
         return Err(SighashError::InputOutOfRange(input_index, tx.inputs.len()));
     }
     if prevouts.len() != tx.inputs.len() {
-        return Err(SighashError::InputOutOfRange(prevouts.len(), tx.inputs.len()));
+        return Err(SighashError::InputOutOfRange(
+            prevouts.len(),
+            tx.inputs.len(),
+        ));
     }
 
     let is_anyprevout = hash_type == SIGHASH_ANYPREVOUT;
@@ -379,6 +382,12 @@ pub struct SighashCache {
     pub hash_outputs: Option<[u8; 32]>,
 }
 
+impl Default for SighashCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SighashCache {
     /// Create a new empty cache.
     pub fn new() -> Self {
@@ -516,7 +525,10 @@ pub fn sighash_taproot(
         return Err(SighashError::InputOutOfRange(input_index, tx.inputs.len()));
     }
     if prevouts.len() != tx.inputs.len() {
-        return Err(SighashError::InputOutOfRange(prevouts.len(), tx.inputs.len()));
+        return Err(SighashError::InputOutOfRange(
+            prevouts.len(),
+            tx.inputs.len(),
+        ));
     }
 
     let base = hash_type.base_type();
@@ -665,13 +677,16 @@ fn find_and_delete<'a>(script: &'a [u8], opcode: btc_primitives::script::Opcode)
                 let len = u16::from_le_bytes([script[pos], script[pos + 1]]) as usize;
                 pos += 2 + len;
             }
-        } else if byte == btc_primitives::script::Opcode::OP_PUSHDATA4.to_u8() {
-            if pos + 4 <= script.len() {
-                let len = u32::from_le_bytes([
-                    script[pos], script[pos + 1], script[pos + 2], script[pos + 3],
-                ]) as usize;
-                pos += 4 + len;
-            }
+        } else if byte == btc_primitives::script::Opcode::OP_PUSHDATA4.to_u8()
+            && pos + 4 <= script.len()
+        {
+            let len = u32::from_le_bytes([
+                script[pos],
+                script[pos + 1],
+                script[pos + 2],
+                script[pos + 3],
+            ]) as usize;
+            pos += 4 + len;
         }
         // else: regular single-byte opcode, pos already advanced by 1.
 
@@ -733,7 +748,7 @@ mod tests {
         let data = match std::fs::read_to_string(path) {
             Ok(d) => d,
             Err(_) => {
-                eprintln!("skipping sighash test: testdata not found at {}", path);
+                eprintln!("skipping sighash test: testdata not found at {path}");
                 return;
             }
         };
@@ -791,22 +806,20 @@ mod tests {
             }
         }
 
-        eprintln!("sighash legacy: {}/{} passed ({} tested)", passed, tested, tested);
+        eprintln!("sighash legacy: {passed}/{tested} passed ({tested} tested)");
         // These are legacy sighash vectors — most should pass
         assert!(
             passed > 400,
-            "expected at least 400 sighash vectors to pass, got {}/{}",
-            passed,
-            tested
+            "expected at least 400 sighash vectors to pass, got {passed}/{tested}"
         );
     }
 
     #[test]
     fn test_sighash_legacy_basic() {
         // Simple test: create a transaction and compute sighash
-        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
-        use btc_primitives::hash::TxHash;
         use btc_primitives::amount::Amount;
+        use btc_primitives::hash::TxHash;
+        use btc_primitives::transaction::{OutPoint, TxIn, TxOut};
 
         let tx = Transaction {
             version: 1,
@@ -832,8 +845,8 @@ mod tests {
     #[test]
     fn test_sighash_single_bug() {
         // SIGHASH_SINGLE with input_index >= outputs.len() should return 1-padded hash
-        use btc_primitives::transaction::{TxIn, OutPoint};
         use btc_primitives::hash::TxHash;
+        use btc_primitives::transaction::{OutPoint, TxIn};
 
         let tx = Transaction {
             version: 1,
@@ -862,9 +875,9 @@ mod tests {
 
     /// Helper to create a test transaction for segwit/taproot tests
     fn make_segwit_test_tx() -> Transaction {
-        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
-        use btc_primitives::hash::TxHash;
         use btc_primitives::amount::Amount;
+        use btc_primitives::hash::TxHash;
+        use btc_primitives::transaction::{OutPoint, TxIn, TxOut};
 
         Transaction {
             version: 2,
@@ -919,7 +932,8 @@ mod tests {
         let value = 10_000_000i64;
 
         let hash_all = sighash_segwit_v0(&tx, 0, &script_code, value, SighashType::ALL).unwrap();
-        let hash_single = sighash_segwit_v0(&tx, 0, &script_code, value, SighashType::SINGLE).unwrap();
+        let hash_single =
+            sighash_segwit_v0(&tx, 0, &script_code, value, SighashType::SINGLE).unwrap();
 
         assert_ne!(hash_single, [0u8; 32]);
         assert_ne!(hash_all, hash_single);
@@ -933,9 +947,13 @@ mod tests {
 
         // SIGHASH_ALL | ANYONECANPAY
         let hash_acp = sighash_segwit_v0(
-            &tx, 0, &script_code, value,
+            &tx,
+            0,
+            &script_code,
+            value,
             SighashType(SighashType::ALL.0 | SighashType::ANYONECANPAY.0),
-        ).unwrap();
+        )
+        .unwrap();
 
         let hash_all = sighash_segwit_v0(&tx, 0, &script_code, value, SighashType::ALL).unwrap();
 
@@ -954,9 +972,9 @@ mod tests {
 
     #[test]
     fn test_sighash_taproot_basic() {
-        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
-        use btc_primitives::hash::TxHash;
         use btc_primitives::amount::Amount;
+        use btc_primitives::hash::TxHash;
+        use btc_primitives::transaction::{OutPoint, TxIn, TxOut};
 
         let tx = Transaction {
             version: 2,
@@ -990,9 +1008,9 @@ mod tests {
 
     #[test]
     fn test_sighash_taproot_with_leaf_hash() {
-        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
-        use btc_primitives::hash::TxHash;
         use btc_primitives::amount::Amount;
+        use btc_primitives::hash::TxHash;
+        use btc_primitives::transaction::{OutPoint, TxIn, TxOut};
 
         let tx = Transaction {
             version: 2,
@@ -1015,13 +1033,11 @@ mod tests {
         }];
 
         let leaf_hash = [0xef; 32];
-        let hash_with_leaf = sighash_taproot(
-            &tx, 0, &prevouts, SighashType(0x00), None, Some(&leaf_hash),
-        ).unwrap();
+        let hash_with_leaf =
+            sighash_taproot(&tx, 0, &prevouts, SighashType(0x00), None, Some(&leaf_hash)).unwrap();
 
-        let hash_without_leaf = sighash_taproot(
-            &tx, 0, &prevouts, SighashType(0x00), None, None,
-        ).unwrap();
+        let hash_without_leaf =
+            sighash_taproot(&tx, 0, &prevouts, SighashType(0x00), None, None).unwrap();
 
         assert_ne!(hash_with_leaf, [0u8; 32]);
         // Script path (with leaf hash) must differ from key path (without)
@@ -1030,9 +1046,9 @@ mod tests {
 
     #[test]
     fn test_sighash_taproot_with_annex() {
-        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
-        use btc_primitives::hash::TxHash;
         use btc_primitives::amount::Amount;
+        use btc_primitives::hash::TxHash;
+        use btc_primitives::transaction::{OutPoint, TxIn, TxOut};
 
         let tx = Transaction {
             version: 2,
@@ -1055,13 +1071,11 @@ mod tests {
         }];
 
         let annex = vec![0x50, 0x01, 0x02, 0x03];
-        let hash_with_annex = sighash_taproot(
-            &tx, 0, &prevouts, SighashType(0x00), Some(&annex), None,
-        ).unwrap();
+        let hash_with_annex =
+            sighash_taproot(&tx, 0, &prevouts, SighashType(0x00), Some(&annex), None).unwrap();
 
-        let hash_without_annex = sighash_taproot(
-            &tx, 0, &prevouts, SighashType(0x00), None, None,
-        ).unwrap();
+        let hash_without_annex =
+            sighash_taproot(&tx, 0, &prevouts, SighashType(0x00), None, None).unwrap();
 
         assert_ne!(hash_with_annex, [0u8; 32]);
         // Annex changes the spend_type byte and adds an annex hash
@@ -1070,9 +1084,9 @@ mod tests {
 
     #[test]
     fn test_sighash_taproot_input_out_of_range() {
-        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
-        use btc_primitives::hash::TxHash;
         use btc_primitives::amount::Amount;
+        use btc_primitives::hash::TxHash;
+        use btc_primitives::transaction::{OutPoint, TxIn, TxOut};
 
         let tx = Transaction {
             version: 2,
@@ -1101,9 +1115,9 @@ mod tests {
 
     #[test]
     fn test_sighash_taproot_prevouts_mismatch() {
-        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
-        use btc_primitives::hash::TxHash;
         use btc_primitives::amount::Amount;
+        use btc_primitives::hash::TxHash;
+        use btc_primitives::transaction::{OutPoint, TxIn, TxOut};
 
         let tx = Transaction {
             version: 2,
@@ -1156,9 +1170,10 @@ mod tests {
 
         // Only the bare OP_CODESEPARATOR at position 4 should be removed.
         // The 0xab inside the push data (position 2) must remain.
-        let expected = vec![0x03, 0xaa, 0xab, 0xac, 0x51];
+        let expected = [0x03, 0xaa, 0xab, 0xac, 0x51];
         assert_eq!(
-            result.as_ref(), &expected[..],
+            result.as_ref(),
+            &expected[..],
             "find_and_delete must not strip 0xab bytes inside push data"
         );
     }
@@ -1173,7 +1188,7 @@ mod tests {
         let result = find_and_delete(&script, Opcode::OP_CODESEPARATOR);
 
         // Both OP_CODESEPARATOR instances should be removed.
-        let expected = vec![0x51, 0x52];
+        let expected = [0x51, 0x52];
         assert_eq!(result.as_ref(), &expected[..]);
     }
 
@@ -1200,9 +1215,10 @@ mod tests {
         let result = find_and_delete(&script, Opcode::OP_CODESEPARATOR);
 
         // Only the bare OP_CODESEPARATOR at position 4 should be removed.
-        let expected = vec![0x4c, 0x02, 0xab, 0xab, 0x51];
+        let expected = [0x4c, 0x02, 0xab, 0xab, 0x51];
         assert_eq!(
-            result.as_ref(), &expected[..],
+            result.as_ref(),
+            &expected[..],
             "find_and_delete must not strip 0xab inside OP_PUSHDATA1 data"
         );
     }
@@ -1211,9 +1227,9 @@ mod tests {
     // Helper: build a multi-input/multi-output transaction for coverage
     // ---------------------------------------------------------------
     fn make_multi_io_tx() -> Transaction {
-        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
-        use btc_primitives::hash::TxHash;
         use btc_primitives::amount::Amount;
+        use btc_primitives::hash::TxHash;
+        use btc_primitives::transaction::{OutPoint, TxIn, TxOut};
 
         Transaction {
             version: 2,
@@ -1250,8 +1266,8 @@ mod tests {
     }
 
     fn make_multi_prevouts() -> Vec<btc_primitives::transaction::TxOut> {
-        use btc_primitives::transaction::TxOut;
         use btc_primitives::amount::Amount;
+        use btc_primitives::transaction::TxOut;
 
         vec![
             TxOut {
@@ -1277,21 +1293,15 @@ mod tests {
         let tx = make_multi_io_tx();
         let prevouts = make_multi_prevouts();
 
-        let hash_none = sighash_taproot(
-            &tx, 0, &prevouts, SighashType::NONE, None, None,
-        ).unwrap();
+        let hash_none = sighash_taproot(&tx, 0, &prevouts, SighashType::NONE, None, None).unwrap();
         assert_ne!(hash_none, [0u8; 32]);
 
         // Must differ from ALL (default 0x00 acts like ALL)
-        let hash_all = sighash_taproot(
-            &tx, 0, &prevouts, SighashType(0x00), None, None,
-        ).unwrap();
+        let hash_all = sighash_taproot(&tx, 0, &prevouts, SighashType(0x00), None, None).unwrap();
         assert_ne!(hash_none, hash_all);
 
         // Deterministic
-        let hash_none2 = sighash_taproot(
-            &tx, 0, &prevouts, SighashType::NONE, None, None,
-        ).unwrap();
+        let hash_none2 = sighash_taproot(&tx, 0, &prevouts, SighashType::NONE, None, None).unwrap();
         assert_eq!(hash_none, hash_none2);
     }
 
@@ -1304,25 +1314,19 @@ mod tests {
         let prevouts = make_multi_prevouts();
 
         // input_index=0, which is < outputs.len() (2), so should succeed
-        let hash_single = sighash_taproot(
-            &tx, 0, &prevouts, SighashType::SINGLE, None, None,
-        ).unwrap();
+        let hash_single =
+            sighash_taproot(&tx, 0, &prevouts, SighashType::SINGLE, None, None).unwrap();
         assert_ne!(hash_single, [0u8; 32]);
 
         // Must differ from ALL and NONE
-        let hash_all = sighash_taproot(
-            &tx, 0, &prevouts, SighashType(0x00), None, None,
-        ).unwrap();
-        let hash_none = sighash_taproot(
-            &tx, 0, &prevouts, SighashType::NONE, None, None,
-        ).unwrap();
+        let hash_all = sighash_taproot(&tx, 0, &prevouts, SighashType(0x00), None, None).unwrap();
+        let hash_none = sighash_taproot(&tx, 0, &prevouts, SighashType::NONE, None, None).unwrap();
         assert_ne!(hash_single, hash_all);
         assert_ne!(hash_single, hash_none);
 
         // SINGLE for input 1 should also work and differ from input 0
-        let hash_single_1 = sighash_taproot(
-            &tx, 1, &prevouts, SighashType::SINGLE, None, None,
-        ).unwrap();
+        let hash_single_1 =
+            sighash_taproot(&tx, 1, &prevouts, SighashType::SINGLE, None, None).unwrap();
         assert_ne!(hash_single, hash_single_1);
     }
 
@@ -1335,12 +1339,13 @@ mod tests {
         let prevouts = make_multi_prevouts();
 
         // input_index=2 but only 2 outputs (indices 0,1), so SINGLE should error
-        let result = sighash_taproot(
-            &tx, 2, &prevouts, SighashType::SINGLE, None, None,
-        );
+        let result = sighash_taproot(&tx, 2, &prevouts, SighashType::SINGLE, None, None);
         assert!(result.is_err());
         let err_msg = format!("{}", result.unwrap_err());
-        assert!(err_msg.contains("out of range"), "expected out-of-range error, got: {}", err_msg);
+        assert!(
+            err_msg.contains("out of range"),
+            "expected out-of-range error, got: {err_msg}"
+        );
     }
 
     // ---------------------------------------------------------------
@@ -1351,14 +1356,11 @@ mod tests {
         let tx = make_multi_io_tx();
         let prevouts = make_multi_prevouts();
 
-        let hash_acp_all = sighash_taproot(
-            &tx, 0, &prevouts, SighashType(0x81), None, None,
-        ).unwrap();
+        let hash_acp_all =
+            sighash_taproot(&tx, 0, &prevouts, SighashType(0x81), None, None).unwrap();
         assert_ne!(hash_acp_all, [0u8; 32]);
 
-        let hash_all = sighash_taproot(
-            &tx, 0, &prevouts, SighashType(0x00), None, None,
-        ).unwrap();
+        let hash_all = sighash_taproot(&tx, 0, &prevouts, SighashType(0x00), None, None).unwrap();
         // ANYONECANPAY skips sha_prevouts/sha_amounts/sha_scriptpubkeys/sha_sequences
         // and instead writes per-input data, so must differ
         assert_ne!(hash_acp_all, hash_all);
@@ -1372,15 +1374,13 @@ mod tests {
         let tx = make_multi_io_tx();
         let prevouts = make_multi_prevouts();
 
-        let hash_acp_none = sighash_taproot(
-            &tx, 0, &prevouts, SighashType(0x82), None, None,
-        ).unwrap();
+        let hash_acp_none =
+            sighash_taproot(&tx, 0, &prevouts, SighashType(0x82), None, None).unwrap();
         assert_ne!(hash_acp_none, [0u8; 32]);
 
         // Must differ from ACP|ALL
-        let hash_acp_all = sighash_taproot(
-            &tx, 0, &prevouts, SighashType(0x81), None, None,
-        ).unwrap();
+        let hash_acp_all =
+            sighash_taproot(&tx, 0, &prevouts, SighashType(0x81), None, None).unwrap();
         assert_ne!(hash_acp_none, hash_acp_all);
     }
 
@@ -1392,18 +1392,15 @@ mod tests {
         let tx = make_multi_io_tx();
         let prevouts = make_multi_prevouts();
 
-        let hash_acp_single = sighash_taproot(
-            &tx, 0, &prevouts, SighashType(0x83), None, None,
-        ).unwrap();
+        let hash_acp_single =
+            sighash_taproot(&tx, 0, &prevouts, SighashType(0x83), None, None).unwrap();
         assert_ne!(hash_acp_single, [0u8; 32]);
 
         // Must differ from ACP|ALL and ACP|NONE
-        let hash_acp_all = sighash_taproot(
-            &tx, 0, &prevouts, SighashType(0x81), None, None,
-        ).unwrap();
-        let hash_acp_none = sighash_taproot(
-            &tx, 0, &prevouts, SighashType(0x82), None, None,
-        ).unwrap();
+        let hash_acp_all =
+            sighash_taproot(&tx, 0, &prevouts, SighashType(0x81), None, None).unwrap();
+        let hash_acp_none =
+            sighash_taproot(&tx, 0, &prevouts, SighashType(0x82), None, None).unwrap();
         assert_ne!(hash_acp_single, hash_acp_all);
         assert_ne!(hash_acp_single, hash_acp_none);
     }
@@ -1420,17 +1417,21 @@ mod tests {
         let leaf_hash = [0xef; 32];
 
         let hash_both = sighash_taproot(
-            &tx, 0, &prevouts, SighashType(0x00), Some(&annex), Some(&leaf_hash),
-        ).unwrap();
+            &tx,
+            0,
+            &prevouts,
+            SighashType(0x00),
+            Some(&annex),
+            Some(&leaf_hash),
+        )
+        .unwrap();
         assert_ne!(hash_both, [0u8; 32]);
 
         // Must differ from annex-only and leaf-only
-        let hash_annex = sighash_taproot(
-            &tx, 0, &prevouts, SighashType(0x00), Some(&annex), None,
-        ).unwrap();
-        let hash_leaf = sighash_taproot(
-            &tx, 0, &prevouts, SighashType(0x00), None, Some(&leaf_hash),
-        ).unwrap();
+        let hash_annex =
+            sighash_taproot(&tx, 0, &prevouts, SighashType(0x00), Some(&annex), None).unwrap();
+        let hash_leaf =
+            sighash_taproot(&tx, 0, &prevouts, SighashType(0x00), None, Some(&leaf_hash)).unwrap();
         assert_ne!(hash_both, hash_annex);
         assert_ne!(hash_both, hash_leaf);
     }
@@ -1444,15 +1445,13 @@ mod tests {
         let prevouts = make_multi_prevouts();
 
         let leaf_hash = [0x42; 32];
-        let hash = sighash_taproot(
-            &tx, 1, &prevouts, SighashType(0x81), None, Some(&leaf_hash),
-        ).unwrap();
+        let hash =
+            sighash_taproot(&tx, 1, &prevouts, SighashType(0x81), None, Some(&leaf_hash)).unwrap();
         assert_ne!(hash, [0u8; 32]);
 
         // Without leaf_hash but same ACP should differ
-        let hash_no_leaf = sighash_taproot(
-            &tx, 1, &prevouts, SighashType(0x81), None, None,
-        ).unwrap();
+        let hash_no_leaf =
+            sighash_taproot(&tx, 1, &prevouts, SighashType(0x81), None, None).unwrap();
         assert_ne!(hash, hash_no_leaf);
     }
 
@@ -1471,9 +1470,9 @@ mod tests {
         assert!(cache.hash_outputs.is_none());
 
         // First call populates the cache
-        let hash0 = sighash_segwit_v0_cached(
-            &tx, 0, &script_code, value, SighashType::ALL, &mut cache,
-        ).unwrap();
+        let hash0 =
+            sighash_segwit_v0_cached(&tx, 0, &script_code, value, SighashType::ALL, &mut cache)
+                .unwrap();
         assert_ne!(hash0, [0u8; 32]);
         assert!(cache.hash_prevouts.is_some());
         assert!(cache.hash_sequence.is_some());
@@ -1485,9 +1484,9 @@ mod tests {
         let cached_outputs = cache.hash_outputs.unwrap();
 
         // Second call reuses the cache (values should remain the same)
-        let hash1 = sighash_segwit_v0_cached(
-            &tx, 1, &script_code, value, SighashType::ALL, &mut cache,
-        ).unwrap();
+        let hash1 =
+            sighash_segwit_v0_cached(&tx, 1, &script_code, value, SighashType::ALL, &mut cache)
+                .unwrap();
         assert_ne!(hash1, [0u8; 32]);
         assert_ne!(hash0, hash1); // different input => different hash
         assert_eq!(cache.hash_prevouts.unwrap(), cached_prevouts);
@@ -1495,14 +1494,12 @@ mod tests {
         assert_eq!(cache.hash_outputs.unwrap(), cached_outputs);
 
         // Cached result must match non-cached for same parameters
-        let hash0_uncached = sighash_segwit_v0(
-            &tx, 0, &script_code, value, SighashType::ALL,
-        ).unwrap();
+        let hash0_uncached =
+            sighash_segwit_v0(&tx, 0, &script_code, value, SighashType::ALL).unwrap();
         assert_eq!(hash0, hash0_uncached);
 
-        let hash1_uncached = sighash_segwit_v0(
-            &tx, 1, &script_code, value, SighashType::ALL,
-        ).unwrap();
+        let hash1_uncached =
+            sighash_segwit_v0(&tx, 1, &script_code, value, SighashType::ALL).unwrap();
         assert_eq!(hash1, hash1_uncached);
     }
 
@@ -1516,9 +1513,9 @@ mod tests {
         let value = 5_000_000i64;
 
         let mut cache = SighashCache::new();
-        let hash_none = sighash_segwit_v0_cached(
-            &tx, 0, &script_code, value, SighashType::NONE, &mut cache,
-        ).unwrap();
+        let hash_none =
+            sighash_segwit_v0_cached(&tx, 0, &script_code, value, SighashType::NONE, &mut cache)
+                .unwrap();
         assert_ne!(hash_none, [0u8; 32]);
 
         // For NONE, hashSequence and hashOutputs should be zeros, so cache
@@ -1528,15 +1525,12 @@ mod tests {
         // the important thing is correctness.
 
         // Must match uncached version
-        let hash_none_uncached = sighash_segwit_v0(
-            &tx, 0, &script_code, value, SighashType::NONE,
-        ).unwrap();
+        let hash_none_uncached =
+            sighash_segwit_v0(&tx, 0, &script_code, value, SighashType::NONE).unwrap();
         assert_eq!(hash_none, hash_none_uncached);
 
         // Must differ from ALL
-        let hash_all = sighash_segwit_v0(
-            &tx, 0, &script_code, value, SighashType::ALL,
-        ).unwrap();
+        let hash_all = sighash_segwit_v0(&tx, 0, &script_code, value, SighashType::ALL).unwrap();
         assert_ne!(hash_none, hash_all);
     }
 
@@ -1550,14 +1544,13 @@ mod tests {
         let value = 5_000_000i64;
 
         let mut cache = SighashCache::new();
-        let hash_single = sighash_segwit_v0_cached(
-            &tx, 0, &script_code, value, SighashType::SINGLE, &mut cache,
-        ).unwrap();
+        let hash_single =
+            sighash_segwit_v0_cached(&tx, 0, &script_code, value, SighashType::SINGLE, &mut cache)
+                .unwrap();
         assert_ne!(hash_single, [0u8; 32]);
 
-        let hash_single_uncached = sighash_segwit_v0(
-            &tx, 0, &script_code, value, SighashType::SINGLE,
-        ).unwrap();
+        let hash_single_uncached =
+            sighash_segwit_v0(&tx, 0, &script_code, value, SighashType::SINGLE).unwrap();
         assert_eq!(hash_single, hash_single_uncached);
     }
 
@@ -1572,14 +1565,13 @@ mod tests {
 
         // input_index=2, but outputs.len()=2 (indices 0,1), so SINGLE has no matching output
         let mut cache = SighashCache::new();
-        let hash = sighash_segwit_v0_cached(
-            &tx, 2, &script_code, value, SighashType::SINGLE, &mut cache,
-        ).unwrap();
+        let hash =
+            sighash_segwit_v0_cached(&tx, 2, &script_code, value, SighashType::SINGLE, &mut cache)
+                .unwrap();
         assert_ne!(hash, [0u8; 32]);
 
-        let hash_uncached = sighash_segwit_v0(
-            &tx, 2, &script_code, value, SighashType::SINGLE,
-        ).unwrap();
+        let hash_uncached =
+            sighash_segwit_v0(&tx, 2, &script_code, value, SighashType::SINGLE).unwrap();
         assert_eq!(hash, hash_uncached);
     }
 
@@ -1593,14 +1585,13 @@ mod tests {
         let value = 5_000_000i64;
 
         let mut cache = SighashCache::new();
-        let hash_acp = sighash_segwit_v0_cached(
-            &tx, 0, &script_code, value, SighashType(0x81), &mut cache,
-        ).unwrap();
+        let hash_acp =
+            sighash_segwit_v0_cached(&tx, 0, &script_code, value, SighashType(0x81), &mut cache)
+                .unwrap();
         assert_ne!(hash_acp, [0u8; 32]);
 
-        let hash_acp_uncached = sighash_segwit_v0(
-            &tx, 0, &script_code, value, SighashType(0x81),
-        ).unwrap();
+        let hash_acp_uncached =
+            sighash_segwit_v0(&tx, 0, &script_code, value, SighashType(0x81)).unwrap();
         assert_eq!(hash_acp, hash_acp_uncached);
     }
 
@@ -1614,14 +1605,13 @@ mod tests {
         let value = 5_000_000i64;
 
         let mut cache = SighashCache::new();
-        let hash = sighash_segwit_v0_cached(
-            &tx, 0, &script_code, value, SighashType(0x82), &mut cache,
-        ).unwrap();
+        let hash =
+            sighash_segwit_v0_cached(&tx, 0, &script_code, value, SighashType(0x82), &mut cache)
+                .unwrap();
         assert_ne!(hash, [0u8; 32]);
 
-        let hash_uncached = sighash_segwit_v0(
-            &tx, 0, &script_code, value, SighashType(0x82),
-        ).unwrap();
+        let hash_uncached =
+            sighash_segwit_v0(&tx, 0, &script_code, value, SighashType(0x82)).unwrap();
         assert_eq!(hash, hash_uncached);
     }
 
@@ -1635,14 +1625,13 @@ mod tests {
         let value = 5_000_000i64;
 
         let mut cache = SighashCache::new();
-        let hash = sighash_segwit_v0_cached(
-            &tx, 0, &script_code, value, SighashType(0x83), &mut cache,
-        ).unwrap();
+        let hash =
+            sighash_segwit_v0_cached(&tx, 0, &script_code, value, SighashType(0x83), &mut cache)
+                .unwrap();
         assert_ne!(hash, [0u8; 32]);
 
-        let hash_uncached = sighash_segwit_v0(
-            &tx, 0, &script_code, value, SighashType(0x83),
-        ).unwrap();
+        let hash_uncached =
+            sighash_segwit_v0(&tx, 0, &script_code, value, SighashType(0x83)).unwrap();
         assert_eq!(hash, hash_uncached);
     }
 
@@ -1656,7 +1645,12 @@ mod tests {
         let mut cache = SighashCache::new();
 
         let result = sighash_segwit_v0_cached(
-            &tx, 5, &script_code, 10_000_000, SighashType::ALL, &mut cache,
+            &tx,
+            5,
+            &script_code,
+            10_000_000,
+            SighashType::ALL,
+            &mut cache,
         );
         assert!(result.is_err());
     }
@@ -1671,15 +1665,11 @@ mod tests {
         let value = 5_000_000i64;
 
         // input_index=2 but outputs.len()=2, so SINGLE has no matching output => zeros
-        let hash = sighash_segwit_v0(
-            &tx, 2, &script_code, value, SighashType::SINGLE,
-        ).unwrap();
+        let hash = sighash_segwit_v0(&tx, 2, &script_code, value, SighashType::SINGLE).unwrap();
         assert_ne!(hash, [0u8; 32]);
 
         // Must differ from ALL at same index
-        let hash_all = sighash_segwit_v0(
-            &tx, 2, &script_code, value, SighashType::ALL,
-        ).unwrap();
+        let hash_all = sighash_segwit_v0(&tx, 2, &script_code, value, SighashType::ALL).unwrap();
         assert_ne!(hash, hash_all);
     }
 
@@ -1692,18 +1682,13 @@ mod tests {
         let script_code = p2wpkh_script_code(&[0xab; 20]);
         let value = 5_000_000i64;
 
-        let hash = sighash_segwit_v0(
-            &tx, 0, &script_code, value, SighashType(0x82),
-        ).unwrap();
+        let hash = sighash_segwit_v0(&tx, 0, &script_code, value, SighashType(0x82)).unwrap();
         assert_ne!(hash, [0u8; 32]);
 
         // Must differ from plain NONE and ACP|ALL
-        let hash_none = sighash_segwit_v0(
-            &tx, 0, &script_code, value, SighashType::NONE,
-        ).unwrap();
-        let hash_acp_all = sighash_segwit_v0(
-            &tx, 0, &script_code, value, SighashType(0x81),
-        ).unwrap();
+        let hash_none = sighash_segwit_v0(&tx, 0, &script_code, value, SighashType::NONE).unwrap();
+        let hash_acp_all =
+            sighash_segwit_v0(&tx, 0, &script_code, value, SighashType(0x81)).unwrap();
         assert_ne!(hash, hash_none);
         assert_ne!(hash, hash_acp_all);
     }
@@ -1717,17 +1702,13 @@ mod tests {
         let script_code = p2wpkh_script_code(&[0xab; 20]);
         let value = 5_000_000i64;
 
-        let hash = sighash_segwit_v0(
-            &tx, 0, &script_code, value, SighashType(0x83),
-        ).unwrap();
+        let hash = sighash_segwit_v0(&tx, 0, &script_code, value, SighashType(0x83)).unwrap();
         assert_ne!(hash, [0u8; 32]);
 
-        let hash_acp_all = sighash_segwit_v0(
-            &tx, 0, &script_code, value, SighashType(0x81),
-        ).unwrap();
-        let hash_acp_none = sighash_segwit_v0(
-            &tx, 0, &script_code, value, SighashType(0x82),
-        ).unwrap();
+        let hash_acp_all =
+            sighash_segwit_v0(&tx, 0, &script_code, value, SighashType(0x81)).unwrap();
+        let hash_acp_none =
+            sighash_segwit_v0(&tx, 0, &script_code, value, SighashType(0x82)).unwrap();
         assert_ne!(hash, hash_acp_all);
         assert_ne!(hash, hash_acp_none);
     }
@@ -1753,7 +1734,10 @@ mod tests {
         let mut tx2 = make_multi_io_tx();
         tx2.inputs[1].sequence = 0x00000001; // change a non-signed input
         let hash_none2 = sighash_legacy(&tx2, 0, &script_code, SighashType::NONE).unwrap();
-        assert_eq!(hash_none, hash_none2, "NONE should zero non-signed input sequences");
+        assert_eq!(
+            hash_none, hash_none2,
+            "NONE should zero non-signed input sequences"
+        );
     }
 
     // ---------------------------------------------------------------
@@ -1839,17 +1823,16 @@ mod tests {
     #[test]
     fn test_p2wpkh_script_code_exact_bytes() {
         let hash = [
-            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
-            0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14,
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10, 0x11, 0x12, 0x13, 0x14,
         ];
         let code = p2wpkh_script_code(&hash);
         let expected = vec![
             0x76, // OP_DUP
             0xa9, // OP_HASH160
             0x14, // push 20 bytes
-            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
-            0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14,
-            0x88, // OP_EQUALVERIFY
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x88, // OP_EQUALVERIFY
             0xac, // OP_CHECKSIG
         ];
         assert_eq!(code, expected);
@@ -1868,9 +1851,10 @@ mod tests {
         let result = find_and_delete(&script, Opcode::OP_CODESEPARATOR);
 
         // Only the bare OP_CODESEPARATOR at position 6 should be removed
-        let expected = vec![0x4d, 0x03, 0x00, 0xab, 0xab, 0xab, 0x51];
+        let expected = [0x4d, 0x03, 0x00, 0xab, 0xab, 0xab, 0x51];
         assert_eq!(
-            result.as_ref(), &expected[..],
+            result.as_ref(),
+            &expected[..],
             "find_and_delete must not strip 0xab inside OP_PUSHDATA2 data"
         );
     }
@@ -1888,9 +1872,10 @@ mod tests {
         let result = find_and_delete(&script, Opcode::OP_CODESEPARATOR);
 
         // Only the bare OP_CODESEPARATOR at position 7 should be removed
-        let expected = vec![0x4e, 0x02, 0x00, 0x00, 0x00, 0xab, 0xab, 0x51];
+        let expected = [0x4e, 0x02, 0x00, 0x00, 0x00, 0xab, 0xab, 0x51];
         assert_eq!(
-            result.as_ref(), &expected[..],
+            result.as_ref(),
+            &expected[..],
             "find_and_delete must not strip 0xab inside OP_PUSHDATA4 data"
         );
     }
@@ -1940,7 +1925,7 @@ mod tests {
         // Script: OP_0 OP_CODESEPARATOR OP_1
         let script = vec![0x00, 0xab, 0x51];
         let result = find_and_delete(&script, Opcode::OP_CODESEPARATOR);
-        let expected = vec![0x00, 0x51];
+        let expected = [0x00, 0x51];
         assert_eq!(result.as_ref(), &expected[..]);
     }
 
@@ -1964,12 +1949,12 @@ mod tests {
     #[test]
     fn test_sighash_error_display() {
         let err = SighashError::InputOutOfRange(5, 2);
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(msg.contains("5"));
         assert!(msg.contains("2"));
 
         let err2 = SighashError::InvalidSighashType(0xFF);
-        let msg2 = format!("{}", err2);
+        let msg2 = format!("{err2}");
         assert!(msg2.contains("255"));
     }
 
@@ -1983,14 +1968,12 @@ mod tests {
         let prevouts = make_multi_prevouts();
         let annex = vec![0x50, 0x01];
 
-        let hash = sighash_taproot(
-            &tx, 1, &prevouts, SighashType(0x82), Some(&annex), None,
-        ).unwrap();
+        let hash =
+            sighash_taproot(&tx, 1, &prevouts, SighashType(0x82), Some(&annex), None).unwrap();
         assert_ne!(hash, [0u8; 32]);
 
-        let hash_no_annex = sighash_taproot(
-            &tx, 1, &prevouts, SighashType(0x82), None, None,
-        ).unwrap();
+        let hash_no_annex =
+            sighash_taproot(&tx, 1, &prevouts, SighashType(0x82), None, None).unwrap();
         assert_ne!(hash, hash_no_annex);
     }
 
@@ -2004,9 +1987,8 @@ mod tests {
         let prevouts = make_multi_prevouts();
         let leaf_hash = [0x77; 32];
 
-        let hash = sighash_taproot(
-            &tx, 0, &prevouts, SighashType(0x83), None, Some(&leaf_hash),
-        ).unwrap();
+        let hash =
+            sighash_taproot(&tx, 0, &prevouts, SighashType(0x83), None, Some(&leaf_hash)).unwrap();
         assert_ne!(hash, [0u8; 32]);
     }
 
@@ -2026,7 +2008,10 @@ mod tests {
         // Compare with script that already has OP_CODESEPARATOR removed
         let script_code_clean = vec![0x76, 0xa9, 0x14];
         let hash_clean = sighash_legacy(&tx, 0, &script_code_clean, SighashType::ALL).unwrap();
-        assert_eq!(hash, hash_clean, "sighash should strip OP_CODESEPARATOR before hashing");
+        assert_eq!(
+            hash, hash_clean,
+            "sighash should strip OP_CODESEPARATOR before hashing"
+        );
     }
 
     // ---- Coverage: sighash_anyprevout input out of range ----
@@ -2089,8 +2074,12 @@ mod tests {
         let annex = vec![0x50, 0x01, 0x02];
         let leaf_hash = [0xaa; 32];
         let result = sighash_anyprevout(
-            &tx, 0, &prevouts, SIGHASH_ANYPREVOUT,
-            Some(&annex), Some(&leaf_hash),
+            &tx,
+            0,
+            &prevouts,
+            SIGHASH_ANYPREVOUT,
+            Some(&annex),
+            Some(&leaf_hash),
         );
         assert!(result.is_ok());
     }
@@ -2104,8 +2093,12 @@ mod tests {
         let annex = vec![0x50, 0x01];
         let leaf_hash = [0xbb; 32];
         let result = sighash_anyprevout(
-            &tx, 0, &prevouts, SIGHASH_ANYPREVOUTANYSCRIPT,
-            Some(&annex), Some(&leaf_hash),
+            &tx,
+            0,
+            &prevouts,
+            SIGHASH_ANYPREVOUTANYSCRIPT,
+            Some(&annex),
+            Some(&leaf_hash),
         );
         assert!(result.is_ok());
     }

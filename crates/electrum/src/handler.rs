@@ -8,9 +8,7 @@ use serde_json::Value;
 use tracing::info;
 
 use crate::methods::*;
-use crate::protocol::{
-    ElectrumRequest, ElectrumResponse, METHOD_NOT_FOUND, PARSE_ERROR,
-};
+use crate::protocol::{ElectrumRequest, ElectrumResponse, METHOD_NOT_FOUND, PARSE_ERROR};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -23,8 +21,7 @@ const SERVER_VERSION: &str = "btc-rust-electrum 0.1.0";
 const PROTOCOL_VERSION: &str = "1.4";
 
 /// Bitcoin mainnet genesis block hash.
-const GENESIS_HASH: &str =
-    "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f";
+const GENESIS_HASH: &str = "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f";
 
 /// Default server banner.
 const DEFAULT_BANNER: &str =
@@ -72,10 +69,7 @@ impl ElectrumHandler {
     }
 
     /// Create a handler with shared state references.
-    pub fn new_with_state(
-        chain_height: Arc<AtomicU64>,
-        best_hash: Arc<RwLock<String>>,
-    ) -> Self {
+    pub fn new_with_state(chain_height: Arc<AtomicU64>, best_hash: Arc<RwLock<String>>) -> Self {
         let scripthash_statuses = Arc::new(RwLock::new(HashMap::new()));
         let mock_balances = Arc::new(RwLock::new(HashMap::new()));
         let mock_history = Arc::new(RwLock::new(HashMap::new()));
@@ -298,7 +292,7 @@ impl ElectrumHandler {
                             use sha2::{Digest, Sha256};
                             let mut hasher = Sha256::new();
                             for (txid, height) in entries {
-                                hasher.update(format!("{}:{}:", txid, height));
+                                hasher.update(format!("{txid}:{height}:"));
                             }
                             let hash = hasher.finalize();
                             hex::encode(hash)
@@ -344,7 +338,7 @@ impl ElectrumHandler {
             use sha2::{Digest, Sha256};
             let bytes = hex::decode(&raw_hex).unwrap_or_default();
             let hash1 = Sha256::digest(&bytes);
-            let hash2 = Sha256::digest(&hash1);
+            let hash2 = Sha256::digest(hash1);
             let mut txid_bytes: [u8; 32] = hash2.into();
             txid_bytes.reverse(); // Bitcoin display order
             serde_json::json!(hex::encode(txid_bytes))
@@ -352,10 +346,7 @@ impl ElectrumHandler {
 
         // --- blockchain.estimatefee ---
         self.register(METHOD_ESTIMATEFEE, |params| {
-            let _nblocks = params
-                .get(0)
-                .and_then(|v| v.as_u64())
-                .unwrap_or(6);
+            let _nblocks = params.get(0).and_then(|v| v.as_u64()).unwrap_or(6);
             // Default fee estimate: 0.0001 BTC/kB (~10 sat/vbyte)
             serde_json::json!(0.0001)
         });
@@ -397,10 +388,7 @@ impl ElectrumHandler {
                 let mut hex_concat = String::new();
                 let mut actual_count = 0u64;
                 for h in start_height..start_height + count {
-                    let header_hex = guard
-                        .get(&h)
-                        .cloned()
-                        .unwrap_or_else(|| "00".repeat(80));
+                    let header_hex = guard.get(&h).cloned().unwrap_or_else(|| "00".repeat(80));
                     hex_concat.push_str(&header_hex);
                     actual_count += 1;
                 }
@@ -476,7 +464,10 @@ impl Default for ElectrumHandler {
 
 /// Extract a string from a params array at the given index.
 fn params_get_str(params: &Value, index: usize) -> Option<String> {
-    params.get(index).and_then(|v| v.as_str()).map(|s| s.to_string())
+    params
+        .get(index)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -501,7 +492,10 @@ mod tests {
     #[test]
     fn test_server_version() {
         let handler = ElectrumHandler::new();
-        let req = make_request(METHOD_SERVER_VERSION, serde_json::json!(["Electrum", "1.4"]));
+        let req = make_request(
+            METHOD_SERVER_VERSION,
+            serde_json::json!(["Electrum", "1.4"]),
+        );
         let resp = handler.handle(&req);
         assert!(resp.error.is_none());
         let result = resp.result.unwrap();
@@ -560,7 +554,7 @@ mod tests {
         let result = resp.result.unwrap();
         assert_eq!(result["height"], 100);
         // hex should be present (placeholder)
-        assert!(result["hex"].as_str().unwrap().len() > 0);
+        assert!(!result["hex"].as_str().unwrap().is_empty());
     }
 
     // -- blockchain.scripthash.get_balance --
@@ -616,10 +610,7 @@ mod tests {
         let sh = "aabbccdd";
         handler.set_mock_history(
             sh,
-            vec![
-                ("tx1111".to_string(), 100),
-                ("tx2222".to_string(), 200),
-            ],
+            vec![("tx1111".to_string(), 100), ("tx2222".to_string(), 200)],
         );
 
         let req = make_request(METHOD_SCRIPTHASH_GET_HISTORY, serde_json::json!([sh]));
@@ -639,10 +630,7 @@ mod tests {
     fn test_scripthash_listunspent() {
         let handler = ElectrumHandler::new();
         let sh = "aabbccdd";
-        handler.set_mock_unspent(
-            sh,
-            vec![("txid1".to_string(), 0, 50_000, 500)],
-        );
+        handler.set_mock_unspent(sh, vec![("txid1".to_string(), 0, 50_000, 500)]);
 
         let req = make_request(METHOD_SCRIPTHASH_LISTUNSPENT, serde_json::json!([sh]));
         let resp = handler.handle(&req);
@@ -660,10 +648,7 @@ mod tests {
     #[test]
     fn test_scripthash_subscribe_no_history() {
         let handler = ElectrumHandler::new();
-        let req = make_request(
-            METHOD_SCRIPTHASH_SUBSCRIBE,
-            serde_json::json!(["deadbeef"]),
-        );
+        let req = make_request(METHOD_SCRIPTHASH_SUBSCRIBE, serde_json::json!(["deadbeef"]));
         let resp = handler.handle(&req);
         assert!(resp.error.is_none());
         // No history => null status
@@ -674,10 +659,7 @@ mod tests {
     fn test_scripthash_subscribe_with_history() {
         let handler = ElectrumHandler::new();
         let sh = "abcdef01";
-        handler.set_mock_history(
-            sh,
-            vec![("txhash_abc".to_string(), 42)],
-        );
+        handler.set_mock_history(sh, vec![("txhash_abc".to_string(), 42)]);
 
         let req = make_request(METHOD_SCRIPTHASH_SUBSCRIBE, serde_json::json!([sh]));
         let resp = handler.handle(&req);
@@ -706,10 +688,7 @@ mod tests {
     #[test]
     fn test_transaction_get_unknown() {
         let handler = ElectrumHandler::new();
-        let req = make_request(
-            METHOD_TRANSACTION_GET,
-            serde_json::json!(["nonexistent"]),
-        );
+        let req = make_request(METHOD_TRANSACTION_GET, serde_json::json!(["nonexistent"]));
         let resp = handler.handle(&req);
         assert!(resp.error.is_none());
         assert_eq!(resp.result, Some(Value::Null));
@@ -721,10 +700,7 @@ mod tests {
     fn test_transaction_broadcast() {
         let handler = ElectrumHandler::new();
         let raw_hex = "0100000001aaaa";
-        let req = make_request(
-            METHOD_TRANSACTION_BROADCAST,
-            serde_json::json!([raw_hex]),
-        );
+        let req = make_request(METHOD_TRANSACTION_BROADCAST, serde_json::json!([raw_hex]));
         let resp = handler.handle(&req);
         assert!(resp.error.is_none());
         // Should return a hex txid (64 chars for sha256d)
@@ -857,7 +833,7 @@ mod tests {
             METHOD_BLOCK_HEADERS,
         ];
         for name in &expected {
-            assert!(names.contains(name), "missing method: {}", name);
+            assert!(names.contains(name), "missing method: {name}");
         }
     }
 
@@ -1089,18 +1065,12 @@ mod tests {
     fn test_transaction_broadcast_deterministic_txid() {
         let handler = ElectrumHandler::new();
         let raw_hex = "01020304";
-        let req1 = make_request(
-            METHOD_TRANSACTION_BROADCAST,
-            serde_json::json!([raw_hex]),
-        );
+        let req1 = make_request(METHOD_TRANSACTION_BROADCAST, serde_json::json!([raw_hex]));
         let resp1 = handler.handle(&req1);
         let txid1 = resp1.result.unwrap();
 
         // Same input should produce same txid
-        let req2 = make_request(
-            METHOD_TRANSACTION_BROADCAST,
-            serde_json::json!([raw_hex]),
-        );
+        let req2 = make_request(METHOD_TRANSACTION_BROADCAST, serde_json::json!([raw_hex]));
         let resp2 = handler.handle(&req2);
         let txid2 = resp2.result.unwrap();
         assert_eq!(txid1, txid2);
@@ -1330,10 +1300,7 @@ mod tests {
         let req = make_request(METHOD_SERVER_FEATURES, serde_json::json!([]));
         let resp = handler.handle(&req);
         let features = resp.result.unwrap();
-        assert_eq!(
-            features["genesis_hash"],
-            GENESIS_HASH,
-        );
+        assert_eq!(features["genesis_hash"], GENESIS_HASH,);
         assert!(features["hosts"].is_object());
         assert!(features["pruning"].is_null());
     }

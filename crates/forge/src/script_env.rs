@@ -87,7 +87,7 @@ impl ScriptEnv {
     /// `account_1`, ...).
     pub fn new_account(&mut self) -> &Account {
         let idx = self.accounts.len();
-        let name = format!("account_{}", idx);
+        let name = format!("account_{idx}");
         self.accounts.push(Account {
             name,
             keypair: TestKeyPair::generate(),
@@ -202,7 +202,7 @@ impl ScriptEnv {
         Ok(ScriptResult {
             success,
             final_stack: stack,
-            op_count: 0,  // engine doesn't expose op_count externally
+            op_count: 0, // engine doesn't expose op_count externally
             script_size: script_sig.len() + script_pubkey.len(),
         })
     }

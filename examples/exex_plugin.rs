@@ -18,21 +18,16 @@ impl ExEx for MyIndexer {
 
     async fn start(mut self, mut ctx: ExExContext) -> eyre::Result<()> {
         while let Ok(notif) = ctx.notifications.recv().await {
-            match notif {
-                ExExNotification::BlockCommitted {
-                    height, block, ..
-                } => {
-                    self.block_count += 1;
-                    self.tx_count += block.transactions.len() as u64;
-                    println!(
-                        "Block {}: {} txs (total: {} blocks, {} txs)",
-                        height,
-                        block.transactions.len(),
-                        self.block_count,
-                        self.tx_count
-                    );
-                }
-                _ => {}
+            if let ExExNotification::BlockCommitted { height, block, .. } = notif {
+                self.block_count += 1;
+                self.tx_count += block.transactions.len() as u64;
+                println!(
+                    "Block {}: {} txs (total: {} blocks, {} txs)",
+                    height,
+                    block.transactions.len(),
+                    self.block_count,
+                    self.tx_count
+                );
             }
         }
         Ok(())
@@ -46,6 +41,9 @@ async fn main() {
 
     let _ctx = manager.subscribe();
     println!("ExEx plugin 'my-indexer' registered on regtest.");
-    println!("Registered extensions: {:?}", manager.registered_extensions());
+    println!(
+        "Registered extensions: {:?}",
+        manager.registered_extensions()
+    );
     println!("In a real node, connect this to the sync pipeline via ExExManager.");
 }

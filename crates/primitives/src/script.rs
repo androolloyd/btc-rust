@@ -1,5 +1,5 @@
+use crate::encode::{Decodable, Encodable, EncodeError, ReadExt, VarInt};
 use std::fmt;
-use crate::encode::{Encodable, Decodable, EncodeError, VarInt, ReadExt};
 use std::io::{Read, Write};
 
 /// A borrowed reference to a Bitcoin script byte slice, providing inspection methods.
@@ -49,23 +49,17 @@ impl Script {
 
     /// Check if this is a P2WPKH script: OP_0 <20 bytes>
     pub fn is_p2wpkh(&self) -> bool {
-        self.0.len() == 22
-            && self.0[0] == Opcode::OP_0 as u8
-            && self.0[1] == 0x14
+        self.0.len() == 22 && self.0[0] == Opcode::OP_0 as u8 && self.0[1] == 0x14
     }
 
     /// Check if this is a P2WSH script: OP_0 <32 bytes>
     pub fn is_p2wsh(&self) -> bool {
-        self.0.len() == 34
-            && self.0[0] == Opcode::OP_0 as u8
-            && self.0[1] == 0x20
+        self.0.len() == 34 && self.0[0] == Opcode::OP_0 as u8 && self.0[1] == 0x20
     }
 
     /// Check if this is a P2TR (Taproot) script: OP_1 <32 bytes>
     pub fn is_p2tr(&self) -> bool {
-        self.0.len() == 34
-            && self.0[0] == Opcode::OP_1 as u8
-            && self.0[1] == 0x20
+        self.0.len() == 34 && self.0[0] == Opcode::OP_1 as u8 && self.0[1] == 0x20
     }
 
     /// Check if this is a witness program (v0-v16)
@@ -80,7 +74,7 @@ impl Script {
             return false;
         }
         let push_len = self.0[1] as usize;
-        push_len >= 2 && push_len <= 40 && push_len + 2 == self.0.len()
+        (2..=40).contains(&push_len) && push_len + 2 == self.0.len()
     }
 
     /// Check if this is an OP_RETURN (provably unspendable) script
@@ -103,7 +97,10 @@ impl Script {
 
     /// Iterate over script instructions (opcodes + push data)
     pub fn instructions(&self) -> ScriptInstructions<'_> {
-        ScriptInstructions { data: &self.0, pos: 0 }
+        ScriptInstructions {
+            data: &self.0,
+            pos: 0,
+        }
     }
 }
 
@@ -252,9 +249,9 @@ impl Decodable for ScriptBuf {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, EncodeError> {
         let len = VarInt::decode(reader)?.0 as usize;
         if len > MAX_SCRIPT_DECODE_SIZE {
-            return Err(EncodeError::InvalidData(
-                format!("script length {} exceeds maximum", len)
-            ));
+            return Err(EncodeError::InvalidData(format!(
+                "script length {len} exceeds maximum"
+            )));
         }
         let data = reader.read_bytes(len)?;
         Ok(ScriptBuf(data))
@@ -729,7 +726,7 @@ mod tests {
     #[test]
     fn test_script_debug() {
         let script = ScriptBuf::from_bytes(vec![0xab, 0xcd]);
-        let debug = format!("{:?}", script);
+        let debug = format!("{script:?}");
         assert!(debug.contains("abcd"));
     }
 
@@ -744,7 +741,7 @@ mod tests {
     fn test_script_debug_borrowed() {
         let data = vec![0x01, 0x02];
         let script = Script::from_bytes(&data);
-        let debug = format!("{:?}", script);
+        let debug = format!("{script:?}");
         assert!(debug.contains("0102"));
     }
 
@@ -856,7 +853,15 @@ mod tests {
     #[test]
     fn test_instructions_pushdata1_data_truncated() {
         // OP_PUSHDATA1 claims 10 bytes but only 5 available
-        let script = ScriptBuf::from_bytes(vec![Opcode::OP_PUSHDATA1 as u8, 10, 0x01, 0x02, 0x03, 0x04, 0x05]);
+        let script = ScriptBuf::from_bytes(vec![
+            Opcode::OP_PUSHDATA1 as u8,
+            10,
+            0x01,
+            0x02,
+            0x03,
+            0x04,
+            0x05,
+        ]);
         let instrs: Vec<_> = script.instructions().collect();
         assert!(instrs[0].is_err());
     }

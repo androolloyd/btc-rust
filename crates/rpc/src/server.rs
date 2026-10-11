@@ -29,7 +29,6 @@ impl Default for RpcServer {
 }
 
 impl RpcServer {
-
     /// Start listening for RPC connections.
     ///
     /// This drives the server to completion; it only returns when the
@@ -144,16 +143,15 @@ mod tests {
         });
 
         // Connect as a client
-        let mut client =
-            tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
-                .await
-                .unwrap();
+        let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
         let (reader, mut writer) = client.split();
 
         // Send a valid RPC request
         let req = r#"{"jsonrpc":"2.0","method":"getblockcount","params":[],"id":1}"#;
         writer
-            .write_all(format!("{}\n", req).as_bytes())
+            .write_all(format!("{req}\n").as_bytes())
             .await
             .unwrap();
 
@@ -195,17 +193,16 @@ mod tests {
             }
         });
 
-        let mut client =
-            tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
-                .await
-                .unwrap();
+        let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
         let (reader, mut writer) = client.split();
 
         // Send empty lines followed by a valid request
         writer.write_all(b"\n\n\n").await.unwrap();
         let req = r#"{"jsonrpc":"2.0","method":"getblockcount","params":[],"id":99}"#;
         writer
-            .write_all(format!("{}\n", req).as_bytes())
+            .write_all(format!("{req}\n").as_bytes())
             .await
             .unwrap();
 
@@ -246,10 +243,9 @@ mod tests {
             }
         });
 
-        let mut client =
-            tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
-                .await
-                .unwrap();
+        let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
         let (reader, mut writer) = client.split();
 
         // Send invalid JSON
@@ -292,20 +288,17 @@ mod tests {
             }
         });
 
-        let mut client =
-            tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
-                .await
-                .unwrap();
+        let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
         let (reader, mut writer) = client.split();
 
         // Send multiple requests on same connection
         for i in 1..=3 {
-            let req = format!(
-                r#"{{"jsonrpc":"2.0","method":"getblockcount","params":[],"id":{}}}"#,
-                i
-            );
+            let req =
+                format!(r#"{{"jsonrpc":"2.0","method":"getblockcount","params":[],"id":{i}}}"#);
             writer
-                .write_all(format!("{}\n", req).as_bytes())
+                .write_all(format!("{req}\n").as_bytes())
                 .await
                 .unwrap();
         }

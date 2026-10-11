@@ -1,0 +1,40 @@
+name: Build and verify
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  workspace:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt --component clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo test --workspace --all-features --locked
+      - run: cargo clippy --workspace --all-targets --all-features --locked
+      - run: cargo build --release --locked --package btc-node
+      - run: cargo check --locked --package btc-primitives --no-default-features
+      - run: cargo check --locked --package btc-network --no-default-features
+      - run: cargo check --locked --package btc-storage --no-default-features
+  advisories:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal
+      - run: cargo +stable install cargo-audit --locked
+      - run: cargo +stable audit --deny unsound
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -f devnet/Dockerfile -t btc-rust:ci .
+      - run: docker run --rm btc-rust:ci --help

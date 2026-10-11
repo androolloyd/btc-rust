@@ -2,7 +2,8 @@
 /fuzz/target
 /fuzz/corpus
 /fuzz/artifacts
-Cargo.lock
+*.profraw
+tarpaulin-report.json
 *.swp
 *.swo
 .DS_Store

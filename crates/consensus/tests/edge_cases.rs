@@ -3,7 +3,6 @@
 /// These tests validate important boundary conditions in Bitcoin's consensus
 /// rules, many of which correspond to historical CVEs or soft-fork activation
 /// rules (BIP30, BIP34, BIP141, etc.).
-
 use btc_primitives::amount::Amount;
 use btc_primitives::hash::TxHash;
 use btc_primitives::script::{Opcode, ScriptBuf};
@@ -44,8 +43,14 @@ fn test_bip30_duplicate_coinbase_txids() {
     //
     // Two coinbase transactions with identical structure will have the same
     // txid. This is what BIP30 prevents.
-    let cb1 = make_coinbase(vec![0x04, 0xff, 0xff, 0x00, 0x1d], Amount::from_sat(5_000_000_000));
-    let cb2 = make_coinbase(vec![0x04, 0xff, 0xff, 0x00, 0x1d], Amount::from_sat(5_000_000_000));
+    let cb1 = make_coinbase(
+        vec![0x04, 0xff, 0xff, 0x00, 0x1d],
+        Amount::from_sat(5_000_000_000),
+    );
+    let cb2 = make_coinbase(
+        vec![0x04, 0xff, 0xff, 0x00, 0x1d],
+        Amount::from_sat(5_000_000_000),
+    );
 
     // Same scriptSig + same outputs => same txid
     assert_eq!(cb1.txid(), cb2.txid());
@@ -89,7 +94,10 @@ fn test_value_overflow_in_outputs() {
     let half_plus_one = Amount::from_sat(max_money.as_sat() / 2 + 1);
     assert!(half_plus_one.is_valid());
     let total = half_plus_one + half_plus_one;
-    assert!(!total.is_valid(), "sum of two half+1 amounts should exceed MAX_MONEY");
+    assert!(
+        !total.is_valid(),
+        "sum of two half+1 amounts should exceed MAX_MONEY"
+    );
 
     // Negative amounts are invalid
     let negative = Amount::from_sat(-1);
@@ -133,7 +141,10 @@ fn test_block_sigops_limit() {
         .filter(|&&b| b == Opcode::OP_CHECKSIG as u8)
         .count() as u32;
     assert_eq!(sigop_count, 20_001);
-    assert!(sigop_count > MAX_LEGACY_SIGOPS, "should exceed the legacy sigops limit");
+    assert!(
+        sigop_count > MAX_LEGACY_SIGOPS,
+        "should exceed the legacy sigops limit"
+    );
 }
 
 // ============================================================================
@@ -153,7 +164,10 @@ fn test_coinbase_script_length() {
     // 1 byte is too short (pre-BIP34 this was valid but post-BIP34 it isn't
     // because you can't encode a height push in 1 byte for height > 0)
     let too_short = ScriptBuf::from_bytes(vec![0x01]);
-    assert!(too_short.len() < 2, "1-byte coinbase scriptSig is below minimum");
+    assert!(
+        too_short.len() < 2,
+        "1-byte coinbase scriptSig is below minimum"
+    );
 
     // Exactly 2 bytes -- minimum valid length
     let min_valid = ScriptBuf::from_bytes(vec![0x01, 0x00]); // push height 0
@@ -165,7 +179,10 @@ fn test_coinbase_script_length() {
 
     // 101 bytes -- exceeds maximum
     let too_long = ScriptBuf::from_bytes(vec![0x00; 101]);
-    assert!(too_long.len() > 100, "101-byte coinbase scriptSig exceeds maximum");
+    assert!(
+        too_long.len() > 100,
+        "101-byte coinbase scriptSig exceeds maximum"
+    );
 
     // BIP34 height encoding: height is pushed as a CScriptNum
     // Height 500000 = 0x07A120 -> push as [0x03, 0x20, 0xA1, 0x07]
@@ -258,8 +275,14 @@ fn test_transaction_final() {
     // >= 500_000_000 => UNIX timestamp
     let height_lock = 499_999_999u32;
     let time_lock = 500_000_000u32;
-    assert!(height_lock < 500_000_000, "should be interpreted as block height");
-    assert!(time_lock >= 500_000_000, "should be interpreted as UNIX timestamp");
+    assert!(
+        height_lock < 500_000_000,
+        "should be interpreted as block height"
+    );
+    assert!(
+        time_lock >= 500_000_000,
+        "should be interpreted as UNIX timestamp"
+    );
 }
 
 // ============================================================================
@@ -302,10 +325,11 @@ fn test_witness_commitment() {
     // OP_RETURN (0x6a) + push length (0x24 = 36) + commitment_prefix + hash
     assert_eq!(script_bytes[0], Opcode::OP_RETURN as u8);
     // Find the commitment prefix in the script
-    let has_commitment = script_bytes
-        .windows(4)
-        .any(|w| w == commitment_prefix);
-    assert!(has_commitment, "witness commitment prefix should be in the script");
+    let has_commitment = script_bytes.windows(4).any(|w| w == commitment_prefix);
+    assert!(
+        has_commitment,
+        "witness commitment prefix should be in the script"
+    );
 
     // Total commitment output is: OP_RETURN + push(36 bytes) = 38 bytes
     assert_eq!(commitment_data.len(), 36); // 4 prefix + 32 hash

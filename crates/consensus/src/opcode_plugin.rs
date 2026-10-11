@@ -1,9 +1,9 @@
-use std::collections::HashMap;
-use btc_primitives::network::Network;
-use btc_primitives::hash::sha256;
-use btc_primitives::encode::Encodable;
-use btc_primitives::transaction::Transaction;
 use crate::script_engine::{ScriptError, ScriptFlags};
+use btc_primitives::encode::Encodable;
+use btc_primitives::hash::sha256;
+use btc_primitives::network::Network;
+use btc_primitives::transaction::Transaction;
+use std::collections::HashMap;
 
 /// Activation context for a pluggable opcode.
 ///
@@ -127,10 +127,7 @@ impl Default for OpcodeRegistry {
 ///   input_index         (4 bytes, LE)
 /// )
 /// ```
-pub fn default_check_template_verify_hash(
-    tx: &Transaction,
-    input_index: usize,
-) -> [u8; 32] {
+pub fn default_check_template_verify_hash(tx: &Transaction, input_index: usize) -> [u8; 32] {
     let mut buf = Vec::with_capacity(4 + 4 + 32 * 4 + 4);
 
     // nVersion (4 bytes LE)
@@ -163,7 +160,8 @@ pub fn default_check_template_verify_hash(
     {
         let mut outputs_preimage = Vec::new();
         for output in &tx.outputs {
-            output.encode(&mut outputs_preimage)
+            output
+                .encode(&mut outputs_preimage)
                 .expect("encoding to vec should not fail");
         }
         buf.extend_from_slice(&sha256(&outputs_preimage));
@@ -324,7 +322,10 @@ impl OpcodePlugin for OpCheckSigFromStack {
             }
         };
 
-        if secp.verify_schnorr(&schnorr_sig, &message, &xonly_key).is_ok() {
+        if secp
+            .verify_schnorr(&schnorr_sig, &message, &xonly_key)
+            .is_ok()
+        {
             ctx.stack.push(vec![0x01]); // OP_TRUE
         } else {
             ctx.stack.push(vec![]); // OP_FALSE
@@ -359,9 +360,7 @@ impl OpcodePlugin for OpInternalKey {
 
     fn execute(&self, ctx: &mut OpcodeExecContext) -> Result<(), ScriptError> {
         // Retrieve the internal key from the execution context.
-        let internal_key = ctx
-            .taproot_internal_key
-            .ok_or(ScriptError::VerifyFailed)?;
+        let internal_key = ctx.taproot_internal_key.ok_or(ScriptError::VerifyFailed)?;
 
         ctx.stack.push(internal_key.to_vec());
         Ok(())
@@ -436,19 +435,18 @@ impl OpcodePlugin for OpCheckSigAnyprevout {
             value: btc_primitives::amount::Amount::from_sat(ctx.input_amount),
             script_pubkey: btc_primitives::script::ScriptBuf::from_bytes(vec![]),
         };
-        let prevouts: Vec<btc_primitives::transaction::TxOut> =
-            (0..tx.inputs.len())
-                .map(|i| {
-                    if i == ctx.input_index {
-                        prevout_txout.clone()
-                    } else {
-                        btc_primitives::transaction::TxOut {
-                            value: btc_primitives::amount::Amount::from_sat(0),
-                            script_pubkey: btc_primitives::script::ScriptBuf::from_bytes(vec![]),
-                        }
+        let prevouts: Vec<btc_primitives::transaction::TxOut> = (0..tx.inputs.len())
+            .map(|i| {
+                if i == ctx.input_index {
+                    prevout_txout.clone()
+                } else {
+                    btc_primitives::transaction::TxOut {
+                        value: btc_primitives::amount::Amount::from_sat(0),
+                        script_pubkey: btc_primitives::script::ScriptBuf::from_bytes(vec![]),
                     }
-                })
-                .collect();
+                }
+            })
+            .collect();
 
         // Compute the ANYPREVOUT sighash
         let sighash = match crate::sighash::sighash_anyprevout(
@@ -486,7 +484,10 @@ impl OpcodePlugin for OpCheckSigAnyprevout {
             }
         };
 
-        if secp.verify_schnorr(&schnorr_sig, &message, &xonly_key).is_ok() {
+        if secp
+            .verify_schnorr(&schnorr_sig, &message, &xonly_key)
+            .is_ok()
+        {
             ctx.stack.push(vec![0x01]); // OP_TRUE
         } else {
             ctx.stack.push(vec![]); // OP_FALSE
@@ -559,8 +560,7 @@ impl OpcodePlugin for OpTxHash {
                 // Inputs hash: SHA256 of all serialized inputs
                 let mut buf = Vec::new();
                 for input in &tx.inputs {
-                    input.encode(&mut buf)
-                        .map_err(|e| ScriptError::Encode(e))?;
+                    input.encode(&mut buf).map_err(ScriptError::Encode)?;
                 }
                 sha256(&buf)
             }
@@ -568,8 +568,7 @@ impl OpcodePlugin for OpTxHash {
                 // Outputs hash: SHA256 of all serialized outputs
                 let mut buf = Vec::new();
                 for output in &tx.outputs {
-                    output.encode(&mut buf)
-                        .map_err(|e| ScriptError::Encode(e))?;
+                    output.encode(&mut buf).map_err(ScriptError::Encode)?;
                 }
                 sha256(&buf)
             }
@@ -689,7 +688,7 @@ mod tests {
     use super::*;
     use crate::script_engine::{ScriptEngine, ScriptFlags};
     use crate::sig_verify::Secp256k1Verifier;
-    use btc_primitives::script::{ScriptBuf, Opcode};
+    use btc_primitives::script::{Opcode, ScriptBuf};
 
     static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
 
@@ -724,9 +723,9 @@ mod tests {
 
     #[test]
     fn test_execute_script_with_custom_opcode() {
-        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
-        use btc_primitives::hash::TxHash;
         use btc_primitives::amount::Amount;
+        use btc_primitives::hash::TxHash;
+        use btc_primitives::transaction::{OutPoint, TxIn, TxOut};
 
         // Build a known transaction so we can compute the correct CTV hash
         let tx = Transaction {
@@ -833,7 +832,7 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             ScriptError::PushSizeLimit => {} // expected
-            other => panic!("expected PushSizeLimit, got {:?}", other),
+            other => panic!("expected PushSizeLimit, got {other:?}"),
         }
     }
 
@@ -867,9 +866,9 @@ mod tests {
 
     #[test]
     fn test_nop_upgrade_context_allows_in_legacy() {
-        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
-        use btc_primitives::hash::TxHash;
         use btc_primitives::amount::Amount;
+        use btc_primitives::hash::TxHash;
+        use btc_primitives::transaction::{OutPoint, TxIn, TxOut};
 
         let ctv = OpCheckTemplateVerify;
         assert_eq!(ctv.context(), OpcodeContext::NopUpgrade);
@@ -1156,9 +1155,9 @@ mod tests {
 
     /// Helper: create a known test transaction for CTV tests
     fn make_ctv_test_tx() -> Transaction {
-        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
-        use btc_primitives::hash::TxHash;
         use btc_primitives::amount::Amount;
+        use btc_primitives::hash::TxHash;
+        use btc_primitives::transaction::{OutPoint, TxIn, TxOut};
 
         Transaction {
             version: 2,
@@ -1170,11 +1169,17 @@ mod tests {
             outputs: vec![
                 TxOut {
                     value: Amount::from_sat(1_000_000),
-                    script_pubkey: ScriptBuf::from_bytes(vec![0x00, 0x14, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab]),
+                    script_pubkey: ScriptBuf::from_bytes(vec![
+                        0x00, 0x14, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab,
+                        0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab,
+                    ]),
                 },
                 TxOut {
                     value: Amount::from_sat(2_000_000),
-                    script_pubkey: ScriptBuf::from_bytes(vec![0x00, 0x14, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd]),
+                    script_pubkey: ScriptBuf::from_bytes(vec![
+                        0x00, 0x14, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd,
+                        0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd,
+                    ]),
                 },
             ],
             witness: Vec::new(),
@@ -1193,9 +1198,9 @@ mod tests {
 
     #[test]
     fn test_ctv_different_input_index_different_hash() {
-        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
-        use btc_primitives::hash::TxHash;
         use btc_primitives::amount::Amount;
+        use btc_primitives::hash::TxHash;
+        use btc_primitives::transaction::{OutPoint, TxIn, TxOut};
 
         let tx = Transaction {
             version: 2,
@@ -1221,7 +1226,10 @@ mod tests {
 
         let hash0 = default_check_template_verify_hash(&tx, 0);
         let hash1 = default_check_template_verify_hash(&tx, 1);
-        assert_ne!(hash0, hash1, "Different input indices must produce different hashes");
+        assert_ne!(
+            hash0, hash1,
+            "Different input indices must produce different hashes"
+        );
     }
 
     #[test]
@@ -1334,10 +1342,12 @@ mod tests {
 
     #[test]
     fn test_anyprevout_sighash_differs_from_taproot() {
-        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
-        use btc_primitives::hash::TxHash;
+        use crate::sighash::{
+            sighash_anyprevout, sighash_taproot, SighashType, SIGHASH_ANYPREVOUT,
+        };
         use btc_primitives::amount::Amount;
-        use crate::sighash::{sighash_taproot, sighash_anyprevout, SIGHASH_ANYPREVOUT, SighashType};
+        use btc_primitives::hash::TxHash;
+        use btc_primitives::transaction::{OutPoint, TxIn, TxOut};
 
         let tx = Transaction {
             version: 2,
@@ -1348,39 +1358,48 @@ mod tests {
             }],
             outputs: vec![TxOut {
                 value: Amount::from_sat(1_000_000),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x20, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab]),
-                }],
+                script_pubkey: ScriptBuf::from_bytes(vec![
+                    0x51, 0x20, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab,
+                    0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab,
+                    0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab,
+                ]),
+            }],
             witness: Vec::new(),
             lock_time: 0,
         };
 
         let prevouts = vec![TxOut {
             value: Amount::from_sat(2_000_000),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x20, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd]),
+            script_pubkey: ScriptBuf::from_bytes(vec![
+                0x51, 0x20, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd,
+                0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd,
+                0xcd, 0xcd, 0xcd, 0xcd, 0xcd, 0xcd,
+            ]),
         }];
 
         // Compute regular taproot sighash (SIGHASH_ALL = 0x01, not 0x00/default)
-        let taproot_hash = sighash_taproot(
-            &tx, 0, &prevouts, SighashType::ALL, None, None,
-        ).unwrap();
+        let taproot_hash =
+            sighash_taproot(&tx, 0, &prevouts, SighashType::ALL, None, None).unwrap();
 
         // Compute ANYPREVOUT sighash
-        let aprevout_hash = sighash_anyprevout(
-            &tx, 0, &prevouts, SIGHASH_ANYPREVOUT, None, None,
-        ).unwrap();
+        let aprevout_hash =
+            sighash_anyprevout(&tx, 0, &prevouts, SIGHASH_ANYPREVOUT, None, None).unwrap();
 
         assert_ne!(taproot_hash, [0u8; 32]);
         assert_ne!(aprevout_hash, [0u8; 32]);
         // ANYPREVOUT must produce a different hash than regular taproot sighash
-        assert_ne!(taproot_hash, aprevout_hash, "ANYPREVOUT sighash must differ from regular taproot sighash");
+        assert_ne!(
+            taproot_hash, aprevout_hash,
+            "ANYPREVOUT sighash must differ from regular taproot sighash"
+        );
     }
 
     #[test]
     fn test_anyprevout_vs_anyprevoutanyscript() {
-        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
-        use btc_primitives::hash::TxHash;
-        use btc_primitives::amount::Amount;
         use crate::sighash::{sighash_anyprevout, SIGHASH_ANYPREVOUT, SIGHASH_ANYPREVOUTANYSCRIPT};
+        use btc_primitives::amount::Amount;
+        use btc_primitives::hash::TxHash;
+        use btc_primitives::transaction::{OutPoint, TxIn, TxOut};
 
         let tx = Transaction {
             version: 2,
@@ -1404,18 +1423,19 @@ mod tests {
             script_pubkey: ScriptBuf::from_bytes(spk_bytes),
         }];
 
-        let hash_apo = sighash_anyprevout(
-            &tx, 0, &prevouts, SIGHASH_ANYPREVOUT, None, None,
-        ).unwrap();
+        let hash_apo =
+            sighash_anyprevout(&tx, 0, &prevouts, SIGHASH_ANYPREVOUT, None, None).unwrap();
 
-        let hash_apoas = sighash_anyprevout(
-            &tx, 0, &prevouts, SIGHASH_ANYPREVOUTANYSCRIPT, None, None,
-        ).unwrap();
+        let hash_apoas =
+            sighash_anyprevout(&tx, 0, &prevouts, SIGHASH_ANYPREVOUTANYSCRIPT, None, None).unwrap();
 
         assert_ne!(hash_apo, [0u8; 32]);
         assert_ne!(hash_apoas, [0u8; 32]);
         // The two ANYPREVOUT variants must differ
-        assert_ne!(hash_apo, hash_apoas, "ANYPREVOUT and ANYPREVOUTANYSCRIPT must produce different hashes");
+        assert_ne!(
+            hash_apo, hash_apoas,
+            "ANYPREVOUT and ANYPREVOUTANYSCRIPT must produce different hashes"
+        );
     }
 
     #[test]
@@ -1440,9 +1460,9 @@ mod tests {
 
     #[test]
     fn test_txhash_different_selectors_produce_different_hashes() {
-        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
-        use btc_primitives::hash::TxHash;
         use btc_primitives::amount::Amount;
+        use btc_primitives::hash::TxHash;
+        use btc_primitives::transaction::{OutPoint, TxIn, TxOut};
 
         let tx = Transaction {
             version: 2,
@@ -1490,8 +1510,7 @@ mod tests {
             for j in (i + 1)..hashes.len() {
                 assert_ne!(
                     hashes[i], hashes[j],
-                    "Selectors 0x{:02x} and 0x{:02x} must produce different hashes",
-                    i, j
+                    "Selectors 0x{i:02x} and 0x{j:02x} must produce different hashes"
                 );
             }
         }
@@ -1577,7 +1596,10 @@ mod tests {
         };
         txhash.execute(&mut ctx2).unwrap();
 
-        assert_eq!(ctx1.stack[0], ctx2.stack[0], "Same selector on same tx must be deterministic");
+        assert_eq!(
+            ctx1.stack[0], ctx2.stack[0],
+            "Same selector on same tx must be deterministic"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1690,9 +1712,15 @@ mod tests {
     fn test_covenant_registry_has_all_opcodes() {
         let registry = covenant_registry();
         assert!(registry.has(0xb3), "CTV (0xb3) must be registered");
-        assert!(registry.has(0xb6), "CHECKSIG_ANYPREVOUT (0xb6) must be registered");
+        assert!(
+            registry.has(0xb6),
+            "CHECKSIG_ANYPREVOUT (0xb6) must be registered"
+        );
         assert!(registry.has(0xb7), "TXHASH (0xb7) must be registered");
-        assert!(registry.has(0xb8), "CHECKCONTRACTVERIFY (0xb8) must be registered");
+        assert!(
+            registry.has(0xb8),
+            "CHECKCONTRACTVERIFY (0xb8) must be registered"
+        );
 
         assert_eq!(registry.get(0xb3).unwrap().name(), "OP_CHECKTEMPLATEVERIFY");
         assert_eq!(registry.get(0xb6).unwrap().name(), "OP_CHECKSIG_ANYPREVOUT");
@@ -1728,10 +1756,18 @@ mod tests {
         // Register a different plugin at the same opcode byte
         struct FakeCTV;
         impl OpcodePlugin for FakeCTV {
-            fn opcode(&self) -> u8 { 0xb3 }
-            fn name(&self) -> &str { "FAKE_CTV" }
-            fn context(&self) -> OpcodeContext { OpcodeContext::Always }
-            fn execute(&self, _ctx: &mut OpcodeExecContext) -> Result<(), ScriptError> { Ok(()) }
+            fn opcode(&self) -> u8 {
+                0xb3
+            }
+            fn name(&self) -> &str {
+                "FAKE_CTV"
+            }
+            fn context(&self) -> OpcodeContext {
+                OpcodeContext::Always
+            }
+            fn execute(&self, _ctx: &mut OpcodeExecContext) -> Result<(), ScriptError> {
+                Ok(())
+            }
         }
         registry.register(Box::new(FakeCTV));
         assert_eq!(registry.get(0xb3).unwrap().name(), "FAKE_CTV");
@@ -1754,7 +1790,10 @@ mod tests {
 
         // NetworkOnly
         let ctx3 = OpcodeContext::NetworkOnly(vec![Network::Mainnet]);
-        assert_eq!(ctx3.clone(), OpcodeContext::NetworkOnly(vec![Network::Mainnet]));
+        assert_eq!(
+            ctx3.clone(),
+            OpcodeContext::NetworkOnly(vec![Network::Mainnet])
+        );
         assert_ne!(ctx3, OpcodeContext::NetworkOnly(vec![Network::Testnet]));
 
         // Always
@@ -1762,10 +1801,10 @@ mod tests {
         assert_eq!(ctx4, OpcodeContext::Always);
 
         // Debug formatting
-        let _ = format!("{:?}", ctx);
-        let _ = format!("{:?}", ctx2);
-        let _ = format!("{:?}", ctx3);
-        let _ = format!("{:?}", ctx4);
+        let _ = format!("{ctx:?}");
+        let _ = format!("{ctx2:?}");
+        let _ = format!("{ctx3:?}");
+        let _ = format!("{ctx4:?}");
     }
 
     // -----------------------------------------------------------------------
@@ -1993,9 +2032,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn make_anyprevout_test_tx() -> Transaction {
-        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
-        use btc_primitives::hash::TxHash;
         use btc_primitives::amount::Amount;
+        use btc_primitives::hash::TxHash;
+        use btc_primitives::transaction::{OutPoint, TxIn, TxOut};
 
         Transaction {
             version: 2,
@@ -2311,9 +2350,9 @@ mod tests {
 
     #[test]
     fn test_txhash_each_selector_individually() {
-        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
-        use btc_primitives::hash::TxHash;
         use btc_primitives::amount::Amount;
+        use btc_primitives::hash::TxHash;
+        use btc_primitives::transaction::{OutPoint, TxIn, TxOut};
 
         let tx = Transaction {
             version: 3,
@@ -2351,9 +2390,13 @@ mod tests {
             let mut stack: Vec<Vec<u8>> = vec![vec![0x00]];
             let mut altstack: Vec<Vec<u8>> = Vec::new();
             let mut ctx = OpcodeExecContext {
-                stack: &mut stack, altstack: &mut altstack,
-                tx: Some(&tx), input_index: 0, input_amount: 0,
-                flags: &flags, taproot_internal_key: None,
+                stack: &mut stack,
+                altstack: &mut altstack,
+                tx: Some(&tx),
+                input_index: 0,
+                input_amount: 0,
+                flags: &flags,
+                taproot_internal_key: None,
             };
             txhash.execute(&mut ctx).unwrap();
             assert_eq!(ctx.stack[0].len(), 32);
@@ -2372,9 +2415,13 @@ mod tests {
             let mut stack: Vec<Vec<u8>> = vec![vec![0x01]];
             let mut altstack: Vec<Vec<u8>> = Vec::new();
             let mut ctx = OpcodeExecContext {
-                stack: &mut stack, altstack: &mut altstack,
-                tx: Some(&tx), input_index: 0, input_amount: 0,
-                flags: &flags, taproot_internal_key: None,
+                stack: &mut stack,
+                altstack: &mut altstack,
+                tx: Some(&tx),
+                input_index: 0,
+                input_amount: 0,
+                flags: &flags,
+                taproot_internal_key: None,
             };
             txhash.execute(&mut ctx).unwrap();
             assert_eq!(ctx.stack[0], sha256(&tx.version.to_le_bytes()).to_vec());
@@ -2385,9 +2432,13 @@ mod tests {
             let mut stack: Vec<Vec<u8>> = vec![vec![0x02]];
             let mut altstack: Vec<Vec<u8>> = Vec::new();
             let mut ctx = OpcodeExecContext {
-                stack: &mut stack, altstack: &mut altstack,
-                tx: Some(&tx), input_index: 0, input_amount: 0,
-                flags: &flags, taproot_internal_key: None,
+                stack: &mut stack,
+                altstack: &mut altstack,
+                tx: Some(&tx),
+                input_index: 0,
+                input_amount: 0,
+                flags: &flags,
+                taproot_internal_key: None,
             };
             txhash.execute(&mut ctx).unwrap();
             assert_eq!(ctx.stack[0], sha256(&tx.lock_time.to_le_bytes()).to_vec());
@@ -2398,9 +2449,13 @@ mod tests {
             let mut stack: Vec<Vec<u8>> = vec![vec![0x03]];
             let mut altstack: Vec<Vec<u8>> = Vec::new();
             let mut ctx = OpcodeExecContext {
-                stack: &mut stack, altstack: &mut altstack,
-                tx: Some(&tx), input_index: 0, input_amount: 0,
-                flags: &flags, taproot_internal_key: None,
+                stack: &mut stack,
+                altstack: &mut altstack,
+                tx: Some(&tx),
+                input_index: 0,
+                input_amount: 0,
+                flags: &flags,
+                taproot_internal_key: None,
             };
             txhash.execute(&mut ctx).unwrap();
             assert_eq!(ctx.stack[0].len(), 32);
@@ -2411,9 +2466,13 @@ mod tests {
             let mut stack: Vec<Vec<u8>> = vec![vec![0x04]];
             let mut altstack: Vec<Vec<u8>> = Vec::new();
             let mut ctx = OpcodeExecContext {
-                stack: &mut stack, altstack: &mut altstack,
-                tx: Some(&tx), input_index: 0, input_amount: 0,
-                flags: &flags, taproot_internal_key: None,
+                stack: &mut stack,
+                altstack: &mut altstack,
+                tx: Some(&tx),
+                input_index: 0,
+                input_amount: 0,
+                flags: &flags,
+                taproot_internal_key: None,
             };
             txhash.execute(&mut ctx).unwrap();
             assert_eq!(ctx.stack[0].len(), 32);
@@ -2424,9 +2483,13 @@ mod tests {
             let mut stack: Vec<Vec<u8>> = vec![vec![0x05]];
             let mut altstack: Vec<Vec<u8>> = Vec::new();
             let mut ctx = OpcodeExecContext {
-                stack: &mut stack, altstack: &mut altstack,
-                tx: Some(&tx), input_index: 0, input_amount: 0,
-                flags: &flags, taproot_internal_key: None,
+                stack: &mut stack,
+                altstack: &mut altstack,
+                tx: Some(&tx),
+                input_index: 0,
+                input_amount: 0,
+                flags: &flags,
+                taproot_internal_key: None,
             };
             txhash.execute(&mut ctx).unwrap();
             // Verify: SHA256(sequence[0] || sequence[1])
@@ -2570,11 +2633,7 @@ mod tests {
     #[test]
     fn test_checkcontractverify_three_elements_underflow() {
         let flags = ScriptFlags::none();
-        let mut stack: Vec<Vec<u8>> = vec![
-            vec![0x01],
-            [0xab; 32].to_vec(),
-            [0xcd; 32].to_vec(),
-        ];
+        let mut stack: Vec<Vec<u8>> = vec![vec![0x01], [0xab; 32].to_vec(), [0xcd; 32].to_vec()];
         let mut altstack: Vec<Vec<u8>> = Vec::new();
 
         let op = OpCheckContractVerify;
@@ -2632,9 +2691,9 @@ mod tests {
 
     #[test]
     fn test_ctv_hash_with_multiple_inputs_and_outputs() {
-        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
-        use btc_primitives::hash::TxHash;
         use btc_primitives::amount::Amount;
+        use btc_primitives::hash::TxHash;
+        use btc_primitives::transaction::{OutPoint, TxIn, TxOut};
 
         let tx = Transaction {
             version: 1,
@@ -2688,9 +2747,9 @@ mod tests {
 
     #[test]
     fn test_anyprevout_with_multi_input_tx() {
-        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
-        use btc_primitives::hash::TxHash;
         use btc_primitives::amount::Amount;
+        use btc_primitives::hash::TxHash;
+        use btc_primitives::transaction::{OutPoint, TxIn, TxOut};
 
         let tx = Transaction {
             version: 2,

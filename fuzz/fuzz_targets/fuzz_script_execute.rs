@@ -3,9 +3,9 @@
 use libfuzzer_sys::fuzz_target;
 use std::panic;
 
-use btc_primitives::script::ScriptBuf;
 use btc_consensus::script_engine::{ScriptEngine, ScriptFlags};
 use btc_consensus::sig_verify::Secp256k1Verifier;
+use btc_primitives::script::ScriptBuf;
 
 fuzz_target!(|data: &[u8]| {
     // Cap script size to Bitcoin's consensus limit (10 000 bytes) to keep

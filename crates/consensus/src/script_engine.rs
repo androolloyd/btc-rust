@@ -1,9 +1,9 @@
-use btc_primitives::script::{Opcode, Script, Instruction};
-use btc_primitives::hash::{sha256, sha256d, hash160};
-use btc_primitives::transaction::{Transaction, TxOut};
+use crate::opcode_plugin::{OpcodeExecContext, OpcodeRegistry};
 use crate::sig_verify::SignatureVerifier;
 use crate::sighash::{sighash_legacy, sighash_segwit_v0, sighash_taproot, SighashType};
-use crate::opcode_plugin::{OpcodeRegistry, OpcodeExecContext};
+use btc_primitives::hash::{hash160, sha256, sha256d};
+use btc_primitives::script::{Instruction, Opcode, Script};
+use btc_primitives::transaction::{Transaction, TxOut};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -350,9 +350,7 @@ impl<'a> ScriptEngine<'a> {
 
         let mut op_count = 0;
         let mut exec_stack: Vec<bool> = Vec::new(); // for IF/ELSE/ENDIF
-        let executing = |exec_stack: &[bool]| -> bool {
-            exec_stack.iter().all(|&b| b)
-        };
+        let executing = |exec_stack: &[bool]| -> bool { exec_stack.iter().all(|&b| b) };
 
         // We need to track byte positions as we iterate instructions.
         // Use a manual position tracker alongside the instruction iterator.
@@ -392,10 +390,11 @@ impl<'a> ScriptEngine<'a> {
                     }
 
                     // MINIMALDATA: reject non-minimal push encodings
-                    if self.flags.verify_minimaldata && executing(&exec_stack) {
-                        if !is_minimal_push(data, push_opcode_byte) {
-                            return Err(ScriptError::MinimalData);
-                        }
+                    if self.flags.verify_minimaldata
+                        && executing(&exec_stack)
+                        && !is_minimal_push(data, push_opcode_byte)
+                    {
+                        return Err(ScriptError::MinimalData);
                     }
 
                     if executing(&exec_stack) {
@@ -407,12 +406,10 @@ impl<'a> ScriptEngine<'a> {
                     let op = *op;
 
                     // Conditionals always counted towards opcount (in non-tapscript mode)
-                    if op as u8 > Opcode::OP_16 as u8 {
-                        if !self.tapscript_mode {
-                            op_count += 1;
-                            if op_count > MAX_OPS_PER_SCRIPT {
-                                return Err(ScriptError::OpCountLimit);
-                            }
+                    if op as u8 > Opcode::OP_16 as u8 && !self.tapscript_mode {
+                        op_count += 1;
+                        if op_count > MAX_OPS_PER_SCRIPT {
+                            return Err(ScriptError::OpCountLimit);
                         }
                     }
 
@@ -445,10 +442,12 @@ impl<'a> ScriptEngine<'a> {
                                 // segwit scripts. The `verify_minimalif_segwit` flag is set
                                 // by the witness execution layer when executing inside a
                                 // witness script context.
-                                if self.flags.verify_minimalif && self.is_witness_execution {
-                                    if !top.is_empty() && top != [0x01] {
-                                        return Err(ScriptError::MinimalIf);
-                                    }
+                                if self.flags.verify_minimalif
+                                    && self.is_witness_execution
+                                    && !top.is_empty()
+                                    && top != [0x01]
+                                {
+                                    return Err(ScriptError::MinimalIf);
                                 }
                                 val = !is_false(&top);
                                 if op == Opcode::OP_NOTIF {
@@ -484,10 +483,21 @@ impl<'a> ScriptEngine<'a> {
                     // OP_SUCCESS stay disabled.
                     if !executing(&exec_stack) {
                         match op {
-                            Opcode::OP_CAT | Opcode::OP_SUBSTR | Opcode::OP_LEFT | Opcode::OP_RIGHT |
-                            Opcode::OP_INVERT | Opcode::OP_AND | Opcode::OP_OR | Opcode::OP_XOR |
-                            Opcode::OP_2MUL | Opcode::OP_2DIV | Opcode::OP_MUL | Opcode::OP_DIV |
-                            Opcode::OP_MOD | Opcode::OP_LSHIFT | Opcode::OP_RSHIFT => {
+                            Opcode::OP_CAT
+                            | Opcode::OP_SUBSTR
+                            | Opcode::OP_LEFT
+                            | Opcode::OP_RIGHT
+                            | Opcode::OP_INVERT
+                            | Opcode::OP_AND
+                            | Opcode::OP_OR
+                            | Opcode::OP_XOR
+                            | Opcode::OP_2MUL
+                            | Opcode::OP_2DIV
+                            | Opcode::OP_MUL
+                            | Opcode::OP_DIV
+                            | Opcode::OP_MOD
+                            | Opcode::OP_LSHIFT
+                            | Opcode::OP_RSHIFT => {
                                 // In tapscript mode, many of these are OP_SUCCESS and would
                                 // have been caught already by the pre-scan. Any remaining
                                 // disabled opcodes still fail.
@@ -550,18 +560,27 @@ impl<'a> ScriptEngine<'a> {
                 // Direct push: skip opcode + data
                 pos += 1 + byte as usize;
             } else if byte == Opcode::OP_PUSHDATA1 as u8 {
-                if pos + 1 >= script_bytes.len() { break; }
+                if pos + 1 >= script_bytes.len() {
+                    break;
+                }
                 let len = script_bytes[pos + 1] as usize;
                 pos += 2 + len;
             } else if byte == Opcode::OP_PUSHDATA2 as u8 {
-                if pos + 2 >= script_bytes.len() { break; }
-                let len = u16::from_le_bytes([script_bytes[pos + 1], script_bytes[pos + 2]]) as usize;
+                if pos + 2 >= script_bytes.len() {
+                    break;
+                }
+                let len =
+                    u16::from_le_bytes([script_bytes[pos + 1], script_bytes[pos + 2]]) as usize;
                 pos += 3 + len;
             } else if byte == Opcode::OP_PUSHDATA4 as u8 {
-                if pos + 4 >= script_bytes.len() { break; }
+                if pos + 4 >= script_bytes.len() {
+                    break;
+                }
                 let len = u32::from_le_bytes([
-                    script_bytes[pos + 1], script_bytes[pos + 2],
-                    script_bytes[pos + 3], script_bytes[pos + 4],
+                    script_bytes[pos + 1],
+                    script_bytes[pos + 2],
+                    script_bytes[pos + 3],
+                    script_bytes[pos + 4],
                 ]) as usize;
                 pos += 5 + len;
             } else {
@@ -635,9 +654,11 @@ impl<'a> ScriptEngine<'a> {
         // Need transaction context to compute sighash
         let tx = match self.tx {
             Some(tx) => tx,
-            None => return Err(ScriptError::SigVerify(
-                "no transaction context for signature verification".into()
-            )),
+            None => {
+                return Err(ScriptError::SigVerify(
+                    "no transaction context for signature verification".into(),
+                ))
+            }
         };
 
         // Last byte of signature is the sighash type
@@ -649,8 +670,14 @@ impl<'a> ScriptEngine<'a> {
 
         // Compute the sighash — use BIP143 segwit digest when in segwit mode
         let sighash = if self.use_segwit_sighash {
-            sighash_segwit_v0(tx, self.input_index, &script_code, self.input_amount, hash_type)
-                .map_err(|e| ScriptError::SigVerify(e.to_string()))?
+            sighash_segwit_v0(
+                tx,
+                self.input_index,
+                &script_code,
+                self.input_amount,
+                hash_type,
+            )
+            .map_err(|e| ScriptError::SigVerify(e.to_string()))?
         } else {
             sighash_legacy(tx, self.input_index, &script_code, hash_type)
                 .map_err(|e| ScriptError::SigVerify(e.to_string()))?
@@ -672,7 +699,11 @@ impl<'a> ScriptEngine<'a> {
     /// - Empty sig = failed check (Ok(false)), costs budget
     /// - Non-empty invalid sig = script failure (Err)
     /// - Valid sig = Ok(true)
-    fn verify_tapscript_signature(&mut self, sig: &[u8], pubkey: &[u8]) -> Result<bool, ScriptError> {
+    fn verify_tapscript_signature(
+        &mut self,
+        sig: &[u8],
+        pubkey: &[u8],
+    ) -> Result<bool, ScriptError> {
         // Empty signature = failed check (not an error)
         if sig.is_empty() {
             // Deduct from signature budget
@@ -711,19 +742,24 @@ impl<'a> ScriptEngine<'a> {
         // Need transaction context
         let tx = match self.tx {
             Some(tx) => tx,
-            None => return Err(ScriptError::SigVerify(
-                "no transaction context for tapscript signature verification".into()
-            )),
+            None => {
+                return Err(ScriptError::SigVerify(
+                    "no transaction context for tapscript signature verification".into(),
+                ))
+            }
         };
 
         let prevouts = match &self.tapscript_prevouts {
             Some(p) => p.clone(),
-            None => return Err(ScriptError::SigVerify(
-                "no prevouts for tapscript signature verification".into()
-            )),
+            None => {
+                return Err(ScriptError::SigVerify(
+                    "no prevouts for tapscript signature verification".into(),
+                ))
+            }
         };
 
-        let leaf_hash = self.tapscript_leaf_hash
+        let leaf_hash = self
+            .tapscript_leaf_hash
             .ok_or_else(|| ScriptError::SigVerify("no leaf hash for tapscript".into()))?;
 
         let annex = self.tapscript_annex.clone();
@@ -736,10 +772,14 @@ impl<'a> ScriptEngine<'a> {
             hash_type,
             annex.as_deref(),
             Some(&leaf_hash),
-        ).map_err(|e| ScriptError::SigVerify(e.to_string()))?;
+        )
+        .map_err(|e| ScriptError::SigVerify(e.to_string()))?;
 
         // Verify Schnorr signature
-        match self.sig_verifier.verify_schnorr(&sighash, schnorr_sig, pubkey) {
+        match self
+            .sig_verifier
+            .verify_schnorr(&sighash, schnorr_sig, pubkey)
+        {
             Ok(true) => Ok(true),
             Ok(false) | Err(_) => {
                 // BIP342: non-empty invalid sig = script failure (not just false)
@@ -828,10 +868,22 @@ impl<'a> ScriptEngine<'a> {
             // Constants
             Opcode::OP_0 => self.push(Vec::new())?,
             Opcode::OP_1NEGATE => self.push(encode_num(-1))?,
-            Opcode::OP_1 | Opcode::OP_2 | Opcode::OP_3 | Opcode::OP_4 |
-            Opcode::OP_5 | Opcode::OP_6 | Opcode::OP_7 | Opcode::OP_8 |
-            Opcode::OP_9 | Opcode::OP_10 | Opcode::OP_11 | Opcode::OP_12 |
-            Opcode::OP_13 | Opcode::OP_14 | Opcode::OP_15 | Opcode::OP_16 => {
+            Opcode::OP_1
+            | Opcode::OP_2
+            | Opcode::OP_3
+            | Opcode::OP_4
+            | Opcode::OP_5
+            | Opcode::OP_6
+            | Opcode::OP_7
+            | Opcode::OP_8
+            | Opcode::OP_9
+            | Opcode::OP_10
+            | Opcode::OP_11
+            | Opcode::OP_12
+            | Opcode::OP_13
+            | Opcode::OP_14
+            | Opcode::OP_15
+            | Opcode::OP_16 => {
                 let n = (op as u8 - Opcode::OP_1 as u8 + 1) as i64;
                 self.push(encode_num(n))?;
             }
@@ -851,17 +903,26 @@ impl<'a> ScriptEngine<'a> {
                 let top = self.top()?.clone();
                 self.push(top)?;
             }
-            Opcode::OP_DROP => { self.pop()?; }
-            Opcode::OP_2DROP => { self.pop()?; self.pop()?; }
+            Opcode::OP_DROP => {
+                self.pop()?;
+            }
+            Opcode::OP_2DROP => {
+                self.pop()?;
+                self.pop()?;
+            }
             Opcode::OP_2DUP => {
-                if self.stack.len() < 2 { return Err(ScriptError::StackUnderflow); }
+                if self.stack.len() < 2 {
+                    return Err(ScriptError::StackUnderflow);
+                }
                 let a = self.stack[self.stack.len() - 2].clone();
                 let b = self.stack[self.stack.len() - 1].clone();
                 self.push(a)?;
                 self.push(b)?;
             }
             Opcode::OP_3DUP => {
-                if self.stack.len() < 3 { return Err(ScriptError::StackUnderflow); }
+                if self.stack.len() < 3 {
+                    return Err(ScriptError::StackUnderflow);
+                }
                 let a = self.stack[self.stack.len() - 3].clone();
                 let b = self.stack[self.stack.len() - 2].clone();
                 let c = self.stack[self.stack.len() - 1].clone();
@@ -870,28 +931,38 @@ impl<'a> ScriptEngine<'a> {
                 self.push(c)?;
             }
             Opcode::OP_NIP => {
-                if self.stack.len() < 2 { return Err(ScriptError::StackUnderflow); }
+                if self.stack.len() < 2 {
+                    return Err(ScriptError::StackUnderflow);
+                }
                 let len = self.stack.len();
                 self.stack.remove(len - 2);
             }
             Opcode::OP_OVER => {
-                if self.stack.len() < 2 { return Err(ScriptError::StackUnderflow); }
+                if self.stack.len() < 2 {
+                    return Err(ScriptError::StackUnderflow);
+                }
                 let val = self.stack[self.stack.len() - 2].clone();
                 self.push(val)?;
             }
             Opcode::OP_SWAP => {
                 let len = self.stack.len();
-                if len < 2 { return Err(ScriptError::StackUnderflow); }
+                if len < 2 {
+                    return Err(ScriptError::StackUnderflow);
+                }
                 self.stack.swap(len - 1, len - 2);
             }
             Opcode::OP_ROT => {
                 let len = self.stack.len();
-                if len < 3 { return Err(ScriptError::StackUnderflow); }
+                if len < 3 {
+                    return Err(ScriptError::StackUnderflow);
+                }
                 let val = self.stack.remove(len - 3);
                 self.stack.push(val);
             }
             Opcode::OP_TUCK => {
-                if self.stack.len() < 2 { return Err(ScriptError::StackUnderflow); }
+                if self.stack.len() < 2 {
+                    return Err(ScriptError::StackUnderflow);
+                }
                 if self.stack.len() + self.altstack.len() >= MAX_STACK_SIZE {
                     return Err(ScriptError::StackOverflow);
                 }
@@ -1215,9 +1286,14 @@ impl<'a> ScriptEngine<'a> {
 
             // NOPs (soft-fork safe) — if a plugin is registered, delegate to it;
             // otherwise treat as NOP (the original behavior).
-            Opcode::OP_NOP1 | Opcode::OP_NOP4 | Opcode::OP_NOP5 |
-            Opcode::OP_NOP6 | Opcode::OP_NOP7 | Opcode::OP_NOP8 |
-            Opcode::OP_NOP9 | Opcode::OP_NOP10 => {
+            Opcode::OP_NOP1
+            | Opcode::OP_NOP4
+            | Opcode::OP_NOP5
+            | Opcode::OP_NOP6
+            | Opcode::OP_NOP7
+            | Opcode::OP_NOP8
+            | Opcode::OP_NOP9
+            | Opcode::OP_NOP10 => {
                 if let Some(registry) = self.opcode_registry {
                     if let Some(plugin) = registry.get(op.to_u8()) {
                         let mut ctx = OpcodeExecContext {
@@ -1241,10 +1317,21 @@ impl<'a> ScriptEngine<'a> {
 
             // Disabled opcodes — if a plugin overrides one (e.g. OP_CAT in
             // tapscript), delegate to the plugin instead of failing.
-            Opcode::OP_CAT | Opcode::OP_SUBSTR | Opcode::OP_LEFT | Opcode::OP_RIGHT |
-            Opcode::OP_INVERT | Opcode::OP_AND | Opcode::OP_OR | Opcode::OP_XOR |
-            Opcode::OP_2MUL | Opcode::OP_2DIV | Opcode::OP_MUL | Opcode::OP_DIV |
-            Opcode::OP_MOD | Opcode::OP_LSHIFT | Opcode::OP_RSHIFT => {
+            Opcode::OP_CAT
+            | Opcode::OP_SUBSTR
+            | Opcode::OP_LEFT
+            | Opcode::OP_RIGHT
+            | Opcode::OP_INVERT
+            | Opcode::OP_AND
+            | Opcode::OP_OR
+            | Opcode::OP_XOR
+            | Opcode::OP_2MUL
+            | Opcode::OP_2DIV
+            | Opcode::OP_MUL
+            | Opcode::OP_DIV
+            | Opcode::OP_MOD
+            | Opcode::OP_LSHIFT
+            | Opcode::OP_RSHIFT => {
                 if let Some(registry) = self.opcode_registry {
                     if let Some(plugin) = registry.get(op.to_u8()) {
                         let mut ctx = OpcodeExecContext {
@@ -1265,31 +1352,43 @@ impl<'a> ScriptEngine<'a> {
             // Pick/Roll
             Opcode::OP_PICK => {
                 let n_val = self.pop_num()?;
-                if n_val < 0 { return Err(ScriptError::InvalidStackOperation); }
+                if n_val < 0 {
+                    return Err(ScriptError::InvalidStackOperation);
+                }
                 let n = n_val as usize;
-                if n >= self.stack.len() { return Err(ScriptError::StackUnderflow); }
+                if n >= self.stack.len() {
+                    return Err(ScriptError::StackUnderflow);
+                }
                 let val = self.stack[self.stack.len() - 1 - n].clone();
                 self.push(val)?;
             }
             Opcode::OP_ROLL => {
                 let n_val = self.pop_num()?;
-                if n_val < 0 { return Err(ScriptError::InvalidStackOperation); }
+                if n_val < 0 {
+                    return Err(ScriptError::InvalidStackOperation);
+                }
                 let n = n_val as usize;
-                if n >= self.stack.len() { return Err(ScriptError::StackUnderflow); }
+                if n >= self.stack.len() {
+                    return Err(ScriptError::StackUnderflow);
+                }
                 let idx = self.stack.len() - 1 - n;
                 let val = self.stack.remove(idx);
                 self.stack.push(val);
             }
 
             Opcode::OP_2OVER => {
-                if self.stack.len() < 4 { return Err(ScriptError::StackUnderflow); }
+                if self.stack.len() < 4 {
+                    return Err(ScriptError::StackUnderflow);
+                }
                 let a = self.stack[self.stack.len() - 4].clone();
                 let b = self.stack[self.stack.len() - 3].clone();
                 self.push(a)?;
                 self.push(b)?;
             }
             Opcode::OP_2ROT => {
-                if self.stack.len() < 6 { return Err(ScriptError::StackUnderflow); }
+                if self.stack.len() < 6 {
+                    return Err(ScriptError::StackUnderflow);
+                }
                 let len = self.stack.len();
                 let a = self.stack.remove(len - 6);
                 let b = self.stack.remove(len - 6); // shifted after removal
@@ -1298,7 +1397,9 @@ impl<'a> ScriptEngine<'a> {
             }
             Opcode::OP_2SWAP => {
                 let len = self.stack.len();
-                if len < 4 { return Err(ScriptError::StackUnderflow); }
+                if len < 4 {
+                    return Err(ScriptError::StackUnderflow);
+                }
                 self.stack.swap(len - 4, len - 2);
                 self.stack.swap(len - 3, len - 1);
             }
@@ -1413,7 +1514,11 @@ impl<'a> ScriptEngine<'a> {
                 }
 
                 if op == Opcode::OP_CHECKMULTISIG {
-                    self.push(if success { encode_num(1) } else { encode_num(0) })?;
+                    self.push(if success {
+                        encode_num(1)
+                    } else {
+                        encode_num(0)
+                    })?;
                 } else {
                     // CHECKMULTISIGVERIFY
                     if !success {
@@ -1529,40 +1634,72 @@ pub fn is_minimal_script_num(data: &[u8]) -> bool {
 /// This validates the DER encoding only — NOT the signature itself.
 fn is_valid_der_signature(sig: &[u8]) -> bool {
     // Minimum DER signature: 30 06 02 01 R 02 01 S
-    if sig.len() < 8 { return false; }
-    if sig.len() > 72 { return false; }
+    if sig.len() < 8 {
+        return false;
+    }
+    if sig.len() > 72 {
+        return false;
+    }
 
     // Compound type tag
-    if sig[0] != 0x30 { return false; }
+    if sig[0] != 0x30 {
+        return false;
+    }
 
     // Total length should cover the rest
     let total_len = sig[1] as usize;
-    if total_len + 2 != sig.len() { return false; }
+    if total_len + 2 != sig.len() {
+        return false;
+    }
 
     // First element: R integer
-    if sig[2] != 0x02 { return false; }
+    if sig[2] != 0x02 {
+        return false;
+    }
     let r_len = sig[3] as usize;
-    if r_len == 0 { return false; }
-    if 4 + r_len >= sig.len() { return false; }
+    if r_len == 0 {
+        return false;
+    }
+    if 4 + r_len >= sig.len() {
+        return false;
+    }
 
     // Check R is not negative (high bit set without padding byte)
-    if sig[4] & 0x80 != 0 { return false; }
+    if sig[4] & 0x80 != 0 {
+        return false;
+    }
     // Check R has no excess padding
-    if r_len > 1 && sig[4] == 0 && sig[5] & 0x80 == 0 { return false; }
+    if r_len > 1 && sig[4] == 0 && sig[5] & 0x80 == 0 {
+        return false;
+    }
 
     // Second element: S integer
     let s_pos = 4 + r_len;
-    if s_pos >= sig.len() { return false; }
-    if sig[s_pos] != 0x02 { return false; }
-    if s_pos + 1 >= sig.len() { return false; }
+    if s_pos >= sig.len() {
+        return false;
+    }
+    if sig[s_pos] != 0x02 {
+        return false;
+    }
+    if s_pos + 1 >= sig.len() {
+        return false;
+    }
     let s_len = sig[s_pos + 1] as usize;
-    if s_len == 0 { return false; }
-    if s_pos + 2 + s_len != sig.len() { return false; }
+    if s_len == 0 {
+        return false;
+    }
+    if s_pos + 2 + s_len != sig.len() {
+        return false;
+    }
 
     // Check S is not negative
-    if sig[s_pos + 2] & 0x80 != 0 { return false; }
+    if sig[s_pos + 2] & 0x80 != 0 {
+        return false;
+    }
     // Check S has no excess padding
-    if s_len > 1 && sig[s_pos + 2] == 0 && sig[s_pos + 3] & 0x80 == 0 { return false; }
+    if s_len > 1 && sig[s_pos + 2] == 0 && sig[s_pos + 3] & 0x80 == 0 {
+        return false;
+    }
 
     true
 }
@@ -1570,7 +1707,9 @@ fn is_valid_der_signature(sig: &[u8]) -> bool {
 /// Check if a DER signature has low S value (BIP62 rule 5).
 /// S must be <= order/2.
 fn is_low_der_signature(sig: &[u8]) -> bool {
-    if !is_valid_der_signature(sig) { return false; }
+    if !is_valid_der_signature(sig) {
+        return false;
+    }
 
     // Extract S value
     let r_len = sig[3] as usize;
@@ -1581,15 +1720,16 @@ fn is_low_der_signature(sig: &[u8]) -> bool {
     // secp256k1 half-order (order/2):
     // 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0
     let half_order: [u8; 32] = [
-        0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-        0x5D, 0x57, 0x6E, 0x73, 0x57, 0xA4, 0x50, 0x1D,
-        0xDF, 0xE9, 0x2F, 0x46, 0x68, 0x1B, 0x20, 0xA0,
+        0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0x5D, 0x57, 0x6E, 0x73, 0x57, 0xA4, 0x50, 0x1D, 0xDF, 0xE9, 0x2F, 0x46, 0x68, 0x1B,
+        0x20, 0xA0,
     ];
 
     // Pad S to 32 bytes for comparison
     let mut s_padded = [0u8; 32];
-    if s_bytes.len() > 32 { return false; }
+    if s_bytes.len() > 32 {
+        return false;
+    }
     let offset = 32 - s_bytes.len();
     s_padded[offset..].copy_from_slice(s_bytes);
 
@@ -1601,15 +1741,19 @@ fn is_low_der_signature(sig: &[u8]) -> bool {
 fn is_defined_hashtype(hash_type: u8) -> bool {
     let base = hash_type & 0x1f;
     let rest = hash_type & !0x9f; // bits besides base and ANYONECANPAY
-    if rest != 0 { return false; }
-    matches!(base, 1 | 2 | 3) // ALL, NONE, SINGLE
+    if rest != 0 {
+        return false;
+    }
+    matches!(base, 1..=3) // ALL, NONE, SINGLE
 }
 
 /// Check if a public key has valid encoding (STRICTENC).
 /// Valid encodings: compressed (02/03 + 32 bytes) or uncompressed (04 + 64 bytes).
 /// Hybrid keys (06/07) are NOT valid under STRICTENC.
 fn is_valid_pubkey_encoding(pubkey: &[u8]) -> bool {
-    if pubkey.is_empty() { return false; }
+    if pubkey.is_empty() {
+        return false;
+    }
     match pubkey[0] {
         0x02 | 0x03 => pubkey.len() == 33,
         0x04 => pubkey.len() == 65,
@@ -1652,7 +1796,7 @@ fn is_minimal_push(data: &[u8], opcode_byte: u8) -> bool {
     }
     if len == 1 {
         let val = data[0];
-        if val >= 1 && val <= 16 {
+        if (1..=16).contains(&val) {
             // Should have used OP_1 through OP_16
             return opcode_byte == (Opcode::OP_1 as u8 + val - 1);
         }
@@ -1697,7 +1841,7 @@ fn is_false(data: &[u8]) -> bool {
 mod tests {
     use super::*;
     use crate::sig_verify::Secp256k1Verifier;
-    use btc_primitives::script::{ScriptBuf, Opcode};
+    use btc_primitives::script::{Opcode, ScriptBuf};
 
     fn make_engine() -> ScriptEngine<'static> {
         static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
@@ -1813,14 +1957,17 @@ mod tests {
         script.push_opcode(Opcode::OP_1);
         script.push_opcode(Opcode::OP_CAT);
         let result = engine.execute(script.as_script());
-        assert!(matches!(result, Err(ScriptError::DisabledOpcode(Opcode::OP_CAT))));
+        assert!(matches!(
+            result,
+            Err(ScriptError::DisabledOpcode(Opcode::OP_CAT))
+        ));
     }
 
     // --- Helper for signature verification tests ---
 
-    use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
-    use btc_primitives::hash::TxHash;
     use btc_primitives::amount::Amount;
+    use btc_primitives::hash::TxHash;
+    use btc_primitives::transaction::{OutPoint, TxIn, TxOut};
 
     /// Create a simple test transaction. Signature creation is done separately
     /// since the sighash depends on the script_code, which is the full script
@@ -1926,18 +2073,15 @@ mod tests {
 
         // Execute in two phases (as Bitcoin does)
         static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
-        let mut engine = ScriptEngine::new(
-            &VERIFIER,
-            ScriptFlags::none(),
-            Some(&tx),
-            0,
-            0,
-        );
+        let mut engine = ScriptEngine::new(&VERIFIER, ScriptFlags::none(), Some(&tx), 0, 0);
         // Phase 1: execute scriptSig (pushes sig onto stack)
         engine.execute(script_sig.as_script()).unwrap();
         // Phase 2: execute scriptPubKey (pops sig+pubkey, verifies)
         engine.execute(script_pubkey.as_script()).unwrap();
-        assert!(engine.success(), "OP_CHECKSIG should succeed with valid signature");
+        assert!(
+            engine.success(),
+            "OP_CHECKSIG should succeed with valid signature"
+        );
     }
 
     #[test]
@@ -1946,7 +2090,8 @@ mod tests {
 
         let secp = secp256k1::Secp256k1::new();
         let (secret_key, _public_key) = secp.generate_keypair(&mut secp256k1::rand::thread_rng());
-        let (_other_secret, other_public) = secp.generate_keypair(&mut secp256k1::rand::thread_rng());
+        let (_other_secret, other_public) =
+            secp.generate_keypair(&mut secp256k1::rand::thread_rng());
         let wrong_pubkey_bytes = other_public.serialize().to_vec();
 
         let tx = make_test_tx();
@@ -1964,16 +2109,13 @@ mod tests {
         script_sig.push_slice(&sig_bytes);
 
         static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
-        let mut engine = ScriptEngine::new(
-            &VERIFIER,
-            ScriptFlags::none(),
-            Some(&tx),
-            0,
-            0,
-        );
+        let mut engine = ScriptEngine::new(&VERIFIER, ScriptFlags::none(), Some(&tx), 0, 0);
         engine.execute(script_sig.as_script()).unwrap();
         engine.execute(script_pubkey.as_script()).unwrap();
-        assert!(!engine.success(), "OP_CHECKSIG should fail with wrong public key");
+        assert!(
+            !engine.success(),
+            "OP_CHECKSIG should fail with wrong public key"
+        );
     }
 
     #[test]
@@ -1999,16 +2141,13 @@ mod tests {
         script_sig.push_slice(&sig_bytes);
 
         static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
-        let mut engine = ScriptEngine::new(
-            &VERIFIER,
-            ScriptFlags::none(),
-            Some(&tx),
-            0,
-            0,
-        );
+        let mut engine = ScriptEngine::new(&VERIFIER, ScriptFlags::none(), Some(&tx), 0, 0);
         engine.execute(script_sig.as_script()).unwrap();
         engine.execute(script_pubkey.as_script()).unwrap();
-        assert!(engine.success(), "OP_CHECKSIGVERIFY should pass with valid sig");
+        assert!(
+            engine.success(),
+            "OP_CHECKSIGVERIFY should pass with valid sig"
+        );
     }
 
     #[test]
@@ -2017,7 +2156,8 @@ mod tests {
 
         let secp = secp256k1::Secp256k1::new();
         let (secret_key, _public_key) = secp.generate_keypair(&mut secp256k1::rand::thread_rng());
-        let (_other_secret, other_public) = secp.generate_keypair(&mut secp256k1::rand::thread_rng());
+        let (_other_secret, other_public) =
+            secp.generate_keypair(&mut secp256k1::rand::thread_rng());
         let wrong_pubkey_bytes = other_public.serialize().to_vec();
 
         let tx = make_test_tx();
@@ -2033,17 +2173,13 @@ mod tests {
         script_sig.push_slice(&sig_bytes);
 
         static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
-        let mut engine = ScriptEngine::new(
-            &VERIFIER,
-            ScriptFlags::none(),
-            Some(&tx),
-            0,
-            0,
-        );
+        let mut engine = ScriptEngine::new(&VERIFIER, ScriptFlags::none(), Some(&tx), 0, 0);
         engine.execute(script_sig.as_script()).unwrap();
         let result = engine.execute(script_pubkey.as_script());
-        assert!(matches!(result, Err(ScriptError::CheckSigFailed)),
-            "OP_CHECKSIGVERIFY with wrong key should return CheckSigFailed");
+        assert!(
+            matches!(result, Err(ScriptError::CheckSigFailed)),
+            "OP_CHECKSIGVERIFY with wrong key should return CheckSigFailed"
+        );
     }
 
     #[test]
@@ -2098,13 +2234,7 @@ mod tests {
         script_sig.push_slice(&sig2_bytes);
 
         static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
-        let mut engine = ScriptEngine::new(
-            &VERIFIER,
-            ScriptFlags::none(),
-            Some(&tx),
-            0,
-            0,
-        );
+        let mut engine = ScriptEngine::new(&VERIFIER, ScriptFlags::none(), Some(&tx), 0, 0);
         // Phase 1: execute scriptSig (pushes dummy + sigs)
         engine.execute(script_sig.as_script()).unwrap();
         // Phase 2: execute scriptPubKey (pops and verifies)
@@ -2165,16 +2295,13 @@ mod tests {
         script_sig.push_slice(&sig2_bytes);
 
         static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
-        let mut engine = ScriptEngine::new(
-            &VERIFIER,
-            ScriptFlags::none(),
-            Some(&tx),
-            0,
-            0,
-        );
+        let mut engine = ScriptEngine::new(&VERIFIER, ScriptFlags::none(), Some(&tx), 0, 0);
         engine.execute(script_sig.as_script()).unwrap();
         engine.execute(script_pubkey.as_script()).unwrap();
-        assert!(!engine.success(), "2-of-3 CHECKMULTISIG with out-of-order sigs should fail");
+        assert!(
+            !engine.success(),
+            "2-of-3 CHECKMULTISIG with out-of-order sigs should fail"
+        );
     }
 
     #[test]
@@ -2187,7 +2314,10 @@ mod tests {
         script.push_slice(&[0x02; 33]); // dummy pubkey
         script.push_opcode(Opcode::OP_CHECKSIG);
         let result = engine.execute(script.as_script());
-        assert!(result.is_err(), "OP_CHECKSIG without tx context should error");
+        assert!(
+            result.is_err(),
+            "OP_CHECKSIG without tx context should error"
+        );
     }
 
     // ========== Stack operation tests ==========
@@ -2290,7 +2420,10 @@ mod tests {
         engine.execute(script.as_script()).unwrap();
         // Stack should be [3, 2]
         assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), 2);
-        assert_eq!(decode_num(&engine.stack()[engine.stack().len() - 2]).unwrap(), 3);
+        assert_eq!(
+            decode_num(&engine.stack()[engine.stack().len() - 2]).unwrap(),
+            3
+        );
     }
 
     #[test]
@@ -2927,7 +3060,10 @@ mod tests {
         let result = engine.stack().last().unwrap();
         assert_eq!(result.len(), 20);
         // Known RIPEMD160("hello") = 108f07b8382412612c048d07d13f814118445acd
-        assert_eq!(hex::encode(result), "108f07b8382412612c048d07d13f814118445acd");
+        assert_eq!(
+            hex::encode(result),
+            "108f07b8382412612c048d07d13f814118445acd"
+        );
     }
 
     #[test]
@@ -2940,7 +3076,10 @@ mod tests {
         let result = engine.stack().last().unwrap();
         assert_eq!(result.len(), 32);
         // Known SHA256("hello") = 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
-        assert_eq!(hex::encode(result), "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
+        assert_eq!(
+            hex::encode(result),
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
     }
 
     #[test]
@@ -3027,8 +3166,11 @@ mod tests {
             let opcode = Opcode::from_u8(0x50 + n as u8); // OP_1=0x51 ... OP_16=0x60
             script.push_opcode(opcode);
             engine.execute(script.as_script()).unwrap();
-            assert_eq!(decode_num(engine.stack().last().unwrap()).unwrap(), n,
-                "OP_{} should push {}", n, n);
+            assert_eq!(
+                decode_num(engine.stack().last().unwrap()).unwrap(),
+                n,
+                "OP_{n} should push {n}"
+            );
         }
     }
 
@@ -3128,13 +3270,7 @@ mod tests {
         script_sig.push_slice(&sig1_bytes);
 
         static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
-        let mut engine = ScriptEngine::new(
-            &VERIFIER,
-            ScriptFlags::none(),
-            Some(&tx),
-            0,
-            0,
-        );
+        let mut engine = ScriptEngine::new(&VERIFIER, ScriptFlags::none(), Some(&tx), 0, 0);
         engine.execute(script_sig.as_script()).unwrap();
         engine.execute(script_pubkey.as_script()).unwrap();
         assert!(engine.success(), "1-of-1 OP_CHECKMULTISIG should succeed");
@@ -3165,16 +3301,13 @@ mod tests {
         script_sig.push_slice(&sig1_bytes);
 
         static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
-        let mut engine = ScriptEngine::new(
-            &VERIFIER,
-            ScriptFlags::none(),
-            Some(&tx),
-            0,
-            0,
-        );
+        let mut engine = ScriptEngine::new(&VERIFIER, ScriptFlags::none(), Some(&tx), 0, 0);
         engine.execute(script_sig.as_script()).unwrap();
         engine.execute(script_pubkey.as_script()).unwrap();
-        assert!(engine.success(), "OP_CHECKMULTISIGVERIFY should succeed and leave OP_1 on stack");
+        assert!(
+            engine.success(),
+            "OP_CHECKMULTISIGVERIFY should succeed and leave OP_1 on stack"
+        );
     }
 
     // ========== Security audit fix tests ==========
@@ -3190,7 +3323,10 @@ mod tests {
         let result = engine.stack().last().unwrap();
         // SHA1("abc") = a9993e364706816aba3e25717850c26c9cd0d89d
         let expected = hex::decode("a9993e364706816aba3e25717850c26c9cd0d89d").unwrap();
-        assert_eq!(result, &expected, "OP_SHA1 must produce the real SHA1 hash, not zeros");
+        assert_eq!(
+            result, &expected,
+            "OP_SHA1 must produce the real SHA1 hash, not zeros"
+        );
     }
 
     #[test]
@@ -3218,8 +3354,7 @@ mod tests {
         let result = engine.execute(script.as_script());
         assert!(
             matches!(result, Err(ScriptError::InvalidStackOperation)),
-            "OP_PICK with negative index must fail with InvalidStackOperation, got {:?}",
-            result
+            "OP_PICK with negative index must fail with InvalidStackOperation, got {result:?}"
         );
     }
 
@@ -3235,8 +3370,7 @@ mod tests {
         let result = engine.execute(script.as_script());
         assert!(
             matches!(result, Err(ScriptError::InvalidStackOperation)),
-            "OP_ROLL with negative index must fail with InvalidStackOperation, got {:?}",
-            result
+            "OP_ROLL with negative index must fail with InvalidStackOperation, got {result:?}"
         );
     }
 
@@ -3271,8 +3405,7 @@ mod tests {
         let result = engine2.execute(script2.as_script());
         assert!(
             matches!(result, Err(ScriptError::StackOverflow)),
-            "OP_TUCK at MAX_STACK_SIZE must fail with StackOverflow, got {:?}",
-            result
+            "OP_TUCK at MAX_STACK_SIZE must fail with StackOverflow, got {result:?}"
         );
     }
 
@@ -3298,8 +3431,7 @@ mod tests {
         let result = engine.execute(script.as_script());
         assert!(
             matches!(result, Err(ScriptError::OpCountLimit)),
-            "OP_CHECKMULTISIG with n_keys pushing op_count over 201 must fail, got {:?}",
-            result
+            "OP_CHECKMULTISIG with n_keys pushing op_count over 201 must fail, got {result:?}"
         );
     }
 
@@ -3314,8 +3446,7 @@ mod tests {
         let result = engine.execute(script.as_script());
         assert!(
             matches!(result, Err(ScriptError::InvalidStackOperation)),
-            "OP_CHECKMULTISIG with negative n_keys must fail, got {:?}",
-            result
+            "OP_CHECKMULTISIG with negative n_keys must fail, got {result:?}"
         );
     }
 
@@ -3331,8 +3462,7 @@ mod tests {
         let result = engine.execute(script.as_script());
         assert!(
             matches!(result, Err(ScriptError::InvalidStackOperation)),
-            "OP_CHECKMULTISIG with negative n_sigs must fail, got {:?}",
-            result
+            "OP_CHECKMULTISIG with negative n_sigs must fail, got {result:?}"
         );
     }
 
@@ -3359,13 +3489,7 @@ mod tests {
         let mut flags = ScriptFlags::none();
         flags.verify_checklocktimeverify = true;
         flags.verify_checksequenceverify = true;
-        ScriptEngine::new(
-            &VERIFIER,
-            flags,
-            Some(tx),
-            0,
-            0,
-        )
+        ScriptEngine::new(&VERIFIER, flags, Some(tx), 0, 0)
     }
 
     #[test]
@@ -3376,7 +3500,10 @@ mod tests {
         script.push_slice(&encode_num(100));
         script.push_opcode(Opcode::OP_CHECKLOCKTIMEVERIFY);
         let result = engine.execute(script.as_script());
-        assert!(result.is_ok(), "CLTV should succeed when tx locktime >= script locktime");
+        assert!(
+            result.is_ok(),
+            "CLTV should succeed when tx locktime >= script locktime"
+        );
     }
 
     #[test]
@@ -3387,8 +3514,10 @@ mod tests {
         script.push_slice(&encode_num(300));
         script.push_opcode(Opcode::OP_CHECKLOCKTIMEVERIFY);
         let result = engine.execute(script.as_script());
-        assert!(matches!(result, Err(ScriptError::UnsatisfiedLocktime)),
-            "CLTV should fail when script locktime > tx locktime");
+        assert!(
+            matches!(result, Err(ScriptError::UnsatisfiedLocktime)),
+            "CLTV should fail when script locktime > tx locktime"
+        );
     }
 
     #[test]
@@ -3398,8 +3527,10 @@ mod tests {
         script.push_slice(&encode_num(-1));
         script.push_opcode(Opcode::OP_CHECKLOCKTIMEVERIFY);
         let result = engine.execute(script.as_script());
-        assert!(matches!(result, Err(ScriptError::NegativeLocktime)),
-            "CLTV should fail with negative locktime");
+        assert!(
+            matches!(result, Err(ScriptError::NegativeLocktime)),
+            "CLTV should fail with negative locktime"
+        );
     }
 
     #[test]
@@ -3410,8 +3541,10 @@ mod tests {
         script.push_slice(&encode_num(100));
         script.push_opcode(Opcode::OP_CHECKLOCKTIMEVERIFY);
         let result = engine.execute(script.as_script());
-        assert!(matches!(result, Err(ScriptError::UnsatisfiedLocktime)),
-            "CLTV should fail when sequence is SEQUENCE_FINAL");
+        assert!(
+            matches!(result, Err(ScriptError::UnsatisfiedLocktime)),
+            "CLTV should fail when sequence is SEQUENCE_FINAL"
+        );
     }
 
     #[test]
@@ -3422,8 +3555,10 @@ mod tests {
         script.push_slice(&encode_num(100));
         script.push_opcode(Opcode::OP_CHECKLOCKTIMEVERIFY);
         let result = engine.execute(script.as_script());
-        assert!(matches!(result, Err(ScriptError::UnsatisfiedLocktime)),
-            "CLTV should fail when locktime types mismatch");
+        assert!(
+            matches!(result, Err(ScriptError::UnsatisfiedLocktime)),
+            "CLTV should fail when locktime types mismatch"
+        );
     }
 
     #[test]
@@ -3434,7 +3569,7 @@ mod tests {
         flags.verify_checklocktimeverify = false;
         let mut engine = ScriptEngine::new_without_tx(&VERIFIER, flags);
         let mut script = ScriptBuf::new();
-        script.push_slice(&encode_num(-1));  // negative locktime would fail if enabled
+        script.push_slice(&encode_num(-1)); // negative locktime would fail if enabled
         script.push_opcode(Opcode::OP_CHECKLOCKTIMEVERIFY);
         let result = engine.execute(script.as_script());
         assert!(result.is_ok(), "CLTV should be NOP when flag is disabled");
@@ -3448,7 +3583,10 @@ mod tests {
         script.push_slice(&encode_num(10));
         script.push_opcode(Opcode::OP_CHECKSEQUENCEVERIFY);
         let result = engine.execute(script.as_script());
-        assert!(result.is_ok(), "CSV should succeed when tx sequence >= script sequence");
+        assert!(
+            result.is_ok(),
+            "CSV should succeed when tx sequence >= script sequence"
+        );
     }
 
     #[test]
@@ -3459,8 +3597,10 @@ mod tests {
         script.push_slice(&encode_num(30));
         script.push_opcode(Opcode::OP_CHECKSEQUENCEVERIFY);
         let result = engine.execute(script.as_script());
-        assert!(matches!(result, Err(ScriptError::UnsatisfiedLocktime)),
-            "CSV should fail when script sequence > tx sequence");
+        assert!(
+            matches!(result, Err(ScriptError::UnsatisfiedLocktime)),
+            "CSV should fail when script sequence > tx sequence"
+        );
     }
 
     #[test]
@@ -3471,8 +3611,10 @@ mod tests {
         script.push_slice(&encode_num(10));
         script.push_opcode(Opcode::OP_CHECKSEQUENCEVERIFY);
         let result = engine.execute(script.as_script());
-        assert!(matches!(result, Err(ScriptError::UnsatisfiedLocktime)),
-            "CSV should fail when tx version < 2");
+        assert!(
+            matches!(result, Err(ScriptError::UnsatisfiedLocktime)),
+            "CSV should fail when tx version < 2"
+        );
     }
 
     #[test]
@@ -3483,8 +3625,10 @@ mod tests {
         script.push_slice(&encode_num(-1));
         script.push_opcode(Opcode::OP_CHECKSEQUENCEVERIFY);
         let result = engine.execute(script.as_script());
-        assert!(matches!(result, Err(ScriptError::NegativeLocktime)),
-            "CSV with negative sequence should return NegativeLocktime");
+        assert!(
+            matches!(result, Err(ScriptError::NegativeLocktime)),
+            "CSV with negative sequence should return NegativeLocktime"
+        );
     }
 
     #[test]
@@ -3500,7 +3644,10 @@ mod tests {
         script.push_slice(&[0x00, 0x00, 0x00, 0x80, 0x00]);
         script.push_opcode(Opcode::OP_CHECKSEQUENCEVERIFY);
         let result = engine.execute(script.as_script());
-        assert!(result.is_ok(), "CSV with bit 31 set (disabled) should be NOP");
+        assert!(
+            result.is_ok(),
+            "CSV with bit 31 set (disabled) should be NOP"
+        );
     }
 
     #[test]
@@ -3513,8 +3660,10 @@ mod tests {
         script.push_slice(&encode_num(script_seq));
         script.push_opcode(Opcode::OP_CHECKSEQUENCEVERIFY);
         let result = engine.execute(script.as_script());
-        assert!(matches!(result, Err(ScriptError::UnsatisfiedLocktime)),
-            "CSV should fail when sequence type flags mismatch");
+        assert!(
+            matches!(result, Err(ScriptError::UnsatisfiedLocktime)),
+            "CSV should fail when sequence type flags mismatch"
+        );
     }
 
     #[test]
@@ -3525,8 +3674,10 @@ mod tests {
         script.push_slice(&encode_num(10));
         script.push_opcode(Opcode::OP_CHECKSEQUENCEVERIFY);
         let result = engine.execute(script.as_script());
-        assert!(matches!(result, Err(ScriptError::UnsatisfiedLocktime)),
-            "CSV should fail when tx sequence has disable flag (bit 31) set");
+        assert!(
+            matches!(result, Err(ScriptError::UnsatisfiedLocktime)),
+            "CSV should fail when tx sequence has disable flag (bit 31) set"
+        );
     }
 
     // ---- Test: BIP147 NULLDUMMY enforcement ----
@@ -3583,7 +3734,10 @@ mod tests {
             );
             engine.execute(script_sig.as_script()).unwrap();
             engine.execute(script_pubkey.as_script()).unwrap();
-            assert!(engine.success(), "should succeed without NULLDUMMY enforcement");
+            assert!(
+                engine.success(),
+                "should succeed without NULLDUMMY enforcement"
+            );
         }
 
         // With verify_nulldummy ON, it should fail
@@ -3593,19 +3747,12 @@ mod tests {
                 verify_nulldummy: true,
                 ..ScriptFlags::none()
             };
-            let mut engine = ScriptEngine::new(
-                &VERIFIER2,
-                flags,
-                Some(&tx),
-                0,
-                0,
-            );
+            let mut engine = ScriptEngine::new(&VERIFIER2, flags, Some(&tx), 0, 0);
             engine.execute(script_sig.as_script()).unwrap();
             let result = engine.execute(script_pubkey.as_script());
             assert!(
                 matches!(result, Err(ScriptError::VerifyFailed)),
-                "NULLDUMMY enforcement should reject non-empty dummy, got: {:?}",
-                result
+                "NULLDUMMY enforcement should reject non-empty dummy, got: {result:?}"
             );
         }
     }
@@ -3653,16 +3800,13 @@ mod tests {
             verify_nulldummy: true,
             ..ScriptFlags::none()
         };
-        let mut engine = ScriptEngine::new(
-            &VERIFIER,
-            flags,
-            Some(&tx),
-            0,
-            0,
-        );
+        let mut engine = ScriptEngine::new(&VERIFIER, flags, Some(&tx), 0, 0);
         engine.execute(script_sig.as_script()).unwrap();
         engine.execute(script_pubkey.as_script()).unwrap();
-        assert!(engine.success(), "NULLDUMMY with empty dummy should succeed");
+        assert!(
+            engine.success(),
+            "NULLDUMMY with empty dummy should succeed"
+        );
     }
 
     // ========== Coverage: Arithmetic stack underflow ==========
@@ -3908,13 +4052,7 @@ mod tests {
         let mut flags = ScriptFlags::none();
         flags.verify_nullfail = true;
 
-        let mut engine = ScriptEngine::new(
-            &VERIFIER,
-            flags,
-            Some(&tx),
-            0,
-            0,
-        );
+        let mut engine = ScriptEngine::new(&VERIFIER, flags, Some(&tx), 0, 0);
 
         // Build a valid DER sig with wrong key so verification fails
         // but the sig is non-empty
@@ -3929,8 +4067,10 @@ mod tests {
         script.push_slice(&[0x02; 33]);
         script.push_opcode(Opcode::OP_CHECKSIG);
         let result = engine.execute(script.as_script());
-        assert!(matches!(result, Err(ScriptError::NullFail)),
-            "NULLFAIL should reject non-empty failed sig, got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::NullFail)),
+            "NULLFAIL should reject non-empty failed sig, got: {result:?}"
+        );
     }
 
     #[test]
@@ -3942,25 +4082,18 @@ mod tests {
         let mut flags = ScriptFlags::none();
         flags.verify_nullfail = true;
 
-        let mut engine = ScriptEngine::new(
-            &VERIFIER,
-            flags,
-            Some(&tx),
-            0,
-            0,
-        );
+        let mut engine = ScriptEngine::new(&VERIFIER, flags, Some(&tx), 0, 0);
 
         let mut script = ScriptBuf::new();
-        let fake_sig: Vec<u8> = vec![
-            0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01,
-            0x01,
-        ];
+        let fake_sig: Vec<u8> = vec![0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, 0x01];
         script.push_slice(&fake_sig);
         script.push_slice(&[0x02; 33]);
         script.push_opcode(Opcode::OP_CHECKSIGVERIFY);
         let result = engine.execute(script.as_script());
-        assert!(matches!(result, Err(ScriptError::NullFail)),
-            "NULLFAIL should reject non-empty failed sig for CHECKSIGVERIFY, got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::NullFail)),
+            "NULLFAIL should reject non-empty failed sig for CHECKSIGVERIFY, got: {result:?}"
+        );
     }
 
     #[test]
@@ -3969,13 +4102,7 @@ mod tests {
         static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
         let tx = make_test_tx();
 
-        let mut engine = ScriptEngine::new(
-            &VERIFIER,
-            ScriptFlags::none(),
-            Some(&tx),
-            0,
-            0,
-        );
+        let mut engine = ScriptEngine::new(&VERIFIER, ScriptFlags::none(), Some(&tx), 0, 0);
 
         let mut script = ScriptBuf::new();
         script.push_opcode(Opcode::OP_0); // empty sig
@@ -4003,8 +4130,10 @@ mod tests {
         ];
         let script = Script::from_bytes(&script_bytes);
         let result = engine.execute(script);
-        assert!(matches!(result, Err(ScriptError::MinimalData)),
-            "MINIMALDATA should reject OP_PUSHDATA1 for data that fits in direct push, got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::MinimalData)),
+            "MINIMALDATA should reject OP_PUSHDATA1 for data that fits in direct push, got: {result:?}"
+        );
     }
 
     #[test]
@@ -4021,8 +4150,10 @@ mod tests {
         ];
         let script = Script::from_bytes(&script_bytes);
         let result = engine.execute(script);
-        assert!(matches!(result, Err(ScriptError::MinimalData)),
-            "MINIMALDATA should reject direct push of value 5 (should use OP_5), got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::MinimalData)),
+            "MINIMALDATA should reject direct push of value 5 (should use OP_5), got: {result:?}"
+        );
     }
 
     #[test]
@@ -4038,8 +4169,10 @@ mod tests {
         ];
         let script = Script::from_bytes(&script_bytes);
         let result = engine.execute(script);
-        assert!(matches!(result, Err(ScriptError::MinimalData)),
-            "MINIMALDATA should reject OP_PUSHDATA1 for empty data, got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::MinimalData)),
+            "MINIMALDATA should reject OP_PUSHDATA1 for empty data, got: {result:?}"
+        );
     }
 
     #[test]
@@ -4055,8 +4188,10 @@ mod tests {
         ];
         let script = Script::from_bytes(&script_bytes);
         let result = engine.execute(script);
-        assert!(matches!(result, Err(ScriptError::MinimalData)),
-            "MINIMALDATA should reject direct push of 0x81 (should use OP_1NEGATE), got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::MinimalData)),
+            "MINIMALDATA should reject direct push of 0x81 (should use OP_1NEGATE), got: {result:?}"
+        );
     }
 
     #[test]
@@ -4074,8 +4209,10 @@ mod tests {
         script_bytes.extend_from_slice(&[0xaa; 10]);
         let script = Script::from_bytes(&script_bytes);
         let result = engine.execute(script);
-        assert!(matches!(result, Err(ScriptError::MinimalData)),
-            "MINIMALDATA should reject OP_PUSHDATA2 for 10 bytes, got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::MinimalData)),
+            "MINIMALDATA should reject OP_PUSHDATA2 for 10 bytes, got: {result:?}"
+        );
     }
 
     #[test]
@@ -4108,8 +4245,10 @@ mod tests {
         script_bytes.push(Opcode::OP_1ADD as u8);
         let script = Script::from_bytes(&script_bytes);
         let result = engine.execute(script);
-        assert!(matches!(result, Err(ScriptError::InvalidNumberEncoding)),
-            "MINIMALDATA should reject non-minimal script number encoding, got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::InvalidNumberEncoding)),
+            "MINIMALDATA should reject non-minimal script number encoding, got: {result:?}"
+        );
     }
 
     // ========== Coverage: MINIMALIF enforcement ==========
@@ -4130,8 +4269,10 @@ mod tests {
         script.push_opcode(Opcode::OP_1);
         script.push_opcode(Opcode::OP_ENDIF);
         let result = engine.execute(script.as_script());
-        assert!(matches!(result, Err(ScriptError::MinimalIf)),
-            "MINIMALIF should reject non-0x01 truthy value for OP_IF, got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::MinimalIf)),
+            "MINIMALIF should reject non-0x01 truthy value for OP_IF, got: {result:?}"
+        );
     }
 
     #[test]
@@ -4149,8 +4290,10 @@ mod tests {
         script.push_opcode(Opcode::OP_1);
         script.push_opcode(Opcode::OP_ENDIF);
         let result = engine.execute(script.as_script());
-        assert!(matches!(result, Err(ScriptError::MinimalIf)),
-            "MINIMALIF should reject non-0x01 truthy value for OP_NOTIF, got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::MinimalIf)),
+            "MINIMALIF should reject non-0x01 truthy value for OP_NOTIF, got: {result:?}"
+        );
     }
 
     #[test]
@@ -4225,8 +4368,10 @@ mod tests {
         script.push_opcode(Opcode::OP_2);
         engine.execute(script.as_script()).unwrap();
         let result = engine.check_cleanstack();
-        assert!(matches!(result, Err(ScriptError::CleanStack)),
-            "CLEANSTACK should reject stack with more than 1 element, got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::CleanStack)),
+            "CLEANSTACK should reject stack with more than 1 element, got: {result:?}"
+        );
     }
 
     #[test]
@@ -4242,8 +4387,10 @@ mod tests {
         let script = ScriptBuf::new();
         engine.execute(script.as_script()).unwrap();
         let result = engine.check_cleanstack();
-        assert!(matches!(result, Err(ScriptError::CleanStack)),
-            "CLEANSTACK should reject empty stack, got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::CleanStack)),
+            "CLEANSTACK should reject empty stack, got: {result:?}"
+        );
     }
 
     #[test]
@@ -4347,8 +4494,10 @@ mod tests {
         script.push_opcode(Opcode::OP_0); // n_keys
         script.push_opcode(Opcode::OP_CHECKMULTISIG);
         let result = engine.execute(script.as_script());
-        assert!(matches!(result, Err(ScriptError::TapscriptCheckmultisigDisabled)),
-            "CHECKMULTISIG should be disabled in tapscript mode, got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::TapscriptCheckmultisigDisabled)),
+            "CHECKMULTISIG should be disabled in tapscript mode, got: {result:?}"
+        );
     }
 
     #[test]
@@ -4363,8 +4512,10 @@ mod tests {
         script.push_opcode(Opcode::OP_0);
         script.push_opcode(Opcode::OP_CHECKMULTISIGVERIFY);
         let result = engine.execute(script.as_script());
-        assert!(matches!(result, Err(ScriptError::TapscriptCheckmultisigDisabled)),
-            "CHECKMULTISIGVERIFY should be disabled in tapscript, got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::TapscriptCheckmultisigDisabled)),
+            "CHECKMULTISIGVERIFY should be disabled in tapscript, got: {result:?}"
+        );
     }
 
     #[test]
@@ -4385,8 +4536,10 @@ mod tests {
 
         // Third: budget goes to -40 (below zero) -> should fail
         let result = engine.verify_tapscript_signature(&[], &[0u8; 32]);
-        assert!(matches!(result, Err(ScriptError::TapscriptSigBudgetExceeded)),
-            "Should fail when budget is exhausted, got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::TapscriptSigBudgetExceeded)),
+            "Should fail when budget is exhausted, got: {result:?}"
+        );
     }
 
     #[test]
@@ -4402,7 +4555,10 @@ mod tests {
 
         // Second empty sig: budget goes from 0 to -50 (fail)
         let result = engine.verify_tapscript_signature(&[], &[0u8; 32]);
-        assert!(matches!(result, Err(ScriptError::TapscriptSigBudgetExceeded)));
+        assert!(matches!(
+            result,
+            Err(ScriptError::TapscriptSigBudgetExceeded)
+        ));
     }
 
     #[test]
@@ -4413,8 +4569,10 @@ mod tests {
 
         // Non-empty sig with wrong length (not 64 or 65) should fail
         let result = engine.verify_tapscript_signature(&[0x01; 10], &[0u8; 32]);
-        assert!(matches!(result, Err(ScriptError::SchnorrSigFailed)),
-            "Invalid sig length should fail, got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::SchnorrSigFailed)),
+            "Invalid sig length should fail, got: {result:?}"
+        );
     }
 
     #[test]
@@ -4425,8 +4583,10 @@ mod tests {
 
         // Empty pubkey with non-empty sig should fail
         let result = engine.verify_tapscript_signature(&[0x01; 64], &[]);
-        assert!(matches!(result, Err(ScriptError::SchnorrSigFailed)),
-            "Empty pubkey with non-empty sig should fail, got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::SchnorrSigFailed)),
+            "Empty pubkey with non-empty sig should fail, got: {result:?}"
+        );
     }
 
     #[test]
@@ -4437,8 +4597,10 @@ mod tests {
 
         // Non-32-byte, non-empty pubkey with non-empty sig should succeed (future extensibility)
         let result = engine.verify_tapscript_signature(&[0x01; 64], &[0x04; 33]);
-        assert!(matches!(result, Ok(true)),
-            "Unknown pubkey type should succeed for forward compatibility, got: {:?}", result);
+        assert!(
+            matches!(result, Ok(true)),
+            "Unknown pubkey type should succeed for forward compatibility, got: {result:?}"
+        );
     }
 
     #[test]
@@ -4451,8 +4613,10 @@ mod tests {
         let mut sig = vec![0x01; 64];
         sig.push(0x00); // explicit 0x00 is invalid
         let result = engine.verify_tapscript_signature(&sig, &[0u8; 32]);
-        assert!(matches!(result, Err(ScriptError::SchnorrSigFailed)),
-            "Explicit 0x00 sighash should fail, got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::SchnorrSigFailed)),
+            "Explicit 0x00 sighash should fail, got: {result:?}"
+        );
     }
 
     #[test]
@@ -4495,7 +4659,10 @@ mod tests {
         script.push_slice(&[0u8; 32]); // x-only pubkey
         script.push_opcode(Opcode::OP_CHECKSIG);
         engine.execute(script.as_script()).unwrap();
-        assert!(!engine.success(), "Empty sig in tapscript CHECKSIG should push false");
+        assert!(
+            !engine.success(),
+            "Empty sig in tapscript CHECKSIG should push false"
+        );
     }
 
     #[test]
@@ -4510,8 +4677,10 @@ mod tests {
         script.push_slice(&[0u8; 32]); // x-only pubkey
         script.push_opcode(Opcode::OP_CHECKSIGVERIFY);
         let result = engine.execute(script.as_script());
-        assert!(matches!(result, Err(ScriptError::CheckSigFailed)),
-            "Empty sig tapscript CHECKSIGVERIFY should fail, got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::CheckSigFailed)),
+            "Empty sig tapscript CHECKSIGVERIFY should fail, got: {result:?}"
+        );
     }
 
     #[test]
@@ -4543,8 +4712,10 @@ mod tests {
         script.push_slice(&[0u8; 32]);
         script.push_opcode(Opcode::OP_CHECKSIGADD);
         let result = engine.execute(script.as_script());
-        assert!(matches!(result, Err(ScriptError::InvalidOpcode(_))),
-            "OP_CHECKSIGADD should be invalid outside tapscript, got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::InvalidOpcode(_))),
+            "OP_CHECKSIGADD should be invalid outside tapscript, got: {result:?}"
+        );
     }
 
     // ========== Coverage: Tapscript execute_tapscript with OP_SUCCESS ==========
@@ -4572,7 +4743,8 @@ mod tests {
         // Push 1 byte of data (0x50 = OP_SUCCESS80), followed by OP_1
         // The 0x50 inside push data should be skipped by the parser
         let script_bytes = vec![
-            0x01, 0x50, // direct push of 1 byte: 0x50 (inside data, not opcode)
+            0x01,
+            0x50, // direct push of 1 byte: 0x50 (inside data, not opcode)
             Opcode::OP_1 as u8,
         ];
         let script = Script::from_bytes(&script_bytes);
@@ -4606,7 +4778,10 @@ mod tests {
             let script_bytes = vec![byte];
             let script = Script::from_bytes(&script_bytes);
             engine.execute_tapscript(script).unwrap();
-            assert!(engine.success(), "OP_SUCCESS byte {} should cause success", byte);
+            assert!(
+                engine.success(),
+                "OP_SUCCESS byte {byte} should cause success"
+            );
         }
     }
 
@@ -4629,17 +4804,12 @@ mod tests {
 
         // Compute segwit v0 sighash
         let amount = 50_000i64;
-        let sighash = sighash_segwit_v0(&tx, 0, script_pubkey.as_bytes(), amount, SighashType::ALL).unwrap();
+        let sighash =
+            sighash_segwit_v0(&tx, 0, script_pubkey.as_bytes(), amount, SighashType::ALL).unwrap();
         let sig_bytes = sign_sighash(&secp, &secret_key, &sighash);
 
         static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
-        let mut engine = ScriptEngine::new(
-            &VERIFIER,
-            ScriptFlags::none(),
-            Some(&tx),
-            0,
-            amount,
-        );
+        let mut engine = ScriptEngine::new(&VERIFIER, ScriptFlags::none(), Some(&tx), 0, amount);
         engine.set_segwit_sighash(true);
 
         // Push sig
@@ -4660,13 +4830,7 @@ mod tests {
         let mut flags = ScriptFlags::none();
         flags.verify_dersig = true;
 
-        let mut engine = ScriptEngine::new(
-            &VERIFIER,
-            flags,
-            Some(&tx),
-            0,
-            0,
-        );
+        let mut engine = ScriptEngine::new(&VERIFIER, flags, Some(&tx), 0, 0);
 
         // Invalid DER: too short
         let mut script = ScriptBuf::new();
@@ -4675,8 +4839,10 @@ mod tests {
         script.push_slice(&[0x02; 33]);
         script.push_opcode(Opcode::OP_CHECKSIG);
         let result = engine.execute(script.as_script());
-        assert!(matches!(result, Err(ScriptError::SigVerify(_))),
-            "Invalid DER should fail with DERSIG flag, got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::SigVerify(_))),
+            "Invalid DER should fail with DERSIG flag, got: {result:?}"
+        );
     }
 
     #[test]
@@ -4687,13 +4853,7 @@ mod tests {
         let mut flags = ScriptFlags::none();
         flags.verify_dersig = true;
 
-        let mut engine = ScriptEngine::new(
-            &VERIFIER,
-            flags,
-            Some(&tx),
-            0,
-            0,
-        );
+        let mut engine = ScriptEngine::new(&VERIFIER, flags, Some(&tx), 0, 0);
 
         let mut script = ScriptBuf::new();
         let valid_der_sig: Vec<u8> = vec![
@@ -4718,13 +4878,7 @@ mod tests {
         let mut flags = ScriptFlags::none();
         flags.verify_low_s = true;
 
-        let mut engine = ScriptEngine::new(
-            &VERIFIER,
-            flags,
-            Some(&tx),
-            0,
-            0,
-        );
+        let mut engine = ScriptEngine::new(&VERIFIER, flags, Some(&tx), 0, 0);
 
         // Construct a DER sig with high S value
         // S = FFFFFFFF...FF (all 0xFF, definitely > half-order)
@@ -4732,23 +4886,22 @@ mod tests {
         let high_s_sig: Vec<u8> = vec![
             0x30, 0x44, // compound, length 68
             0x02, 0x20, // R integer, length 32
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-            0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
-            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
-            0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
-            0x02, 0x20, // S integer, length 32
-            0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-            0x5d, 0x57, 0x6e, 0x73, 0x57, 0xa4, 0x50, 0x1d,
-            0xdf, 0xe9, 0x2f, 0x46, 0x68, 0x1b, 0x20, 0xa1, // S > half-order by 1
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f, 0x02, 0x20, // S integer, length 32
+            0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0x5d, 0x57, 0x6e, 0x73, 0x57, 0xa4, 0x50, 0x1d, 0xdf, 0xe9, 0x2f, 0x46,
+            0x68, 0x1b, 0x20, 0xa1, // S > half-order by 1
             0x01, // SIGHASH_ALL
         ];
         script.push_slice(&high_s_sig);
         script.push_slice(&[0x02; 33]);
         script.push_opcode(Opcode::OP_CHECKSIG);
         let result = engine.execute(script.as_script());
-        assert!(matches!(result, Err(ScriptError::SigVerify(_))),
-            "High S value should be rejected with LOW_S flag, got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::SigVerify(_))),
+            "High S value should be rejected with LOW_S flag, got: {result:?}"
+        );
     }
 
     // ========== Coverage: STRICTENC ==========
@@ -4760,25 +4913,20 @@ mod tests {
         let mut flags = ScriptFlags::none();
         flags.verify_strictenc = true;
 
-        let mut engine = ScriptEngine::new(
-            &VERIFIER,
-            flags,
-            Some(&tx),
-            0,
-            0,
-        );
+        let mut engine = ScriptEngine::new(&VERIFIER, flags, Some(&tx), 0, 0);
 
         let mut script = ScriptBuf::new();
         let sig_with_bad_hashtype: Vec<u8> = vec![
-            0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01,
-            0x04, // hashtype 0x04 is undefined
+            0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, 0x04, // hashtype 0x04 is undefined
         ];
         script.push_slice(&sig_with_bad_hashtype);
         script.push_slice(&[0x02; 33]);
         script.push_opcode(Opcode::OP_CHECKSIG);
         let result = engine.execute(script.as_script());
-        assert!(matches!(result, Err(ScriptError::SigVerify(_))),
-            "Undefined hashtype should fail with STRICTENC, got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::SigVerify(_))),
+            "Undefined hashtype should fail with STRICTENC, got: {result:?}"
+        );
     }
 
     #[test]
@@ -4788,18 +4936,11 @@ mod tests {
         let mut flags = ScriptFlags::none();
         flags.verify_strictenc = true;
 
-        let mut engine = ScriptEngine::new(
-            &VERIFIER,
-            flags,
-            Some(&tx),
-            0,
-            0,
-        );
+        let mut engine = ScriptEngine::new(&VERIFIER, flags, Some(&tx), 0, 0);
 
         let mut script = ScriptBuf::new();
         let valid_sig: Vec<u8> = vec![
-            0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01,
-            0x01, // SIGHASH_ALL
+            0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, 0x01, // SIGHASH_ALL
         ];
         script.push_slice(&valid_sig);
         // Invalid pubkey: 0x05 prefix (not 02, 03, or 04)
@@ -4808,8 +4949,10 @@ mod tests {
         script.push_slice(&bad_pubkey);
         script.push_opcode(Opcode::OP_CHECKSIG);
         let result = engine.execute(script.as_script());
-        assert!(matches!(result, Err(ScriptError::SigVerify(_))),
-            "Invalid pubkey encoding should fail with STRICTENC, got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::SigVerify(_))),
+            "Invalid pubkey encoding should fail with STRICTENC, got: {result:?}"
+        );
     }
 
     #[test]
@@ -4871,10 +5014,12 @@ mod tests {
 
     #[test]
     fn test_encode_decode_roundtrip() {
-        for n in &[-32768i64, -256, -128, -1, 0, 1, 127, 128, 255, 256, 32767, 65535] {
+        for n in &[
+            -32768i64, -256, -128, -1, 0, 1, 127, 128, 255, 256, 32767, 65535,
+        ] {
             let encoded = encode_num(*n);
             let decoded = decode_num(&encoded).unwrap();
-            assert_eq!(*n, decoded, "roundtrip failed for {}", n);
+            assert_eq!(*n, decoded, "roundtrip failed for {n}");
         }
     }
 
@@ -4924,8 +5069,10 @@ mod tests {
             script.push_opcode(Opcode::OP_1);
             script.push_opcode(op);
             let result = engine.execute(script.as_script());
-            assert!(matches!(result, Err(ScriptError::DisabledOpcode(_))),
-                "Opcode {:?} should be disabled, got: {:?}", op, result);
+            assert!(
+                matches!(result, Err(ScriptError::DisabledOpcode(_))),
+                "Opcode {op:?} should be disabled, got: {result:?}"
+            );
         }
     }
 
@@ -4941,8 +5088,10 @@ mod tests {
         script.push_opcode(Opcode::OP_CAT); // disabled, even in unexecuted branch
         script.push_opcode(Opcode::OP_ENDIF);
         let result = engine.execute(script.as_script());
-        assert!(matches!(result, Err(ScriptError::DisabledOpcode(_))),
-            "Disabled opcodes should fail even in unexecuted branches, got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::DisabledOpcode(_))),
+            "Disabled opcodes should fail even in unexecuted branches, got: {result:?}"
+        );
     }
 
     // ========== Coverage: OP_RESERVED, OP_VER, OP_RESERVED1, OP_RESERVED2 ==========
@@ -4953,8 +5102,10 @@ mod tests {
         let mut script = ScriptBuf::new();
         script.push_opcode(Opcode::OP_RESERVED);
         let result = engine.execute(script.as_script());
-        assert!(result.is_err(),
-            "OP_RESERVED should fail when executed, got: {:?}", result);
+        assert!(
+            result.is_err(),
+            "OP_RESERVED should fail when executed, got: {result:?}"
+        );
     }
 
     #[test]
@@ -4963,8 +5114,10 @@ mod tests {
         let mut script = ScriptBuf::new();
         script.push_opcode(Opcode::OP_VER);
         let result = engine.execute(script.as_script());
-        assert!(result.is_err(),
-            "OP_VER should fail when executed, got: {:?}", result);
+        assert!(
+            result.is_err(),
+            "OP_VER should fail when executed, got: {result:?}"
+        );
     }
 
     #[test]
@@ -4973,8 +5126,10 @@ mod tests {
         let mut script = ScriptBuf::new();
         script.push_opcode(Opcode::OP_RESERVED1);
         let result = engine.execute(script.as_script());
-        assert!(result.is_err(),
-            "OP_RESERVED1 should fail when executed, got: {:?}", result);
+        assert!(
+            result.is_err(),
+            "OP_RESERVED1 should fail when executed, got: {result:?}"
+        );
     }
 
     #[test]
@@ -4983,8 +5138,10 @@ mod tests {
         let mut script = ScriptBuf::new();
         script.push_opcode(Opcode::OP_RESERVED2);
         let result = engine.execute(script.as_script());
-        assert!(result.is_err(),
-            "OP_RESERVED2 should fail when executed, got: {:?}", result);
+        assert!(
+            result.is_err(),
+            "OP_RESERVED2 should fail when executed, got: {result:?}"
+        );
     }
 
     #[test]
@@ -4994,8 +5151,10 @@ mod tests {
         let mut script = ScriptBuf::new();
         script.push_opcode(Opcode::OP_VERIF);
         let result = engine.execute(script.as_script());
-        assert!(matches!(result, Err(ScriptError::DisabledOpcode(Opcode::OP_VERIF))),
-            "OP_VERIF should always fail, got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::DisabledOpcode(Opcode::OP_VERIF))),
+            "OP_VERIF should always fail, got: {result:?}"
+        );
     }
 
     #[test]
@@ -5004,8 +5163,13 @@ mod tests {
         let mut script = ScriptBuf::new();
         script.push_opcode(Opcode::OP_VERNOTIF);
         let result = engine.execute(script.as_script());
-        assert!(matches!(result, Err(ScriptError::DisabledOpcode(Opcode::OP_VERNOTIF))),
-            "OP_VERNOTIF should always fail, got: {:?}", result);
+        assert!(
+            matches!(
+                result,
+                Err(ScriptError::DisabledOpcode(Opcode::OP_VERNOTIF))
+            ),
+            "OP_VERNOTIF should always fail, got: {result:?}"
+        );
     }
 
     #[test]
@@ -5017,7 +5181,10 @@ mod tests {
         script.push_opcode(Opcode::OP_VERIF); // still fails!
         script.push_opcode(Opcode::OP_ENDIF);
         let result = engine.execute(script.as_script());
-        assert!(matches!(result, Err(ScriptError::DisabledOpcode(Opcode::OP_VERIF))));
+        assert!(matches!(
+            result,
+            Err(ScriptError::DisabledOpcode(Opcode::OP_VERIF))
+        ));
     }
 
     // ========== Coverage: Discourage upgradable NOPs ==========
@@ -5035,15 +5202,22 @@ mod tests {
         script.push_opcode(Opcode::OP_1);
         script.push_opcode(Opcode::OP_NOP1);
         let result = engine.execute(script.as_script());
-        assert!(matches!(result, Err(ScriptError::DiscourageUpgradableNops)),
-            "NOP1 should be discouraged with flag set, got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::DiscourageUpgradableNops)),
+            "NOP1 should be discouraged with flag set, got: {result:?}"
+        );
     }
 
     #[test]
     fn test_discourage_upgradable_nops_nop4_through_nop10() {
         let nops = vec![
-            Opcode::OP_NOP4, Opcode::OP_NOP5, Opcode::OP_NOP6,
-            Opcode::OP_NOP7, Opcode::OP_NOP8, Opcode::OP_NOP9, Opcode::OP_NOP10,
+            Opcode::OP_NOP4,
+            Opcode::OP_NOP5,
+            Opcode::OP_NOP6,
+            Opcode::OP_NOP7,
+            Opcode::OP_NOP8,
+            Opcode::OP_NOP9,
+            Opcode::OP_NOP10,
         ];
         for nop in nops {
             static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
@@ -5057,8 +5231,10 @@ mod tests {
             script.push_opcode(Opcode::OP_1);
             script.push_opcode(nop);
             let result = engine.execute(script.as_script());
-            assert!(matches!(result, Err(ScriptError::DiscourageUpgradableNops)),
-                "NOP {:?} should be discouraged with flag set, got: {:?}", nop, result);
+            assert!(
+                matches!(result, Err(ScriptError::DiscourageUpgradableNops)),
+                "NOP {nop:?} should be discouraged with flag set, got: {result:?}"
+            );
         }
     }
 
@@ -5081,11 +5257,13 @@ mod tests {
     fn test_script_size_limit() {
         let mut engine = make_engine();
         // Script larger than MAX_SCRIPT_SIZE (10000)
-        let mut script_bytes = vec![Opcode::OP_1 as u8; 10001];
+        let script_bytes = vec![Opcode::OP_1 as u8; 10001];
         let script = Script::from_bytes(&script_bytes);
         let result = engine.execute(script);
-        assert!(matches!(result, Err(ScriptError::ScriptSizeLimit)),
-            "Scripts larger than 10000 bytes should fail, got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::ScriptSizeLimit)),
+            "Scripts larger than 10000 bytes should fail, got: {result:?}"
+        );
     }
 
     #[test]
@@ -5121,8 +5299,10 @@ mod tests {
         }
         let script = Script::from_bytes(&script_bytes);
         let result = engine.execute(script);
-        assert!(matches!(result, Err(ScriptError::OpCountLimit)),
-            "More than 201 opcodes should fail, got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::OpCountLimit)),
+            "More than 201 opcodes should fail, got: {result:?}"
+        );
     }
 
     #[test]
@@ -5154,8 +5334,10 @@ mod tests {
         script_bytes.extend_from_slice(&vec![0xaa; 521]);
         let script = Script::from_bytes(&script_bytes);
         let result = engine.execute(script);
-        assert!(matches!(result, Err(ScriptError::PushSizeLimit)),
-            "Push data > 520 bytes should fail, got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::PushSizeLimit)),
+            "Push data > 520 bytes should fail, got: {result:?}"
+        );
     }
 
     // ========== Coverage: success() and stack edge cases ==========
@@ -5199,49 +5381,77 @@ mod tests {
         assert!(!is_valid_der_signature(&[0x30; 73]));
 
         // Wrong compound type
-        assert!(!is_valid_der_signature(&[0x31, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01]));
+        assert!(!is_valid_der_signature(&[
+            0x31, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01
+        ]));
 
         // Wrong total length
-        assert!(!is_valid_der_signature(&[0x30, 0x07, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01]));
+        assert!(!is_valid_der_signature(&[
+            0x30, 0x07, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01
+        ]));
 
         // R not integer type
-        assert!(!is_valid_der_signature(&[0x30, 0x06, 0x03, 0x01, 0x01, 0x02, 0x01, 0x01]));
+        assert!(!is_valid_der_signature(&[
+            0x30, 0x06, 0x03, 0x01, 0x01, 0x02, 0x01, 0x01
+        ]));
 
         // R length 0
-        assert!(!is_valid_der_signature(&[0x30, 0x06, 0x02, 0x00, 0x02, 0x01, 0x01, 0x01]));
+        assert!(!is_valid_der_signature(&[
+            0x30, 0x06, 0x02, 0x00, 0x02, 0x01, 0x01, 0x01
+        ]));
 
         // R is negative (high bit set)
-        assert!(!is_valid_der_signature(&[0x30, 0x06, 0x02, 0x01, 0x80, 0x02, 0x01, 0x01]));
+        assert!(!is_valid_der_signature(&[
+            0x30, 0x06, 0x02, 0x01, 0x80, 0x02, 0x01, 0x01
+        ]));
 
         // R has excess padding
-        assert!(!is_valid_der_signature(&[0x30, 0x08, 0x02, 0x03, 0x00, 0x01, 0x01, 0x02, 0x01, 0x01]));
+        assert!(!is_valid_der_signature(&[
+            0x30, 0x08, 0x02, 0x03, 0x00, 0x01, 0x01, 0x02, 0x01, 0x01
+        ]));
 
         // Valid minimal
-        assert!(is_valid_der_signature(&[0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01]));
+        assert!(is_valid_der_signature(&[
+            0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01
+        ]));
 
         // S not integer type
-        assert!(!is_valid_der_signature(&[0x30, 0x06, 0x02, 0x01, 0x01, 0x03, 0x01, 0x01]));
+        assert!(!is_valid_der_signature(&[
+            0x30, 0x06, 0x02, 0x01, 0x01, 0x03, 0x01, 0x01
+        ]));
 
         // S length 0
-        assert!(!is_valid_der_signature(&[0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x00, 0x01]));
+        assert!(!is_valid_der_signature(&[
+            0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x00, 0x01
+        ]));
 
         // S is negative
-        assert!(!is_valid_der_signature(&[0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x80]));
+        assert!(!is_valid_der_signature(&[
+            0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x80
+        ]));
 
         // S has excess padding
-        assert!(!is_valid_der_signature(&[0x30, 0x08, 0x02, 0x01, 0x01, 0x02, 0x03, 0x00, 0x01, 0x01]));
+        assert!(!is_valid_der_signature(&[
+            0x30, 0x08, 0x02, 0x01, 0x01, 0x02, 0x03, 0x00, 0x01, 0x01
+        ]));
 
         // S wrong total length
-        assert!(!is_valid_der_signature(&[0x30, 0x07, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, 0x00]));
+        assert!(!is_valid_der_signature(&[
+            0x30, 0x07, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, 0x00
+        ]));
     }
 
     #[test]
     fn test_is_valid_der_r_len_bounds() {
         // R length going past end of sig
-        assert!(!is_valid_der_signature(&[0x30, 0x06, 0x02, 0x04, 0x01, 0x01, 0x01, 0x01]));
+        assert!(!is_valid_der_signature(&[
+            0x30, 0x06, 0x02, 0x04, 0x01, 0x01, 0x01, 0x01
+        ]));
 
         // S tag position at or past end
-        assert!(!is_valid_der_signature(&[0x30, 0x04, 0x02, 0x02, 0x01, 0x01]));
+        assert!(!is_valid_der_signature(&[
+            0x30, 0x04, 0x02, 0x02, 0x01, 0x01
+        ]));
     }
 
     // ========== Coverage: is_low_der_signature ==========
@@ -5450,14 +5660,8 @@ mod tests {
     #[test]
     fn test_new_with_registry_none() {
         static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
-        let engine = ScriptEngine::new_with_registry(
-            &VERIFIER,
-            ScriptFlags::none(),
-            None,
-            0,
-            0,
-            None,
-        );
+        let engine =
+            ScriptEngine::new_with_registry(&VERIFIER, ScriptFlags::none(), None, 0, 0, None);
         assert!(engine.opcode_registry.is_none());
     }
 
@@ -5551,7 +5755,7 @@ mod tests {
         let mut engine = make_engine();
         let mut script = ScriptBuf::new();
         script.push_opcode(Opcode::OP_0); // dummy
-        // n_sigs = 2, but n_keys = 1 => should fail
+                                          // n_sigs = 2, but n_keys = 1 => should fail
         script.push_opcode(Opcode::OP_0); // sig placeholder (empty)
         script.push_opcode(Opcode::OP_0); // sig placeholder (empty)
         script.push_opcode(Opcode::OP_2); // n_sigs = 2
@@ -5559,8 +5763,10 @@ mod tests {
         script.push_opcode(Opcode::OP_1); // n_keys = 1
         script.push_opcode(Opcode::OP_CHECKMULTISIG);
         let result = engine.execute(script.as_script());
-        assert!(matches!(result, Err(ScriptError::InvalidStackOperation)),
-            "n_sigs > n_keys should fail, got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::InvalidStackOperation)),
+            "n_sigs > n_keys should fail, got: {result:?}"
+        );
     }
 
     // ========== Coverage: checkmultisig n_keys > 20 ==========
@@ -5579,8 +5785,10 @@ mod tests {
         script.push_slice(&encode_num(21));
         script.push_opcode(Opcode::OP_CHECKMULTISIG);
         let result = engine.execute(script.as_script());
-        assert!(matches!(result, Err(ScriptError::InvalidStackOperation)),
-            "n_keys > 20 should fail, got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::InvalidStackOperation)),
+            "n_keys > 20 should fail, got: {result:?}"
+        );
     }
 
     // ========== Coverage: NULLFAIL in CHECKMULTISIG ==========
@@ -5615,17 +5823,13 @@ mod tests {
             verify_nullfail: true,
             ..ScriptFlags::none()
         };
-        let mut engine = ScriptEngine::new(
-            &VERIFIER,
-            flags,
-            Some(&tx),
-            0,
-            0,
-        );
+        let mut engine = ScriptEngine::new(&VERIFIER, flags, Some(&tx), 0, 0);
         engine.execute(script_sig.as_script()).unwrap();
         let result = engine.execute(script_pubkey.as_script());
-        assert!(matches!(result, Err(ScriptError::NullFail)),
-            "NULLFAIL should trigger for non-empty failed sig in CHECKMULTISIG, got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::NullFail)),
+            "NULLFAIL should trigger for non-empty failed sig in CHECKMULTISIG, got: {result:?}"
+        );
     }
 
     // ========== Coverage: CHECKMULTISIGVERIFY failure ==========
@@ -5636,17 +5840,19 @@ mod tests {
         let mut script = ScriptBuf::new();
         script.push_opcode(Opcode::OP_0); // dummy
         script.push_opcode(Opcode::OP_0); // n_sigs = 0 (but we have empty sigs = fail)
-        // Actually 0 sigs with 0 keys succeeds. Let's set up a real failure.
-        // 1 key, 1 sig (empty = fails)
+                                          // Actually 0 sigs with 0 keys succeeds. Let's set up a real failure.
+                                          // 1 key, 1 sig (empty = fails)
         script.push_opcode(Opcode::OP_0); // dummy
         script.push_opcode(Opcode::OP_0); // empty sig = fails
         script.push_opcode(Opcode::OP_1); // n_sigs = 1
-        script.push_slice(&[0x02; 33]);   // pubkey
+        script.push_slice(&[0x02; 33]); // pubkey
         script.push_opcode(Opcode::OP_1); // n_keys = 1
         script.push_opcode(Opcode::OP_CHECKMULTISIGVERIFY);
         let result = engine.execute(script.as_script());
-        assert!(matches!(result, Err(ScriptError::CheckSigFailed)),
-            "CHECKMULTISIGVERIFY with failed verification should return CheckSigFailed, got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::CheckSigFailed)),
+            "CHECKMULTISIGVERIFY with failed verification should return CheckSigFailed, got: {result:?}"
+        );
     }
 
     // ========== Coverage: OP_CODESEPARATOR position tracking ==========
@@ -5678,10 +5884,11 @@ mod tests {
         engine.set_tapscript_mode([0u8; 32], vec![], None, 100);
 
         // OP_PUSHDATA1 with OP_SUCCESS byte inside data (should be skipped)
-        let mut script_bytes = vec![
+        let script_bytes = vec![
             Opcode::OP_PUSHDATA1 as u8,
             0x02, // length 2
-            0x50, 0x62, // data contains OP_SUCCESS bytes but inside push data
+            0x50,
+            0x62, // data contains OP_SUCCESS bytes but inside push data
             Opcode::OP_1 as u8,
         ];
         let script = Script::from_bytes(&script_bytes);
@@ -5695,10 +5902,12 @@ mod tests {
         let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
         engine.set_tapscript_mode([0u8; 32], vec![], None, 100);
 
-        let mut script_bytes = vec![
+        let script_bytes = vec![
             Opcode::OP_PUSHDATA2 as u8,
-            0x02, 0x00, // length 2 (LE)
-            0x50, 0x62, // data with OP_SUCCESS bytes (skipped)
+            0x02,
+            0x00, // length 2 (LE)
+            0x50,
+            0x62, // data with OP_SUCCESS bytes (skipped)
             Opcode::OP_1 as u8,
         ];
         let script = Script::from_bytes(&script_bytes);
@@ -5712,10 +5921,14 @@ mod tests {
         let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
         engine.set_tapscript_mode([0u8; 32], vec![], None, 100);
 
-        let mut script_bytes = vec![
+        let script_bytes = vec![
             Opcode::OP_PUSHDATA4 as u8,
-            0x02, 0x00, 0x00, 0x00, // length 2 (LE)
-            0x50, 0x62, // data with OP_SUCCESS bytes (skipped)
+            0x02,
+            0x00,
+            0x00,
+            0x00, // length 2 (LE)
+            0x50,
+            0x62, // data with OP_SUCCESS bytes (skipped)
             Opcode::OP_1 as u8,
         ];
         let script = Script::from_bytes(&script_bytes);
@@ -5797,13 +6010,17 @@ mod tests {
 
         // Push non-minimal encoding of 100: [0x64, 0x00] instead of [0x64]
         let script_bytes = vec![
-            0x02, 0x64, 0x00, // push 2 bytes: non-minimal 100
+            0x02,
+            0x64,
+            0x00, // push 2 bytes: non-minimal 100
             Opcode::OP_CHECKLOCKTIMEVERIFY as u8,
         ];
         let script = Script::from_bytes(&script_bytes);
         let result = engine.execute(script);
-        assert!(matches!(result, Err(ScriptError::InvalidNumberEncoding)),
-            "CLTV should reject non-minimal encoding with MINIMALDATA, got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::InvalidNumberEncoding)),
+            "CLTV should reject non-minimal encoding with MINIMALDATA, got: {result:?}"
+        );
     }
 
     #[test]
@@ -5830,13 +6047,17 @@ mod tests {
 
         // Push non-minimal encoding of 10: [0x0a, 0x00] instead of [0x0a]
         let script_bytes = vec![
-            0x02, 0x0a, 0x00, // push 2 bytes: non-minimal 10
+            0x02,
+            0x0a,
+            0x00, // push 2 bytes: non-minimal 10
             Opcode::OP_CHECKSEQUENCEVERIFY as u8,
         ];
         let script = Script::from_bytes(&script_bytes);
         let result = engine.execute(script);
-        assert!(matches!(result, Err(ScriptError::InvalidNumberEncoding)),
-            "CSV should reject non-minimal encoding with MINIMALDATA, got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::InvalidNumberEncoding)),
+            "CSV should reject non-minimal encoding with MINIMALDATA, got: {result:?}"
+        );
     }
 
     // ========== Coverage: OP_PUSHDATA4 byte position tracking ==========
@@ -5847,7 +6068,10 @@ mod tests {
         let mut engine = make_engine();
         let script_bytes = vec![
             Opcode::OP_PUSHDATA4 as u8,
-            0x00, 0x00, 0x00, 0x00, // length 0
+            0x00,
+            0x00,
+            0x00,
+            0x00, // length 0
             Opcode::OP_1 as u8,
         ];
         let script = Script::from_bytes(&script_bytes);
@@ -5861,7 +6085,8 @@ mod tests {
         let mut engine = make_engine();
         let script_bytes = vec![
             Opcode::OP_PUSHDATA2 as u8,
-            0x00, 0x00, // length 0
+            0x00,
+            0x00, // length 0
             Opcode::OP_1 as u8,
         ];
         let script = Script::from_bytes(&script_bytes);
@@ -5887,8 +6112,10 @@ mod tests {
         script.push_opcode(Opcode::OP_CAT);
         script.push_opcode(Opcode::OP_ENDIF);
         let result = engine.execute(script.as_script());
-        assert!(matches!(result, Err(ScriptError::DisabledOpcode(_))),
-            "OP_CAT in tapscript unexecuted branch should still fail, got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::DisabledOpcode(_))),
+            "OP_CAT in tapscript unexecuted branch should still fail, got: {result:?}"
+        );
     }
 
     // ========== Coverage: CHECKSIG without tx context in tapscript ==========
@@ -5906,7 +6133,10 @@ mod tests {
         script.push_slice(&[0u8; 32]); // x-only pubkey
         script.push_opcode(Opcode::OP_CHECKSIG);
         let result = engine.execute(script.as_script());
-        assert!(result.is_err(), "tapscript CHECKSIG without tx should error");
+        assert!(
+            result.is_err(),
+            "tapscript CHECKSIG without tx should error"
+        );
     }
 
     // ========== Coverage: Nested IF/ELSE/ENDIF ==========
@@ -5947,7 +6177,7 @@ mod tests {
         // When in a false branch, OP_IF should just push false to exec_stack
         let mut engine = make_engine();
         let mut script = ScriptBuf::new();
-        script.push_opcode(Opcode::OP_0);  // false
+        script.push_opcode(Opcode::OP_0); // false
         script.push_opcode(Opcode::OP_IF); // enter false branch
         script.push_opcode(Opcode::OP_IF); // nested IF in false branch (no stack pop)
         script.push_opcode(Opcode::OP_ENDIF);
@@ -5971,7 +6201,10 @@ mod tests {
         script.push_opcode(Opcode::OP_1); // n_keys = 1
         script.push_opcode(Opcode::OP_CHECKMULTISIG);
         engine.execute(script.as_script()).unwrap();
-        assert!(!engine.success(), "CHECKMULTISIG with empty sig should fail");
+        assert!(
+            !engine.success(),
+            "CHECKMULTISIG with empty sig should fail"
+        );
     }
 
     // ========== Coverage: Tapscript 65-byte sig with valid sighash ==========
@@ -5985,7 +6218,7 @@ mod tests {
         // 65-byte sig with explicit SIGHASH_ALL (0x01)
         let mut sig = vec![0x01; 64];
         sig.push(0x01); // SIGHASH_ALL
-        // This will fail due to no tx context, but it tests the 65-byte path
+                        // This will fail due to no tx context, but it tests the 65-byte path
         let result = engine.verify_tapscript_signature(&sig, &[0u8; 32]);
         assert!(result.is_err()); // no tx context
     }
@@ -6007,7 +6240,8 @@ mod tests {
         script_pubkey.push_opcode(Opcode::OP_CHECKSIG);
 
         let amount = 50_000i64;
-        let sighash = sighash_segwit_v0(&tx, 0, script_pubkey.as_bytes(), amount, SighashType::NONE).unwrap();
+        let sighash =
+            sighash_segwit_v0(&tx, 0, script_pubkey.as_bytes(), amount, SighashType::NONE).unwrap();
 
         // Sign with SIGHASH_NONE
         let message = secp256k1::Message::from_digest(sighash);
@@ -6016,20 +6250,17 @@ mod tests {
         sig_bytes.push(SighashType::NONE.0 as u8);
 
         static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
-        let mut engine = ScriptEngine::new(
-            &VERIFIER,
-            ScriptFlags::none(),
-            Some(&tx),
-            0,
-            amount,
-        );
+        let mut engine = ScriptEngine::new(&VERIFIER, ScriptFlags::none(), Some(&tx), 0, amount);
         engine.set_segwit_sighash(true);
 
         let mut script_sig = ScriptBuf::new();
         script_sig.push_slice(&sig_bytes);
         engine.execute(script_sig.as_script()).unwrap();
         engine.execute(script_pubkey.as_script()).unwrap();
-        assert!(engine.success(), "Segwit SIGHASH_NONE CHECKSIG should succeed");
+        assert!(
+            engine.success(),
+            "Segwit SIGHASH_NONE CHECKSIG should succeed"
+        );
     }
 
     #[test]
@@ -6047,7 +6278,14 @@ mod tests {
         script_pubkey.push_opcode(Opcode::OP_CHECKSIG);
 
         let amount = 50_000i64;
-        let sighash = sighash_segwit_v0(&tx, 0, script_pubkey.as_bytes(), amount, SighashType::SINGLE).unwrap();
+        let sighash = sighash_segwit_v0(
+            &tx,
+            0,
+            script_pubkey.as_bytes(),
+            amount,
+            SighashType::SINGLE,
+        )
+        .unwrap();
 
         let message = secp256k1::Message::from_digest(sighash);
         let sig = secp.sign_ecdsa(&message, &secret_key);
@@ -6055,20 +6293,17 @@ mod tests {
         sig_bytes.push(SighashType::SINGLE.0 as u8);
 
         static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
-        let mut engine = ScriptEngine::new(
-            &VERIFIER,
-            ScriptFlags::none(),
-            Some(&tx),
-            0,
-            amount,
-        );
+        let mut engine = ScriptEngine::new(&VERIFIER, ScriptFlags::none(), Some(&tx), 0, amount);
         engine.set_segwit_sighash(true);
 
         let mut script_sig = ScriptBuf::new();
         script_sig.push_slice(&sig_bytes);
         engine.execute(script_sig.as_script()).unwrap();
         engine.execute(script_pubkey.as_script()).unwrap();
-        assert!(engine.success(), "Segwit SIGHASH_SINGLE CHECKSIG should succeed");
+        assert!(
+            engine.success(),
+            "Segwit SIGHASH_SINGLE CHECKSIG should succeed"
+        );
     }
 
     #[test]
@@ -6095,20 +6330,17 @@ mod tests {
         sig_bytes.push(0x81);
 
         static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
-        let mut engine = ScriptEngine::new(
-            &VERIFIER,
-            ScriptFlags::none(),
-            Some(&tx),
-            0,
-            amount,
-        );
+        let mut engine = ScriptEngine::new(&VERIFIER, ScriptFlags::none(), Some(&tx), 0, amount);
         engine.set_segwit_sighash(true);
 
         let mut script_sig = ScriptBuf::new();
         script_sig.push_slice(&sig_bytes);
         engine.execute(script_sig.as_script()).unwrap();
         engine.execute(script_pubkey.as_script()).unwrap();
-        assert!(engine.success(), "Segwit SIGHASH_ALL|ANYONECANPAY CHECKSIG should succeed");
+        assert!(
+            engine.success(),
+            "Segwit SIGHASH_ALL|ANYONECANPAY CHECKSIG should succeed"
+        );
     }
 
     // ========== Coverage: PUSHDATA1/2 for large data in is_minimal_push ==========
@@ -6151,21 +6383,17 @@ mod tests {
     fn test_checksigverify_empty_sig_fails() {
         static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
         let tx = make_test_tx();
-        let mut engine = ScriptEngine::new(
-            &VERIFIER,
-            ScriptFlags::none(),
-            Some(&tx),
-            0,
-            0,
-        );
+        let mut engine = ScriptEngine::new(&VERIFIER, ScriptFlags::none(), Some(&tx), 0, 0);
 
         let mut script = ScriptBuf::new();
         script.push_opcode(Opcode::OP_0); // empty sig
         script.push_slice(&[0x02; 33]);
         script.push_opcode(Opcode::OP_CHECKSIGVERIFY);
         let result = engine.execute(script.as_script());
-        assert!(matches!(result, Err(ScriptError::CheckSigFailed)),
-            "CHECKSIGVERIFY with empty sig should fail with CheckSigFailed, got: {:?}", result);
+        assert!(
+            matches!(result, Err(ScriptError::CheckSigFailed)),
+            "CHECKSIGVERIFY with empty sig should fail with CheckSigFailed, got: {result:?}"
+        );
     }
 
     // ========== Coverage: encode_num large values ==========
@@ -6395,10 +6623,10 @@ mod tests {
         script.push_opcode(Opcode::OP_3DUP); // 1,2,3,1,2,3
         script.push_opcode(Opcode::OP_2DROP); // 1,2,3,1
         script.push_opcode(Opcode::OP_2DROP); // 1,2
-        script.push_opcode(Opcode::OP_SWAP);  // 2,1
-        script.push_opcode(Opcode::OP_NIP);   // 1
-        script.push_opcode(Opcode::OP_DUP);   // 1,1
-        script.push_opcode(Opcode::OP_2DUP);  // 1,1,1,1
+        script.push_opcode(Opcode::OP_SWAP); // 2,1
+        script.push_opcode(Opcode::OP_NIP); // 1
+        script.push_opcode(Opcode::OP_DUP); // 1,1
+        script.push_opcode(Opcode::OP_2DUP); // 1,1,1,1
         script.push_opcode(Opcode::OP_DROP);
         script.push_opcode(Opcode::OP_DROP);
         script.push_opcode(Opcode::OP_DROP);
@@ -6407,68 +6635,68 @@ mod tests {
         // OP_IFDUP with truthy value
         script.push_opcode(Opcode::OP_1);
         script.push_opcode(Opcode::OP_IFDUP); // 1,1
-        script.push_opcode(Opcode::OP_DROP);   // 1
+        script.push_opcode(Opcode::OP_DROP); // 1
 
         // OP_DEPTH
-        script.push_opcode(Opcode::OP_DEPTH);  // 1, depth(1)
-        script.push_opcode(Opcode::OP_DROP);   // 1
+        script.push_opcode(Opcode::OP_DEPTH); // 1, depth(1)
+        script.push_opcode(Opcode::OP_DROP); // 1
 
         // OP_TOALTSTACK / OP_FROMALTSTACK
         script.push_opcode(Opcode::OP_TOALTSTACK);
         script.push_opcode(Opcode::OP_FROMALTSTACK); // 1
 
         // OP_SIZE
-        script.push_opcode(Opcode::OP_SIZE);   // 1, size(1)
-        script.push_opcode(Opcode::OP_DROP);   // 1
+        script.push_opcode(Opcode::OP_SIZE); // 1, size(1)
+        script.push_opcode(Opcode::OP_DROP); // 1
 
         // OP_OVER
         script.push_opcode(Opcode::OP_2);
-        script.push_opcode(Opcode::OP_OVER);   // 1,2,1
+        script.push_opcode(Opcode::OP_OVER); // 1,2,1
         script.push_opcode(Opcode::OP_DROP);
-        script.push_opcode(Opcode::OP_DROP);   // 1
+        script.push_opcode(Opcode::OP_DROP); // 1
 
         // OP_ROT
         script.push_opcode(Opcode::OP_2);
         script.push_opcode(Opcode::OP_3);
-        script.push_opcode(Opcode::OP_ROT);    // 2,3,1
+        script.push_opcode(Opcode::OP_ROT); // 2,3,1
         script.push_opcode(Opcode::OP_DROP);
-        script.push_opcode(Opcode::OP_DROP);   // 2
+        script.push_opcode(Opcode::OP_DROP); // 2
 
         // OP_TUCK
         script.push_opcode(Opcode::OP_3);
-        script.push_opcode(Opcode::OP_TUCK);   // 3,2,3
+        script.push_opcode(Opcode::OP_TUCK); // 3,2,3
         script.push_opcode(Opcode::OP_DROP);
         script.push_opcode(Opcode::OP_DROP);
         script.push_opcode(Opcode::OP_DROP);
 
         // Arithmetic
         script.push_opcode(Opcode::OP_5);
-        script.push_opcode(Opcode::OP_1ADD);   // 6
-        script.push_opcode(Opcode::OP_1SUB);   // 5
+        script.push_opcode(Opcode::OP_1ADD); // 6
+        script.push_opcode(Opcode::OP_1SUB); // 5
         script.push_opcode(Opcode::OP_NEGATE); // -5
-        script.push_opcode(Opcode::OP_ABS);    // 5
-        script.push_opcode(Opcode::OP_NOT);    // 0
+        script.push_opcode(Opcode::OP_ABS); // 5
+        script.push_opcode(Opcode::OP_NOT); // 0
         script.push_opcode(Opcode::OP_0NOTEQUAL); // 0
 
         script.push_opcode(Opcode::OP_3);
         script.push_opcode(Opcode::OP_4);
-        script.push_opcode(Opcode::OP_ADD);    // 7
+        script.push_opcode(Opcode::OP_ADD); // 7
         script.push_opcode(Opcode::OP_2);
-        script.push_opcode(Opcode::OP_SUB);    // 5
+        script.push_opcode(Opcode::OP_SUB); // 5
 
         // Comparisons
         script.push_opcode(Opcode::OP_DUP);
         script.push_opcode(Opcode::OP_5);
-        script.push_opcode(Opcode::OP_NUMEQUAL);  // 1
+        script.push_opcode(Opcode::OP_NUMEQUAL); // 1
         script.push_opcode(Opcode::OP_DROP);
 
         script.push_opcode(Opcode::OP_4);
-        script.push_opcode(Opcode::OP_LESSTHAN);     // 0 (5 < 4 is false)
+        script.push_opcode(Opcode::OP_LESSTHAN); // 0 (5 < 4 is false)
         script.push_opcode(Opcode::OP_DROP);
 
         script.push_opcode(Opcode::OP_3);
         script.push_opcode(Opcode::OP_2);
-        script.push_opcode(Opcode::OP_GREATERTHAN);   // 1
+        script.push_opcode(Opcode::OP_GREATERTHAN); // 1
         script.push_opcode(Opcode::OP_DROP);
 
         script.push_opcode(Opcode::OP_3);
@@ -6483,12 +6711,12 @@ mod tests {
 
         script.push_opcode(Opcode::OP_1);
         script.push_opcode(Opcode::OP_2);
-        script.push_opcode(Opcode::OP_MIN);    // 1
+        script.push_opcode(Opcode::OP_MIN); // 1
         script.push_opcode(Opcode::OP_DROP);
 
         script.push_opcode(Opcode::OP_1);
         script.push_opcode(Opcode::OP_2);
-        script.push_opcode(Opcode::OP_MAX);    // 2
+        script.push_opcode(Opcode::OP_MAX); // 2
         script.push_opcode(Opcode::OP_DROP);
 
         // OP_WITHIN
@@ -6539,7 +6767,7 @@ mod tests {
         // OP_EQUAL, OP_EQUALVERIFY
         script.push_opcode(Opcode::OP_1);
         script.push_opcode(Opcode::OP_1);
-        script.push_opcode(Opcode::OP_EQUAL);  // 1
+        script.push_opcode(Opcode::OP_EQUAL); // 1
         script.push_opcode(Opcode::OP_DROP);
 
         script.push_opcode(Opcode::OP_3);

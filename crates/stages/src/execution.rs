@@ -121,13 +121,11 @@ impl ExecutionStage {
         // }
 
         // Simulate: record undo data for this block.
-        let undo_changes = vec![
-            UtxoChange::Created {
-                height,
-                tx_index: 0,
-                output_index: 0,
-            },
-        ];
+        let undo_changes = vec![UtxoChange::Created {
+            height,
+            tx_index: 0,
+            output_index: 0,
+        }];
         self.undo_log.push((height, undo_changes));
 
         Ok(())
@@ -195,7 +193,10 @@ impl Stage for ExecutionStage {
         self.checkpoint = batch_end;
         let done = batch_end >= target;
 
-        info!(checkpoint = self.checkpoint, done, "execution batch complete");
+        info!(
+            checkpoint = self.checkpoint,
+            done, "execution batch complete"
+        );
 
         Ok(ExecOutput {
             checkpoint: self.checkpoint,
@@ -224,9 +225,7 @@ impl Stage for ExecutionStage {
 
         self.checkpoint = target;
 
-        Ok(UnwindOutput {
-            checkpoint: target,
-        })
+        Ok(UnwindOutput { checkpoint: target })
     }
 }
 

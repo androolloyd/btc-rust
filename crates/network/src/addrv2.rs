@@ -65,7 +65,7 @@ impl Decodable for NetworkId {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, EncodeError> {
         let byte = reader.read_u8()?;
         NetworkId::from_u8(byte).ok_or_else(|| {
-            EncodeError::InvalidData(format!("unknown addrv2 network id: 0x{:02x}", byte))
+            EncodeError::InvalidData(format!("unknown addrv2 network id: 0x{byte:02x}"))
         })
     }
 }
@@ -113,7 +113,12 @@ impl AddrV2 {
         if self.network_id != NetworkId::IPv4 || self.addr.len() != 4 {
             return None;
         }
-        Some(Ipv4Addr::new(self.addr[0], self.addr[1], self.addr[2], self.addr[3]))
+        Some(Ipv4Addr::new(
+            self.addr[0],
+            self.addr[1],
+            self.addr[2],
+            self.addr[3],
+        ))
     }
 
     /// Try to interpret the address as an IPv6 address.
@@ -158,8 +163,7 @@ impl Decodable for AddrV2 {
         let expected = network_id.addr_len();
         if addr_len != expected {
             return Err(EncodeError::InvalidData(format!(
-                "addrv2 network {:?} expects {} byte address, got {}",
-                network_id, expected, addr_len,
+                "addrv2 network {network_id:?} expects {expected} byte address, got {addr_len}",
             )));
         }
 
@@ -381,12 +385,7 @@ mod tests {
                 addr: vec![0x42; 32],
                 port: 9050,
             },
-            AddrV2::from_ipv6(
-                Ipv6Addr::LOCALHOST,
-                18333,
-                0x01,
-                1_700_000_000,
-            ),
+            AddrV2::from_ipv6(Ipv6Addr::LOCALHOST, 18333, 0x01, 1_700_000_000),
         ]);
 
         let encoded = encode::encode(&msg);

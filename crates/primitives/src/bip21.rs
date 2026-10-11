@@ -197,11 +197,11 @@ impl fmt::Display for BitcoinUri {
             let btc_whole = sats / 100_000_000;
             let btc_frac = (sats % 100_000_000).unsigned_abs();
             if btc_frac == 0 {
-                write!(f, "amount={}", btc_whole)?;
+                write!(f, "amount={btc_whole}")?;
             } else {
-                let frac_str = format!("{:08}", btc_frac);
+                let frac_str = format!("{btc_frac:08}");
                 let trimmed = frac_str.trim_end_matches('0');
-                write!(f, "amount={}.{}", btc_whole, trimmed)?;
+                write!(f, "amount={btc_whole}.{trimmed}")?;
             }
         }
 
@@ -217,7 +217,7 @@ impl fmt::Display for BitcoinUri {
 
         // Sort custom params for deterministic output.
         let mut sorted_params: Vec<_> = self.params.iter().collect();
-        sorted_params.sort_by_key(|(k, _)| k.clone());
+        sorted_params.sort_by(|(left, _), (right, _)| left.cmp(right));
         for (key, value) in sorted_params {
             sep(f)?;
             write!(f, "{}={}", key, percent_encode(value))?;
@@ -250,7 +250,7 @@ fn parse_btc_amount(s: &str) -> Result<Amount, Bip21Error> {
             // Integer BTC
             let whole: i64 = parts[0]
                 .parse()
-                .map_err(|e| Bip21Error::InvalidAmount(format!("{}", e)))?;
+                .map_err(|e| Bip21Error::InvalidAmount(format!("{e}")))?;
             Ok(Amount::from_sat(whole * 100_000_000))
         }
         2 => {
@@ -259,7 +259,7 @@ fn parse_btc_amount(s: &str) -> Result<Amount, Bip21Error> {
             } else {
                 parts[0]
                     .parse()
-                    .map_err(|e| Bip21Error::InvalidAmount(format!("{}", e)))?
+                    .map_err(|e| Bip21Error::InvalidAmount(format!("{e}")))?
             };
             let frac_str = parts[1];
             if frac_str.len() > 8 {
@@ -268,10 +268,10 @@ fn parse_btc_amount(s: &str) -> Result<Amount, Bip21Error> {
                 ));
             }
             // Pad to 8 digits
-            let padded = format!("{:0<8}", frac_str);
+            let padded = format!("{frac_str:0<8}");
             let frac: i64 = padded
                 .parse()
-                .map_err(|e| Bip21Error::InvalidAmount(format!("{}", e)))?;
+                .map_err(|e| Bip21Error::InvalidAmount(format!("{e}")))?;
             Ok(Amount::from_sat(whole * 100_000_000 + frac))
         }
         _ => Err(Bip21Error::InvalidAmount(
@@ -315,7 +315,7 @@ fn percent_decode(s: &str) -> Result<String, Bip21Error> {
         }
     }
     String::from_utf8(result)
-        .map_err(|e| Bip21Error::InvalidPercentEncoding(format!("invalid UTF-8: {}", e)))
+        .map_err(|e| Bip21Error::InvalidPercentEncoding(format!("invalid UTF-8: {e}")))
 }
 
 /// Percent-encode a URI component (BIP21 compatible).
@@ -369,7 +369,7 @@ fn validate_address(addr: &str, network: Option<Network>) -> Result<(), Bip21Err
             Network::Testnet
         };
         Address::from_bech32(addr, effective_net)
-            .map_err(|e| Bip21Error::InvalidAddress(format!("{}", e)))?;
+            .map_err(|e| Bip21Error::InvalidAddress(format!("{e}")))?;
         return Ok(());
     }
 
@@ -386,8 +386,7 @@ fn validate_address(addr: &str, network: Option<Network>) -> Result<(), Bip21Err
     }
 
     Err(Bip21Error::InvalidAddress(format!(
-        "unrecognized address format: {}",
-        addr
+        "unrecognized address format: {addr}"
     )))
 }
 
@@ -429,7 +428,8 @@ mod tests {
 
     #[test]
     fn test_parse_full_uri() {
-        let uri = "bitcoin:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa?amount=0.1&label=Satoshi&message=Donation";
+        let uri =
+            "bitcoin:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa?amount=0.1&label=Satoshi&message=Donation";
         let parsed = BitcoinUri::parse(uri).unwrap();
         assert_eq!(parsed.address, "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa");
         assert_eq!(parsed.amount.unwrap().as_sat(), 10_000_000);
@@ -449,17 +449,17 @@ mod tests {
         let uri =
             "bitcoin:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa?message=Pay%20for%20lunch%20%26%20coffee";
         let parsed = BitcoinUri::parse(uri).unwrap();
-        assert_eq!(
-            parsed.message.as_deref(),
-            Some("Pay for lunch & coffee")
-        );
+        assert_eq!(parsed.message.as_deref(), Some("Pay for lunch & coffee"));
     }
 
     #[test]
     fn test_parse_custom_params() {
         let uri = "bitcoin:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa?amount=1&req-custom=value";
         let parsed = BitcoinUri::parse(uri).unwrap();
-        assert_eq!(parsed.params.get("req-custom").map(|s| s.as_str()), Some("value"));
+        assert_eq!(
+            parsed.params.get("req-custom").map(|s| s.as_str()),
+            Some("value")
+        );
     }
 
     #[test]
@@ -508,9 +508,8 @@ mod tests {
 
     #[test]
     fn test_parse_invalid_amount_too_many_decimals() {
-        let result = BitcoinUri::parse(
-            "bitcoin:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa?amount=0.123456789",
-        );
+        let result =
+            BitcoinUri::parse("bitcoin:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa?amount=0.123456789");
         assert!(matches!(result, Err(Bip21Error::InvalidAmount(_))));
     }
 
@@ -524,7 +523,10 @@ mod tests {
     #[test]
     fn test_to_string_address_only() {
         let uri = BitcoinUri::new("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa".to_string());
-        assert_eq!(uri.to_string(), "bitcoin:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa");
+        assert_eq!(
+            uri.to_string(),
+            "bitcoin:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"
+        );
     }
 
     #[test]
@@ -631,13 +633,13 @@ mod tests {
     #[test]
     fn test_bip21_error_display() {
         let e = Bip21Error::MissingScheme;
-        assert!(format!("{}", e).contains("scheme"));
+        assert!(format!("{e}").contains("scheme"));
 
         let e = Bip21Error::MissingAddress;
-        assert!(format!("{}", e).contains("address"));
+        assert!(format!("{e}").contains("address"));
 
         let e = Bip21Error::InvalidAmount("test".to_string());
-        assert!(format!("{}", e).contains("test"));
+        assert!(format!("{e}").contains("test"));
     }
 
     #[test]

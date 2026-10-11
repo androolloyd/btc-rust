@@ -141,10 +141,7 @@ impl TestNode {
                     input_sum = input_sum + entry.txout.value;
                 }
             }
-            let output_sum: Amount = tx
-                .outputs
-                .iter()
-                .fold(Amount::ZERO, |acc, o| acc + o.value);
+            let output_sum: Amount = tx.outputs.iter().fold(Amount::ZERO, |acc, o| acc + o.value);
             if input_sum.as_sat() > output_sum.as_sat() {
                 total_fees = total_fees + (input_sum - output_sum);
             }
@@ -255,17 +252,11 @@ impl TestNode {
                 .utxo_set
                 .get_utxo(&inp.previous_output)
                 .ok_or_else(|| {
-                    format!(
-                        "input references unknown UTXO {:?}",
-                        inp.previous_output
-                    )
+                    format!("input references unknown UTXO {:?}", inp.previous_output)
                 })?;
             input_sum = input_sum + entry.txout.value;
         }
-        let output_sum: Amount = tx
-            .outputs
-            .iter()
-            .fold(Amount::ZERO, |acc, o| acc + o.value);
+        let output_sum: Amount = tx.outputs.iter().fold(Amount::ZERO, |acc, o| acc + o.value);
 
         if output_sum.as_sat() > input_sum.as_sat() {
             return Err(format!(
@@ -278,9 +269,7 @@ impl TestNode {
         let fee = input_sum - output_sum;
         let now = self.height; // use height as a cheap timestamp stand-in
 
-        self.mempool
-            .add_tx(tx, fee, now)
-            .map_err(|e| e.to_string())
+        self.mempool.add_tx(tx, fee, now).map_err(|e| e.to_string())
     }
 
     // ------------------------------------------------------------------
@@ -398,12 +387,7 @@ impl TestKeyPair {
     ///
     /// Returns the DER-encoded signature with the sighash byte appended,
     /// ready for use in `script_sig`.
-    pub fn sign_input(
-        &self,
-        tx: &Transaction,
-        input_index: usize,
-        prev_output: &TxOut,
-    ) -> Vec<u8> {
+    pub fn sign_input(&self, tx: &Transaction, input_index: usize, prev_output: &TxOut) -> Vec<u8> {
         use btc_consensus::sighash::{sighash_legacy, SighashType};
 
         let hash = sighash_legacy(
@@ -585,7 +569,7 @@ fn encode_script_num(n: i64) -> Vec<u8> {
 
     // If the most significant byte has the sign bit set, add an extra byte
     // to disambiguate from a negative number.
-    if result.last().map_or(false, |b| b & 0x80 != 0) {
+    if result.last().is_some_and(|b| b & 0x80 != 0) {
         result.push(if negative { 0x80 } else { 0x00 });
     } else if negative {
         let last = result.last_mut().unwrap();

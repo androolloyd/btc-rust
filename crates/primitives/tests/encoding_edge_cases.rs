@@ -3,7 +3,6 @@
 /// These tests cover boundary conditions in varint encoding, transaction
 /// serialisation, and script construction that are important for consensus
 /// compatibility.
-
 use btc_primitives::amount::Amount;
 use btc_primitives::encode::{self, VarInt};
 use btc_primitives::hash::TxHash;
@@ -23,7 +22,10 @@ fn test_varint_max_value() {
     // Encode
     let encoded = encode::encode(&max_vi);
     assert_eq!(encoded.len(), 9, "u64::MAX varint should be 9 bytes");
-    assert_eq!(encoded[0], 0xFF, "prefix byte for 8-byte varint should be 0xFF");
+    assert_eq!(
+        encoded[0], 0xFF,
+        "prefix byte for 8-byte varint should be 0xFF"
+    );
 
     // The remaining 8 bytes should be u64::MAX in little-endian
     let le_bytes = u64::MAX.to_le_bytes();
@@ -47,13 +49,13 @@ fn test_varint_boundary_values() {
 
     let boundaries: &[(u64, usize)] = &[
         (0, 1),
-        (0xFC, 1),           // last 1-byte value
-        (0xFD, 3),           // first 3-byte value
-        (0xFFFF, 3),         // last 3-byte value
-        (0x10000, 5),        // first 5-byte value
-        (0xFFFFFFFF, 5),     // last 5-byte value
-        (0x100000000, 9),    // first 9-byte value
-        (u64::MAX, 9),       // last 9-byte value
+        (0xFC, 1),        // last 1-byte value
+        (0xFD, 3),        // first 3-byte value
+        (0xFFFF, 3),      // last 3-byte value
+        (0x10000, 5),     // first 5-byte value
+        (0xFFFFFFFF, 5),  // last 5-byte value
+        (0x100000000, 9), // first 9-byte value
+        (u64::MAX, 9),    // last 9-byte value
     ];
 
     for &(value, expected_size) in boundaries {
@@ -70,7 +72,7 @@ fn test_varint_boundary_values() {
         assert_eq!(vi.encoded_size(), expected_size);
 
         let decoded: VarInt = encode::decode(&encoded).unwrap();
-        assert_eq!(decoded.0, value, "roundtrip failed for VarInt({})", value);
+        assert_eq!(decoded.0, value, "roundtrip failed for VarInt({value})");
     }
 }
 
@@ -179,21 +181,33 @@ fn test_max_transaction_size() {
 
     let encoded = encode::encode(&large_tx);
     // Should be well under 1MB but still a substantial size
-    assert!(encoded.len() > 90_000,
-        "encoded size {} should be > 90000", encoded.len());
-    assert!(encoded.len() <= MAX_LEGACY_TX_SIZE,
-        "encoded size {} should be <= {}", encoded.len(), MAX_LEGACY_TX_SIZE);
+    assert!(
+        encoded.len() > 90_000,
+        "encoded size {} should be > 90000",
+        encoded.len()
+    );
+    assert!(
+        encoded.len() <= MAX_LEGACY_TX_SIZE,
+        "encoded size {} should be <= {}",
+        encoded.len(),
+        MAX_LEGACY_TX_SIZE
+    );
 
     // Verify it roundtrips
     let decoded: Transaction = encode::decode(&encoded).unwrap();
     assert_eq!(decoded.version, large_tx.version);
     assert_eq!(decoded.inputs.len(), 1);
-    assert_eq!(decoded.inputs[0].script_sig.len(), large_tx.inputs[0].script_sig.len());
+    assert_eq!(
+        decoded.inputs[0].script_sig.len(),
+        large_tx.inputs[0].script_sig.len()
+    );
 
     // Weight calculation for legacy tx: weight = 4 * size
     let legacy_weight = 4 * encoded.len();
-    assert!(legacy_weight <= MAX_BLOCK_WEIGHT,
-        "weight {} should be <= {}", legacy_weight, MAX_BLOCK_WEIGHT);
+    assert!(
+        legacy_weight <= MAX_BLOCK_WEIGHT,
+        "weight {legacy_weight} should be <= {MAX_BLOCK_WEIGHT}"
+    );
 
     // Verify that at the theoretical max, the weight limit holds:
     // A single legacy tx of 1MB would have weight = 4MB = MAX_BLOCK_WEIGHT
@@ -217,10 +231,22 @@ fn test_script_with_all_opcodes() {
         Opcode::OP_0,
         Opcode::OP_1NEGATE,
         Opcode::OP_RESERVED,
-        Opcode::OP_1, Opcode::OP_2, Opcode::OP_3, Opcode::OP_4,
-        Opcode::OP_5, Opcode::OP_6, Opcode::OP_7, Opcode::OP_8,
-        Opcode::OP_9, Opcode::OP_10, Opcode::OP_11, Opcode::OP_12,
-        Opcode::OP_13, Opcode::OP_14, Opcode::OP_15, Opcode::OP_16,
+        Opcode::OP_1,
+        Opcode::OP_2,
+        Opcode::OP_3,
+        Opcode::OP_4,
+        Opcode::OP_5,
+        Opcode::OP_6,
+        Opcode::OP_7,
+        Opcode::OP_8,
+        Opcode::OP_9,
+        Opcode::OP_10,
+        Opcode::OP_11,
+        Opcode::OP_12,
+        Opcode::OP_13,
+        Opcode::OP_14,
+        Opcode::OP_15,
+        Opcode::OP_16,
         // Flow control
         Opcode::OP_NOP,
         Opcode::OP_VER,
@@ -334,20 +360,29 @@ fn test_script_with_all_opcodes() {
     for &op in &all_opcodes {
         let byte = op as u8;
         let recovered = Opcode::from_u8(byte);
-        assert_eq!(recovered, op,
-            "Opcode::from_u8({:#04x}) returned {:?}, expected {:?}", byte, recovered, op);
+        assert_eq!(
+            recovered, op,
+            "Opcode::from_u8({byte:#04x}) returned {recovered:?}, expected {op:?}"
+        );
     }
 
     // Verify that iterating instructions yields the correct opcodes
     // Note: OP_0 (0x00) is handled specially by the instruction iterator
     let instructions: Vec<_> = script.instructions().collect();
-    assert_eq!(instructions.len(), all_opcodes.len(),
-        "instruction count should match opcode count");
+    assert_eq!(
+        instructions.len(),
+        all_opcodes.len(),
+        "instruction count should match opcode count"
+    );
 
     // All instructions should parse successfully
     for (i, instr) in instructions.iter().enumerate() {
-        assert!(instr.is_ok(),
-            "instruction {} ({:?}) failed to parse", i, all_opcodes[i]);
+        assert!(
+            instr.is_ok(),
+            "instruction {} ({:?}) failed to parse",
+            i,
+            all_opcodes[i]
+        );
     }
 
     // Verify script encode/decode roundtrip
@@ -375,9 +410,7 @@ fn test_segwit_tx_with_empty_witness() {
             value: Amount::from_sat(50_000),
             script_pubkey: ScriptBuf::p2wpkh(&[0u8; 20]),
         }],
-        witness: vec![
-            Witness::from_items(vec![vec![0x30; 72], vec![0x02; 33]]),
-        ],
+        witness: vec![Witness::from_items(vec![vec![0x30; 72], vec![0x02; 33]])],
         lock_time: 0,
     };
 
@@ -410,12 +443,29 @@ fn test_outpoint_encoding_deterministic() {
 #[test]
 fn test_varint_encoded_size_matches_actual() {
     // Ensure encoded_size() always matches the actual encoded length
-    let values = [0u64, 1, 252, 253, 254, 255, 65534, 65535, 65536,
-                  0xFFFFFFFE, 0xFFFFFFFF, 0x100000000, u64::MAX / 2, u64::MAX];
+    let values = [
+        0u64,
+        1,
+        252,
+        253,
+        254,
+        255,
+        65534,
+        65535,
+        65536,
+        0xFFFFFFFE,
+        0xFFFFFFFF,
+        0x100000000,
+        u64::MAX / 2,
+        u64::MAX,
+    ];
     for val in values {
         let vi = VarInt(val);
         let encoded = encode::encode(&vi);
-        assert_eq!(vi.encoded_size(), encoded.len(),
-            "encoded_size() mismatch for VarInt({})", val);
+        assert_eq!(
+            vi.encoded_size(),
+            encoded.len(),
+            "encoded_size() mismatch for VarInt({val})"
+        );
     }
 }

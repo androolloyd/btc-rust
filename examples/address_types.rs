@@ -33,16 +33,31 @@ fn main() {
     };
 
     println!("=== Bitcoin Address Types (Mainnet) ===\n");
-    println!("P2PKH:  {}", p2pkh);
-    println!("P2SH:   {}", p2sh);
-    println!("P2WPKH: {}", p2wpkh);
-    println!("P2WSH:  {}", p2wsh);
-    println!("P2TR:   {}", p2tr);
+    println!("P2PKH:  {p2pkh}");
+    println!("P2SH:   {p2sh}");
+    println!("P2WPKH: {p2wpkh}");
+    println!("P2WSH:  {p2wsh}");
+    println!("P2TR:   {p2tr}");
 
     println!("\n=== Script PubKeys ===\n");
-    println!("P2PKH  script: {}", hex::encode(p2pkh.script_pubkey().as_bytes()));
-    println!("P2SH   script: {}", hex::encode(p2sh.script_pubkey().as_bytes()));
-    println!("P2WPKH script: {}", hex::encode(p2wpkh.script_pubkey().as_bytes()));
-    println!("P2WSH  script: {}", hex::encode(p2wsh.script_pubkey().as_bytes()));
-    println!("P2TR   script: {}", hex::encode(p2tr.script_pubkey().as_bytes()));
+    println!(
+        "P2PKH  script: {}",
+        hex::encode(p2pkh.script_pubkey().as_bytes())
+    );
+    println!(
+        "P2SH   script: {}",
+        hex::encode(p2sh.script_pubkey().as_bytes())
+    );
+    println!(
+        "P2WPKH script: {}",
+        hex::encode(p2wpkh.script_pubkey().as_bytes())
+    );
+    println!(
+        "P2WSH  script: {}",
+        hex::encode(p2wsh.script_pubkey().as_bytes())
+    );
+    println!(
+        "P2TR   script: {}",
+        hex::encode(p2tr.script_pubkey().as_bytes())
+    );
 }

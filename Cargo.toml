@@ -2,11 +2,12 @@
 name = "btc-rust"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/example/btc-rust"
+repository = "https://github.com/androolloyd/btc-rust"
 
 [workspace]
+default-members = [".", "crates/node"]
 exclude = ["fuzz"]
 members = [
     "crates/primitives",
@@ -65,9 +66,9 @@ path = "examples/address_types.rs"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/example/btc-rust"
+repository = "https://github.com/androolloyd/btc-rust"
 
 [workspace.dependencies]
 # Internal crates

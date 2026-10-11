@@ -103,11 +103,9 @@ pub fn decode_script(hex_str: &str) -> eyre::Result<serde_json::Value> {
     let mut ops = Vec::new();
     for instruction in script.instructions() {
         match instruction {
-            Ok(Instruction::Op(op)) => ops.push(format!("{:?}", op)),
-            Ok(Instruction::PushBytes(data)) => {
-                ops.push(format!("PUSH({})", hex::encode(data)))
-            }
-            Err(e) => ops.push(format!("ERROR: {}", e)),
+            Ok(Instruction::Op(op)) => ops.push(format!("{op:?}")),
+            Ok(Instruction::PushBytes(data)) => ops.push(format!("PUSH({})", hex::encode(data))),
+            Err(e) => ops.push(format!("ERROR: {e}")),
         }
     }
 
@@ -146,8 +144,7 @@ pub fn decode_header(hex_str: &str) -> eyre::Result<serde_json::Value> {
 ///
 /// Returns a structured JSON object with decoded fields and computed sizes.
 pub fn simulate_tx(hex_str: &str) -> eyre::Result<serde_json::Value> {
-    let bytes =
-        hex::decode(hex_str).map_err(|e| eyre::eyre!("invalid hex: {}", e))?;
+    let bytes = hex::decode(hex_str).map_err(|e| eyre::eyre!("invalid hex: {}", e))?;
     let tx: Transaction = btc_primitives::decode(&bytes)
         .map_err(|e| eyre::eyre!("failed to decode transaction: {}", e))?;
 
@@ -173,7 +170,7 @@ pub fn simulate_tx(hex_str: &str) -> eyre::Result<serde_json::Value> {
 
     // Weight = base_size * 3 + total_size  (BIP141)
     let weight = legacy_size * 3 + total_size;
-    let vsize = (weight + 3) / 4; // ceiling division
+    let vsize = weight.div_ceil(4); // ceiling division
 
     let is_coinbase = tx.is_coinbase();
     let total_output: i64 = tx.outputs.iter().map(|o| o.value.as_sat()).sum();
@@ -237,8 +234,8 @@ pub fn simulate_tx(hex_str: &str) -> eyre::Result<serde_json::Value> {
 
 /// Compile a miniscript policy string into Bitcoin Script.
 pub fn compile_policy(policy_str: &str) -> eyre::Result<serde_json::Value> {
-    let policy = Policy::parse(policy_str)
-        .map_err(|e| eyre::eyre!("failed to parse policy: {}", e))?;
+    let policy =
+        Policy::parse(policy_str).map_err(|e| eyre::eyre!("failed to parse policy: {}", e))?;
 
     let script = policy.compile();
     let script_ref = script.as_script();
@@ -247,11 +244,11 @@ pub fn compile_policy(policy_str: &str) -> eyre::Result<serde_json::Value> {
     let mut asm_ops = Vec::new();
     for instruction in script_ref.instructions() {
         match instruction {
-            Ok(Instruction::Op(op)) => asm_ops.push(format!("{:?}", op)),
+            Ok(Instruction::Op(op)) => asm_ops.push(format!("{op:?}")),
             Ok(Instruction::PushBytes(data)) => {
                 asm_ops.push(format!("PUSH({})", hex::encode(data)))
             }
-            Err(e) => asm_ops.push(format!("ERROR: {}", e)),
+            Err(e) => asm_ops.push(format!("ERROR: {e}")),
         }
     }
 
@@ -270,15 +267,10 @@ pub fn compile_policy(policy_str: &str) -> eyre::Result<serde_json::Value> {
 // ---------------------------------------------------------------------------
 
 /// Parse and classify a Bitcoin address for watching.
-pub fn watch_address(
-    address_str: &str,
-    network: Network,
-) -> eyre::Result<serde_json::Value> {
+pub fn watch_address(address_str: &str, network: Network) -> eyre::Result<serde_json::Value> {
     let addr = Address::from_bech32(address_str, network)
         .or_else(|_| Address::from_base58(address_str, network))
-        .map_err(|e| {
-            eyre::eyre!("failed to parse address '{}': {}", address_str, e)
-        })?;
+        .map_err(|e| eyre::eyre!("failed to parse address '{}': {}", address_str, e))?;
 
     let script_pubkey = addr.script_pubkey();
     let spk_bytes = script_pubkey.as_bytes();
@@ -317,9 +309,8 @@ pub fn build_status(config: &NodeConfig) -> output::NodeStatus {
     output::NodeStatus {
         network: config.network.to_string(),
         chain_height: 0,
-        best_block_hash:
-            "0000000000000000000000000000000000000000000000000000000000000000"
-                .to_string(),
+        best_block_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+            .to_string(),
         peer_count: 0,
         mempool_size: 0,
         syncing: false,
@@ -374,20 +365,13 @@ pub fn build_explore(config: &NodeConfig, explorer_port: u16) -> serde_json::Val
 }
 
 /// Build the JSON-RPC envelope for the `rpc` subcommand.
-pub fn build_rpc_request(
-    method: &str,
-    params: &[String],
-    rpc_port: u16,
-) -> serde_json::Value {
+pub fn build_rpc_request(method: &str, params: &[String], _rpc_port: u16) -> serde_json::Value {
     let params_json: serde_json::Value = if params.is_empty() {
         serde_json::Value::Array(vec![])
     } else {
         let parsed: Vec<serde_json::Value> = params
             .iter()
-            .map(|p| {
-                serde_json::from_str(p)
-                    .unwrap_or(serde_json::Value::String(p.clone()))
-            })
+            .map(|p| serde_json::from_str(p).unwrap_or(serde_json::Value::String(p.clone())))
             .collect();
         serde_json::Value::Array(parsed)
     };
@@ -399,19 +383,32 @@ pub fn build_rpc_request(
         "id": 1,
     });
 
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "result": null,
-        "error": {
-            "code": -32600,
-            "message": "RPC client not yet connected",
-            "data": {
-                "request": request,
-                "target": format!("127.0.0.1:{}", rpc_port),
-            }
+    request
+}
+
+/// Call the node's newline-delimited TCP JSON-RPC server.
+pub async fn call_rpc(
+    method: &str,
+    params: &[String],
+    rpc_port: u16,
+) -> eyre::Result<serde_json::Value> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+    let request = build_rpc_request(method, params, rpc_port);
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", rpc_port)).await?;
+        let mut bytes = serde_json::to_vec(&request)?;
+        bytes.push(b'\n');
+        stream.write_all(&bytes).await?;
+        let mut reader = tokio::io::BufReader::new(stream.take(8 * 1024 * 1024));
+        let mut line = String::new();
+        reader.read_line(&mut line).await?;
+        if !line.ends_with('\n') {
+            eyre::bail!("RPC response closed or exceeded size limit");
         }
+        Ok::<_, eyre::Report>(serde_json::from_str(&line)?)
     })
+    .await
+    .map_err(|_| eyre::eyre!("RPC request timed out"))?
 }
 
 // ---------------------------------------------------------------------------
@@ -516,12 +513,8 @@ pub fn parse_opcode_or_data(input: &str) -> Option<ScriptItem> {
             "OP_CHECKMULTISIG" => Some(Opcode::OP_CHECKMULTISIG),
             "OP_CHECKMULTISIGVERIFY" => Some(Opcode::OP_CHECKMULTISIGVERIFY),
             "OP_NOP1" => Some(Opcode::OP_NOP1),
-            "OP_CHECKLOCKTIMEVERIFY" | "OP_CLTV" => {
-                Some(Opcode::OP_CHECKLOCKTIMEVERIFY)
-            }
-            "OP_CHECKSEQUENCEVERIFY" | "OP_CSV" => {
-                Some(Opcode::OP_CHECKSEQUENCEVERIFY)
-            }
+            "OP_CHECKLOCKTIMEVERIFY" | "OP_CLTV" => Some(Opcode::OP_CHECKLOCKTIMEVERIFY),
+            "OP_CHECKSEQUENCEVERIFY" | "OP_CSV" => Some(Opcode::OP_CHECKSEQUENCEVERIFY),
             "OP_NOP4" => Some(Opcode::OP_NOP4),
             "OP_NOP5" => Some(Opcode::OP_NOP5),
             "OP_NOP6" => Some(Opcode::OP_NOP6),
@@ -566,11 +559,11 @@ pub fn format_stack_to_string(stack: &[Vec<u8>]) -> String {
             if !item.is_empty() && (item.last().unwrap() & 0x80) != 0 {
                 val = -(val & !(0x80i64 << ((item.len() - 1) * 8)));
             }
-            format!(" ({})", val)
+            format!(" ({val})")
         } else {
             String::new()
         };
-        lines.push(format!("  [{}] {}{}", i, hex_str, int_repr));
+        lines.push(format!("  [{i}] {hex_str}{int_repr}"));
     }
     lines.join("\n")
 }
@@ -842,7 +835,10 @@ mod tests {
         assert!(result["weight"].as_u64().unwrap() > 0);
         assert!(result["vsize"].as_u64().unwrap() > 0);
         assert_eq!(result["is_coinbase"], false);
-        assert_eq!(result["simulation"]["valid"], "indeterminate (dry-run without UTXO set)");
+        assert_eq!(
+            result["simulation"]["valid"],
+            "indeterminate (dry-run without UTXO set)"
+        );
     }
 
     #[test]
@@ -862,7 +858,7 @@ mod tests {
     #[test]
     fn test_compile_policy_after() {
         let result = compile_policy("after(100)").unwrap();
-        assert!(result["script_hex"].as_str().unwrap().len() > 0);
+        assert!(!result["script_hex"].as_str().unwrap().is_empty());
         assert!(result["script_size"].as_u64().unwrap() > 0);
         assert_eq!(result["policy"], "after(100)");
     }
@@ -879,8 +875,10 @@ mod tests {
     #[test]
     fn test_watch_address_bech32() {
         // A valid regtest bech32 address
-        let result =
-            watch_address("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080", Network::Regtest);
+        let result = watch_address(
+            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
+            Network::Regtest,
+        );
         assert!(result.is_ok());
         let info = result.unwrap();
         assert_eq!(info["type"], "p2wpkh");
@@ -987,46 +985,27 @@ mod tests {
         let result = build_rpc_request("getblockcount", &[], 8332);
         assert_eq!(result["jsonrpc"], "2.0");
         assert_eq!(result["id"], 1);
-        assert!(result["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("not yet connected"));
-        let req = &result["error"]["data"]["request"];
+        let req = &result;
         assert_eq!(req["method"], "getblockcount");
         assert_eq!(req["params"], serde_json::json!([]));
     }
 
     #[test]
     fn test_build_rpc_request_with_params() {
-        let result = build_rpc_request(
-            "getblockhash",
-            &["100".to_string()],
-            18332,
-        );
-        let req = &result["error"]["data"]["request"];
+        let result = build_rpc_request("getblockhash", &["100".to_string()], 18332);
+        let req = &result;
         assert_eq!(req["method"], "getblockhash");
         // "100" should parse as a JSON number
         assert_eq!(req["params"][0], 100);
-        assert_eq!(
-            result["error"]["data"]["target"],
-            "127.0.0.1:18332"
-        );
     }
 
     #[test]
     fn test_build_rpc_request_with_string_params() {
-        let result = build_rpc_request(
-            "getblock",
-            &["00000000000000001111".to_string()],
-            8332,
-        );
-        let req = &result["error"]["data"]["request"];
+        let result = build_rpc_request("getblock", &["00000000000000001111".to_string()], 8332);
+        let req = &result;
         assert_eq!(req["method"], "getblock");
         // Non-JSON string stays as string
-        assert_eq!(
-            req["params"][0],
-            "00000000000000001111"
-        );
+        assert_eq!(req["params"][0], "00000000000000001111");
     }
 
     // -----------------------------------------------------------------------
@@ -1099,12 +1078,13 @@ mod tests {
 
     #[test]
     fn test_parse_opcode_all_nops() {
-        for name in &["OP_NOP", "OP_NOP1", "OP_NOP4", "OP_NOP5", "OP_NOP6",
-                       "OP_NOP7", "OP_NOP8", "OP_NOP9", "OP_NOP10"] {
+        for name in &[
+            "OP_NOP", "OP_NOP1", "OP_NOP4", "OP_NOP5", "OP_NOP6", "OP_NOP7", "OP_NOP8", "OP_NOP9",
+            "OP_NOP10",
+        ] {
             assert!(
                 matches!(parse_opcode_or_data(name), Some(ScriptItem::Op(_))),
-                "failed to parse {}",
-                name
+                "failed to parse {name}"
             );
         }
     }
@@ -1112,14 +1092,20 @@ mod tests {
     #[test]
     fn test_parse_opcode_crypto_ops() {
         for name in &[
-            "OP_RIPEMD160", "OP_SHA1", "OP_SHA256", "OP_HASH160", "OP_HASH256",
-            "OP_CHECKSIG", "OP_CHECKSIGVERIFY", "OP_CHECKMULTISIG",
-            "OP_CHECKMULTISIGVERIFY", "OP_CHECKSIGADD",
+            "OP_RIPEMD160",
+            "OP_SHA1",
+            "OP_SHA256",
+            "OP_HASH160",
+            "OP_HASH256",
+            "OP_CHECKSIG",
+            "OP_CHECKSIGVERIFY",
+            "OP_CHECKMULTISIG",
+            "OP_CHECKMULTISIGVERIFY",
+            "OP_CHECKSIGADD",
         ] {
             assert!(
                 matches!(parse_opcode_or_data(name), Some(ScriptItem::Op(_))),
-                "failed to parse {}",
-                name
+                "failed to parse {name}"
             );
         }
     }
@@ -1127,15 +1113,28 @@ mod tests {
     #[test]
     fn test_parse_opcode_stack_ops() {
         for name in &[
-            "OP_TOALTSTACK", "OP_FROMALTSTACK", "OP_2DROP", "OP_2DUP",
-            "OP_3DUP", "OP_2OVER", "OP_2ROT", "OP_2SWAP", "OP_IFDUP",
-            "OP_DEPTH", "OP_DROP", "OP_NIP", "OP_OVER", "OP_PICK",
-            "OP_ROLL", "OP_ROT", "OP_SWAP", "OP_TUCK",
+            "OP_TOALTSTACK",
+            "OP_FROMALTSTACK",
+            "OP_2DROP",
+            "OP_2DUP",
+            "OP_3DUP",
+            "OP_2OVER",
+            "OP_2ROT",
+            "OP_2SWAP",
+            "OP_IFDUP",
+            "OP_DEPTH",
+            "OP_DROP",
+            "OP_NIP",
+            "OP_OVER",
+            "OP_PICK",
+            "OP_ROLL",
+            "OP_ROT",
+            "OP_SWAP",
+            "OP_TUCK",
         ] {
             assert!(
                 matches!(parse_opcode_or_data(name), Some(ScriptItem::Op(_))),
-                "failed to parse {}",
-                name
+                "failed to parse {name}"
             );
         }
     }
@@ -1143,27 +1142,47 @@ mod tests {
     #[test]
     fn test_parse_opcode_arithmetic_ops() {
         for name in &[
-            "OP_1ADD", "OP_1SUB", "OP_NEGATE", "OP_ABS", "OP_NOT",
-            "OP_0NOTEQUAL", "OP_ADD", "OP_SUB", "OP_BOOLAND", "OP_BOOLOR",
-            "OP_NUMEQUAL", "OP_NUMEQUALVERIFY", "OP_NUMNOTEQUAL",
-            "OP_LESSTHAN", "OP_GREATERTHAN", "OP_LESSTHANOREQUAL",
-            "OP_GREATERTHANOREQUAL", "OP_MIN", "OP_MAX", "OP_WITHIN",
+            "OP_1ADD",
+            "OP_1SUB",
+            "OP_NEGATE",
+            "OP_ABS",
+            "OP_NOT",
+            "OP_0NOTEQUAL",
+            "OP_ADD",
+            "OP_SUB",
+            "OP_BOOLAND",
+            "OP_BOOLOR",
+            "OP_NUMEQUAL",
+            "OP_NUMEQUALVERIFY",
+            "OP_NUMNOTEQUAL",
+            "OP_LESSTHAN",
+            "OP_GREATERTHAN",
+            "OP_LESSTHANOREQUAL",
+            "OP_GREATERTHANOREQUAL",
+            "OP_MIN",
+            "OP_MAX",
+            "OP_WITHIN",
         ] {
             assert!(
                 matches!(parse_opcode_or_data(name), Some(ScriptItem::Op(_))),
-                "failed to parse {}",
-                name
+                "failed to parse {name}"
             );
         }
     }
 
     #[test]
     fn test_parse_opcode_control_flow() {
-        for name in &["OP_IF", "OP_NOTIF", "OP_ELSE", "OP_ENDIF", "OP_VERIFY", "OP_RETURN"] {
+        for name in &[
+            "OP_IF",
+            "OP_NOTIF",
+            "OP_ELSE",
+            "OP_ENDIF",
+            "OP_VERIFY",
+            "OP_RETURN",
+        ] {
             assert!(
                 matches!(parse_opcode_or_data(name), Some(ScriptItem::Op(_))),
-                "failed to parse {}",
-                name
+                "failed to parse {name}"
             );
         }
     }
@@ -1173,8 +1192,7 @@ mod tests {
         for name in &["OP_SIZE", "OP_EQUAL", "OP_EQUALVERIFY"] {
             assert!(
                 matches!(parse_opcode_or_data(name), Some(ScriptItem::Op(_))),
-                "failed to parse {}",
-                name
+                "failed to parse {name}"
             );
         }
     }
@@ -1404,19 +1422,15 @@ mod tests {
             &[r#"{"hex":"abc"}"#.to_string()],
             8332,
         );
-        let req = &result["error"]["data"]["request"];
+        let req = &result;
         // JSON string params should be parsed as JSON objects
         assert_eq!(req["params"][0]["hex"], "abc");
     }
 
     #[test]
     fn test_build_rpc_request_multiple_params() {
-        let result = build_rpc_request(
-            "getblock",
-            &["abc123".to_string(), "2".to_string()],
-            8332,
-        );
-        let req = &result["error"]["data"]["request"];
+        let result = build_rpc_request("getblock", &["abc123".to_string(), "2".to_string()], 8332);
+        let req = &result;
         assert_eq!(req["params"].as_array().unwrap().len(), 2);
     }
 
@@ -1471,11 +1485,10 @@ mod tests {
     #[test]
     fn test_parse_opcode_numbers_2_through_16() {
         for n in 2..=16 {
-            let name = format!("OP_{}", n);
+            let name = format!("OP_{n}");
             assert!(
                 matches!(parse_opcode_or_data(&name), Some(ScriptItem::Op(_))),
-                "failed to parse {}",
-                name
+                "failed to parse {name}"
             );
         }
     }
@@ -1704,8 +1717,7 @@ mod tests {
         // Build a P2WSH address manually (witness version 0, 32-byte program)
         let witness_program = [0u8; 32];
         let addr_str =
-            btc_primitives::bech32::encode_witness_address("bcrt", 0, &witness_program)
-                .unwrap();
+            btc_primitives::bech32::encode_witness_address("bcrt", 0, &witness_program).unwrap();
         let result = watch_address(&addr_str, Network::Regtest);
         assert!(result.is_ok());
         let info = result.unwrap();
@@ -1717,8 +1729,7 @@ mod tests {
         // Build a P2TR address: witness version 1, 32 byte program
         let witness_program = [0x01u8; 32];
         let addr_str =
-            btc_primitives::bech32::encode_witness_address("bcrt", 1, &witness_program)
-                .unwrap();
+            btc_primitives::bech32::encode_witness_address("bcrt", 1, &witness_program).unwrap();
         let result = watch_address(&addr_str, Network::Regtest);
         assert!(result.is_ok());
         let info = result.unwrap();
@@ -1729,9 +1740,9 @@ mod tests {
     fn test_compile_policy_pk() {
         // A simple pk() policy
         let key_hex = "02".to_string() + &"ab".repeat(32);
-        let policy = format!("pk({})", key_hex);
+        let policy = format!("pk({key_hex})");
         let result = compile_policy(&policy).unwrap();
-        assert!(result["script_hex"].as_str().unwrap().len() > 0);
+        assert!(!result["script_hex"].as_str().unwrap().is_empty());
         assert!(result["asm"].as_str().unwrap().contains("OP_CHECKSIG"));
     }
 }

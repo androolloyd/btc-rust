@@ -35,10 +35,7 @@ pub enum ExExNotification {
     },
 
     /// A block has been reverted (disconnected) from the chain tip.
-    BlockReverted {
-        height: u64,
-        hash: BlockHash,
-    },
+    BlockReverted { height: u64, hash: BlockHash },
 
     /// A chain reorganisation has occurred.
     ChainReorged {
@@ -511,10 +508,7 @@ mod tests {
         let mut ctx = manager.subscribe();
 
         let hash = BlockHash::from_bytes([0xab; 32]);
-        manager.notify(ExExNotification::BlockReverted {
-            height: 100,
-            hash,
-        });
+        manager.notify(ExExNotification::BlockReverted { height: 100, hash });
 
         let notification = ctx.notifications.recv().await.unwrap();
         match notification {
@@ -689,10 +683,9 @@ mod tests {
 
         // Use sender() directly to emit a notification
         let hash = BlockHash::from_bytes([0xcc; 32]);
-        let _ = manager.sender().send(ExExNotification::BlockReverted {
-            height: 55,
-            hash,
-        });
+        let _ = manager
+            .sender()
+            .send(ExExNotification::BlockReverted { height: 55, hash });
 
         let notif = ctx.notifications.recv().await.unwrap();
         match notif {
@@ -919,10 +912,7 @@ mod tests {
         });
 
         // BlockReverted
-        manager.notify(ExExNotification::BlockReverted {
-            height: 1,
-            hash,
-        });
+        manager.notify(ExExNotification::BlockReverted { height: 1, hash });
 
         // ChainReorged
         let old_tip = BlockHash::from_bytes([0xaa; 32]);

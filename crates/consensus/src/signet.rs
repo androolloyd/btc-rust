@@ -1,450 +1,276 @@
-//! BIP325 Signet block challenge validation.
-//!
-//! Signet is a test network where blocks must satisfy a challenge script in
-//! addition to the standard proof-of-work requirement. The challenge is
-//! embedded in the block's coinbase transaction (via a witness commitment),
-//! and the solution (signature/witness satisfying the challenge) is also
-//! placed in the coinbase witness.
-//!
-//! The default signet uses a 1-of-2 multisig challenge controlled by the
-//! signet operators.
-
-use btc_primitives::block::Block;
-use btc_primitives::hash::sha256d;
-use btc_primitives::script::ScriptBuf;
+//! BIP325 challenge verification using the two virtual transactions.
+use crate::{script_engine::ScriptFlags, sig_verify::Secp256k1Verifier, witness::verify_input};
+use btc_primitives::{
+    amount::Amount,
+    block::{merkle_root, Block},
+    encode::{Decodable, ReadExt, VarInt},
+    hash::BlockHash,
+    script::{Instruction, Opcode, ScriptBuf},
+    transaction::{OutPoint, Transaction, TxIn, TxOut, Witness},
+};
 use thiserror::Error;
-
-/// The signet commitment header: 4 bytes identifying a signet block signature
-/// in the coinbase witness. This is `0xecc7daa2` in BIP325.
 const SIGNET_HEADER: [u8; 4] = [0xec, 0xc7, 0xda, 0xa2];
-
-/// Maximum allowed size of a signet solution in bytes.
-const MAX_SIGNET_SOLUTION_SIZE: usize = 10_000;
-
-// ---------------------------------------------------------------------------
-// Errors
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Error)]
 pub enum SignetError {
     #[error("block has no transactions")]
     NoTransactions,
-    #[error("first transaction is not a coinbase")]
+    #[error("first transaction is not coinbase")]
     NoCoinbase,
-    #[error("coinbase has no witness data")]
-    NoWitnessData,
-    #[error("signet commitment not found in coinbase witness")]
+    #[error("BIP141 witness commitment missing")]
     CommitmentNotFound,
-    #[error("signet solution exceeds maximum size ({size} > {max})")]
-    SolutionTooLarge { size: usize, max: usize },
+    #[error("malformed signet solution")]
+    InvalidCommitmentHeader,
     #[error("signet challenge verification failed")]
     ChallengeFailed,
-    #[error("invalid signet commitment header")]
-    InvalidCommitmentHeader,
-    #[error("block signature does not satisfy the challenge script")]
-    InvalidSignature,
 }
-
-// ---------------------------------------------------------------------------
-// SignetChallenge
-// ---------------------------------------------------------------------------
-
-/// The signet challenge script that blocks must satisfy.
-///
-/// On the default signet network this is a 1-of-2 multisig controlled by
-/// the signet operators, but custom signets can use any valid script.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignetChallenge {
-    /// The challenge script that the coinbase witness must satisfy.
     pub script: ScriptBuf,
 }
-
 impl SignetChallenge {
-    /// Create a new signet challenge from a raw script.
     pub fn new(script: ScriptBuf) -> Self {
-        SignetChallenge { script }
+        Self { script }
     }
-
-    /// Return the default signet challenge script.
-    ///
-    /// This is the 1-of-2 multisig used by the default signet network
-    /// (BIP325). The two public keys belong to the signet operators.
     pub fn default_signet() -> Self {
-        // Default signet challenge: OP_1 <pubkey1> <pubkey2> OP_2 OP_CHECKMULTISIG
-        // These are the well-known default signet operator keys.
-        let script_bytes = hex::decode(
-            "512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430\
-             2103348f40a18fc8ebbf4a26a07f8fb37c46eb9e6f1f87d3e0e5e8af20c6d26ae27852ae"
-        ).expect("valid hex for default signet challenge");
-        SignetChallenge {
-            script: ScriptBuf::from_bytes(script_bytes),
-        }
+        Self::new(ScriptBuf::from_bytes(hex::decode("512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae").unwrap()))
     }
 }
-
-// ---------------------------------------------------------------------------
-// Signet commitment extraction
-// ---------------------------------------------------------------------------
-
-/// Extract the signet solution from the coinbase witness.
-///
-/// Per BIP325, the signet commitment is found in the coinbase witness stack.
-/// We look for a witness item that begins with the 4-byte signet header
-/// (`0xecc7daa2`). The remainder of that item is the solution (scriptSig +
-/// scriptWitness satisfying the challenge).
-fn extract_signet_solution(block: &Block) -> Result<Vec<u8>, SignetError> {
-    if block.transactions.is_empty() {
-        return Err(SignetError::NoTransactions);
-    }
-
-    let coinbase = &block.transactions[0];
+/// Construct the BIP325 virtual spend with the solution removed from the
+/// coinbase commitment. Exposed so custom signet miners can sign the same data.
+pub fn signet_transactions(
+    block: &Block,
+    challenge: &SignetChallenge,
+) -> Result<(Transaction, Transaction), SignetError> {
+    let mut coinbase = block
+        .transactions
+        .first()
+        .ok_or(SignetError::NoTransactions)?
+        .clone();
     if !coinbase.is_coinbase() {
         return Err(SignetError::NoCoinbase);
     }
-
-    if coinbase.witness.is_empty() {
-        return Err(SignetError::NoWitnessData);
-    }
-
-    // The signet commitment is in the last output's scriptPubKey as an
-    // OP_RETURN push, but the *solution* (the signature data) is in the
-    // coinbase witness. We search the coinbase's first witness stack for
-    // an item starting with the signet header.
-    let witness = &coinbase.witness[0];
-    for item in witness.iter() {
-        if item.len() >= SIGNET_HEADER.len() && item[..4] == SIGNET_HEADER {
-            let solution = item[4..].to_vec();
-            if solution.len() > MAX_SIGNET_SOLUTION_SIZE {
-                return Err(SignetError::SolutionTooLarge {
-                    size: solution.len(),
-                    max: MAX_SIGNET_SOLUTION_SIZE,
-                });
+    let index = coinbase
+        .outputs
+        .iter()
+        .rposition(|o| {
+            let s = o.script_pubkey.as_bytes();
+            s.len() >= 38 && s[..6] == [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed]
+        })
+        .ok_or(SignetError::CommitmentNotFound)?;
+    let mut replacement = ScriptBuf::new();
+    let mut solution = None;
+    for instruction in coinbase.outputs[index].script_pubkey.instructions() {
+        match instruction.map_err(|_| SignetError::InvalidCommitmentHeader)? {
+            Instruction::Op(op) => replacement.push_opcode(op),
+            Instruction::PushBytes(data) => {
+                if solution.is_none() && data.len() > 4 && data[..4] == SIGNET_HEADER {
+                    solution = Some(data[4..].to_vec());
+                    replacement.push_slice(&SIGNET_HEADER);
+                } else {
+                    replacement.push_slice(data);
+                }
             }
-            return Ok(solution);
         }
     }
-
-    Err(SignetError::CommitmentNotFound)
-}
-
-/// Compute the signet block hash used for signature verification.
-///
-/// Per BIP325, the "signing data" is a modified version of the block where
-/// the signet solution is stripped from the coinbase. We simplify this by
-/// hashing the block header together with the challenge script.
-fn compute_signet_sighash(block: &Block, challenge: &SignetChallenge) -> [u8; 32] {
-    // Build the signing message: block header bytes + challenge script bytes.
-    // This is a simplified version; a full implementation would serialize the
-    // block with the signet solution removed.
-    let mut data = Vec::new();
-
-    // Encode block header (80 bytes).
-    let mut header_buf = [0u8; 80];
-    {
-        use btc_primitives::encode::Encodable;
-        let mut cursor = std::io::Cursor::new(&mut header_buf[..]);
-        block.header.encode(&mut cursor).expect("header encoding cannot fail");
+    let mut script_sig = ScriptBuf::new();
+    let mut witness = Witness::new();
+    if let Some(solution) = solution {
+        coinbase.outputs[index].script_pubkey = replacement;
+        let mut reader = std::io::Cursor::new(&solution);
+        script_sig =
+            ScriptBuf::decode(&mut reader).map_err(|_| SignetError::InvalidCommitmentHeader)?;
+        let count = VarInt::decode(&mut reader)
+            .map_err(|_| SignetError::InvalidCommitmentHeader)?
+            .0;
+        if count > solution.len() as u64 {
+            return Err(SignetError::InvalidCommitmentHeader);
+        }
+        for _ in 0..count {
+            let len = VarInt::decode(&mut reader)
+                .map_err(|_| SignetError::InvalidCommitmentHeader)?
+                .0;
+            if len > solution.len() as u64 {
+                return Err(SignetError::InvalidCommitmentHeader);
+            }
+            witness.push(
+                reader
+                    .read_bytes(len as usize)
+                    .map_err(|_| SignetError::InvalidCommitmentHeader)?,
+            );
+        }
+        if reader.position() != solution.len() as u64 {
+            return Err(SignetError::InvalidCommitmentHeader);
+        }
     }
-    data.extend_from_slice(&header_buf);
-
-    // Append the challenge script bytes.
-    data.extend_from_slice(challenge.script.as_bytes());
-
-    sha256d(&data)
+    let mut leaves = vec![coinbase.txid().to_bytes()];
+    leaves.extend(
+        block
+            .transactions
+            .iter()
+            .skip(1)
+            .map(|t| t.txid().to_bytes()),
+    );
+    let mut block_data = block.header.version.to_le_bytes().to_vec();
+    block_data.extend_from_slice(block.header.prev_blockhash.as_bytes());
+    block_data.extend_from_slice(&merkle_root(&leaves));
+    block_data.extend_from_slice(&block.header.time.to_le_bytes());
+    let mut spend_sig = ScriptBuf::new();
+    spend_sig.push_opcode(Opcode::OP_0);
+    spend_sig.push_slice(&block_data);
+    let spend = Transaction {
+        version: 0,
+        lock_time: 0,
+        inputs: vec![TxIn {
+            previous_output: OutPoint::COINBASE,
+            script_sig: spend_sig,
+            sequence: 0,
+        }],
+        outputs: vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: challenge.script.clone(),
+        }],
+        witness: vec![],
+    };
+    let sign = Transaction {
+        version: 0,
+        lock_time: 0,
+        inputs: vec![TxIn {
+            previous_output: OutPoint::new(spend.txid(), 0),
+            script_sig,
+            sequence: 0,
+        }],
+        outputs: vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(vec![Opcode::OP_RETURN as u8]),
+        }],
+        witness: vec![witness],
+    };
+    Ok((spend, sign))
 }
-
-// ---------------------------------------------------------------------------
-// Validation
-// ---------------------------------------------------------------------------
-
-/// Validate that a signet block satisfies the given challenge.
-///
-/// This performs the following checks:
-/// 1. The coinbase transaction exists and has witness data.
-/// 2. A signet commitment (with the correct header) is found in the witness.
-/// 3. The solution size is within limits.
-/// 4. The solution is valid against the challenge script (simplified check).
-///
-/// Returns `Ok(())` if the block is valid for the given signet challenge,
-/// or a `SignetError` describing why validation failed.
 pub fn validate_signet_block(
     block: &Block,
     challenge: &SignetChallenge,
 ) -> Result<(), SignetError> {
-    // Step 1-3: Extract the signet solution from the coinbase witness.
-    let solution = extract_signet_solution(block)?;
-
-    // Step 4: Verify the solution satisfies the challenge.
-    //
-    // In a full implementation we would:
-    //   a) Compute the signet sighash (block header with solution stripped).
-    //   b) Execute the challenge script with the solution as the scriptSig.
-    //   c) Verify the script evaluates to true.
-    //
-    // For now we perform a simplified verification: we check that the
-    // solution is non-empty (a real signature) and that the sighash can
-    // be computed without error.
-    if solution.is_empty() {
-        return Err(SignetError::InvalidSignature);
+    if block.block_hash()
+        == BlockHash::from_hex("00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6")
+            .unwrap()
+    {
+        return Ok(());
     }
-
-    let _sighash = compute_signet_sighash(block, challenge);
-
-    // The solution must contain at least some data that could plausibly
-    // satisfy a multisig (minimum ~70 bytes for a single DER signature +
-    // OP_0 prefix for CHECKMULTISIG). We use a very conservative minimum.
-    // In production, the full script engine would execute the challenge.
-    if solution.len() < 2 {
-        return Err(SignetError::ChallengeFailed);
-    }
-
-    Ok(())
+    let (spend, sign) = signet_transactions(block, challenge)?;
+    let flags = ScriptFlags {
+        verify_p2sh: true,
+        verify_witness: true,
+        verify_dersig: true,
+        verify_nulldummy: true,
+        ..ScriptFlags::none()
+    };
+    verify_input(&sign, 0, &spend.outputs[0], &Secp256k1Verifier, &flags)
+        .map_err(|_| SignetError::ChallengeFailed)
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use btc_primitives::amount::Amount;
-    use btc_primitives::block::BlockHeader;
-    use btc_primitives::compact::CompactTarget;
-    use btc_primitives::hash::{BlockHash, TxHash};
-    use btc_primitives::script::ScriptBuf;
-    use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut, Witness};
-
-    /// Build a minimal signet block with the given solution in the coinbase witness.
-    fn make_signet_block(solution: Option<Vec<u8>>) -> Block {
-        let header = BlockHeader {
-            version: 1,
-            prev_blockhash: BlockHash::ZERO,
-            merkle_root: TxHash::from_bytes([0u8; 32]),
-            time: 1598918400,
-            bits: CompactTarget::from_u32(0x1e0377ae),
-            nonce: 0,
-        };
-
-        let mut witness = Witness::new();
-        if let Some(sol) = solution {
-            // Build the commitment: SIGNET_HEADER + solution
-            let mut commitment = SIGNET_HEADER.to_vec();
-            commitment.extend_from_slice(&sol);
-            witness.push(commitment);
-        } else {
-            // Push the standard segwit coinbase witness commitment (32 zero bytes)
-            witness.push(vec![0u8; 32]);
-        }
-
-        let coinbase = Transaction {
-            version: 2,
-            inputs: vec![TxIn {
-                previous_output: OutPoint::COINBASE,
-                script_sig: ScriptBuf::from_bytes(vec![0x51, 0x01, 0x01]),
-                sequence: TxIn::SEQUENCE_FINAL,
-            }],
-            outputs: vec![TxOut {
-                value: Amount::from_sat(5_000_000_000),
-                script_pubkey: ScriptBuf::new(),
-            }],
-            witness: vec![witness],
-            lock_time: 0,
-        };
-
+    use btc_primitives::hash::TxHash;
+    use btc_primitives::{
+        block::BlockHeader, compact::CompactTarget, encode::encode, hash::sha256d,
+    };
+    fn block() -> Block {
+        let mut commitment = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+        commitment.extend_from_slice(&[0; 32]);
         Block {
-            header,
-            transactions: vec![coinbase],
-        }
-    }
-
-    #[test]
-    fn test_signet_challenge_default() {
-        let challenge = SignetChallenge::default_signet();
-        // Default signet challenge is a 1-of-2 multisig, which starts with OP_1 (0x51)
-        assert!(!challenge.script.is_empty());
-        assert_eq!(challenge.script.as_bytes()[0], 0x51); // OP_1
-    }
-
-    #[test]
-    fn test_valid_signet_block() {
-        let challenge = SignetChallenge::new(ScriptBuf::from_bytes(vec![0x51])); // OP_1 (always true)
-        // Solution: a fake signature (just needs to be non-empty and >= 2 bytes)
-        let solution = vec![0x30, 0x44, 0x02, 0x20]; // DER sig prefix
-        let block = make_signet_block(Some(solution));
-
-        let result = validate_signet_block(&block, &challenge);
-        assert!(result.is_ok(), "valid signet block should pass: {:?}", result);
-    }
-
-    #[test]
-    fn test_reject_missing_commitment() {
-        let challenge = SignetChallenge::new(ScriptBuf::from_bytes(vec![0x51]));
-        // Block without signet commitment (just standard witness)
-        let block = make_signet_block(None);
-
-        let result = validate_signet_block(&block, &challenge);
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            SignetError::CommitmentNotFound => {} // expected
-            other => panic!("expected CommitmentNotFound, got: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_reject_empty_solution() {
-        let challenge = SignetChallenge::new(ScriptBuf::from_bytes(vec![0x51]));
-        // Empty solution (signet header present but no data after it)
-        let block = make_signet_block(Some(vec![]));
-
-        let result = validate_signet_block(&block, &challenge);
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            SignetError::InvalidSignature => {} // expected
-            other => panic!("expected InvalidSignature, got: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_reject_no_transactions() {
-        let challenge = SignetChallenge::new(ScriptBuf::from_bytes(vec![0x51]));
-        let block = Block {
             header: BlockHeader {
                 version: 1,
                 prev_blockhash: BlockHash::ZERO,
-                merkle_root: TxHash::from_bytes([0u8; 32]),
-                time: 1598918400,
+                merkle_root: TxHash::ZERO,
+                time: 1598918401,
                 bits: CompactTarget::from_u32(0x1e0377ae),
                 nonce: 0,
             },
-            transactions: vec![],
-        };
-
-        let result = validate_signet_block(&block, &challenge);
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            SignetError::NoTransactions => {}
-            other => panic!("expected NoTransactions, got: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_reject_non_coinbase() {
-        let challenge = SignetChallenge::new(ScriptBuf::from_bytes(vec![0x51]));
-        // A block whose first transaction is NOT a coinbase
-        let non_coinbase = Transaction {
-            version: 2,
-            inputs: vec![TxIn {
-                previous_output: OutPoint::new(TxHash::from_bytes([0xab; 32]), 0),
-                script_sig: ScriptBuf::new(),
-                sequence: TxIn::SEQUENCE_FINAL,
-            }],
-            outputs: vec![TxOut {
-                value: Amount::from_sat(1_000),
-                script_pubkey: ScriptBuf::new(),
-            }],
-            witness: vec![],
-            lock_time: 0,
-        };
-
-        let block = Block {
-            header: BlockHeader {
+            transactions: vec![Transaction {
                 version: 1,
-                prev_blockhash: BlockHash::ZERO,
-                merkle_root: TxHash::from_bytes([0u8; 32]),
-                time: 1598918400,
-                bits: CompactTarget::from_u32(0x1e0377ae),
-                nonce: 0,
-            },
-            transactions: vec![non_coinbase],
-        };
-
-        let result = validate_signet_block(&block, &challenge);
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            SignetError::NoCoinbase => {}
-            other => panic!("expected NoCoinbase, got: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_reject_no_witness() {
-        let challenge = SignetChallenge::new(ScriptBuf::from_bytes(vec![0x51]));
-        // Coinbase without any witness data
-        let coinbase = Transaction {
-            version: 2,
-            inputs: vec![TxIn {
-                previous_output: OutPoint::COINBASE,
-                script_sig: ScriptBuf::from_bytes(vec![0x51, 0x01, 0x01]),
-                sequence: TxIn::SEQUENCE_FINAL,
+                inputs: vec![TxIn {
+                    previous_output: OutPoint::COINBASE,
+                    script_sig: ScriptBuf::from_bytes(vec![1, 1]),
+                    sequence: u32::MAX,
+                }],
+                outputs: vec![TxOut {
+                    value: Amount::ZERO,
+                    script_pubkey: ScriptBuf::from_bytes(commitment),
+                }],
+                witness: vec![Witness::from_items(vec![vec![0; 32]])],
+                lock_time: 0,
             }],
-            outputs: vec![TxOut {
-                value: Amount::from_sat(5_000_000_000),
-                script_pubkey: ScriptBuf::new(),
-            }],
-            witness: vec![],
-            lock_time: 0,
-        };
-
-        let block = Block {
-            header: BlockHeader {
-                version: 1,
-                prev_blockhash: BlockHash::ZERO,
-                merkle_root: TxHash::from_bytes([0u8; 32]),
-                time: 1598918400,
-                bits: CompactTarget::from_u32(0x1e0377ae),
-                nonce: 0,
-            },
-            transactions: vec![coinbase],
-        };
-
-        let result = validate_signet_block(&block, &challenge);
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            SignetError::NoWitnessData => {}
-            other => panic!("expected NoWitnessData, got: {:?}", other),
         }
     }
-
     #[test]
-    fn test_signet_challenge_custom_script() {
-        // Verify we can create a custom challenge with an arbitrary script
-        let custom_script = ScriptBuf::from_bytes(vec![0xac]); // OP_CHECKSIG
-        let challenge = SignetChallenge::new(custom_script.clone());
-        assert_eq!(challenge.script, custom_script);
+    fn standard_challenge_matches_network_magic() {
+        let c = SignetChallenge::default_signet();
+        let encoded = encode(&c.script);
+        assert_eq!(&sha256d(&encoded)[..4], &[0x0a, 0x03, 0xcf, 0x40]);
     }
-
     #[test]
-    fn test_solution_too_short_fails() {
-        let challenge = SignetChallenge::new(ScriptBuf::from_bytes(vec![0x51]));
-        // Solution of only 1 byte should fail the minimum length check
-        let block = make_signet_block(Some(vec![0x01]));
-
-        let result = validate_signet_block(&block, &challenge);
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            SignetError::ChallengeFailed => {}
-            other => panic!("expected ChallengeFailed, got: {:?}", other),
-        }
+    fn trivial_challenge_needs_no_solution() {
+        let b = block();
+        assert!(validate_signet_block(
+            &b,
+            &SignetChallenge::new(ScriptBuf::from_bytes(vec![0x51]))
+        )
+        .is_ok());
+        assert!(validate_signet_block(&b, &SignetChallenge::default_signet()).is_err());
     }
-
-    // ---- Coverage: solution too large (line 118-120) ----
-
     #[test]
-    fn test_solution_too_large() {
-        let challenge = SignetChallenge::new(ScriptBuf::from_bytes(vec![0x51]));
-        // Create a solution larger than MAX_SIGNET_SOLUTION_SIZE
-        let huge_solution = vec![0x42; MAX_SIGNET_SOLUTION_SIZE + 1];
-        let block = make_signet_block(Some(huge_solution));
-
-        let result = validate_signet_block(&block, &challenge);
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            SignetError::SolutionTooLarge { size, max } => {
-                assert_eq!(max, MAX_SIGNET_SOLUTION_SIZE);
-                assert!(size > MAX_SIGNET_SOLUTION_SIZE);
-            }
-            other => panic!("expected SolutionTooLarge, got: {:?}", other),
-        }
+    fn real_signature_and_header_tampering() {
+        use crate::sighash::{sighash_legacy, SighashType};
+        use secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[1; 32]).unwrap();
+        let pk = PublicKey::from_secret_key(&secp, &sk);
+        let mut script = ScriptBuf::new();
+        script.push_slice(&pk.serialize());
+        script.push_opcode(Opcode::OP_CHECKSIG);
+        let challenge = SignetChallenge::new(script);
+        let mut b = block();
+        let mut empty = SIGNET_HEADER.to_vec();
+        empty.extend_from_slice(&[0, 0]);
+        b.transactions[0].outputs[0]
+            .script_pubkey
+            .push_slice(&empty);
+        let (_, sign) = signet_transactions(&b, &challenge).unwrap();
+        let digest =
+            sighash_legacy(&sign, 0, challenge.script.as_bytes(), SighashType::ALL).unwrap();
+        let mut signature = secp
+            .sign_ecdsa(&Message::from_digest(digest), &sk)
+            .serialize_der()
+            .to_vec();
+        signature.push(1);
+        let mut sig = ScriptBuf::new();
+        sig.push_slice(&signature);
+        let mut solution = SIGNET_HEADER.to_vec();
+        solution.extend(encode(&sig));
+        solution.push(0);
+        b.transactions[0].outputs[0].script_pubkey =
+            block().transactions[0].outputs[0].script_pubkey.clone();
+        b.transactions[0].outputs[0]
+            .script_pubkey
+            .push_slice(&solution);
+        assert!(validate_signet_block(&b, &challenge).is_ok());
+        b.header.nonce += 1;
+        assert!(validate_signet_block(&b, &challenge).is_ok());
+        b.header.time += 1;
+        assert!(validate_signet_block(&b, &challenge).is_err());
+    }
+    #[test]
+    fn malformed_solution_rejected() {
+        let mut b = block();
+        let mut solution = SIGNET_HEADER.to_vec();
+        solution.extend([0xfd, 1, 0]);
+        b.transactions[0].outputs[0]
+            .script_pubkey
+            .push_slice(&solution);
+        assert!(matches!(
+            signet_transactions(&b, &SignetChallenge::default_signet()),
+            Err(SignetError::InvalidCommitmentHeader)
+        ));
     }
 }

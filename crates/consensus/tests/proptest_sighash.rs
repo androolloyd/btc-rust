@@ -4,7 +4,7 @@
 
 use proptest::prelude::*;
 
-use btc_consensus::script_engine::{encode_num, decode_num};
+use btc_consensus::script_engine::{decode_num, encode_num};
 use btc_consensus::sighash::{sighash_legacy, SighashType};
 use btc_primitives::amount::Amount;
 use btc_primitives::hash::TxHash;
@@ -16,9 +16,8 @@ use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
 // ---------------------------------------------------------------------------
 
 fn arb_outpoint() -> impl Strategy<Value = OutPoint> {
-    (any::<[u8; 32]>(), any::<u32>()).prop_map(|(hash, vout)| {
-        OutPoint::new(TxHash::from_bytes(hash), vout)
-    })
+    (any::<[u8; 32]>(), any::<u32>())
+        .prop_map(|(hash, vout)| OutPoint::new(TxHash::from_bytes(hash), vout))
 }
 
 fn arb_script(max_len: usize) -> impl Strategy<Value = ScriptBuf> {
@@ -26,21 +25,19 @@ fn arb_script(max_len: usize) -> impl Strategy<Value = ScriptBuf> {
 }
 
 fn arb_txin() -> impl Strategy<Value = TxIn> {
-    (arb_outpoint(), arb_script(50), any::<u32>()).prop_map(|(previous_output, script_sig, sequence)| {
-        TxIn {
+    (arb_outpoint(), arb_script(50), any::<u32>()).prop_map(
+        |(previous_output, script_sig, sequence)| TxIn {
             previous_output,
             script_sig,
             sequence,
-        }
-    })
+        },
+    )
 }
 
 fn arb_txout() -> impl Strategy<Value = TxOut> {
-    (any::<i64>(), arb_script(50)).prop_map(|(value, script_pubkey)| {
-        TxOut {
-            value: Amount::from_sat(value),
-            script_pubkey,
-        }
+    (any::<i64>(), arb_script(50)).prop_map(|(value, script_pubkey)| TxOut {
+        value: Amount::from_sat(value),
+        script_pubkey,
     })
 }
 
@@ -52,14 +49,12 @@ fn arb_sighash_tx() -> impl Strategy<Value = Transaction> {
         prop::collection::vec(arb_txout(), 1..=3),
         any::<u32>(),
     )
-        .prop_map(|(version, inputs, outputs, lock_time)| {
-            Transaction {
-                version,
-                inputs,
-                outputs,
-                witness: Vec::new(),
-                lock_time,
-            }
+        .prop_map(|(version, inputs, outputs, lock_time)| Transaction {
+            version,
+            inputs,
+            outputs,
+            witness: Vec::new(),
+            lock_time,
         })
 }
 

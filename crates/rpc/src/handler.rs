@@ -202,10 +202,7 @@ impl RpcHandler {
 
         // --- getblockheader ---
         handler.register(METHOD_GETBLOCKHEADER, |params| {
-            let _hash = params
-                .get(0)
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
+            let _hash = params.get(0).and_then(|v| v.as_str()).unwrap_or_default();
             serde_json::json!({
                 "hash": _hash,
                 "confirmations": 1,
@@ -352,7 +349,7 @@ impl RpcHandler {
                 let curtime = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
-                    .unwrap_or(0) as u64;
+                    .unwrap_or(0);
                 // Coinbase value: subsidy for next block height (no fees from empty tx list)
                 let subsidy = block_subsidy_sats(h + 1);
 
@@ -446,7 +443,9 @@ impl RpcHandler {
                     }
                 };
                 // params[1] is the dummy value (ignored, for Bitcoin Core compat)
-                let fee_delta = match params.get(2).and_then(|v| v.as_i64())
+                let fee_delta = match params
+                    .get(2)
+                    .and_then(|v| v.as_i64())
                     .or_else(|| params.get(1).and_then(|v| v.as_i64()))
                 {
                     Some(d) => d,
@@ -484,9 +483,7 @@ impl RpcHandler {
                 };
                 // In regtest, generate nblocks placeholder hashes.
                 // Real block generation requires full chain integration.
-                let hashes: Vec<String> = (0..nblocks)
-                    .map(|i| format!("{:064x}", i + 1))
-                    .collect();
+                let hashes: Vec<String> = (0..nblocks).map(|i| format!("{:064x}", i + 1)).collect();
                 serde_json::json!(hashes)
             });
         }
@@ -602,12 +599,12 @@ fn block_subsidy_sats(height: u64) -> u64 {
     if halvings >= 64 {
         return 0;
     }
-    50 * 100_000_000u64 >> halvings
+    (50 * 100_000_000u64) >> halvings
 }
 
 /// Convert compact bits to floating-point difficulty.
 fn compact_bits_to_difficulty(bits: u32) -> f64 {
-    let exponent = (bits >> 24) as u32;
+    let exponent = bits >> 24;
     let mantissa = (bits & 0x00ff_ffff) as f64;
     if mantissa == 0.0 {
         return 0.0;
@@ -733,9 +730,7 @@ mod tests {
         let hash = resp.result.unwrap();
         assert_eq!(
             hash,
-            serde_json::json!(
-                "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
-            )
+            serde_json::json!("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
         );
     }
 
@@ -744,9 +739,7 @@ mod tests {
         let handler = RpcHandler::new();
         let req = make_request(
             METHOD_GETBLOCKHEADER,
-            serde_json::json!([
-                "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
-            ]),
+            serde_json::json!(["000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"]),
         );
         let resp = handler.handle(&req);
         assert!(resp.error.is_none());
@@ -941,9 +934,7 @@ mod tests {
         assert!(resp.error.is_none());
         assert_eq!(
             resp.result.unwrap(),
-            serde_json::json!(
-                "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
-            )
+            serde_json::json!("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
         );
 
         // After update
@@ -1000,9 +991,7 @@ mod tests {
         // Non-genesis returns zeroed hash placeholder
         assert_eq!(
             resp.result.unwrap(),
-            serde_json::json!(
-                "0000000000000000000000000000000000000000000000000000000000000000"
-            )
+            serde_json::json!("0000000000000000000000000000000000000000000000000000000000000000")
         );
     }
 
@@ -1011,7 +1000,10 @@ mod tests {
     #[test]
     fn test_getblocktemplate_returns_valid_json() {
         let handler = RpcHandler::new();
-        handler.update_chain_state(810000, "0000000000000000000000000000000000000000000000000000000000abcdef");
+        handler.update_chain_state(
+            810000,
+            "0000000000000000000000000000000000000000000000000000000000abcdef",
+        );
         let req = make_request(METHOD_GETBLOCKTEMPLATE, serde_json::json!([]));
         let resp = handler.handle(&req);
         assert!(resp.error.is_none());
@@ -1042,7 +1034,10 @@ mod tests {
         assert!(resp.error.is_none()); // returns a result, not an RPC-level error
         let result = resp.result.unwrap();
         let msg = result.as_str().unwrap();
-        assert!(msg.contains("invalid hex"), "expected hex error, got: {}", msg);
+        assert!(
+            msg.contains("invalid hex"),
+            "expected hex error, got: {msg}"
+        );
     }
 
     #[test]
@@ -1054,7 +1049,10 @@ mod tests {
         assert!(resp.error.is_none());
         let result = resp.result.unwrap();
         let msg = result.as_str().unwrap();
-        assert!(msg.contains("decode error"), "expected decode error, got: {}", msg);
+        assert!(
+            msg.contains("decode error"),
+            "expected decode error, got: {msg}"
+        );
     }
 
     #[test]
@@ -1124,12 +1122,7 @@ mod tests {
         let result = resp.result.unwrap();
         // Should contain an error message, not an array of hashes
         assert!(result["error"].is_string());
-        assert!(
-            result["error"]
-                .as_str()
-                .unwrap()
-                .contains("regtest"),
-        );
+        assert!(result["error"].as_str().unwrap().contains("regtest"),);
     }
 
     #[test]
@@ -1273,10 +1266,7 @@ mod tests {
     fn test_prioritisetransaction_no_fee_delta() {
         let handler = RpcHandler::new();
         let txid = "aaaa000000000000000000000000000000000000000000000000000000000001";
-        let req = make_request(
-            METHOD_PRIORITISETRANSACTION,
-            serde_json::json!([txid]),
-        );
+        let req = make_request(METHOD_PRIORITISETRANSACTION, serde_json::json!([txid]));
         let resp = handler.handle(&req);
         assert!(resp.error.is_none());
         assert_eq!(resp.result.unwrap(), serde_json::json!(false));
@@ -1732,13 +1722,13 @@ mod tests {
 
     #[test]
     fn test_submitblock_valid_block_with_coinbase() {
+        use btc_primitives::amount::Amount;
         use btc_primitives::block::{Block, BlockHeader};
         use btc_primitives::compact::CompactTarget;
         use btc_primitives::encode::Encodable;
         use btc_primitives::hash::{BlockHash, TxHash};
-        use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
         use btc_primitives::script::ScriptBuf;
-        use btc_primitives::amount::Amount;
+        use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
 
         let handler = RpcHandler::new();
 
@@ -1811,18 +1801,21 @@ mod tests {
         let resp = handler.handle(&req);
         assert!(resp.error.is_none());
         let msg = resp.result.unwrap();
-        assert_eq!(msg.as_str().unwrap(), "block must have at least one transaction");
+        assert_eq!(
+            msg.as_str().unwrap(),
+            "block must have at least one transaction"
+        );
     }
 
     #[test]
     fn test_submitblock_non_coinbase_first_tx() {
+        use btc_primitives::amount::Amount;
         use btc_primitives::block::{Block, BlockHeader};
         use btc_primitives::compact::CompactTarget;
         use btc_primitives::encode::Encodable;
         use btc_primitives::hash::{BlockHash, TxHash};
-        use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
         use btc_primitives::script::ScriptBuf;
-        use btc_primitives::amount::Amount;
+        use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
 
         let handler = RpcHandler::new();
 

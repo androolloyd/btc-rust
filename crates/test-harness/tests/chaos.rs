@@ -3,11 +3,11 @@
 //! These tests use the btc-test harness to mine blocks with complex
 //! transactions and verify the node handles them correctly.
 
-use btc_test::{TestNode, TestKeyPair, ScriptBuilder};
-use btc_primitives::script::{Opcode, ScriptBuf};
-use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint};
 use btc_primitives::amount::Amount;
 use btc_primitives::hash::TxHash;
+use btc_primitives::script::{Opcode, ScriptBuf};
+use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
+use btc_test::{ScriptBuilder, TestKeyPair, TestNode};
 
 // ============================================================================
 // Basic spending patterns
@@ -105,7 +105,7 @@ fn test_max_script_size() {
     // Script just under the 10KB limit using multiple 520-byte pushes
     let mut script = ScriptBuf::new();
     let chunk = vec![0x42u8; 520]; // Max push size
-    // 19 pushes * (3 + 520) = 9937 bytes + 19 OP_DROP + 1 OP_1 = 9957 bytes
+                                   // 19 pushes * (3 + 520) = 9937 bytes + 19 OP_DROP + 1 OP_1 = 9957 bytes
     for _ in 0..19 {
         script.push_slice(&chunk);
         script.push_opcode(Opcode::OP_DROP);
@@ -160,7 +160,7 @@ fn test_op_count_limit() {
 
 #[test]
 fn test_arithmetic_boundary_values() {
-    use btc_consensus::script_engine::{ScriptEngine, ScriptFlags, encode_num};
+    use btc_consensus::script_engine::{encode_num, ScriptEngine, ScriptFlags};
     use btc_consensus::sig_verify::Secp256k1Verifier;
 
     static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
@@ -181,7 +181,7 @@ fn test_arithmetic_boundary_values() {
 
 #[test]
 fn test_negative_numbers() {
-    use btc_consensus::script_engine::{ScriptEngine, ScriptFlags, decode_num};
+    use btc_consensus::script_engine::{decode_num, ScriptEngine, ScriptFlags};
     use btc_consensus::sig_verify::Secp256k1Verifier;
 
     static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
@@ -216,7 +216,7 @@ fn test_hash_chain() {
     script.push_opcode(Opcode::OP_RIPEMD160);
     script.push_opcode(Opcode::OP_SHA256);
     script.push_opcode(Opcode::OP_HASH256); // SHA256d
-    // Result is 32 bytes — truthy
+                                            // Result is 32 bytes — truthy
     script.push_opcode(Opcode::OP_SIZE);
     // Stack: [32-byte-hash, 32]
     // 32 is truthy
@@ -268,7 +268,7 @@ fn test_stack_overflow_rejected() {
 
 #[test]
 fn test_altstack_operations() {
-    use btc_consensus::script_engine::{ScriptEngine, ScriptFlags, decode_num};
+    use btc_consensus::script_engine::{decode_num, ScriptEngine, ScriptFlags};
     use btc_consensus::sig_verify::Secp256k1Verifier;
 
     static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
@@ -294,7 +294,7 @@ fn test_altstack_operations() {
 
 #[test]
 fn test_cltv_with_valid_locktime() {
-    use btc_consensus::script_engine::{ScriptEngine, ScriptFlags, encode_num};
+    use btc_consensus::script_engine::{encode_num, ScriptEngine, ScriptFlags};
     use btc_consensus::sig_verify::Secp256k1Verifier;
 
     static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
@@ -334,7 +334,7 @@ fn test_cltv_with_valid_locktime() {
 
 #[test]
 fn test_cltv_rejects_premature_spend() {
-    use btc_consensus::script_engine::{ScriptEngine, ScriptFlags, encode_num};
+    use btc_consensus::script_engine::{encode_num, ScriptEngine, ScriptFlags};
     use btc_consensus::sig_verify::Secp256k1Verifier;
 
     static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
@@ -491,7 +491,10 @@ fn test_multiple_keys_different_scripts() {
     // All scripts should be unique
     for i in 0..scripts.len() {
         for j in (i + 1)..scripts.len() {
-            assert_ne!(scripts[i], scripts[j], "keys {} and {} produced same script", i, j);
+            assert_ne!(
+                scripts[i], scripts[j],
+                "keys {i} and {j} produced same script"
+            );
         }
     }
 }

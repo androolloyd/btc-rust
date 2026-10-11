@@ -1,6 +1,6 @@
 use crate::stage::{ExecOutput, Stage, StageError, StageId, UnwindOutput, TX_INDEX};
-use tracing::info;
 use std::collections::HashMap;
+use tracing::info;
 
 /// Maximum number of blocks to index in a single batch.
 const INDEXING_BATCH_SIZE: u64 = 1000;
@@ -164,9 +164,7 @@ impl Stage for IndexingStage {
 
         self.checkpoint = target;
 
-        Ok(UnwindOutput {
-            checkpoint: target,
-        })
+        Ok(UnwindOutput { checkpoint: target })
     }
 }
 

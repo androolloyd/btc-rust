@@ -5,17 +5,12 @@
 //! processing, and the specialized indexing plugins (Ordinals, Runes).
 
 use btc_consensus::utxo::{UtxoEntry, UtxoSetUpdate};
-use btc_exex::ordinals::{
-    scan_transaction_for_inscriptions, OrdinalsExEx,
-};
+use btc_exex::ordinals::{scan_transaction_for_inscriptions, OrdinalsExEx};
 use btc_exex::runes::{
     build_etch_payload, build_mint_payload, build_runestone_script, build_transfer_payload,
     parse_runestone, RuneOperation, RunesExEx,
 };
-use btc_exex::{
-    ExEx, ExExManager, ExExNotification, LoggingExEx, MetricsExEx,
-};
-use tokio::sync::broadcast;
+use btc_exex::{ExEx, ExExManager, ExExNotification, LoggingExEx, MetricsExEx};
 use btc_primitives::amount::Amount;
 use btc_primitives::block::{Block, BlockHeader};
 use btc_primitives::compact::CompactTarget;
@@ -23,6 +18,7 @@ use btc_primitives::hash::{BlockHash, TxHash};
 use btc_primitives::network::Network;
 use btc_primitives::script::{Opcode, ScriptBuf};
 use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut, Witness};
+use tokio::sync::broadcast;
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -265,10 +261,7 @@ async fn test_logging_exex_processes_all_notification_types() {
         utxo_changes,
     });
 
-    manager.notify(ExExNotification::BlockReverted {
-        height: 1,
-        hash,
-    });
+    manager.notify(ExExNotification::BlockReverted { height: 1, hash });
 
     let old_tip = BlockHash::from_bytes([0x01; 32]);
     let new_tip = BlockHash::from_bytes([0x02; 32]);
@@ -542,7 +535,7 @@ async fn test_multiple_exex_concurrent() {
         if i % 10 == 0 {
             let inscription_tx = make_inscription_tx(
                 "text/plain",
-                format!("inscription #{}", i).as_bytes(),
+                format!("inscription #{i}").as_bytes(),
                 (i as u8).wrapping_add(1),
             );
             txs.push(inscription_tx);
@@ -550,7 +543,7 @@ async fn test_multiple_exex_concurrent() {
 
         // Every 15th block: add a rune etch
         if i % 15 == 0 {
-            let name = format!("RUNE{}", i);
+            let name = format!("RUNE{i}");
             let payload = build_etch_payload(&name, '#', (i as u128 + 1) * 1000);
             let rune_tx = make_rune_tx(&payload, (i as u8).wrapping_add(128));
             txs.push(rune_tx);
@@ -614,10 +607,7 @@ async fn test_block_reverted_flows_to_all_subscribers() {
     let mut ctx3 = manager.subscribe();
 
     let hash = BlockHash::from_bytes([0xbb; 32]);
-    manager.notify(ExExNotification::BlockReverted {
-        height: 42,
-        hash,
-    });
+    manager.notify(ExExNotification::BlockReverted { height: 42, hash });
 
     for ctx in [&mut ctx1, &mut ctx2, &mut ctx3] {
         let notif = ctx.notifications.recv().await.unwrap();
@@ -714,7 +704,9 @@ fn test_multiple_rune_txs_in_block() {
     assert!(matches!(&ops2[0], RuneOperation::Mint { rune_id } if rune_id == "100:0"));
 
     assert_eq!(ops3.len(), 1);
-    assert!(matches!(&ops3[0], RuneOperation::Transfer { rune_id, amount } if rune_id == "100:0" && *amount == 500));
+    assert!(
+        matches!(&ops3[0], RuneOperation::Transfer { rune_id, amount } if rune_id == "100:0" && *amount == 500)
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -75,7 +75,9 @@ impl Default for RbfPolicy {
 /// Per BIP125, a transaction is considered to have opted in to RBF if any
 /// of its inputs has an nSequence number strictly less than `0xfffffffe`.
 pub fn signals_rbf(tx: &Transaction) -> bool {
-    tx.inputs.iter().any(|input| input.sequence < RBF_SEQUENCE_THRESHOLD)
+    tx.inputs
+        .iter()
+        .any(|input| input.sequence < RBF_SEQUENCE_THRESHOLD)
 }
 
 /// Determine whether `new_tx` may replace the given set of conflicting
@@ -139,10 +141,7 @@ pub fn can_replace(
     // In practice each conflict may have descendants in the mempool.
     // The `descendants` field on MempoolEntry tracks how many.  We sum them
     // up, counting each conflict itself as one displaced tx.
-    let total_displaced: usize = conflicts
-        .iter()
-        .map(|(_, e)| 1 + e.descendants)
-        .sum();
+    let total_displaced: usize = conflicts.iter().map(|(_, e)| 1 + e.descendants).sum();
 
     if total_displaced > policy.max_replacements {
         return Err(RbfError::TooManyReplacements {
@@ -173,9 +172,7 @@ pub fn can_replace(
         // any of the replaced txs AND its txid matches a conflict, it is
         // a new unconfirmed input.
         if !old_inputs.contains(&outpoint) {
-            let spends_conflict = conflicts
-                .iter()
-                .any(|(txid, _)| *txid == outpoint.txid);
+            let spends_conflict = conflicts.iter().any(|(txid, _)| *txid == outpoint.txid);
             if spends_conflict {
                 return Err(RbfError::NewUnconfirmedInput(outpoint.txid.to_hex()));
             }
@@ -467,7 +464,10 @@ mod tests {
 
         assert!(matches!(
             can_replace(&new_tx, Amount::from_sat(10_000), &conflicts, &policy),
-            Err(RbfError::TooManyReplacements { count: 101, max: 100 }),
+            Err(RbfError::TooManyReplacements {
+                count: 101,
+                max: 100
+            }),
         ));
     }
 
@@ -780,14 +780,14 @@ mod tests {
     #[test]
     fn test_rbf_error_display_disabled() {
         let err = RbfError::Disabled;
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(msg.contains("disabled"));
     }
 
     #[test]
     fn test_rbf_error_display_not_signaling() {
         let err = RbfError::NotSignaling("aabb".to_string());
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(msg.contains("aabb"));
         assert!(msg.contains("replaceability"));
     }
@@ -799,7 +799,7 @@ mod tests {
             old_fee: 5000,
             min_increment: 1000,
         };
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(msg.contains("3000"));
         assert!(msg.contains("5000"));
     }
@@ -810,7 +810,7 @@ mod tests {
             count: 150,
             max: 100,
         };
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(msg.contains("150"));
         assert!(msg.contains("100"));
     }
@@ -818,7 +818,7 @@ mod tests {
     #[test]
     fn test_rbf_error_display_new_unconfirmed_input() {
         let err = RbfError::NewUnconfirmedInput("deadbeef".to_string());
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(msg.contains("deadbeef"));
         assert!(msg.contains("unconfirmed"));
     }
@@ -826,10 +826,7 @@ mod tests {
     #[test]
     fn test_rbf_error_equality() {
         assert_eq!(RbfError::Disabled, RbfError::Disabled);
-        assert_ne!(
-            RbfError::Disabled,
-            RbfError::NotSignaling("x".to_string()),
-        );
+        assert_ne!(RbfError::Disabled, RbfError::NotSignaling("x".to_string()),);
     }
 
     #[test]
@@ -841,8 +838,8 @@ mod tests {
             max_replacements: 50,
         };
         let cloned = policy.clone();
-        assert_eq!(cloned.enabled, false);
-        assert_eq!(cloned.full_rbf, false);
+        assert!(!cloned.enabled);
+        assert!(!cloned.full_rbf);
         assert_eq!(cloned.min_fee_increment.as_sat(), 5_000);
         assert_eq!(cloned.max_replacements, 50);
     }
@@ -850,14 +847,14 @@ mod tests {
     #[test]
     fn test_rbf_policy_debug() {
         let policy = RbfPolicy::default();
-        let debug = format!("{:?}", policy);
+        let debug = format!("{policy:?}");
         assert!(debug.contains("RbfPolicy"));
     }
 
     #[test]
     fn test_rbf_error_debug() {
         let err = RbfError::Disabled;
-        let debug = format!("{:?}", err);
+        let debug = format!("{err:?}");
         assert!(debug.contains("Disabled"));
     }
 

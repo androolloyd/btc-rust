@@ -6,12 +6,12 @@
 //! - `verify_witness_program()` -- validates witness data against a witness program
 //! - `verify_input()` -- top-level per-input verification that dispatches based on script type
 
-use btc_primitives::hash::{hash160, sha256};
-use btc_primitives::script::{Script, ScriptBuf, Opcode};
-use btc_primitives::transaction::{Transaction, TxOut, Witness};
 use crate::script_engine::{ScriptEngine, ScriptFlags};
 use crate::sig_verify::SignatureVerifier;
-use crate::sighash::{sighash_segwit_v0, SighashType, p2wpkh_script_code};
+use crate::sighash::{p2wpkh_script_code, sighash_segwit_v0, SighashType};
+use btc_primitives::hash::{hash160, sha256};
+use btc_primitives::script::{Opcode, Script, ScriptBuf};
+use btc_primitives::transaction::{Transaction, TxOut, Witness};
 use thiserror::Error;
 
 /// Errors that can occur during witness verification.
@@ -60,7 +60,10 @@ pub enum WitnessError {
     LegacyScriptFailed,
 
     #[error("P2WSH script execution failed: stack result is false (witness_items={witness_items}, script_len={script_len})")]
-    P2wshScriptFailed { witness_items: usize, script_len: usize },
+    P2wshScriptFailed {
+        witness_items: usize,
+        script_len: usize,
+    },
 
     #[error("P2SH redeem script verification failed")]
     P2shRedeemFailed,
@@ -70,6 +73,8 @@ pub enum WitnessError {
 
     #[error("scriptSig must be empty for native segwit spend")]
     ScriptSigNotEmpty,
+    #[error("Taproot verification requires all transaction prevouts")]
+    MissingPrevouts,
 }
 
 /// Verify a witness program against its witness data.
@@ -98,21 +103,53 @@ pub fn verify_witness_program(
                 return Err(WitnessError::EmptyWitness);
             }
             match program.len() {
-                20 => verify_p2wpkh(program, witness, tx, input_index, input_amount, sig_verifier),
-                32 => verify_p2wsh(program, witness, tx, input_index, input_amount, sig_verifier, flags),
-                other => Err(WitnessError::ProgramMismatch { expected: 20, got: other }),
+                20 => verify_p2wpkh(
+                    program,
+                    witness,
+                    tx,
+                    input_index,
+                    input_amount,
+                    sig_verifier,
+                ),
+                32 => verify_p2wsh(
+                    program,
+                    witness,
+                    tx,
+                    input_index,
+                    input_amount,
+                    sig_verifier,
+                    flags,
+                ),
+                other => Err(WitnessError::ProgramMismatch {
+                    expected: 20,
+                    got: other,
+                }),
             }
         }
         1 if program.len() == 32 => {
-            // Taproot (v1, 32-byte program) requires non-empty witness
+            if !flags.verify_taproot {
+                return Ok(());
+            }
             if witness.is_empty() {
                 return Err(WitnessError::EmptyWitness);
             }
-            if !flags.verify_taproot {
-                Ok(())
-            } else {
-                Ok(())
+            if tx.inputs.len() != 1 {
+                return Err(WitnessError::MissingPrevouts);
             }
+            let output = TxOut {
+                value: btc_primitives::amount::Amount::from_sat(input_amount),
+                script_pubkey: ScriptBuf::p2tr(&program.try_into().unwrap()),
+            };
+            crate::taproot::verify_taproot_input(
+                &program.try_into().unwrap(),
+                witness,
+                tx,
+                input_index,
+                &[output],
+                sig_verifier,
+                flags,
+            )
+            .map_err(|e| WitnessError::SigVerify(e.to_string()))
         }
         v if v >= 2 => {
             // Future witness versions: succeed unconditionally (soft-fork safe).
@@ -162,8 +199,13 @@ fn verify_p2wpkh(
     }
 
     // Build script_code as P2PKH equivalent for BIP143
-    let program_array: [u8; 20] = program.try_into()
-        .map_err(|_| WitnessError::ProgramMismatch { expected: 20, got: program.len() })?;
+    let program_array: [u8; 20] =
+        program
+            .try_into()
+            .map_err(|_| WitnessError::ProgramMismatch {
+                expected: 20,
+                got: program.len(),
+            })?;
     let script_code = p2wpkh_script_code(&program_array);
 
     // Extract sighash type from the last byte of the signature
@@ -214,13 +256,7 @@ fn verify_p2wsh(
     // Create a ScriptEngine in segwit sighash mode. When enabled, the engine
     // computes BIP143 sighash (using the post-OP_CODESEPARATOR scriptCode)
     // instead of legacy sighash for CHECKSIG/CHECKMULTISIG operations.
-    let mut engine = ScriptEngine::new(
-        sig_verifier,
-        *flags,
-        Some(tx),
-        input_index,
-        input_amount,
-    );
+    let mut engine = ScriptEngine::new(sig_verifier, *flags, Some(tx), input_index, input_amount);
     engine.set_segwit_sighash(true);
     engine.set_witness_execution(true);
 
@@ -253,6 +289,44 @@ fn verify_p2wsh(
     Ok(())
 }
 
+/// Verify with every spent output, as required by non-ANYONECANPAY BIP341
+/// signatures. Legacy and SegWit v0 verification use the selected output.
+pub fn verify_input_with_prevouts(
+    tx: &Transaction,
+    input_index: usize,
+    prevouts: &[TxOut],
+    sig_verifier: &dyn SignatureVerifier,
+    flags: &ScriptFlags,
+) -> Result<(), WitnessError> {
+    if prevouts.len() != tx.inputs.len() {
+        return Err(WitnessError::MissingPrevouts);
+    }
+    let output = prevouts
+        .get(input_index)
+        .ok_or(WitnessError::InputOutOfRange(input_index, tx.inputs.len()))?;
+    if flags.verify_witness && flags.verify_taproot && output.script_pubkey.is_p2tr() {
+        if !tx.inputs[input_index].script_sig.is_empty() {
+            return Err(WitnessError::ScriptSigNotEmpty);
+        }
+        let witness = tx
+            .witness
+            .get(input_index)
+            .ok_or(WitnessError::EmptyWitness)?;
+        let key = output.script_pubkey.as_bytes()[2..].try_into().unwrap();
+        return crate::taproot::verify_taproot_input(
+            &key,
+            witness,
+            tx,
+            input_index,
+            prevouts,
+            sig_verifier,
+            flags,
+        )
+        .map_err(|e| WitnessError::SigVerify(e.to_string()));
+    }
+    verify_input(tx, input_index, output, sig_verifier, flags)
+}
+
 /// Top-level per-input verification.
 ///
 /// Determines the script type from the previous output's script_pubkey and dispatches
@@ -280,8 +354,8 @@ pub fn verify_input(
         let spk_bytes = script_pubkey.as_bytes();
         // Extract witness version and program
         let version = match spk_bytes[0] {
-            0x00 => 0u8, // OP_0
-            v if v >= 0x51 && v <= 0x60 => v - 0x50, // OP_1..OP_16
+            0x00 => 0u8,                                 // OP_0
+            v if (0x51..=0x60).contains(&v) => v - 0x50, // OP_1..OP_16
             _ => return Err(WitnessError::UnsupportedVersion(spk_bytes[0])),
         };
         let program = &spk_bytes[2..]; // skip version byte and push length byte
@@ -331,7 +405,7 @@ pub fn verify_input(
                 let rs_bytes = redeem.as_bytes();
                 let version = match rs_bytes[0] {
                     0x00 => 0u8,
-                    v if v >= 0x51 && v <= 0x60 => v - 0x50,
+                    v if (0x51..=0x60).contains(&v) => v - 0x50,
                     _ => return Err(WitnessError::UnsupportedVersion(rs_bytes[0])),
                 };
                 let program = &rs_bytes[2..];
@@ -350,6 +424,8 @@ pub fn verify_input(
                     return Err(WitnessError::EmptyWitness);
                 };
 
+                let mut nested_flags = *flags;
+                nested_flags.verify_taproot = false;
                 return verify_witness_program(
                     version,
                     program,
@@ -358,7 +434,7 @@ pub fn verify_input(
                     input_index,
                     input_amount,
                     sig_verifier,
-                    flags,
+                    &nested_flags,
                 );
             }
 
@@ -372,13 +448,8 @@ pub fn verify_input(
             }
 
             // Execute the redeem script with the scriptSig stack
-            let mut engine = ScriptEngine::new(
-                sig_verifier,
-                *flags,
-                Some(tx),
-                input_index,
-                input_amount,
-            );
+            let mut engine =
+                ScriptEngine::new(sig_verifier, *flags, Some(tx), input_index, input_amount);
 
             // Push the remaining scriptSig items (everything before the redeem script push)
             // onto the stack, then execute the redeem script.
@@ -395,7 +466,9 @@ pub fn verify_input(
             // Note: In Bitcoin Core, after running scriptSig, the top of stack is the
             // serialized redeem script (which was just pushed by scriptSig).
             // We pop it and execute it.
-            let _redeem_on_stack = engine.stack().last()
+            let _redeem_on_stack = engine
+                .stack()
+                .last()
                 .ok_or(WitnessError::P2shRedeemFailed)?;
 
             // Actually, for a clean P2SH implementation, we should:
@@ -407,13 +480,8 @@ pub fn verify_input(
             //
             // For simplicity, since we already verified the hash above, we just execute
             // the redeem script with a fresh engine that has the data items on the stack.
-            let mut redeem_engine = ScriptEngine::new(
-                sig_verifier,
-                *flags,
-                Some(tx),
-                input_index,
-                input_amount,
-            );
+            let mut redeem_engine =
+                ScriptEngine::new(sig_verifier, *flags, Some(tx), input_index, input_amount);
 
             // Build a script that pushes all scriptSig items except the last (redeem script)
             // The scriptSig for P2SH is typically: <sig> <pubkey> <serialized-redeem-script>
@@ -440,13 +508,7 @@ pub fn verify_input(
     }
 
     // Legacy script verification: run scriptSig + scriptPubKey
-    let mut engine = ScriptEngine::new(
-        sig_verifier,
-        *flags,
-        Some(tx),
-        input_index,
-        input_amount,
-    );
+    let mut engine = ScriptEngine::new(sig_verifier, *flags, Some(tx), input_index, input_amount);
 
     // Execute scriptSig first
     let script_sig = &tx.inputs[input_index].script_sig;
@@ -481,7 +543,7 @@ fn extract_single_push(script: &[u8]) -> Option<&[u8]> {
     let (data, consumed) = if first == 0 {
         // OP_0
         (&script[1..1], 1)
-    } else if first >= 1 && first <= 75 {
+    } else if (1..=75).contains(&first) {
         let len = first as usize;
         if script.len() < 1 + len {
             return None;
@@ -528,7 +590,7 @@ fn extract_all_pushes(script: &[u8]) -> Vec<&[u8]> {
         if opcode == 0 {
             result.push(&script[pos + 1..pos + 1]); // empty push
             pos += 1;
-        } else if opcode >= 1 && opcode <= 75 {
+        } else if (1..=75).contains(&opcode) {
             let len = opcode as usize;
             if pos + 1 + len > script.len() {
                 break;
@@ -567,10 +629,10 @@ fn extract_all_pushes(script: &[u8]) -> Vec<&[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sig_verify::Secp256k1Verifier;
     use btc_primitives::amount::Amount;
     use btc_primitives::hash::TxHash;
     use btc_primitives::transaction::{OutPoint, TxIn};
-    use crate::sig_verify::Secp256k1Verifier;
 
     /// Helper: create a keypair and return (secret_key, compressed_pubkey_bytes)
     fn generate_keypair() -> (secp256k1::SecretKey, Vec<u8>) {
@@ -581,7 +643,11 @@ mod tests {
     }
 
     /// Helper: sign a sighash with a secret key, return DER sig + sighash type byte
-    fn sign_sighash(sk: &secp256k1::SecretKey, sighash: &[u8; 32], hash_type: SighashType) -> Vec<u8> {
+    fn sign_sighash(
+        sk: &secp256k1::SecretKey,
+        sighash: &[u8; 32],
+        hash_type: SighashType,
+    ) -> Vec<u8> {
         let secp = secp256k1::Secp256k1::signing_only();
         let msg = secp256k1::Message::from_digest(*sighash);
         let sig = secp.sign_ecdsa(&msg, sk);
@@ -653,8 +719,21 @@ mod tests {
         // Verify using verify_witness_program
         let program = &script_pubkey.as_bytes()[2..]; // skip OP_0 and push-length
         let flags = ScriptFlags::all();
-        let result = verify_witness_program(0, program, &witness, &tx, 0, input_amount, &verifier, &flags);
-        assert!(result.is_ok(), "P2WPKH verification should succeed: {:?}", result.err());
+        let result = verify_witness_program(
+            0,
+            program,
+            &witness,
+            &tx,
+            0,
+            input_amount,
+            &verifier,
+            &flags,
+        );
+        assert!(
+            result.is_ok(),
+            "P2WPKH verification should succeed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -683,7 +762,8 @@ mod tests {
 
         // Sign with the correct key
         let script_code = p2wpkh_script_code(&pubkey_hash);
-        let sighash = sighash_segwit_v0(&tx, 0, &script_code, input_amount, SighashType::ALL).unwrap();
+        let sighash =
+            sighash_segwit_v0(&tx, 0, &script_code, input_amount, SighashType::ALL).unwrap();
         let sig = sign_sighash(&sk, &sighash, SighashType::ALL);
 
         let witness = Witness::from_items(vec![sig, pubkey]);
@@ -691,11 +771,20 @@ mod tests {
         // Use a WRONG program (different hash)
         let wrong_program = [0xddu8; 20];
         let flags = ScriptFlags::all();
-        let result = verify_witness_program(0, &wrong_program, &witness, &tx, 0, input_amount, &verifier, &flags);
+        let result = verify_witness_program(
+            0,
+            &wrong_program,
+            &witness,
+            &tx,
+            0,
+            input_amount,
+            &verifier,
+            &flags,
+        );
         assert!(result.is_err(), "P2WPKH with wrong pubkey hash should fail");
         match result.unwrap_err() {
             WitnessError::P2wpkhPubkeyMismatch => {} // expected
-            other => panic!("Expected P2wpkhPubkeyMismatch, got {:?}", other),
+            other => panic!("Expected P2wpkhPubkeyMismatch, got {other:?}"),
         }
     }
 
@@ -708,17 +797,19 @@ mod tests {
         // Witness with 1 item (should need 2)
         let witness = Witness::from_items(vec![vec![0x01]]);
         let tx = make_simple_tx(witness.clone());
-        let result = verify_witness_program(0, &program, &witness, &tx, 0, 50_000, &verifier, &flags);
+        let result =
+            verify_witness_program(0, &program, &witness, &tx, 0, 50_000, &verifier, &flags);
         assert!(result.is_err());
         match result.unwrap_err() {
             WitnessError::P2wpkhWitnessCount(1) => {} // expected
-            other => panic!("Expected P2wpkhWitnessCount(1), got {:?}", other),
+            other => panic!("Expected P2wpkhWitnessCount(1), got {other:?}"),
         }
 
         // Witness with 3 items (should need 2)
         let witness = Witness::from_items(vec![vec![0x01], vec![0x02], vec![0x03]]);
         let tx = make_simple_tx(witness.clone());
-        let result = verify_witness_program(0, &program, &witness, &tx, 0, 50_000, &verifier, &flags);
+        let result =
+            verify_witness_program(0, &program, &witness, &tx, 0, 50_000, &verifier, &flags);
         assert!(result.is_err());
     }
 
@@ -744,8 +835,13 @@ mod tests {
 
         let tx = make_simple_tx(witness.clone());
 
-        let result = verify_witness_program(0, &program, &witness, &tx, 0, 50_000, &verifier, &flags);
-        assert!(result.is_ok(), "P2WSH with OP_TRUE should succeed: {:?}", result.err());
+        let result =
+            verify_witness_program(0, &program, &witness, &tx, 0, 50_000, &verifier, &flags);
+        assert!(
+            result.is_ok(),
+            "P2WSH with OP_TRUE should succeed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -764,11 +860,20 @@ mod tests {
 
         let tx = make_simple_tx(witness.clone());
 
-        let result = verify_witness_program(0, &wrong_program, &witness, &tx, 0, 50_000, &verifier, &flags);
+        let result = verify_witness_program(
+            0,
+            &wrong_program,
+            &witness,
+            &tx,
+            0,
+            50_000,
+            &verifier,
+            &flags,
+        );
         assert!(result.is_err());
         match result.unwrap_err() {
             WitnessError::P2wshScriptMismatch => {} // expected
-            other => panic!("Expected P2wshScriptMismatch, got {:?}", other),
+            other => panic!("Expected P2wshScriptMismatch, got {other:?}"),
         }
     }
 
@@ -807,22 +912,41 @@ mod tests {
         };
 
         // Compute BIP143 sighash using the witness script as script_code
-        let sighash = sighash_segwit_v0(&tx, 0, &witness_script_bytes, input_amount, SighashType::ALL)
-            .expect("sighash should succeed");
+        let sighash = sighash_segwit_v0(
+            &tx,
+            0,
+            &witness_script_bytes,
+            input_amount,
+            SighashType::ALL,
+        )
+        .expect("sighash should succeed");
 
         // Sign
         let sig = sign_sighash(&sk, &sighash, SighashType::ALL);
 
         // Witness items: [dummy (for CHECKMULTISIG bug), sig, witness_script]
         let witness = Witness::from_items(vec![
-            vec![],   // dummy element for CHECKMULTISIG off-by-one
+            vec![], // dummy element for CHECKMULTISIG off-by-one
             sig,
             witness_script_bytes,
         ]);
         tx.witness = vec![witness.clone()];
 
-        let result = verify_witness_program(0, &program, &witness, &tx, 0, input_amount, &verifier, &flags);
-        assert!(result.is_ok(), "P2WSH 1-of-1 multisig should succeed: {:?}", result.err());
+        let result = verify_witness_program(
+            0,
+            &program,
+            &witness,
+            &tx,
+            0,
+            input_amount,
+            &verifier,
+            &flags,
+        );
+        assert!(
+            result.is_ok(),
+            "P2WSH 1-of-1 multisig should succeed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -850,7 +974,8 @@ mod tests {
         };
 
         let script_code = p2wpkh_script_code(&pubkey_hash);
-        let sighash = sighash_segwit_v0(&tx, 0, &script_code, input_amount, SighashType::ALL).unwrap();
+        let sighash =
+            sighash_segwit_v0(&tx, 0, &script_code, input_amount, SighashType::ALL).unwrap();
         let sig = sign_sighash(&sk, &sighash, SighashType::ALL);
 
         let witness = Witness::from_items(vec![sig, pubkey]);
@@ -863,7 +988,11 @@ mod tests {
 
         let flags = ScriptFlags::all();
         let result = verify_input(&tx, 0, &prev_output, &verifier, &flags);
-        assert!(result.is_ok(), "verify_input P2WPKH should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "verify_input P2WPKH should succeed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -896,8 +1025,9 @@ mod tests {
 
         // Compute legacy sighash
         // For P2PKH, the script_code is the scriptPubKey
-        let sighash = crate::sighash::sighash_legacy(&tx, 0, script_pubkey.as_bytes(), SighashType::ALL)
-            .expect("legacy sighash should succeed");
+        let sighash =
+            crate::sighash::sighash_legacy(&tx, 0, script_pubkey.as_bytes(), SighashType::ALL)
+                .expect("legacy sighash should succeed");
 
         // Sign
         let msg = secp256k1::Message::from_digest(sighash);
@@ -918,7 +1048,11 @@ mod tests {
 
         let flags = ScriptFlags::all();
         let result = verify_input(&tx, 0, &prev_output, &verifier, &flags);
-        assert!(result.is_ok(), "verify_input legacy P2PKH should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "verify_input legacy P2PKH should succeed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -957,7 +1091,11 @@ mod tests {
         };
 
         let result = verify_input(&tx, 0, &prev_output, &verifier, &flags);
-        assert!(result.is_ok(), "verify_input P2WSH should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "verify_input P2WSH should succeed: {:?}",
+            result.err()
+        );
     }
 
     /// Test P2WSH with OP_CHECKSIG through the full verify_input path.
@@ -1010,7 +1148,11 @@ mod tests {
         };
 
         let result = verify_input(&tx, 0, &prev_output, &verifier, &flags);
-        assert!(result.is_ok(), "verify_input P2WSH CHECKSIG should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "verify_input P2WSH CHECKSIG should succeed: {:?}",
+            result.err()
+        );
     }
 
     /// Test P2WSH with 2-of-3 CHECKMULTISIG through verify_input.
@@ -1069,7 +1211,11 @@ mod tests {
         };
 
         let result = verify_input(&tx, 0, &prev_output, &verifier, &flags);
-        assert!(result.is_ok(), "verify_input P2WSH 2-of-3 multisig should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "verify_input P2WSH 2-of-3 multisig should succeed: {:?}",
+            result.err()
+        );
     }
 
     /// Test P2WSH with OP_CODESEPARATOR — the exact pattern from signet block 277442.
@@ -1111,7 +1257,10 @@ mod tests {
 
         // The scriptCode for BIP143 sighash is only the part AFTER OP_CODESEPARATOR:
         // OP_DUP OP_HASH160 <20-byte-hash> OP_EQUALVERIFY OP_CHECKSIG
-        let codesep_pos = ws_bytes.iter().position(|&b| b == Opcode::OP_CODESEPARATOR as u8).unwrap();
+        let codesep_pos = ws_bytes
+            .iter()
+            .position(|&b| b == Opcode::OP_CODESEPARATOR as u8)
+            .unwrap();
         let script_code_after_codesep = &ws_bytes[codesep_pos + 1..];
 
         let mut tx = Transaction {
@@ -1132,8 +1281,13 @@ mod tests {
 
         // Compute BIP143 sighash using the POST-CODESEPARATOR scriptCode
         let sighash = sighash_segwit_v0(
-            &tx, 0, script_code_after_codesep, input_amount, SighashType::ALL
-        ).expect("sighash should succeed");
+            &tx,
+            0,
+            script_code_after_codesep,
+            input_amount,
+            SighashType::ALL,
+        )
+        .expect("sighash should succeed");
 
         // Sign
         let sig = sign_sighash(&sk, &sighash, SighashType::ALL);
@@ -1185,11 +1339,12 @@ mod tests {
         let witness = Witness::new();
 
         let tx = make_simple_tx(witness.clone());
-        let result = verify_witness_program(0, &program, &witness, &tx, 0, 50_000, &verifier, &flags);
+        let result =
+            verify_witness_program(0, &program, &witness, &tx, 0, 50_000, &verifier, &flags);
         assert!(result.is_err());
         match result.unwrap_err() {
             WitnessError::EmptyWitness => {}
-            other => panic!("Expected EmptyWitness, got {:?}", other),
+            other => panic!("Expected EmptyWitness, got {other:?}"),
         }
     }
 
@@ -1203,10 +1358,12 @@ mod tests {
         let tx = make_simple_tx(witness.clone());
 
         // Version 2+ should succeed (future soft-fork safe)
-        let result = verify_witness_program(2, &program, &witness, &tx, 0, 50_000, &verifier, &flags);
+        let result =
+            verify_witness_program(2, &program, &witness, &tx, 0, 50_000, &verifier, &flags);
         assert!(result.is_ok(), "Future witness version should succeed");
 
-        let result = verify_witness_program(16, &program, &witness, &tx, 0, 50_000, &verifier, &flags);
+        let result =
+            verify_witness_program(16, &program, &witness, &tx, 0, 50_000, &verifier, &flags);
         assert!(result.is_ok(), "Witness v16 should succeed");
     }
 
@@ -1286,8 +1443,21 @@ mod tests {
 
         let script_pubkey = ScriptBuf::p2wpkh(&pubkey_hash);
         let program = &script_pubkey.as_bytes()[2..];
-        let result = verify_witness_program(0, program, &witness, &tx, 0, input_amount, &verifier, &flags);
-        assert!(result.is_ok(), "P2WPKH with SIGHASH_ALL should succeed: {:?}", result.err());
+        let result = verify_witness_program(
+            0,
+            program,
+            &witness,
+            &tx,
+            0,
+            input_amount,
+            &verifier,
+            &flags,
+        );
+        assert!(
+            result.is_ok(),
+            "P2WPKH with SIGHASH_ALL should succeed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -1325,8 +1495,21 @@ mod tests {
 
         let script_pubkey = ScriptBuf::p2wpkh(&pubkey_hash);
         let program = &script_pubkey.as_bytes()[2..];
-        let result = verify_witness_program(0, program, &witness, &tx, 0, input_amount, &verifier, &flags);
-        assert!(result.is_ok(), "P2WPKH with SIGHASH_NONE should succeed: {:?}", result.err());
+        let result = verify_witness_program(
+            0,
+            program,
+            &witness,
+            &tx,
+            0,
+            input_amount,
+            &verifier,
+            &flags,
+        );
+        assert!(
+            result.is_ok(),
+            "P2WPKH with SIGHASH_NONE should succeed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -1362,8 +1545,14 @@ mod tests {
         };
 
         // Compute BIP143 sighash using the witness script as script_code
-        let sighash = sighash_segwit_v0(&tx, 0, &witness_script_bytes, input_amount, SighashType::ALL)
-            .expect("sighash should succeed");
+        let sighash = sighash_segwit_v0(
+            &tx,
+            0,
+            &witness_script_bytes,
+            input_amount,
+            SighashType::ALL,
+        )
+        .expect("sighash should succeed");
 
         let sig = sign_sighash(&sk, &sighash, SighashType::ALL);
 
@@ -1371,8 +1560,21 @@ mod tests {
         let witness = Witness::from_items(vec![sig, witness_script_bytes]);
         tx.witness = vec![witness.clone()];
 
-        let result = verify_witness_program(0, &program, &witness, &tx, 0, input_amount, &verifier, &flags);
-        assert!(result.is_ok(), "P2WSH CHECKSIG with SIGHASH_ALL should succeed: {:?}", result.err());
+        let result = verify_witness_program(
+            0,
+            &program,
+            &witness,
+            &tx,
+            0,
+            input_amount,
+            &verifier,
+            &flags,
+        );
+        assert!(
+            result.is_ok(),
+            "P2WSH CHECKSIG with SIGHASH_ALL should succeed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -1410,7 +1612,11 @@ mod tests {
         };
 
         let result = verify_input(&tx, 0, &prev_output, &verifier, &flags);
-        assert!(result.is_ok(), "verify_input with verify_witness=false should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "verify_input with verify_witness=false should succeed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -1443,8 +1649,9 @@ mod tests {
         };
 
         // Compute legacy sighash and sign
-        let sighash = crate::sighash::sighash_legacy(&tx, 0, script_pubkey.as_bytes(), SighashType::ALL)
-            .expect("legacy sighash should succeed");
+        let sighash =
+            crate::sighash::sighash_legacy(&tx, 0, script_pubkey.as_bytes(), SighashType::ALL)
+                .expect("legacy sighash should succeed");
         let msg = secp256k1::Message::from_digest(sighash);
         let ecdsa_sig = secp.sign_ecdsa(&msg, &sk);
         let mut sig_bytes = ecdsa_sig.serialize_der().to_vec();
@@ -1466,10 +1673,13 @@ mod tests {
 
         let flags = ScriptFlags::all(); // verify_witness = true
         let result = verify_input(&tx, 0, &prev_output, &verifier, &flags);
-        assert!(result.is_err(), "Legacy input with unexpected witness data should fail");
+        assert!(
+            result.is_err(),
+            "Legacy input with unexpected witness data should fail"
+        );
         match result.unwrap_err() {
             WitnessError::UnexpectedWitness => {} // expected
-            other => panic!("Expected UnexpectedWitness, got {:?}", other),
+            other => panic!("Expected UnexpectedWitness, got {other:?}"),
         }
     }
 
@@ -1501,7 +1711,8 @@ mod tests {
 
         // Build valid witness
         let script_code = p2wpkh_script_code(&pubkey_hash);
-        let sighash = sighash_segwit_v0(&tx, 0, &script_code, input_amount, SighashType::ALL).unwrap();
+        let sighash =
+            sighash_segwit_v0(&tx, 0, &script_code, input_amount, SighashType::ALL).unwrap();
         let sig = sign_sighash(&sk, &sighash, SighashType::ALL);
         let witness = Witness::from_items(vec![sig, pubkey]);
         tx.witness = vec![witness];
@@ -1513,10 +1724,13 @@ mod tests {
 
         let flags = ScriptFlags::all();
         let result = verify_input(&tx, 0, &prev_output, &verifier, &flags);
-        assert!(result.is_err(), "Native segwit with non-empty scriptSig should fail");
+        assert!(
+            result.is_err(),
+            "Native segwit with non-empty scriptSig should fail"
+        );
         match result.unwrap_err() {
             WitnessError::ScriptSigNotEmpty => {} // expected
-            other => panic!("Expected ScriptSigNotEmpty, got {:?}", other),
+            other => panic!("Expected ScriptSigNotEmpty, got {other:?}"),
         }
     }
 
@@ -1531,14 +1745,34 @@ mod tests {
         // Test version 2 through 16 with various program sizes
         for version in 2..=16u8 {
             let program = vec![0xab; 20];
-            let result = verify_witness_program(version, &program, &witness, &tx, 0, 50_000, &verifier, &flags);
-            assert!(result.is_ok(), "Witness version {} should succeed (soft-fork safe): {:?}", version, result.err());
+            let result = verify_witness_program(
+                version, &program, &witness, &tx, 0, 50_000, &verifier, &flags,
+            );
+            assert!(
+                result.is_ok(),
+                "Witness version {} should succeed (soft-fork safe): {:?}",
+                version,
+                result.err()
+            );
         }
 
         // Also test v1 with non-32-byte program (should also succeed as future-safe)
         let short_program = vec![0xcd; 20];
-        let result = verify_witness_program(1, &short_program, &witness, &tx, 0, 50_000, &verifier, &flags);
-        assert!(result.is_ok(), "Witness v1 with non-32-byte program should succeed: {:?}", result.err());
+        let result = verify_witness_program(
+            1,
+            &short_program,
+            &witness,
+            &tx,
+            0,
+            50_000,
+            &verifier,
+            &flags,
+        );
+        assert!(
+            result.is_ok(),
+            "Witness v1 with non-32-byte program should succeed: {:?}",
+            result.err()
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1601,7 +1835,11 @@ mod tests {
 
         let flags = ScriptFlags::all();
         let result = verify_input(&tx, 0, &prev_output, &verifier, &flags);
-        assert!(result.is_ok(), "P2SH-wrapped P2WPKH should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "P2SH-wrapped P2WPKH should succeed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -1654,7 +1892,11 @@ mod tests {
 
         let flags = ScriptFlags::all();
         let result = verify_input(&tx, 0, &prev_output, &verifier, &flags);
-        assert!(result.is_ok(), "P2SH-wrapped P2WSH with OP_TRUE should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "P2SH-wrapped P2WSH with OP_TRUE should succeed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -1669,7 +1911,10 @@ mod tests {
         spk_bytes.push(20); // push 20 bytes
         spk_bytes.extend_from_slice(&[0xab; 20]);
         let script_pubkey = ScriptBuf::from_bytes(spk_bytes);
-        assert!(script_pubkey.is_witness_program(), "should be a witness program");
+        assert!(
+            script_pubkey.is_witness_program(),
+            "should be a witness program"
+        );
 
         let tx = Transaction {
             version: 2,
@@ -1692,7 +1937,11 @@ mod tests {
         };
 
         let result = verify_input(&tx, 0, &prev_output, &verifier, &flags);
-        assert!(result.is_ok(), "native segwit v2 should succeed for soft-fork safety: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "native segwit v2 should succeed for soft-fork safety: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -1729,10 +1978,13 @@ mod tests {
 
         let flags = ScriptFlags::all(); // verify_witness = true
         let result = verify_input(&tx, 0, &prev_output, &verifier, &flags);
-        assert!(result.is_err(), "non-witness input with witness data should be rejected");
+        assert!(
+            result.is_err(),
+            "non-witness input with witness data should be rejected"
+        );
         match result.unwrap_err() {
             WitnessError::UnexpectedWitness => {} // expected
-            other => panic!("Expected UnexpectedWitness, got {:?}", other),
+            other => panic!("Expected UnexpectedWitness, got {other:?}"),
         }
 
         // With verify_witness = false, the same tx should succeed.
@@ -1741,7 +1993,11 @@ mod tests {
         let result2 = verify_input(&tx, 0, &prev_output, &verifier, &no_witness_flags);
         // With verify_witness=false the engine doesn't check for unexpected witness
         // but the legacy script OP_TRUE should still succeed.
-        assert!(result2.is_ok(), "with verify_witness=false, should succeed: {:?}", result2.err());
+        assert!(
+            result2.is_ok(),
+            "with verify_witness=false, should succeed: {:?}",
+            result2.err()
+        );
     }
 
     // ==================================================================
@@ -1792,7 +2048,7 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             WitnessError::P2shRedeemFailed => {}
-            other => panic!("Expected P2shRedeemFailed, got {:?}", other),
+            other => panic!("Expected P2shRedeemFailed, got {other:?}"),
         }
     }
 
@@ -1834,7 +2090,11 @@ mod tests {
         };
 
         let result = verify_input(&tx, 0, &prev_output, &verifier, &flags);
-        assert!(result.is_ok(), "P2SH with OP_TRUE redeem should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "P2SH with OP_TRUE redeem should succeed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -1877,7 +2137,11 @@ mod tests {
         };
 
         let result = verify_input(&tx, 0, &prev_output, &verifier, &flags);
-        assert!(result.is_ok(), "P2SH with OP_1 OP_EQUAL and correct data should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "P2SH with OP_1 OP_EQUAL and correct data should succeed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -1921,7 +2185,7 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             WitnessError::P2shRedeemFailed => {}
-            other => panic!("Expected P2shRedeemFailed, got {:?}", other),
+            other => panic!("Expected P2shRedeemFailed, got {other:?}"),
         }
     }
 
@@ -1963,7 +2227,7 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             WitnessError::P2shRedeemFailed => {}
-            other => panic!("Expected P2shRedeemFailed, got {:?}", other),
+            other => panic!("Expected P2shRedeemFailed, got {other:?}"),
         }
     }
 
@@ -2025,11 +2289,12 @@ mod tests {
         let witness = Witness::from_items(vec![witness_script_bytes.clone()]);
         let tx = make_simple_tx(witness.clone());
 
-        let result = verify_witness_program(0, &program, &witness, &tx, 0, 50_000, &verifier, &flags);
+        let result =
+            verify_witness_program(0, &program, &witness, &tx, 0, 50_000, &verifier, &flags);
         assert!(result.is_err());
         match result.unwrap_err() {
             WitnessError::P2wshScriptFailed { .. } => {}
-            other => panic!("Expected P2wshScriptFailed, got {:?}", other),
+            other => panic!("Expected P2wshScriptFailed, got {other:?}"),
         }
     }
 
@@ -2236,7 +2501,7 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             WitnessError::EmptyWitness => {}
-            other => panic!("Expected EmptyWitness, got {:?}", other),
+            other => panic!("Expected EmptyWitness, got {other:?}"),
         }
     }
 
@@ -2252,11 +2517,12 @@ mod tests {
         let witness = Witness::from_items(vec![vec![], pubkey]);
         let tx = make_simple_tx(witness.clone());
 
-        let result = verify_witness_program(0, &pubkey_hash, &witness, &tx, 0, 50_000, &verifier, &flags);
+        let result =
+            verify_witness_program(0, &pubkey_hash, &witness, &tx, 0, 50_000, &verifier, &flags);
         assert!(result.is_err());
         match result.unwrap_err() {
             WitnessError::SignatureVerificationFailed => {}
-            other => panic!("Expected SignatureVerificationFailed, got {:?}", other),
+            other => panic!("Expected SignatureVerificationFailed, got {other:?}"),
         }
     }
 
@@ -2269,11 +2535,15 @@ mod tests {
         let witness = Witness::from_items(vec![vec![0x01]]);
         let tx = make_simple_tx(witness.clone());
 
-        let result = verify_witness_program(0, &program, &witness, &tx, 0, 50_000, &verifier, &flags);
+        let result =
+            verify_witness_program(0, &program, &witness, &tx, 0, 50_000, &verifier, &flags);
         assert!(result.is_err());
         match result.unwrap_err() {
-            WitnessError::ProgramMismatch { expected: 20, got: 25 } => {}
-            other => panic!("Expected ProgramMismatch {{ expected: 20, got: 25 }}, got {:?}", other),
+            WitnessError::ProgramMismatch {
+                expected: 20,
+                got: 25,
+            } => {}
+            other => panic!("Expected ProgramMismatch {{ expected: 20, got: 25 }}, got {other:?}"),
         }
     }
 
@@ -2286,16 +2556,17 @@ mod tests {
         let witness = Witness::new(); // empty
         let tx = make_simple_tx(witness.clone());
 
-        let result = verify_witness_program(1, &program, &witness, &tx, 0, 50_000, &verifier, &flags);
+        let result =
+            verify_witness_program(1, &program, &witness, &tx, 0, 50_000, &verifier, &flags);
         assert!(result.is_err());
         match result.unwrap_err() {
             WitnessError::EmptyWitness => {}
-            other => panic!("Expected EmptyWitness, got {:?}", other),
+            other => panic!("Expected EmptyWitness, got {other:?}"),
         }
     }
 
     #[test]
-    fn test_taproot_v1_32byte_program_nonempty_witness_succeeds() {
+    fn test_taproot_v1_32byte_program_invalid_signature_fails() {
         // Taproot (v1, 32-byte program) with non-empty witness should succeed.
         let verifier = Secp256k1Verifier;
         let flags = ScriptFlags::all();
@@ -2303,8 +2574,13 @@ mod tests {
         let witness = Witness::from_items(vec![vec![0x01]]);
         let tx = make_simple_tx(witness.clone());
 
-        let result = verify_witness_program(1, &program, &witness, &tx, 0, 50_000, &verifier, &flags);
-        assert!(result.is_ok(), "Taproot v1 with non-empty witness should succeed: {:?}", result.err());
+        let result =
+            verify_witness_program(1, &program, &witness, &tx, 0, 50_000, &verifier, &flags);
+        assert!(
+            result.is_err(),
+            "Taproot v1 with an invalid signature must fail: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -2317,8 +2593,13 @@ mod tests {
         let witness = Witness::from_items(vec![vec![0x01]]);
         let tx = make_simple_tx(witness.clone());
 
-        let result = verify_witness_program(1, &program, &witness, &tx, 0, 50_000, &verifier, &flags);
-        assert!(result.is_ok(), "Taproot v1 with verify_taproot=false should succeed: {:?}", result.err());
+        let result =
+            verify_witness_program(1, &program, &witness, &tx, 0, 50_000, &verifier, &flags);
+        assert!(
+            result.is_ok(),
+            "Taproot v1 with verify_taproot=false should succeed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -2357,8 +2638,13 @@ mod tests {
             };
 
             let result = verify_input(&tx, 0, &prev_output, &verifier, &flags);
-            assert!(result.is_ok(), "Native segwit version {} (byte 0x{:02x}) should succeed: {:?}",
-                    version, version_byte, result.err());
+            assert!(
+                result.is_ok(),
+                "Native segwit version {} (byte 0x{:02x}) should succeed: {:?}",
+                version,
+                version_byte,
+                result.err()
+            );
         }
     }
 
@@ -2403,8 +2689,12 @@ mod tests {
             };
 
             let result = verify_input(&tx, 0, &prev_output, &verifier, &flags);
-            assert!(result.is_ok(), "P2SH-wrapped segwit version {} should succeed: {:?}",
-                    version_byte - 0x50, result.err());
+            assert!(
+                result.is_ok(),
+                "P2SH-wrapped segwit version {} should succeed: {:?}",
+                version_byte - 0x50,
+                result.err()
+            );
         }
     }
 
@@ -2444,8 +2734,21 @@ mod tests {
         let witness = Witness::from_items(vec![sig, ws_bytes]);
         tx.witness = vec![witness.clone()];
 
-        let result = verify_witness_program(0, &program, &witness, &tx, 0, input_amount, &verifier, &flags);
-        assert!(result.is_ok(), "P2WSH CHECKSIG with SIGHASH_NONE should succeed: {:?}", result.err());
+        let result = verify_witness_program(
+            0,
+            &program,
+            &witness,
+            &tx,
+            0,
+            input_amount,
+            &verifier,
+            &flags,
+        );
+        assert!(
+            result.is_ok(),
+            "P2WSH CHECKSIG with SIGHASH_NONE should succeed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -2484,8 +2787,21 @@ mod tests {
         let witness = Witness::from_items(vec![sig, ws_bytes]);
         tx.witness = vec![witness.clone()];
 
-        let result = verify_witness_program(0, &program, &witness, &tx, 0, input_amount, &verifier, &flags);
-        assert!(result.is_ok(), "P2WSH CHECKSIG with SIGHASH_SINGLE should succeed: {:?}", result.err());
+        let result = verify_witness_program(
+            0,
+            &program,
+            &witness,
+            &tx,
+            0,
+            input_amount,
+            &verifier,
+            &flags,
+        );
+        assert!(
+            result.is_ok(),
+            "P2WSH CHECKSIG with SIGHASH_SINGLE should succeed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -2525,8 +2841,21 @@ mod tests {
         let witness = Witness::from_items(vec![sig, ws_bytes]);
         tx.witness = vec![witness.clone()];
 
-        let result = verify_witness_program(0, &program, &witness, &tx, 0, input_amount, &verifier, &flags);
-        assert!(result.is_ok(), "P2WSH CHECKSIG with SIGHASH_ALL|ANYONECANPAY should succeed: {:?}", result.err());
+        let result = verify_witness_program(
+            0,
+            &program,
+            &witness,
+            &tx,
+            0,
+            input_amount,
+            &verifier,
+            &flags,
+        );
+        assert!(
+            result.is_ok(),
+            "P2WSH CHECKSIG with SIGHASH_ALL|ANYONECANPAY should succeed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -2562,8 +2891,21 @@ mod tests {
 
         let script_pubkey = ScriptBuf::p2wpkh(&pubkey_hash);
         let program = &script_pubkey.as_bytes()[2..];
-        let result = verify_witness_program(0, program, &witness, &tx, 0, input_amount, &verifier, &flags);
-        assert!(result.is_ok(), "P2WPKH with SIGHASH_SINGLE should succeed: {:?}", result.err());
+        let result = verify_witness_program(
+            0,
+            program,
+            &witness,
+            &tx,
+            0,
+            input_amount,
+            &verifier,
+            &flags,
+        );
+        assert!(
+            result.is_ok(),
+            "P2WPKH with SIGHASH_SINGLE should succeed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -2600,8 +2942,21 @@ mod tests {
 
         let script_pubkey = ScriptBuf::p2wpkh(&pubkey_hash);
         let program = &script_pubkey.as_bytes()[2..];
-        let result = verify_witness_program(0, program, &witness, &tx, 0, input_amount, &verifier, &flags);
-        assert!(result.is_ok(), "P2WPKH with SIGHASH_ALL|ANYONECANPAY should succeed: {:?}", result.err());
+        let result = verify_witness_program(
+            0,
+            program,
+            &witness,
+            &tx,
+            0,
+            input_amount,
+            &verifier,
+            &flags,
+        );
+        assert!(
+            result.is_ok(),
+            "P2WPKH with SIGHASH_ALL|ANYONECANPAY should succeed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -2646,7 +3001,11 @@ mod tests {
 
         // Verify input_index 1, which is >= tx.witness.len() (only 1 witness entry)
         let result = verify_input(&tx, 1, &prev_output, &verifier, &flags);
-        assert!(result.is_ok(), "Future version with missing witness should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Future version with missing witness should succeed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -2668,7 +3027,7 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             WitnessError::P2wshEmptyWitness => {}
-            other => panic!("Expected P2wshEmptyWitness, got {:?}", other),
+            other => panic!("Expected P2wshEmptyWitness, got {other:?}"),
         }
     }
 
@@ -2717,7 +3076,7 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             WitnessError::LegacyScriptFailed => {}
-            other => panic!("Expected LegacyScriptFailed, got {:?}", other),
+            other => panic!("Expected LegacyScriptFailed, got {other:?}"),
         }
     }
 
@@ -2768,7 +3127,8 @@ mod tests {
 
         // Compute sighash for one message but sign a different one
         let script_code = p2wpkh_script_code(&pubkey_hash);
-        let sighash = sighash_segwit_v0(&tx, 0, &script_code, input_amount, SighashType::ALL).unwrap();
+        let sighash =
+            sighash_segwit_v0(&tx, 0, &script_code, input_amount, SighashType::ALL).unwrap();
         // Sign the correct sighash but then change the tx so the sighash is different
         let sig = sign_sighash(&sk, &sighash, SighashType::ALL);
 
@@ -2780,11 +3140,20 @@ mod tests {
 
         let script_pubkey = ScriptBuf::p2wpkh(&pubkey_hash);
         let program = &script_pubkey.as_bytes()[2..];
-        let result = verify_witness_program(0, program, &witness, &tx, 0, input_amount, &verifier, &flags);
+        let result = verify_witness_program(
+            0,
+            program,
+            &witness,
+            &tx,
+            0,
+            input_amount,
+            &verifier,
+            &flags,
+        );
         assert!(result.is_err(), "P2WPKH with wrong signature should fail");
         match result.unwrap_err() {
             WitnessError::SignatureVerificationFailed => {}
-            other => panic!("Expected SignatureVerificationFailed, got {:?}", other),
+            other => panic!("Expected SignatureVerificationFailed, got {other:?}"),
         }
     }
 
@@ -2812,8 +3181,13 @@ mod tests {
         let witness = Witness::from_items(vec![item1, item2, ws_bytes.clone()]);
         let tx = make_simple_tx(witness.clone());
 
-        let result = verify_witness_program(0, &program, &witness, &tx, 0, 50_000, &verifier, &flags);
-        assert!(result.is_ok(), "P2WSH with stack items should succeed: {:?}", result.err());
+        let result =
+            verify_witness_program(0, &program, &witness, &tx, 0, 50_000, &verifier, &flags);
+        assert!(
+            result.is_ok(),
+            "P2WSH with stack items should succeed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -2846,7 +3220,11 @@ mod tests {
         };
 
         let result = verify_input(&tx, 0, &prev_output, &verifier, &flags);
-        assert!(result.is_ok(), "Legacy OP_TRUE with empty witness should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Legacy OP_TRUE with empty witness should succeed: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -2885,7 +3263,10 @@ mod tests {
         // OP_PUSHDATA1 push followed by extra bytes (not a single push)
         let script = vec![Opcode::OP_PUSHDATA1 as u8, 2, 0xaa, 0xbb, 0xcc];
         let result = extract_single_push(&script);
-        assert!(result.is_none(), "OP_PUSHDATA1 with trailing bytes should not be a single push");
+        assert!(
+            result.is_none(),
+            "OP_PUSHDATA1 with trailing bytes should not be a single push"
+        );
     }
 
     #[test]
@@ -2927,7 +3308,11 @@ mod tests {
         };
 
         let result = verify_input(&tx, 0, &prev_output, &verifier, &flags);
-        assert!(result.is_ok(), "P2SH with verify_p2sh=false should run as legacy: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "P2SH with verify_p2sh=false should run as legacy: {:?}",
+            result.err()
+        );
     }
 
     // ---- Coverage: verify_input with witness v0 and empty scriptSig ----

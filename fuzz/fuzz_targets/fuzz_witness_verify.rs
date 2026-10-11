@@ -3,13 +3,13 @@
 use libfuzzer_sys::fuzz_target;
 use std::panic;
 
+use btc_consensus::script_engine::ScriptFlags;
+use btc_consensus::sig_verify::Secp256k1Verifier;
+use btc_consensus::witness::{verify_input, verify_witness_program};
 use btc_primitives::amount::Amount;
 use btc_primitives::hash::TxHash;
 use btc_primitives::script::ScriptBuf;
 use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut, Witness};
-use btc_consensus::script_engine::ScriptFlags;
-use btc_consensus::sig_verify::Secp256k1Verifier;
-use btc_consensus::witness::{verify_witness_program, verify_input};
 
 fuzz_target!(|data: &[u8]| {
     // We need at least a few bytes to construct meaningful inputs:
@@ -38,7 +38,9 @@ fuzz_target!(|data: &[u8]| {
         if pos >= witness_data.len() {
             break;
         }
-        let item_len = (witness_data[pos] as usize).min(witness_data.len() - pos - 1).min(75);
+        let item_len = (witness_data[pos] as usize)
+            .min(witness_data.len() - pos - 1)
+            .min(75);
         pos += 1;
         if pos + item_len > witness_data.len() {
             break;
@@ -70,14 +72,7 @@ fuzz_target!(|data: &[u8]| {
     // verify_witness_program must NEVER panic, regardless of inputs.
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         let _ = verify_witness_program(
-            version,
-            program,
-            &witness,
-            &tx,
-            0,
-            50_000,
-            &verifier,
-            &flags,
+            version, program, &witness, &tx, 0, 50_000, &verifier, &flags,
         );
     }));
     if let Err(e) = result {

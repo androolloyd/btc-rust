@@ -1,6 +1,6 @@
-use crate::encode::{Encodable, Decodable, EncodeError, VarInt, ReadExt, WriteExt};
-use crate::hash::{BlockHash, sha256d, TxHash};
 use crate::compact::CompactTarget;
+use crate::encode::{Decodable, Encodable, EncodeError, ReadExt, VarInt, WriteExt};
+use crate::hash::{sha256d, BlockHash, TxHash};
 use crate::transaction::Transaction;
 use std::io::{Read, Write};
 
@@ -22,7 +22,8 @@ impl BlockHeader {
     pub fn block_hash(&self) -> BlockHash {
         let mut buf = [0u8; 80];
         let mut cursor = std::io::Cursor::new(&mut buf[..]);
-        self.encode(&mut cursor).expect("encoding 80 bytes should not fail");
+        self.encode(&mut cursor)
+            .expect("encoding 80 bytes should not fail");
         BlockHash::compute(&buf)
     }
 
@@ -60,7 +61,14 @@ impl Decodable for BlockHeader {
         let time = reader.read_u32_le()?;
         let bits = CompactTarget::from_u32(reader.read_u32_le()?);
         let nonce = reader.read_u32_le()?;
-        Ok(BlockHeader { version, prev_blockhash, merkle_root, time, bits, nonce })
+        Ok(BlockHeader {
+            version,
+            prev_blockhash,
+            merkle_root,
+            time,
+            bits,
+            nonce,
+        })
     }
 }
 
@@ -78,7 +86,8 @@ impl Block {
 
     /// Compute the merkle root from transactions
     pub fn compute_merkle_root(&self) -> TxHash {
-        let txids: Vec<[u8; 32]> = self.transactions
+        let txids: Vec<[u8; 32]> = self
+            .transactions
             .iter()
             .map(|tx| tx.txid().to_bytes())
             .collect();
@@ -129,7 +138,10 @@ impl Decodable for Block {
         for _ in 0..tx_count {
             transactions.push(Transaction::decode(reader)?);
         }
-        Ok(Block { header, transactions })
+        Ok(Block {
+            header,
+            transactions,
+        })
     }
 }
 
@@ -145,7 +157,7 @@ pub fn merkle_root(hashes: &[[u8; 32]]) -> [u8; 32] {
     let mut current_level: Vec<[u8; 32]> = hashes.to_vec();
 
     while current_level.len() > 1 {
-        let mut next_level = Vec::with_capacity((current_level.len() + 1) / 2);
+        let mut next_level = Vec::with_capacity(current_level.len().div_ceil(2));
 
         for pair in current_level.chunks(2) {
             let mut combined = [0u8; 64];
@@ -172,8 +184,9 @@ mod tests {
         let raw_header = hex::decode(
             "0100000000000000000000000000000000000000000000000000000000000000\
              000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa\
-             4b1e5e4a29ab5f49ffff001d1dac2b7c"
-        ).unwrap();
+             4b1e5e4a29ab5f49ffff001d1dac2b7c",
+        )
+        .unwrap();
 
         let header: BlockHeader = encode::decode(&raw_header).unwrap();
         assert_eq!(header.version, 1);
@@ -271,9 +284,15 @@ mod tests {
         buf.extend_from_slice(&100_001u32.to_le_bytes());
 
         let result = encode::decode::<Block>(&buf);
-        assert!(result.is_err(), "Block with >100k transactions should be rejected");
+        assert!(
+            result.is_err(),
+            "Block with >100k transactions should be rejected"
+        );
         let err_msg = format!("{}", result.unwrap_err());
-        assert!(err_msg.contains("too many transactions"), "Error should mention too many transactions, got: {}", err_msg);
+        assert!(
+            err_msg.contains("too many transactions"),
+            "Error should mention too many transactions, got: {err_msg}"
+        );
     }
 
     #[test]

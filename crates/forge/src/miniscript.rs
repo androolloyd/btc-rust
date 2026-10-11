@@ -47,7 +47,6 @@ pub enum MiniscriptError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Miniscript {
     // -- Basic key checks --------------------------------------------------
-
     /// `<key> OP_CHECKSIG`
     Pk(Vec<u8>),
     /// `OP_DUP OP_HASH160 <hash160(key)> OP_EQUALVERIFY OP_CHECKSIG`
@@ -56,7 +55,6 @@ pub enum Miniscript {
     Multi(u32, Vec<Vec<u8>>),
 
     // -- Hashlocks ---------------------------------------------------------
-
     /// `OP_SIZE <32> OP_EQUALVERIFY OP_SHA256 <hash> OP_EQUAL`
     Sha256(Vec<u8>),
     /// `OP_SIZE <32> OP_EQUALVERIFY OP_HASH256 <hash> OP_EQUAL`
@@ -67,14 +65,12 @@ pub enum Miniscript {
     Hash160(Vec<u8>),
 
     // -- Timelocks ---------------------------------------------------------
-
     /// `<n> OP_CHECKLOCKTIMEVERIFY`
     After(u32),
     /// `<n> OP_CHECKSEQUENCEVERIFY`
     Older(u32),
 
     // -- Combinators -------------------------------------------------------
-
     /// `[X] [Y]` (verify-wrapped left, expression right)
     AndV(Box<Miniscript>, Box<Miniscript>),
     /// `[X] [Y] OP_BOOLAND`
@@ -89,12 +85,10 @@ pub enum Miniscript {
     OrI(Box<Miniscript>, Box<Miniscript>),
 
     // -- Thresholds --------------------------------------------------------
-
     /// `[X1] [X2] OP_ADD ... [Xn] OP_ADD <k> OP_EQUAL`
     Thresh(u32, Vec<Miniscript>),
 
     // -- Wrappers ----------------------------------------------------------
-
     /// `[X] OP_VERIFY`
     Verify(Box<Miniscript>),
     /// `OP_SIZE OP_0NOTEQUAL OP_IF [X] OP_ENDIF`
@@ -254,8 +248,10 @@ impl Miniscript {
             // Multi: OP_0 dummy + k signatures => 1 + k * (1+73)
             Miniscript::Multi(k, _) => 1 + (*k as usize) * (1 + 73),
             // Hashlocks: 32-byte preimage => 1 + 32
-            Miniscript::Sha256(_) | Miniscript::Hash256(_) |
-            Miniscript::Ripemd160(_) | Miniscript::Hash160(_) => 1 + 32,
+            Miniscript::Sha256(_)
+            | Miniscript::Hash256(_)
+            | Miniscript::Ripemd160(_)
+            | Miniscript::Hash160(_) => 1 + 32,
             // Timelocks: no witness items (locktime checked by interpreter)
             Miniscript::After(_) | Miniscript::Older(_) => 0,
             // And: both branches must be satisfied
@@ -310,18 +306,20 @@ impl Miniscript {
     fn requires_signature(&self) -> bool {
         match self {
             Miniscript::Pk(_) | Miniscript::PkH(_) | Miniscript::Multi(_, _) => true,
-            Miniscript::Sha256(_) | Miniscript::Hash256(_) |
-            Miniscript::Ripemd160(_) | Miniscript::Hash160(_) => false,
+            Miniscript::Sha256(_)
+            | Miniscript::Hash256(_)
+            | Miniscript::Ripemd160(_)
+            | Miniscript::Hash160(_) => false,
             Miniscript::After(_) | Miniscript::Older(_) => false,
             // And: at least one branch requires sig
             Miniscript::AndV(x, y) | Miniscript::AndB(x, y) => {
                 x.requires_signature() || y.requires_signature()
             }
             // Or: both branches must require sig (either path could be taken)
-            Miniscript::OrB(x, y) | Miniscript::OrD(x, y) |
-            Miniscript::OrC(x, y) | Miniscript::OrI(x, y) => {
-                x.requires_signature() && y.requires_signature()
-            }
+            Miniscript::OrB(x, y)
+            | Miniscript::OrD(x, y)
+            | Miniscript::OrC(x, y)
+            | Miniscript::OrI(x, y) => x.requires_signature() && y.requires_signature(),
             Miniscript::Thresh(k, subs) => {
                 // Safe if even the weakest k subs all require a signature.
                 // Count how many subs do NOT require a signature.
@@ -489,8 +487,7 @@ impl Policy {
                         .collect();
                     Miniscript::Multi(*k as u32, keys)
                 } else {
-                    let ms: Vec<Miniscript> =
-                        subs.iter().map(|p| p.to_miniscript()).collect();
+                    let ms: Vec<Miniscript> = subs.iter().map(|p| p.to_miniscript()).collect();
                     Miniscript::Thresh(*k as u32, ms)
                 }
             }
@@ -522,9 +519,9 @@ fn parse_policy(input: &str) -> Result<(Policy, &str), MiniscriptError> {
     }
 
     // Find the function name (everything up to the first '(')
-    let open = input.find('(').ok_or_else(|| {
-        MiniscriptError::Expected("(".to_string(), input.to_string())
-    })?;
+    let open = input
+        .find('(')
+        .ok_or_else(|| MiniscriptError::Expected("(".to_string(), input.to_string()))?;
     let name = input[..open].trim();
     let after_open = &input[open + 1..];
 
@@ -554,8 +551,7 @@ fn parse_policy(input: &str) -> Result<(Policy, &str), MiniscriptError> {
             let (arg, rest) = read_until_close(after_open)?;
             let hash = arg.trim().to_string();
             // Validate hex
-            hex::decode(&hash)
-                .map_err(|e| MiniscriptError::InvalidHex(e.to_string()))?;
+            hex::decode(&hash).map_err(|e| MiniscriptError::InvalidHex(e.to_string()))?;
             Ok((Policy::Sha256(hash), rest))
         }
         "and" => {
@@ -639,7 +635,10 @@ fn read_until_close(input: &str) -> Result<(&str, &str), MiniscriptError> {
             _ => {}
         }
     }
-    Err(MiniscriptError::Expected(")".to_string(), input.to_string()))
+    Err(MiniscriptError::Expected(
+        ")".to_string(),
+        input.to_string(),
+    ))
 }
 
 /// Read characters until we find a comma at depth 0.
@@ -664,7 +663,10 @@ fn read_until_comma(input: &str) -> Result<(&str, &str), MiniscriptError> {
             _ => {}
         }
     }
-    Err(MiniscriptError::Expected(",".to_string(), input.to_string()))
+    Err(MiniscriptError::Expected(
+        ",".to_string(),
+        input.to_string(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -700,7 +702,7 @@ fn encode_script_num(n: i64) -> Vec<u8> {
         abs >>= 8;
     }
 
-    if result.last().map_or(false, |b| b & 0x80 != 0) {
+    if result.last().is_some_and(|b| b & 0x80 != 0) {
         result.push(if negative { 0x80 } else { 0x00 });
     } else if negative {
         let last = result.last_mut().unwrap();
@@ -725,7 +727,7 @@ mod tests {
             .as_script()
             .instructions()
             .map(|r| match r.unwrap() {
-                Instruction::Op(op) => format!("{:?}", op),
+                Instruction::Op(op) => format!("{op:?}"),
                 Instruction::PushBytes(data) => format!("PUSH({})", hex::encode(data)),
             })
             .collect()
@@ -756,7 +758,7 @@ mod tests {
     #[test]
     fn parse_sha256() {
         let h = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-        let p = Policy::parse(&format!("sha256({})", h)).unwrap();
+        let p = Policy::parse(&format!("sha256({h})")).unwrap();
         assert_eq!(p, Policy::Sha256(h.to_string()));
     }
 
@@ -848,10 +850,7 @@ mod tests {
     fn compile_after() {
         let p = Policy::After(100);
         let asm = disasm(&p.compile());
-        assert_eq!(
-            asm,
-            vec!["PUSH(64)", "OP_CHECKLOCKTIMEVERIFY", "OP_DROP"]
-        );
+        assert_eq!(asm, vec!["PUSH(64)", "OP_CHECKLOCKTIMEVERIFY", "OP_DROP"]);
     }
 
     #[test]
@@ -866,10 +865,7 @@ mod tests {
     fn compile_older() {
         let p = Policy::Older(144);
         let asm = disasm(&p.compile());
-        assert_eq!(
-            asm,
-            vec!["PUSH(9000)", "OP_CHECKSEQUENCEVERIFY", "OP_DROP"]
-        );
+        assert_eq!(asm, vec!["PUSH(9000)", "OP_CHECKSEQUENCEVERIFY", "OP_DROP"]);
     }
 
     #[test]
@@ -878,7 +874,7 @@ mod tests {
         let p = Policy::Sha256(hash.to_string());
         let asm = disasm(&p.compile());
         assert_eq!(asm[0], "OP_SHA256");
-        assert_eq!(asm[1], format!("PUSH({})", hash));
+        assert_eq!(asm[1], format!("PUSH({hash})"));
         assert_eq!(asm[2], "OP_EQUAL");
         assert_eq!(asm.len(), 3);
     }
@@ -949,10 +945,7 @@ mod tests {
 
     #[test]
     fn compile_thresh_general() {
-        let p = Policy::Thresh(
-            1,
-            vec![Policy::Key("aa".to_string()), Policy::After(10)],
-        );
+        let p = Policy::Thresh(1, vec![Policy::Key("aa".to_string()), Policy::After(10)]);
         let asm = disasm(&p.compile());
         assert_eq!(
             asm,
@@ -1034,7 +1027,14 @@ mod tests {
         let asm = disasm(&ms.compile());
         assert_eq!(
             asm,
-            vec!["OP_2", "PUSH(aa)", "PUSH(bb)", "PUSH(cc)", "OP_3", "OP_CHECKMULTISIG"]
+            vec![
+                "OP_2",
+                "PUSH(aa)",
+                "PUSH(bb)",
+                "PUSH(cc)",
+                "OP_3",
+                "OP_CHECKMULTISIG"
+            ]
         );
     }
 
@@ -1122,7 +1122,13 @@ mod tests {
         let asm = disasm(&ms.compile());
         assert_eq!(
             asm,
-            vec!["PUSH(aa)", "OP_CHECKSIG", "PUSH(bb)", "OP_CHECKSIG", "OP_BOOLAND"]
+            vec![
+                "PUSH(aa)",
+                "OP_CHECKSIG",
+                "PUSH(bb)",
+                "OP_CHECKSIG",
+                "OP_BOOLAND"
+            ]
         );
     }
 
@@ -1135,7 +1141,13 @@ mod tests {
         let asm = disasm(&ms.compile());
         assert_eq!(
             asm,
-            vec!["PUSH(aa)", "OP_CHECKSIG", "PUSH(bb)", "OP_CHECKSIG", "OP_BOOLOR"]
+            vec![
+                "PUSH(aa)",
+                "OP_CHECKSIG",
+                "PUSH(bb)",
+                "OP_CHECKSIG",
+                "OP_BOOLOR"
+            ]
         );
     }
 
@@ -1149,9 +1161,12 @@ mod tests {
         assert_eq!(
             asm,
             vec![
-                "PUSH(aa)", "OP_CHECKSIG",
-                "OP_IFDUP", "OP_NOTIF",
-                "PUSH(bb)", "OP_CHECKSIG",
+                "PUSH(aa)",
+                "OP_CHECKSIG",
+                "OP_IFDUP",
+                "OP_NOTIF",
+                "PUSH(bb)",
+                "OP_CHECKSIG",
                 "OP_ENDIF"
             ]
         );
@@ -1167,9 +1182,11 @@ mod tests {
         assert_eq!(
             asm,
             vec![
-                "PUSH(aa)", "OP_CHECKSIG",
+                "PUSH(aa)",
+                "OP_CHECKSIG",
                 "OP_NOTIF",
-                "PUSH(bb)", "OP_CHECKSIG",
+                "PUSH(bb)",
+                "OP_CHECKSIG",
                 "OP_ENDIF"
             ]
         );
@@ -1186,9 +1203,11 @@ mod tests {
             asm,
             vec![
                 "OP_IF",
-                "PUSH(aa)", "OP_CHECKSIG",
+                "PUSH(aa)",
+                "OP_CHECKSIG",
                 "OP_ELSE",
-                "PUSH(bb)", "OP_CHECKSIG",
+                "PUSH(bb)",
+                "OP_CHECKSIG",
                 "OP_ENDIF"
             ]
         );
@@ -1198,19 +1217,19 @@ mod tests {
     fn ms_thresh_compile() {
         let ms = Miniscript::Thresh(
             1,
-            vec![
-                Miniscript::Pk(vec![0xaa]),
-                Miniscript::Pk(vec![0xbb]),
-            ],
+            vec![Miniscript::Pk(vec![0xaa]), Miniscript::Pk(vec![0xbb])],
         );
         let asm = disasm(&ms.compile());
         assert_eq!(
             asm,
             vec![
-                "PUSH(aa)", "OP_CHECKSIG",
-                "PUSH(bb)", "OP_CHECKSIG",
+                "PUSH(aa)",
+                "OP_CHECKSIG",
+                "PUSH(bb)",
+                "OP_CHECKSIG",
                 "OP_ADD",
-                "OP_1", "OP_EQUAL",
+                "OP_1",
+                "OP_EQUAL",
             ]
         );
     }
@@ -1229,8 +1248,11 @@ mod tests {
         assert_eq!(
             asm,
             vec![
-                "OP_SIZE", "OP_0NOTEQUAL", "OP_IF",
-                "PUSH(aa)", "OP_CHECKSIG",
+                "OP_SIZE",
+                "OP_0NOTEQUAL",
+                "OP_IF",
+                "PUSH(aa)",
+                "OP_CHECKSIG",
                 "OP_ENDIF"
             ]
         );
@@ -1521,17 +1543,11 @@ mod tests {
 
     #[test]
     fn policy_to_ms_thresh_general() {
-        let p = Policy::Thresh(
-            1,
-            vec![Policy::Key("aa".to_string()), Policy::After(10)],
-        );
+        let p = Policy::Thresh(1, vec![Policy::Key("aa".to_string()), Policy::After(10)]);
         let ms = p.to_miniscript();
         assert_eq!(
             ms,
-            Miniscript::Thresh(
-                1,
-                vec![Miniscript::Pk(vec![0xaa]), Miniscript::After(10)]
-            )
+            Miniscript::Thresh(1, vec![Miniscript::Pk(vec![0xaa]), Miniscript::After(10)])
         );
     }
 
@@ -1560,7 +1576,7 @@ mod tests {
     fn policy_to_ms_nested_unsafe() {
         // or(sha256(hash), after(100)) -- no keys anywhere
         let h = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-        let p = Policy::parse(&format!("or(sha256({}),after(100))", h)).unwrap();
+        let p = Policy::parse(&format!("or(sha256({h}),after(100))")).unwrap();
         let ms = p.to_miniscript();
         assert!(!ms.is_safe());
     }

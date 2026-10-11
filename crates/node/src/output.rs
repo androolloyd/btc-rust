@@ -50,7 +50,7 @@ pub fn emit<T: Serialize>(format: OutputFormat, value: &T) {
     match format {
         OutputFormat::Json => {
             let json = serde_json::to_string(value).expect("serialization failed");
-            println!("{}", json);
+            println!("{json}");
         }
         OutputFormat::Text => {
             // For text, try to pretty-print
@@ -90,10 +90,10 @@ pub fn emit_error(format: OutputFormat, code: i32, message: &str) -> ! {
             });
             let _ = writeln!(io::stdout(), "{}", serde_json::to_string(&err).unwrap());
             // Also log to stderr for humans watching the terminal
-            eprintln!("error: {}", message);
+            eprintln!("error: {message}");
         }
         OutputFormat::Text => {
-            eprintln!("error: {}", message);
+            eprintln!("error: {message}");
         }
     }
     std::process::exit(code);
@@ -106,7 +106,7 @@ fn print_value_as_text(value: &serde_json::Value, indent: usize) {
             for (k, v) in map {
                 match v {
                     serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
-                        println!("{}{}:", prefix, k);
+                        println!("{prefix}{k}:");
                         print_value_as_text(v, indent + 2);
                     }
                     _ => {
@@ -208,8 +208,8 @@ mod tests {
 
     #[test]
     fn test_format_scalar_float() {
-        let v = serde_json::json!(3.14);
-        assert_eq!(format_scalar(&v), "3.14");
+        let v = serde_json::json!(1.25);
+        assert_eq!(format_scalar(&v), "1.25");
     }
 
     #[test]
@@ -417,15 +417,13 @@ mod tests {
 
     #[test]
     fn test_emit_text_mode_array() {
-        let peers: Vec<PeerEntry> = vec![
-            PeerEntry {
-                addr: "127.0.0.1:8333".into(),
-                version: 70016,
-                user_agent: "/test/".into(),
-                start_height: 0,
-                inbound: false,
-            },
-        ];
+        let peers: Vec<PeerEntry> = vec![PeerEntry {
+            addr: "127.0.0.1:8333".into(),
+            version: 70016,
+            user_agent: "/test/".into(),
+            start_height: 0,
+            inbound: false,
+        }];
         emit(OutputFormat::Text, &peers);
     }
 

@@ -158,8 +158,16 @@ impl Minisketch {
         let len = self.buckets.len().max(other.buckets.len());
         let mut result_buckets = vec![0u64; len];
         for i in 0..len {
-            let a = if i < self.buckets.len() { self.buckets[i] } else { 0 };
-            let b = if i < other.buckets.len() { other.buckets[i] } else { 0 };
+            let a = if i < self.buckets.len() {
+                self.buckets[i]
+            } else {
+                0
+            };
+            let b = if i < other.buckets.len() {
+                other.buckets[i]
+            } else {
+                0
+            };
             result_buckets[i] = a ^ b;
         }
         let diff_elements: HashSet<u64> = self
@@ -237,7 +245,9 @@ impl Minisketch {
     fn bucket_index(element: u64, hash_idx: u64, num_buckets: usize) -> usize {
         // Simple mixing function: multiply by different primes for each hash_idx
         let mixed = element
-            .wrapping_mul(0x517cc1b727220a95u64.wrapping_add(hash_idx.wrapping_mul(0x6c62272e07bb0142)))
+            .wrapping_mul(
+                0x517cc1b727220a95u64.wrapping_add(hash_idx.wrapping_mul(0x6c62272e07bb0142)),
+            )
             .wrapping_add(hash_idx);
         (mixed as usize) % num_buckets
     }
@@ -255,8 +265,7 @@ impl Minisketch {
 pub fn short_id(txid: &TxHash) -> u64 {
     let bytes = txid.as_bytes();
     u64::from_le_bytes([
-        bytes[0], bytes[1], bytes[2], bytes[3],
-        bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
     ])
 }
 
@@ -279,8 +288,7 @@ pub fn should_flood(txid: &TxHash, config: &ErlayConfig) -> bool {
     // then compare against q_factor * u64::MAX.
     let bytes = txid.as_bytes();
     let val = u64::from_le_bytes([
-        bytes[24], bytes[25], bytes[26], bytes[27],
-        bytes[28], bytes[29], bytes[30], bytes[31],
+        bytes[24], bytes[25], bytes[26], bytes[27], bytes[28], bytes[29], bytes[30], bytes[31],
     ]);
     let threshold = (config.q_factor * u64::MAX as f64) as u64;
     val < threshold
@@ -518,7 +526,9 @@ pub struct ReqSketchExt {
 
 impl ReqSketchExt {
     pub fn new(additional_capacity: u32) -> Self {
-        ReqSketchExt { additional_capacity }
+        ReqSketchExt {
+            additional_capacity,
+        }
     }
 
     pub fn command() -> &'static str {
@@ -550,8 +560,7 @@ mod tests {
         for i in 0..20u8 {
             assert!(
                 should_flood(&txhash(i), &config),
-                "txhash({}) should flood when Erlay is disabled",
-                i
+                "txhash({i}) should flood when Erlay is disabled"
             );
         }
     }
@@ -565,8 +574,7 @@ mod tests {
         for i in 0..20u8 {
             assert!(
                 should_flood(&txhash(i), &config),
-                "txhash({}) should flood with q_factor=1.0",
-                i
+                "txhash({i}) should flood with q_factor=1.0"
             );
         }
     }
@@ -580,8 +588,7 @@ mod tests {
         for i in 0..20u8 {
             assert!(
                 !should_flood(&txhash(i), &config),
-                "txhash({}) should NOT flood with q_factor=0.0",
-                i
+                "txhash({i}) should NOT flood with q_factor=0.0"
             );
         }
     }
@@ -620,9 +627,7 @@ mod tests {
         // Allow generous range for deterministic hash-based selection.
         assert!(
             flood_count > 0 && flood_count < 900,
-            "Expected some flood decisions, got {}/{}",
-            flood_count,
-            total
+            "Expected some flood decisions, got {flood_count}/{total}"
         );
     }
 
@@ -746,7 +751,10 @@ mod tests {
         s1.add(2);
         // s2 is empty -> 2 differences, exceeds capacity of 1.
         let result = s1.decode_differences(&s2);
-        assert!(result.is_none(), "should fail when differences exceed capacity");
+        assert!(
+            result.is_none(),
+            "should fail when differences exceed capacity"
+        );
     }
 
     #[test]
@@ -758,9 +766,15 @@ mod tests {
         // capacity=5 -> 2*5+1 = 11 buckets -> 8 + 11*8 = 96 bytes
         assert_eq!(bytes.len(), 8 + 11 * 8);
         // First 4 bytes: capacity (5)
-        assert_eq!(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]), 5);
+        assert_eq!(
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            5
+        );
         // Next 4 bytes: bucket count (11)
-        assert_eq!(u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]), 11);
+        assert_eq!(
+            u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+            11
+        );
     }
 
     // ---- Short-id tests ----
@@ -949,7 +963,10 @@ mod tests {
         s2.add(400);
 
         let diff = s1.xor_with(&s2);
-        assert!(!diff.is_zero(), "XOR of different sketches should be non-zero");
+        assert!(
+            !diff.is_zero(),
+            "XOR of different sketches should be non-zero"
+        );
 
         // The symmetric difference should contain 300 and 400
         let decoded = s1.decode_differences(&s2).unwrap();

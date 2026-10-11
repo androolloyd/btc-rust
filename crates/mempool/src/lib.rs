@@ -1,5 +1,5 @@
-pub mod pool;
 pub mod policy;
+pub mod pool;
 pub mod rbf;
 
 #[cfg(feature = "cluster")]

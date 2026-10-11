@@ -41,6 +41,7 @@ secp256k1 = { workspace = true }
 redb = { workspace = true }
 
 [dev-dependencies]
+btc-test = { workspace = true }
 tempfile = { workspace = true }
 
 [lib]

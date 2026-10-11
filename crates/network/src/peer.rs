@@ -1,5 +1,5 @@
-use std::net::SocketAddr;
 use crate::protocol::{ProtocolVersion, ServiceFlags};
+use std::net::SocketAddr;
 
 /// State of a peer connection
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,7 +116,7 @@ mod tests {
     #[test]
     fn test_peer_info_debug() {
         let info = PeerInfo::new(test_addr(), false);
-        let debug_str = format!("{:?}", info);
+        let debug_str = format!("{info:?}");
         assert!(debug_str.contains("Connecting"));
     }
 }

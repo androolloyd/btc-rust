@@ -1,4 +1,4 @@
-use btc_primitives::encode::{Encodable, Decodable, EncodeError, ReadExt, WriteExt};
+use btc_primitives::encode::{Decodable, Encodable, EncodeError, ReadExt, WriteExt};
 use btc_primitives::hash::sha256d;
 use std::io::{Read, Write};
 
@@ -59,7 +59,12 @@ impl Decodable for MessageHeader {
         let payload_size = reader.read_u32_le()?;
         let mut checksum = [0u8; 4];
         reader.read_exact(&mut checksum)?;
-        Ok(MessageHeader { magic, command, payload_size, checksum })
+        Ok(MessageHeader {
+            magic,
+            command,
+            payload_size,
+            checksum,
+        })
     }
 }
 
@@ -164,21 +169,11 @@ pub enum InvType {
     WitnessBlock = 0x40000002,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct NetAddress {
     pub services: u64,
     pub ip: [u8; 16], // IPv6-mapped
     pub port: u16,
-}
-
-impl Default for NetAddress {
-    fn default() -> Self {
-        NetAddress {
-            services: 0,
-            ip: [0; 16],
-            port: 0,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -212,7 +207,11 @@ mod tests {
         assert_eq!(NetworkMessage::MemPool.command(), "mempool");
         assert_eq!(NetworkMessage::GetAddr.command(), "getaddr");
         assert_eq!(
-            NetworkMessage::SendCmpct { announce: false, version: 1 }.command(),
+            NetworkMessage::SendCmpct {
+                announce: false,
+                version: 1
+            }
+            .command(),
             "sendcmpct"
         );
         assert_eq!(
@@ -322,7 +321,11 @@ mod tests {
         ];
 
         for (msg, expected_cmd) in test_cases {
-            assert_eq!(msg.command(), expected_cmd, "command mismatch for {:?}", expected_cmd);
+            assert_eq!(
+                msg.command(),
+                expected_cmd,
+                "command mismatch for {expected_cmd:?}"
+            );
         }
     }
 
@@ -507,7 +510,7 @@ mod tests {
     #[test]
     fn test_network_message_debug() {
         let msg = NetworkMessage::Verack;
-        let debug_str = format!("{:?}", msg);
+        let debug_str = format!("{msg:?}");
         assert!(debug_str.contains("Verack"));
     }
 

@@ -63,10 +63,7 @@ impl Handshake {
     }
 
     /// Build the version message we will send to the peer.
-    pub fn build_version_message(
-        _network: Network,
-        start_height: i32,
-    ) -> NetworkMessage {
+    pub fn build_version_message(_network: Network, start_height: i32) -> NetworkMessage {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -167,14 +164,17 @@ mod tests {
         match msg {
             NetworkMessage::Version(v) => {
                 assert_eq!(v.version, ProtocolVersion::CURRENT.0);
-                assert_eq!(v.services, ServiceFlags::NETWORK.0 | ServiceFlags::WITNESS.0);
+                assert_eq!(
+                    v.services,
+                    ServiceFlags::NETWORK.0 | ServiceFlags::WITNESS.0
+                );
                 assert_eq!(v.user_agent, USER_AGENT);
                 assert_eq!(v.start_height, 800_000);
                 assert!(v.relay);
                 assert!(v.timestamp > 0);
                 assert_ne!(v.nonce, 0); // extremely unlikely to be 0
             }
-            other => panic!("expected Version, got {:?}", other),
+            other => panic!("expected Version, got {other:?}"),
         }
     }
 
@@ -439,7 +439,7 @@ mod tests {
                 assert_eq!(v.start_height, 100);
                 assert_eq!(v.version, ProtocolVersion::CURRENT.0);
             }
-            other => panic!("expected Version, got {:?}", other),
+            other => panic!("expected Version, got {other:?}"),
         }
     }
 
@@ -450,7 +450,7 @@ mod tests {
             NetworkMessage::Version(v) => {
                 assert_eq!(v.start_height, 0);
             }
-            other => panic!("expected Version, got {:?}", other),
+            other => panic!("expected Version, got {other:?}"),
         }
     }
 

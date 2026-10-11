@@ -57,7 +57,9 @@ pub fn is_truc(tx: &Transaction) -> bool {
 /// A transaction signals RBF if at least one of its inputs has an
 /// nSequence number strictly less than `0xfffffffe`.
 pub fn signals_rbf(tx: &Transaction) -> bool {
-    tx.inputs.iter().any(|input| input.sequence < RBF_SEQUENCE_THRESHOLD)
+    tx.inputs
+        .iter()
+        .any(|input| input.sequence < RBF_SEQUENCE_THRESHOLD)
 }
 
 /// Returns `true` if the given script is a Pay-to-Anchor (P2A) output.
@@ -67,12 +69,15 @@ pub fn signals_rbf(tx: &Transaction) -> bool {
 pub fn is_p2a_output(tx: &Transaction, output_index: usize) -> bool {
     tx.outputs
         .get(output_index)
-        .map_or(false, |o| o.script_pubkey.is_p2a())
+        .is_some_and(|o| o.script_pubkey.is_p2a())
 }
 
 /// Count P2A outputs in a transaction.
 pub fn count_p2a_outputs(tx: &Transaction) -> usize {
-    tx.outputs.iter().filter(|o| o.script_pubkey.is_p2a()).count()
+    tx.outputs
+        .iter()
+        .filter(|o| o.script_pubkey.is_p2a())
+        .count()
 }
 
 /// Validate a v3 (TRUC) transaction against TRUC policy rules.
@@ -270,10 +275,7 @@ mod tests {
         let result = validate_truc(&tx, 2, 0, false);
         assert_eq!(
             result,
-            Err(TrucError::TooManyAncestors {
-                count: 2,
-                max: 1,
-            })
+            Err(TrucError::TooManyAncestors { count: 2, max: 1 })
         );
     }
 
@@ -290,10 +292,7 @@ mod tests {
         let result = validate_truc(&tx, 0, 2, false);
         assert_eq!(
             result,
-            Err(TrucError::TooManyDescendants {
-                count: 2,
-                max: 1,
-            })
+            Err(TrucError::TooManyDescendants { count: 2, max: 1 })
         );
     }
 
@@ -355,7 +354,7 @@ mod tests {
     fn test_p2a_output_detection() {
         let tx = make_v3_with_p2a(0);
         assert!(!is_p2a_output(&tx, 0)); // first output is normal
-        assert!(is_p2a_output(&tx, 1));  // second output is P2A
+        assert!(is_p2a_output(&tx, 1)); // second output is P2A
         assert!(!is_p2a_output(&tx, 2)); // out of range
     }
 

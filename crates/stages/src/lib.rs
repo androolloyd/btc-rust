@@ -1,18 +1,18 @@
-pub mod pipeline;
-pub mod stage;
-pub mod headers;
+pub mod address_index;
 pub mod bodies;
 pub mod execution;
+pub mod headers;
 pub mod indexing;
-pub mod address_index;
+pub mod pipeline;
+pub mod stage;
 
-pub use pipeline::Pipeline;
-pub use stage::{Stage, StageId, StageError, ExecOutput, UnwindOutput};
-pub use headers::{HeadersStage, HeadersSyncState};
+pub use address_index::{AddressIndexEntry, AddressIndexStage};
 pub use bodies::{BodiesStage, BodiesSyncState};
 pub use execution::{ExecutionStage, UtxoChange};
+pub use headers::{HeadersStage, HeadersSyncState};
 pub use indexing::{IndexingStage, TxIndexEntry};
-pub use address_index::{AddressIndexStage, AddressIndexEntry};
+pub use pipeline::Pipeline;
+pub use stage::{ExecOutput, Stage, StageError, StageId, UnwindOutput};
 
 /// Build the default sync pipeline with all standard stages.
 ///
@@ -35,7 +35,7 @@ pub fn build_default_pipeline() -> Pipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stage::{HEADERS, BODIES, VALIDATION, TX_INDEX, ADDRESS_INDEX};
+    use crate::stage::{ADDRESS_INDEX, BODIES, HEADERS, TX_INDEX, VALIDATION};
 
     #[test]
     fn test_build_default_pipeline() {
@@ -78,7 +78,7 @@ mod tests {
 
     #[test]
     fn test_pipeline_unwinds_on_failure() {
-        use crate::stage::{Stage, StageId, ExecOutput, UnwindOutput, StageError};
+        use crate::stage::{ExecOutput, Stage, StageError, StageId, UnwindOutput};
 
         struct FailingStage;
 
@@ -193,15 +193,15 @@ mod tests {
     fn test_stage_error_display() {
         use crate::stage::StageError;
         let e1 = StageError::StageFailed(HEADERS, "reason".into());
-        assert!(format!("{}", e1).contains("Headers"));
+        assert!(format!("{e1}").contains("Headers"));
         let e2 = StageError::Database("db error".into());
-        assert!(format!("{}", e2).contains("db error"));
+        assert!(format!("{e2}").contains("db error"));
         let e3 = StageError::Network("net error".into());
-        assert!(format!("{}", e3).contains("net error"));
+        assert!(format!("{e3}").contains("net error"));
         let e4 = StageError::Consensus("bad".into());
-        assert!(format!("{}", e4).contains("bad"));
+        assert!(format!("{e4}").contains("bad"));
         let e5 = StageError::Aborted;
-        assert!(format!("{}", e5).contains("aborted"));
+        assert!(format!("{e5}").contains("aborted"));
     }
 
     #[test]
@@ -224,15 +224,18 @@ mod tests {
 
     #[test]
     fn test_exec_output_debug() {
-        let out = ExecOutput { checkpoint: 42, done: true };
-        let debug = format!("{:?}", out);
+        let out = ExecOutput {
+            checkpoint: 42,
+            done: true,
+        };
+        let debug = format!("{out:?}");
         assert!(debug.contains("42"));
     }
 
     #[test]
     fn test_unwind_output_debug() {
         let out = UnwindOutput { checkpoint: 10 };
-        let debug = format!("{:?}", out);
+        let debug = format!("{out:?}");
         assert!(debug.contains("10"));
     }
 
@@ -273,7 +276,7 @@ mod tests {
             tx_index: 0,
             output_index: 0,
         };
-        let debug = format!("{:?}", created);
+        let debug = format!("{created:?}");
         assert!(debug.contains("Created"));
 
         let spent = UtxoChange::Spent {
@@ -281,21 +284,28 @@ mod tests {
             tx_index: 1,
             input_index: 0,
         };
-        let debug2 = format!("{:?}", spent);
+        let debug2 = format!("{spent:?}");
         assert!(debug2.contains("Spent"));
     }
 
     #[test]
     fn test_utxo_change_clone_eq() {
-        let c1 = UtxoChange::Created { height: 1, tx_index: 0, output_index: 0 };
+        let c1 = UtxoChange::Created {
+            height: 1,
+            tx_index: 0,
+            output_index: 0,
+        };
         let c2 = c1.clone();
         assert_eq!(c1, c2);
     }
 
     #[test]
     fn test_tx_index_entry_debug() {
-        let entry = TxIndexEntry { block_height: 100, tx_position: 5 };
-        let debug = format!("{:?}", entry);
+        let entry = TxIndexEntry {
+            block_height: 100,
+            tx_position: 5,
+        };
+        let debug = format!("{entry:?}");
         assert!(debug.contains("100"));
     }
 
@@ -308,37 +318,37 @@ mod tests {
             value: 1000,
             output_index: 0,
         };
-        let debug = format!("{:?}", entry);
+        let debug = format!("{entry:?}");
         assert!(debug.contains("50"));
     }
 
     #[test]
     fn test_headers_sync_state_debug() {
         let idle = HeadersSyncState::Idle;
-        assert!(format!("{:?}", idle).contains("Idle"));
+        assert!(format!("{idle:?}").contains("Idle"));
         let req = HeadersSyncState::Requesting { from: 1, to: 100 };
-        assert!(format!("{:?}", req).contains("Requesting"));
+        assert!(format!("{req:?}").contains("Requesting"));
         let proc = HeadersSyncState::Processing;
-        assert!(format!("{:?}", proc).contains("Processing"));
+        assert!(format!("{proc:?}").contains("Processing"));
         let done = HeadersSyncState::Done;
-        assert!(format!("{:?}", done).contains("Done"));
+        assert!(format!("{done:?}").contains("Done"));
     }
 
     #[test]
     fn test_bodies_sync_state_debug() {
         let idle = BodiesSyncState::Idle;
-        assert!(format!("{:?}", idle).contains("Idle"));
+        assert!(format!("{idle:?}").contains("Idle"));
         let dl = BodiesSyncState::Downloading { from: 1, to: 50 };
-        assert!(format!("{:?}", dl).contains("Downloading"));
+        assert!(format!("{dl:?}").contains("Downloading"));
         let val = BodiesSyncState::Validating;
-        assert!(format!("{:?}", val).contains("Validating"));
+        assert!(format!("{val:?}").contains("Validating"));
         let done = BodiesSyncState::Done;
-        assert!(format!("{:?}", done).contains("Done"));
+        assert!(format!("{done:?}").contains("Done"));
     }
 
     #[test]
     fn test_pipeline_with_unwind_failure() {
-        use crate::stage::{Stage, StageId, ExecOutput, UnwindOutput, StageError};
+        use crate::stage::{ExecOutput, Stage, StageError, StageId, UnwindOutput};
 
         struct FailUnwindStage;
 

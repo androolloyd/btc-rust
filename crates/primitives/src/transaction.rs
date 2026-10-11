@@ -1,7 +1,7 @@
-use crate::encode::{Encodable, Decodable, EncodeError, VarInt, ReadExt, WriteExt};
+use crate::amount::Amount;
+use crate::encode::{Decodable, Encodable, EncodeError, ReadExt, VarInt, WriteExt};
 use crate::hash::TxHash;
 use crate::script::ScriptBuf;
-use crate::amount::Amount;
 use std::io::{Read, Write};
 
 /// A reference to a specific output of a previous transaction, identified by txid and index.
@@ -107,7 +107,10 @@ impl Decodable for TxOut {
             return Err(EncodeError::InvalidData("invalid output value".into()));
         }
         let script_pubkey = ScriptBuf::decode(reader)?;
-        Ok(TxOut { value, script_pubkey })
+        Ok(TxOut {
+            value,
+            script_pubkey,
+        })
     }
 }
 
@@ -199,7 +202,8 @@ impl Transaction {
     /// Compute the txid (hash of non-witness serialization)
     pub fn txid(&self) -> TxHash {
         let mut buf = Vec::new();
-        self.encode_legacy(&mut buf).expect("encoding to vec should not fail");
+        self.encode_legacy(&mut buf)
+            .expect("encoding to vec should not fail");
         TxHash::compute(&buf)
     }
 
@@ -209,14 +213,16 @@ impl Transaction {
             return self.txid();
         }
         let mut buf = Vec::new();
-        self.encode_segwit(&mut buf).expect("encoding to vec should not fail");
+        self.encode_segwit(&mut buf)
+            .expect("encoding to vec should not fail");
         TxHash::compute(&buf)
     }
 
     /// Compute the base (non-witness) serialized size in bytes.
     pub fn base_size(&self) -> usize {
         let mut counter = crate::encode::CountWriter(0);
-        self.encode_legacy(&mut counter).expect("counting should not fail");
+        self.encode_legacy(&mut counter)
+            .expect("counting should not fail");
         counter.0
     }
 
@@ -224,9 +230,11 @@ impl Transaction {
     pub fn total_size(&self) -> usize {
         let mut counter = crate::encode::CountWriter(0);
         if self.is_segwit() {
-            self.encode_segwit(&mut counter).expect("counting should not fail");
+            self.encode_segwit(&mut counter)
+                .expect("counting should not fail");
         } else {
-            self.encode_legacy(&mut counter).expect("counting should not fail");
+            self.encode_legacy(&mut counter)
+                .expect("counting should not fail");
         }
         counter.0
     }
@@ -297,7 +305,9 @@ impl Decodable for Transaction {
             // Segwit format: marker=0, flag=1
             let flag = reader.read_u8()?;
             if flag != 1 {
-                return Err(EncodeError::InvalidData(format!("invalid segwit flag: {}", flag)));
+                return Err(EncodeError::InvalidData(format!(
+                    "invalid segwit flag: {flag}"
+                )));
             }
 
             let input_count = VarInt::decode(reader)?.0 as usize;
@@ -323,9 +333,21 @@ impl Decodable for Transaction {
                 witness.push(Witness::decode_items(reader)?);
             }
 
+            if witness.iter().all(Witness::is_empty) {
+                return Err(EncodeError::InvalidData(
+                    "superfluous witness record".into(),
+                ));
+            }
+
             let lock_time = reader.read_u32_le()?;
 
-            Ok(Transaction { version, inputs, outputs, witness, lock_time })
+            Ok(Transaction {
+                version,
+                inputs,
+                outputs,
+                witness,
+                lock_time,
+            })
         } else {
             // Legacy format: marker was actually the input count
             let input_count = marker as usize;
@@ -388,8 +410,9 @@ mod tests {
              68616e63656c6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f7574\
              20666f722062616e6b73ffffffff0100f2052a01000000434104678afdb0fe5548271967\
              f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec1\
-             12de5c384df7ba0b8d578a4c702b6bf11d5fac00000000"
-        ).unwrap();
+             12de5c384df7ba0b8d578a4c702b6bf11d5fac00000000",
+        )
+        .unwrap();
 
         let tx: Transaction = encode::decode(&raw).unwrap();
         assert!(tx.is_coinbase());
@@ -448,7 +471,10 @@ mod tests {
         buf.extend_from_slice(&excessive.to_le_bytes());
         buf.push(0x00); // empty script_pubkey
         let result = encode::decode::<TxOut>(&buf);
-        assert!(result.is_err(), "TxOut value exceeding MAX_MONEY should be rejected");
+        assert!(
+            result.is_err(),
+            "TxOut value exceeding MAX_MONEY should be rejected"
+        );
     }
 
     #[test]
@@ -466,12 +492,9 @@ mod tests {
         // A simple segwit transaction (from Bitcoin test vectors)
         // version(4) + marker(1) + flag(1) + vin_count + vin + vout_count + vout + witness + locktime
         let raw = hex::decode(
-            "02000000000101000000000000000000000000000000000000000000000000000000000000\
-             0000ffffffff03510101ffffffff0200f2052a01000000160014751e76e8199196d454941c\
-             45d1b3a323f1433bd60000000000000000266a24aa21a9ede2f61c3f71d1defd3fa999dfa3\
-             6953755c690689799962b48bebd836974e8cf90120000000000000000000000000000000000\
-             00000000000000000000000000000000000000000"
-        ).unwrap();
+            "020000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff03510101ffffffff0200f2052a01000000160014751e76e8199196d454941c45d1b3a323f1433bd60000000000000000266a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf90120000000000000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
 
         let tx: Transaction = encode::decode(&raw).unwrap();
         assert_eq!(tx.version, 2);
@@ -509,19 +532,19 @@ mod tests {
     fn test_segwit_tx_weight() {
         // Decode a real segwit transaction and verify weight = base * 3 + total.
         let raw = hex::decode(
-            "02000000000101000000000000000000000000000000000000000000000000000000000000\
-             0000ffffffff03510101ffffffff0200f2052a01000000160014751e76e8199196d454941c\
-             45d1b3a323f1433bd60000000000000000266a24aa21a9ede2f61c3f71d1defd3fa999dfa3\
-             6953755c690689799962b48bebd836974e8cf90120000000000000000000000000000000000\
-             00000000000000000000000000000000000000000"
-        ).unwrap();
+            "020000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff03510101ffffffff0200f2052a01000000160014751e76e8199196d454941c45d1b3a323f1433bd60000000000000000266a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf90120000000000000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
         let tx: Transaction = encode::decode(&raw).unwrap();
 
         let base = tx.base_size();
         let total = tx.total_size();
 
         // total_size includes marker(1) + flag(1) + witness data, so total > base
-        assert!(total > base, "segwit total_size ({}) should exceed base_size ({})", total, base);
+        assert!(
+            total > base,
+            "segwit total_size ({total}) should exceed base_size ({base})"
+        );
 
         // weight = base_size * 3 + total_size
         assert_eq!(tx.weight(), base * 3 + total);

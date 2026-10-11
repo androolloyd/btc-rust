@@ -166,9 +166,7 @@ impl Stage for HeadersStage {
         self.checkpoint = target;
         self.state = HeadersSyncState::Idle;
 
-        Ok(UnwindOutput {
-            checkpoint: target,
-        })
+        Ok(UnwindOutput { checkpoint: target })
     }
 }
 

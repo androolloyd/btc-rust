@@ -9,8 +9,6 @@ use btc_primitives::block::BlockHeader;
 use btc_primitives::hash::{sha256d, TxHash};
 use btc_primitives::transaction::Transaction;
 
-
-
 /// SipHash key derived from block header + nonce
 /// Used to compute short transaction IDs
 #[derive(Debug, Clone, Copy)]
@@ -128,11 +126,7 @@ pub struct BlockTxnResponse {
 
 impl CompactBlock {
     /// Create a compact block from a full block
-    pub fn from_block(
-        header: BlockHeader,
-        transactions: &[Transaction],
-        nonce: u64,
-    ) -> Self {
+    pub fn from_block(header: BlockHeader, transactions: &[Transaction], nonce: u64) -> Self {
         let block_hash = header.block_hash();
         let key = ShortIdKey::new(block_hash.as_bytes(), nonce);
 
@@ -283,9 +277,9 @@ mod tests {
 
     #[test]
     fn test_compact_block_creation() {
-        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
-        use btc_primitives::script::ScriptBuf;
         use btc_primitives::amount::Amount;
+        use btc_primitives::script::ScriptBuf;
+        use btc_primitives::transaction::{OutPoint, TxIn, TxOut};
 
         let header = BlockHeader {
             version: 1,
@@ -334,9 +328,9 @@ mod tests {
 
     #[test]
     fn test_compact_block_reconstruct_success() {
-        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
-        use btc_primitives::script::ScriptBuf;
         use btc_primitives::amount::Amount;
+        use btc_primitives::script::ScriptBuf;
+        use btc_primitives::transaction::{OutPoint, TxIn, TxOut};
 
         let header = BlockHeader {
             version: 1,
@@ -393,9 +387,9 @@ mod tests {
 
     #[test]
     fn test_compact_block_reconstruct_missing() {
-        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
-        use btc_primitives::script::ScriptBuf;
         use btc_primitives::amount::Amount;
+        use btc_primitives::script::ScriptBuf;
+        use btc_primitives::transaction::{OutPoint, TxIn, TxOut};
 
         let header = BlockHeader {
             version: 1,
@@ -450,9 +444,9 @@ mod tests {
     fn test_compact_block_reconstruct_partial_mempool() {
         // Block has 3 non-coinbase transactions. Mempool only has 2 of them.
         // Reconstruction should fail and report exactly 1 missing short ID.
-        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
-        use btc_primitives::script::ScriptBuf;
         use btc_primitives::amount::Amount;
+        use btc_primitives::script::ScriptBuf;
+        use btc_primitives::transaction::{OutPoint, TxIn, TxOut};
 
         let header = BlockHeader {
             version: 1,
@@ -614,9 +608,9 @@ mod tests {
 
     #[test]
     fn test_compact_block_coinbase_only() {
-        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
-        use btc_primitives::script::ScriptBuf;
         use btc_primitives::amount::Amount;
+        use btc_primitives::script::ScriptBuf;
+        use btc_primitives::transaction::{OutPoint, TxIn, TxOut};
 
         let header = BlockHeader {
             version: 1,
@@ -650,9 +644,9 @@ mod tests {
 
     #[test]
     fn test_compact_block_many_transactions() {
-        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
-        use btc_primitives::script::ScriptBuf;
         use btc_primitives::amount::Amount;
+        use btc_primitives::script::ScriptBuf;
+        use btc_primitives::transaction::{OutPoint, TxIn, TxOut};
 
         let header = BlockHeader {
             version: 1,
@@ -693,7 +687,7 @@ mod tests {
             lock_time: 0,
         };
 
-        let txs: Vec<Transaction> = (1..=10).map(|i| make_tx(i)).collect();
+        let txs: Vec<Transaction> = (1..=10).map(make_tx).collect();
         let mut all_txs = vec![coinbase];
         all_txs.extend(txs);
 
@@ -706,9 +700,9 @@ mod tests {
 
     #[test]
     fn test_reconstruct_all_from_mempool() {
-        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
-        use btc_primitives::script::ScriptBuf;
         use btc_primitives::amount::Amount;
+        use btc_primitives::script::ScriptBuf;
+        use btc_primitives::transaction::{OutPoint, TxIn, TxOut};
 
         let header = BlockHeader {
             version: 1,
@@ -800,9 +794,9 @@ mod tests {
 
     #[test]
     fn test_prefilled_tx() {
-        use btc_primitives::transaction::{TxIn, TxOut, OutPoint};
-        use btc_primitives::script::ScriptBuf;
         use btc_primitives::amount::Amount;
+        use btc_primitives::script::ScriptBuf;
+        use btc_primitives::transaction::{OutPoint, TxIn, TxOut};
 
         let tx = Transaction {
             version: 1,

@@ -68,12 +68,7 @@ fn compute_event_id(
     content: &str,
 ) -> [u8; 32] {
     let serialised = serde_json::to_string(&serde_json::json!([
-        0,
-        pubkey,
-        created_at,
-        kind,
-        tags,
-        content,
+        0, pubkey, created_at, kind, tags, content,
     ]))
     .expect("JSON serialisation should not fail");
 
@@ -192,8 +187,7 @@ impl ExEx for NostrPublisher {
                     let tx_count = block.transactions.len();
                     let total_fees = Self::estimate_total_fees(&block);
 
-                    let event =
-                        self.build_block_event(height, &hash_hex, tx_count, total_fees);
+                    let event = self.build_block_event(height, &hash_hex, tx_count, total_fees);
 
                     let relay_msg = Self::relay_message(&event);
 
@@ -223,7 +217,10 @@ impl ExEx for NostrPublisher {
                     );
                 }
                 Ok(ExExNotification::ChainReorged {
-                    old_tip, new_tip, fork_height, ..
+                    old_tip,
+                    new_tip,
+                    fork_height,
+                    ..
                 }) => {
                     info!(
                         %old_tip,
@@ -233,7 +230,10 @@ impl ExEx for NostrPublisher {
                     );
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    warn!(skipped, "NostrPublisher: lagged behind, skipped notifications");
+                    warn!(
+                        skipped,
+                        "NostrPublisher: lagged behind, skipped notifications"
+                    );
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     info!("NostrPublisher: channel closed, shutting down");
@@ -302,10 +302,8 @@ mod tests {
 
     #[test]
     fn test_build_block_event() {
-        let publisher = NostrPublisher::new(
-            vec!["wss://relay.example.com".to_string()],
-            test_key(),
-        );
+        let publisher =
+            NostrPublisher::new(vec!["wss://relay.example.com".to_string()], test_key());
 
         let event = publisher.build_block_event(
             800_000,
@@ -468,12 +466,7 @@ mod tests {
     #[test]
     fn test_nostr_event_content_format() {
         let publisher = NostrPublisher::new(vec![], test_key());
-        let event = publisher.build_block_event(
-            42,
-            "abcdef",
-            5,
-            Amount::from_sat(100_000),
-        );
+        let event = publisher.build_block_event(42, "abcdef", 5, Amount::from_sat(100_000));
         assert!(event.content.contains("42"));
         assert!(event.content.contains("abcdef"));
         assert!(event.content.contains("5"));
@@ -512,10 +505,8 @@ mod tests {
         // Drop manager to close channel so the ExEx will eventually stop.
         drop(manager);
 
-        let publisher = NostrPublisher::new(
-            vec!["wss://relay.example.com".to_string()],
-            test_key(),
-        );
+        let publisher =
+            NostrPublisher::new(vec!["wss://relay.example.com".to_string()], test_key());
         let result = publisher.start(ctx).await;
         assert!(result.is_ok());
     }

@@ -277,7 +277,7 @@ async fn main() -> eyre::Result<()> {
         Some(Commands::Config) => cmd_config(config, format),
         Some(Commands::Init) => cmd_init(config, format),
         Some(Commands::Version) => cmd_version(format),
-        Some(Commands::Rpc { method, params }) => cmd_rpc(config, format, &method, &params),
+        Some(Commands::Rpc { method, params }) => cmd_rpc(config, format, &method, &params).await,
         Some(Commands::DecodeTx { hex }) => cmd_decode_tx(&hex, format),
         Some(Commands::DecodeScript { hex }) => cmd_decode_script(&hex, format),
         Some(Commands::DecodeHeader { hex }) => cmd_decode_header(&hex, format),
@@ -309,12 +309,17 @@ async fn cmd_run(
     match policy {
         "core" | "consensus" | "all" => {}
         other => {
-            output::emit_error(format, 2, &format!("unknown policy preset '{}': expected 'core', 'consensus', or 'all'", other));
+            output::emit_error(
+                format,
+                2,
+                &format!("unknown policy preset '{other}': expected 'core', 'consensus', or 'all'"),
+            );
         }
     }
 
     let full_rbf = !no_full_rbf;
-    let effective_op_return_limit = op_return_limit.unwrap_or(btc_mempool::policy::MAX_OP_RETURN_SIZE);
+    let effective_op_return_limit =
+        op_return_limit.unwrap_or(btc_mempool::policy::MAX_OP_RETURN_SIZE);
 
     // Collect ZMQ topics from CLI flags
     let mut zmq_topics: Vec<String> = Vec::new();
@@ -338,18 +343,21 @@ async fn cmd_run(
             "P2P port: {}, RPC port: {}",
             config.p2p_port, config.rpc_port
         );
-        eprintln!("Policy preset: {}", policy);
+        eprintln!("Policy preset: {policy}");
         if no_nullfail {
             eprintln!("  NULLFAIL: disabled");
         }
         if let Some(dl) = dust_limit {
-            eprintln!("  Dust limit: {} sat", dl);
+            eprintln!("  Dust limit: {dl} sat");
         }
         if let Some(ds) = datacarrier_size {
-            eprintln!("  OP_RETURN data limit: {} bytes", ds);
+            eprintln!("  OP_RETURN data limit: {ds} bytes");
         }
-        eprintln!("  Full RBF: {}", if full_rbf { "enabled" } else { "disabled" });
-        eprintln!("  OP_RETURN limit: {} bytes", effective_op_return_limit);
+        eprintln!(
+            "  Full RBF: {}",
+            if full_rbf { "enabled" } else { "disabled" }
+        );
+        eprintln!("  OP_RETURN limit: {effective_op_return_limit} bytes");
         if !zmq_topics.is_empty() {
             eprintln!("  ZMQ topics: {}", zmq_topics.join(", "));
         }
@@ -377,8 +385,11 @@ async fn cmd_run(
     if let Some(ref snapshot_path) = assumeutxo {
         let path = std::path::Path::new(snapshot_path);
         if !path.exists() {
-            output::emit_error(format, 1, &format!("assumeutxo snapshot file not found: {}", snapshot_path));
-            return Ok(());
+            output::emit_error(
+                format,
+                1,
+                &format!("assumeutxo snapshot file not found: {snapshot_path}"),
+            );
         }
 
         output::emit_progress(
@@ -392,8 +403,7 @@ async fn cmd_run(
         match btc_storage::redb_backend::RedbDatabase::new(&db_path) {
             Ok(db) => {
                 if let Err(e) = db.init_tables() {
-                    output::emit_error(format, 5, &format!("failed to init database tables: {}", e));
-                    return Ok(());
+                    output::emit_error(format, 5, &format!("failed to init database tables: {e}"));
                 }
                 match btc_storage::snapshot::load_utxo_snapshot(path, &db) {
                     Ok(metadata) => {
@@ -407,14 +417,16 @@ async fn cmd_run(
                         );
                     }
                     Err(e) => {
-                        output::emit_error(format, 5, &format!("failed to load UTXO snapshot: {}", e));
-                        return Ok(());
+                        output::emit_error(
+                            format,
+                            5,
+                            &format!("failed to load UTXO snapshot: {e}"),
+                        );
                     }
                 }
             }
             Err(e) => {
-                output::emit_error(format, 5, &format!("failed to open database: {}", e));
-                return Ok(());
+                output::emit_error(format, 5, &format!("failed to open database: {e}"));
             }
         }
     }
@@ -483,13 +495,13 @@ fn cmd_version(format: OutputFormat) -> eyre::Result<()> {
     Ok(())
 }
 
-fn cmd_rpc(
+async fn cmd_rpc(
     config: NodeConfig,
     _format: OutputFormat,
     method: &str,
     params: &[String],
 ) -> eyre::Result<()> {
-    let result = cli::build_rpc_request(method, params, config.rpc_port);
+    let result = cli::call_rpc(method, params, config.rpc_port).await?;
     // Always emit JSON-RPC responses as JSON (the protocol is JSON-native)
     output::emit(OutputFormat::Json, &result);
     Ok(())
@@ -625,7 +637,7 @@ fn cmd_playground() -> eyre::Result<()> {
                         format_stack(engine.stack());
                     }
                     Err(e) => {
-                        println!("Execution error: {}", e);
+                        println!("Execution error: {e}");
                         println!("Stack at error:");
                         format_stack(engine.stack());
                     }
@@ -636,11 +648,11 @@ fn cmd_playground() -> eyre::Result<()> {
                 let s = script.as_script();
                 for instruction in s.instructions() {
                     match instruction {
-                        Ok(Instruction::Op(op)) => print!("{:?} ", op),
+                        Ok(Instruction::Op(op)) => print!("{op:?} "),
                         Ok(Instruction::PushBytes(data)) => {
                             print!("PUSH({}) ", hex::encode(data));
                         }
-                        Err(e) => print!("ERROR({}) ", e),
+                        Err(e) => print!("ERROR({e}) "),
                     }
                 }
                 println!();
@@ -660,13 +672,13 @@ fn cmd_playground() -> eyre::Result<()> {
                 for instruction in s.instructions() {
                     match instruction {
                         Ok(Instruction::Op(op)) => {
-                            println!("  step {}: {:?}", step, op);
+                            println!("  step {step}: {op:?}");
                         }
                         Ok(Instruction::PushBytes(data)) => {
                             println!("  step {}: PUSH({})", step, hex::encode(data));
                         }
                         Err(e) => {
-                            println!("  step {}: ERROR: {}", step, e);
+                            println!("  step {step}: ERROR: {e}");
                         }
                     }
                     step += 1;
@@ -685,7 +697,7 @@ fn cmd_playground() -> eyre::Result<()> {
                         format_stack(engine.stack());
                     }
                     Err(e) => {
-                        println!("Execution error: {}", e);
+                        println!("Execution error: {e}");
                         println!("Stack at error:");
                         format_stack(engine.stack());
                     }
@@ -714,14 +726,14 @@ fn cmd_playground() -> eyre::Result<()> {
                     match cli::parse_opcode_or_data(token) {
                         Some(ScriptItem::Op(op)) => {
                             script.push_opcode(op);
-                            println!("+ {:?}", op);
+                            println!("+ {op:?}");
                         }
                         Some(ScriptItem::Data(d)) => {
                             let len = d.len();
                             script.push_slice(&d);
                             println!("+ PUSH({} bytes: {})", len, hex::encode(&d));
                         }
-                        None => println!("Unknown: {}", token),
+                        None => println!("Unknown: {token}"),
                     }
                 }
             }

@@ -18,12 +18,14 @@ pub mod erlay;
 pub mod package_relay;
 
 #[cfg(feature = "v2")]
+pub mod v2codec;
+#[cfg(feature = "v2")]
 pub mod v2transport;
 
 pub use codec::BitcoinCodec;
 pub use connection::Connection;
 pub use handshake::Handshake;
-pub use message::{NetworkMessage, MessageHeader};
+pub use message::{MessageHeader, NetworkMessage};
 pub use protocol::ProtocolVersion;
 
 #[cfg(feature = "compact-blocks")]

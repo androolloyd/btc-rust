@@ -6,9 +6,7 @@ use thiserror::Error;
 use tracing::{info, warn};
 
 use crate::chain::ChainState;
-use crate::utxo::{
-    connect_block, disconnect_block, InMemoryUtxoSet, UtxoSetUpdate,
-};
+use crate::utxo::{connect_block, disconnect_block, InMemoryUtxoSet, UtxoSetUpdate};
 use crate::validation::BlockValidator;
 
 // ---------------------------------------------------------------------------
@@ -216,9 +214,8 @@ pub fn execute_reorg(
 
     // --- Validate all new blocks before disconnecting anything ---
     for block in new_blocks {
-        BlockValidator::validate_block(block).map_err(|e| {
-            ReorgError::ValidationFailed(e.to_string())
-        })?;
+        BlockValidator::validate_block(block)
+            .map_err(|e| ReorgError::ValidationFailed(e.to_string()))?;
     }
 
     // --- Collect block hashes to disconnect (tip → fork_point, exclusive) ---
@@ -235,8 +232,7 @@ pub fn execute_reorg(
     }
 
     // --- Disconnect blocks (from tip backwards) ---
-    let disconnected: Vec<BlockHash> =
-        blocks_to_disconnect.iter().map(|(h, _)| *h).collect();
+    let disconnected: Vec<BlockHash> = blocks_to_disconnect.iter().map(|(h, _)| *h).collect();
 
     for &(_hash, height) in &blocks_to_disconnect {
         let undo = reorg_mgr
@@ -261,10 +257,7 @@ pub fn execute_reorg(
         connected.push(block.block_hash());
     }
 
-    info!(
-        count = connected.len(),
-        "connected blocks on new chain"
-    );
+    info!(count = connected.len(), "connected blocks on new chain");
 
     // --- Accept headers of new blocks into chain state ---
     for block in new_blocks {
@@ -483,9 +476,8 @@ mod tests {
         let genesis_entry = chain.get_header_by_height(0).unwrap().clone();
         let (fork_hashes, _) = build_fork(&mut chain, &genesis_entry, 1, 0xBB);
 
-        let (fork_hash, fork_height) =
-            find_fork_point(&chain, &main_hashes[0], &fork_hashes[0])
-                .expect("should find genesis as fork point");
+        let (fork_hash, fork_height) = find_fork_point(&chain, &main_hashes[0], &fork_hashes[0])
+            .expect("should find genesis as fork point");
 
         assert_eq!(fork_height, 0, "fork should be at genesis");
         assert_eq!(fork_hash, ChainParams::regtest().genesis_hash);
@@ -556,8 +548,7 @@ mod tests {
         let mut reorg_mgr = ReorgManager::new(100);
 
         // Build main chain: genesis -> B1 -> B2
-        let (main_hashes, _main_blocks, undos) =
-            build_chain(&mut chain, &mut utxo_set, 2);
+        let (main_hashes, _main_blocks, undos) = build_chain(&mut chain, &mut utxo_set, 2);
 
         // Store undo data from the main chain.
         for (h, u) in &undos {
@@ -602,8 +593,7 @@ mod tests {
         let mut reorg_mgr = ReorgManager::new(100);
 
         // Build main chain: genesis -> B1 -> B2 -> ... -> B8
-        let (main_hashes, _main_blocks, undos) =
-            build_chain(&mut chain, &mut utxo_set, 8);
+        let (main_hashes, _main_blocks, undos) = build_chain(&mut chain, &mut utxo_set, 8);
 
         for (h, u) in &undos {
             reorg_mgr.store_undo(*h, u.clone());
@@ -647,8 +637,7 @@ mod tests {
         let reorg_mgr = ReorgManager::new(3); // only allow 3 blocks deep
 
         // Build main chain: genesis -> B1 -> ... -> B5
-        let (main_hashes, _main_blocks, _undos) =
-            build_chain(&mut chain, &mut utxo_set, 5);
+        let (main_hashes, _main_blocks, _undos) = build_chain(&mut chain, &mut utxo_set, 5);
 
         let old_tip = *main_hashes.last().unwrap();
 
@@ -687,8 +676,7 @@ mod tests {
         let mut reorg_mgr = ReorgManager::new(100);
 
         // Build main chain: genesis -> B1 -> B2
-        let (main_hashes, main_blocks, undos) =
-            build_chain(&mut chain, &mut utxo_set, 2);
+        let (main_hashes, main_blocks, undos) = build_chain(&mut chain, &mut utxo_set, 2);
 
         for (h, u) in &undos {
             reorg_mgr.store_undo(*h, u.clone());
@@ -746,8 +734,7 @@ mod tests {
         let reorg_mgr = ReorgManager::new(100);
 
         // Build main chain: genesis -> B1 -> B2
-        let (main_hashes, _main_blocks, _undos) =
-            build_chain(&mut chain, &mut utxo_set, 2);
+        let (main_hashes, _main_blocks, _undos) = build_chain(&mut chain, &mut utxo_set, 2);
 
         let old_tip = *main_hashes.last().unwrap();
 
@@ -807,9 +794,8 @@ mod tests {
         let (fork_hashes, _) = build_fork(&mut chain, &fork_entry, 1, 0xAA);
 
         // Old tip at height 4, new tip at height 2 => old is taller
-        let (fork_hash, fork_height) =
-            find_fork_point(&chain, &main_hashes[3], &fork_hashes[0])
-                .expect("should find fork point");
+        let (fork_hash, fork_height) = find_fork_point(&chain, &main_hashes[3], &fork_hashes[0])
+            .expect("should find fork point");
 
         assert_eq!(fork_hash, main_hashes[0]);
         assert_eq!(fork_height, 1);

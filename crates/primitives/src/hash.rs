@@ -1,5 +1,5 @@
-use sha2::{Digest, Sha256};
 use ripemd::Ripemd160;
+use sha2::{Digest, Sha256};
 use std::fmt;
 
 /// Perform SHA-256 hash
@@ -104,7 +104,11 @@ macro_rules! define_hash_type {
 define_hash_type!(Hash256, 32, "A 256-bit hash (used for SHA256d results)");
 define_hash_type!(BlockHash, 32, "A block hash (SHA256d of block header)");
 define_hash_type!(TxHash, 32, "A transaction hash (txid)");
-define_hash_type!(Hash160, 20, "A 160-bit hash (HASH160 = RIPEMD160(SHA256(x)))");
+define_hash_type!(
+    Hash160,
+    20,
+    "A 160-bit hash (HASH160 = RIPEMD160(SHA256(x)))"
+);
 
 impl BlockHash {
     pub fn compute(header_bytes: &[u8]) -> Self {
@@ -203,9 +207,9 @@ mod tests {
     #[test]
     fn test_hash_debug_display() {
         let hash = BlockHash::from_bytes([0x01; 32]);
-        let debug = format!("{:?}", hash);
+        let debug = format!("{hash:?}");
         assert!(debug.starts_with("BlockHash("));
-        let display = format!("{}", hash);
+        let display = format!("{hash}");
         assert!(!display.is_empty());
     }
 

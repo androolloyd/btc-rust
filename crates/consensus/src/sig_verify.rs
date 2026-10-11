@@ -14,15 +14,30 @@ pub enum SigError {
 
 /// Signature verification trait — designed to be swappable for post-quantum algorithms
 pub trait SignatureVerifier: Send + Sync {
-    fn verify_ecdsa(&self, msg_hash: &[u8; 32], sig: &[u8], pubkey: &[u8]) -> Result<bool, SigError>;
-    fn verify_schnorr(&self, msg_hash: &[u8; 32], sig: &[u8], pubkey: &[u8]) -> Result<bool, SigError>;
+    fn verify_ecdsa(
+        &self,
+        msg_hash: &[u8; 32],
+        sig: &[u8],
+        pubkey: &[u8],
+    ) -> Result<bool, SigError>;
+    fn verify_schnorr(
+        &self,
+        msg_hash: &[u8; 32],
+        sig: &[u8],
+        pubkey: &[u8],
+    ) -> Result<bool, SigError>;
 }
 
 /// Default secp256k1-based verifier (current Bitcoin consensus)
 pub struct Secp256k1Verifier;
 
 impl SignatureVerifier for Secp256k1Verifier {
-    fn verify_ecdsa(&self, msg_hash: &[u8; 32], sig: &[u8], pubkey: &[u8]) -> Result<bool, SigError> {
+    fn verify_ecdsa(
+        &self,
+        msg_hash: &[u8; 32],
+        sig: &[u8],
+        pubkey: &[u8],
+    ) -> Result<bool, SigError> {
         let secp = secp256k1::Secp256k1::verification_only();
         let message = secp256k1::Message::from_digest(*msg_hash);
         // Use from_der_lax for consensus compatibility — Bitcoin accepted
@@ -35,7 +50,12 @@ impl SignatureVerifier for Secp256k1Verifier {
         Ok(secp.verify_ecdsa(&message, &signature, &public_key).is_ok())
     }
 
-    fn verify_schnorr(&self, msg_hash: &[u8; 32], sig: &[u8], pubkey: &[u8]) -> Result<bool, SigError> {
+    fn verify_schnorr(
+        &self,
+        msg_hash: &[u8; 32],
+        sig: &[u8],
+        pubkey: &[u8],
+    ) -> Result<bool, SigError> {
         let secp = secp256k1::Secp256k1::verification_only();
         let message = secp256k1::Message::from_digest(*msg_hash);
 

@@ -74,7 +74,10 @@ impl BodiesStage {
 
         // Transition: Downloading -> Validating
         self.state = BodiesSyncState::Validating;
-        info!(from, to, "validating block bodies against header commitments");
+        info!(
+            from,
+            to, "validating block bodies against header commitments"
+        );
 
         // In a real implementation we would:
         //   for height in from..=to:
@@ -172,9 +175,7 @@ impl Stage for BodiesStage {
         self.checkpoint = target;
         self.state = BodiesSyncState::Idle;
 
-        Ok(UnwindOutput {
-            checkpoint: target,
-        })
+        Ok(UnwindOutput { checkpoint: target })
     }
 }
 

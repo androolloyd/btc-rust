@@ -27,8 +27,7 @@ fuzz_target!(|data: &[u8]| {
 
     // --- Roundtrip invariant ---
     let re_encoded = encode(&block);
-    let block2: Block =
-        decode(&re_encoded).expect("re-encoded block must decode successfully");
+    let block2: Block = decode(&re_encoded).expect("re-encoded block must decode successfully");
     assert_eq!(block, block2, "roundtrip mismatch");
 
     // --- Header roundtrip ---

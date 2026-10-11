@@ -8,12 +8,13 @@
 //! [`DbTx::get_utxo`] and transparently inserted into the cache so that
 //! subsequent lookups for the same outpoint are fast.
 
-use std::cell::UnsafeCell;
-use std::collections::HashMap;
+use parking_lot::Mutex;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use btc_consensus::utxo::{UtxoEntry, UtxoSet, UtxoSetUpdate};
 use btc_primitives::amount::Amount;
+use btc_primitives::hash::BlockHash;
 use btc_primitives::script::ScriptBuf;
 use btc_primitives::transaction::{OutPoint, TxOut};
 
@@ -38,39 +39,26 @@ const DEFAULT_CACHE_SIZE_LIMIT: usize = 100_000;
 ///   always be reloaded on the next cache miss.
 pub struct PersistentUtxoSet<DB: Database> {
     db: Arc<DB>,
-    /// Read-through cache for hot UTXOs.
-    ///
-    /// # Safety
-    ///
-    /// Wrapped in `UnsafeCell` to allow interior mutation during `get_utxo`
-    /// (`&self`).  This is sound because:
-    ///
-    /// 1. During `&self` borrows (reads), entries are only *added* to the map —
-    ///    never removed — so outstanding `&UtxoEntry` references remain valid.
-    /// 2. Methods that remove entries (`apply_update`, `flush_cache`) require
-    ///    `&mut self`, which the borrow checker guarantees is exclusive (no
-    ///    `&self` borrows can coexist).
-    /// 3. `PersistentUtxoSet` is `!Sync` (due to `UnsafeCell`) so no concurrent
-    ///    `&self` access can occur across threads.
-    cache: UnsafeCell<HashMap<OutPoint, UtxoEntry>>,
+    /// Owned entries behind a mutex; callers receive clones, so cache growth
+    /// cannot invalidate entries returned by earlier reads.
+    cache: Mutex<HashMap<OutPoint, UtxoEntry>>,
+    /// Unflushed creations must never be evicted.
+    dirty: HashSet<OutPoint>,
     cache_size_limit: usize,
     /// Outpoints that were spent via `apply_update_cached` and need to be
     /// deleted from the DB on the next `flush_cache()`.
-    pending_deletes: Vec<OutPoint>,
+    pending_deletes: HashSet<OutPoint>,
 }
-
-// PersistentUtxoSet is Send if DB is Send (UnsafeCell is Send when inner is Send).
-// It is intentionally !Sync due to UnsafeCell, which is correct for our use case.
-unsafe impl<DB: Database> Send for PersistentUtxoSet<DB> {}
 
 impl<DB: Database> PersistentUtxoSet<DB> {
     /// Create a new `PersistentUtxoSet` wrapping the given database.
     pub fn new(db: Arc<DB>) -> Self {
         Self {
             db,
-            cache: UnsafeCell::new(HashMap::new()),
+            cache: Mutex::new(HashMap::new()),
+            dirty: HashSet::new(),
             cache_size_limit: DEFAULT_CACHE_SIZE_LIMIT,
-            pending_deletes: Vec::new(),
+            pending_deletes: HashSet::new(),
         }
     }
 
@@ -78,9 +66,10 @@ impl<DB: Database> PersistentUtxoSet<DB> {
     pub fn with_cache_limit(db: Arc<DB>, cache_size_limit: usize) -> Self {
         Self {
             db,
-            cache: UnsafeCell::new(HashMap::new()),
+            cache: Mutex::new(HashMap::new()),
+            dirty: HashSet::new(),
             cache_size_limit,
-            pending_deletes: Vec::new(),
+            pending_deletes: HashSet::new(),
         }
     }
 
@@ -89,25 +78,38 @@ impl<DB: Database> PersistentUtxoSet<DB> {
     /// This writes through to the database in a single transaction and updates
     /// the in-memory cache accordingly.
     pub fn apply_update(&mut self, update: &UtxoSetUpdate) -> Result<(), StorageError> {
+        self.flush_cache()?;
         let tx = self.db.tx_mut()?;
+        let spent: HashSet<_> = update.spent.iter().map(|(op, _)| *op).collect();
 
         // Remove spent UTXOs from DB and cache.
         for (outpoint, _entry) in &update.spent {
-            tx.delete_utxo(outpoint)?;
-            self.delete_utxo_meta(&tx, outpoint)?;
-            self.cache.get_mut().remove(outpoint);
+            if tx.get_utxo(outpoint)?.is_some() {
+                tx.delete_utxo(outpoint)?;
+                self.delete_utxo_meta(&tx, outpoint)?;
+            }
         }
 
         // Insert created UTXOs into DB and cache.
         for (outpoint, entry) in &update.created {
+            if spent.contains(outpoint) {
+                continue;
+            }
             tx.put_utxo(outpoint, &entry.txout)?;
             // We also need to persist height + is_coinbase metadata.
             // Encode as: height(8 LE) || is_coinbase(1)
             self.put_utxo_meta(&tx, outpoint, entry)?;
-            self.cache.get_mut().insert(*outpoint, entry.clone());
         }
 
         tx.commit()?;
+        for (outpoint, _) in &update.spent {
+            self.cache.get_mut().remove(outpoint);
+        }
+        for (outpoint, entry) in &update.created {
+            if !spent.contains(outpoint) {
+                self.cache.get_mut().insert(*outpoint, entry.clone());
+            }
+        }
 
         // Evict if cache is over the limit.
         self.evict_cache();
@@ -120,20 +122,48 @@ impl<DB: Database> PersistentUtxoSet<DB> {
     /// Tracks spent outpoints in `pending_deletes` so `flush_cache()`
     /// can delete them from the DB.
     pub fn apply_update_cached(&mut self, update: &UtxoSetUpdate) {
+        let spent: HashSet<_> = update.spent.iter().map(|(op, _)| *op).collect();
         for (outpoint, _) in &update.spent {
             self.cache.get_mut().remove(outpoint);
-            self.pending_deletes.push(*outpoint);
+            self.dirty.remove(outpoint);
+            self.pending_deletes.insert(*outpoint);
         }
         for (outpoint, entry) in &update.created {
+            if spent.contains(outpoint) {
+                continue;
+            }
+            self.pending_deletes.remove(outpoint);
             self.cache.get_mut().insert(*outpoint, entry.clone());
+            self.dirty.insert(*outpoint);
         }
         self.evict_cache();
     }
 
     /// Write all cached entries to the database, delete spent UTXOs, and clear.
     pub fn flush_cache(&mut self) -> Result<(), StorageError> {
+        self.flush_cache_at(None)
+    }
+    /// Commit the validated tip in the same transaction as its UTXO delta.
+    pub fn flush_cache_with_tip(
+        &mut self,
+        height: u64,
+        hash: BlockHash,
+    ) -> Result<(), StorageError> {
+        self.flush_cache_at(Some((height, hash)))
+    }
+    pub fn validated_tip(&self) -> Result<Option<(u64, BlockHash)>, StorageError> {
+        let tx = self.db.tx()?;
+        let hash = tx.get_best_block_hash()?;
+        if hash == BlockHash::ZERO {
+            Ok(None)
+        } else {
+            Ok(Some((tx.get_best_block_height()?, hash)))
+        }
+    }
+    fn flush_cache_at(&mut self, tip: Option<(u64, BlockHash)>) -> Result<(), StorageError> {
         let cache = self.cache.get_mut();
-        if cache.is_empty() && self.pending_deletes.is_empty() {
+        if self.dirty.is_empty() && self.pending_deletes.is_empty() && tip.is_none() {
+            cache.clear();
             return Ok(());
         }
 
@@ -154,7 +184,8 @@ impl<DB: Database> PersistentUtxoSet<DB> {
         }
 
         // Write created/cached UTXOs to DB
-        for (outpoint, entry) in cache.iter() {
+        for outpoint in &self.dirty {
+            let entry = &cache[outpoint];
             tx.put_utxo(outpoint, &entry.txout)?;
             let meta_outpoint = OutPoint::new(outpoint.txid, outpoint.vout | 0x8000_0000);
             let meta_txout = TxOut {
@@ -163,17 +194,21 @@ impl<DB: Database> PersistentUtxoSet<DB> {
             };
             tx.put_utxo(&meta_outpoint, &meta_txout)?;
         }
+        if let Some((height, hash)) = tip {
+            tx.set_best_block(height, &hash)?;
+        }
         tx.commit()?;
 
         cache.clear();
+        self.dirty.clear();
         self.pending_deletes.clear();
+        self.evict_cache();
         Ok(())
     }
 
     /// Return the number of entries currently in the cache.
     pub fn cache_len(&self) -> usize {
-        // SAFETY: only reading the length, no mutation.
-        unsafe { (*self.cache.get()).len() }
+        self.cache.lock().len()
     }
 
     // -----------------------------------------------------------------------
@@ -260,7 +295,12 @@ impl<DB: Database> PersistentUtxoSet<DB> {
             return;
         }
         let to_remove = cache.len() - self.cache_size_limit;
-        let keys_to_remove: Vec<OutPoint> = cache.keys().take(to_remove).copied().collect();
+        let keys_to_remove: Vec<OutPoint> = cache
+            .keys()
+            .filter(|op| !self.dirty.contains(op))
+            .take(to_remove)
+            .copied()
+            .collect();
         for key in keys_to_remove {
             cache.remove(&key);
         }
@@ -268,29 +308,20 @@ impl<DB: Database> PersistentUtxoSet<DB> {
 }
 
 impl<DB: Database> UtxoSet for PersistentUtxoSet<DB> {
-    fn get_utxo(&self, outpoint: &OutPoint) -> Option<&UtxoEntry> {
-        let cache_ptr = self.cache.get();
-
-        // SAFETY: We only read from the map here.  If we find the entry, we
-        // return a reference whose lifetime is tied to `&self`.  The entry will
-        // not be removed until `&mut self` is taken (apply_update / flush_cache),
-        // which cannot happen while `&self` is borrowed.
-        if let Some(entry) = unsafe { (*cache_ptr).get(outpoint) } {
+    fn get_utxo(&self, outpoint: &OutPoint) -> Option<UtxoEntry> {
+        if self.pending_deletes.contains(outpoint) {
+            return None;
+        }
+        if let Some(entry) = self.cache.lock().get(outpoint).cloned() {
             return Some(entry);
         }
-
-        // Cache miss — load from DB and promote into cache.
         let entry = self.load_from_db(outpoint)?;
-
-        // SAFETY: No outstanding references into the map exist (the `get` above
-        // returned `None`).  We insert a new entry and immediately obtain a
-        // reference to it.  The reference is valid for `&self`'s lifetime because
-        // entries are never removed while `&self` is borrowed (removal requires
-        // `&mut self`).
-        unsafe {
-            (*cache_ptr).insert(*outpoint, entry);
-            (*cache_ptr).get(outpoint)
+        // Bound clean read-through entries without evicting dirty creations.
+        let mut cache = self.cache.lock();
+        if cache.len() < self.cache_size_limit {
+            cache.insert(*outpoint, entry.clone());
         }
+        Some(entry)
     }
 }
 
@@ -307,6 +338,38 @@ mod tests {
     use btc_primitives::hash::TxHash;
     use btc_primitives::script::ScriptBuf;
     use btc_primitives::transaction::{OutPoint, TxOut};
+
+    #[test]
+    fn validated_tip_is_committed_with_utxo_changes() {
+        let (db, _dir) = temp_db();
+        let mut set = PersistentUtxoSet::new(Arc::clone(&db));
+        let op = make_outpoint(0xe0, 0);
+        let hash = BlockHash::from_bytes([0xaa; 32]);
+        set.apply_update_cached(&UtxoSetUpdate {
+            spent: vec![],
+            created: vec![(op, make_entry(42, 1, false))],
+        });
+        let old = PersistentUtxoSet::new(Arc::clone(&db));
+        assert_eq!(old.validated_tip().unwrap(), None);
+        assert!(!old.contains(&op));
+        set.flush_cache_with_tip(1, hash).unwrap();
+        let committed = PersistentUtxoSet::new(Arc::clone(&db));
+        assert_eq!(committed.validated_tip().unwrap(), Some((1, hash)));
+        assert!(committed.contains(&op));
+        let entry = set.get_utxo(&op).unwrap();
+        set.apply_update_cached(&UtxoSetUpdate {
+            spent: vec![(op, entry)],
+            created: vec![],
+        });
+        let old = PersistentUtxoSet::new(Arc::clone(&db));
+        assert_eq!(old.validated_tip().unwrap(), Some((1, hash)));
+        assert!(old.contains(&op));
+        let next = BlockHash::from_bytes([0xbb; 32]);
+        set.flush_cache_with_tip(2, next).unwrap();
+        let committed = PersistentUtxoSet::new(db);
+        assert_eq!(committed.validated_tip().unwrap(), Some((2, next)));
+        assert!(!committed.contains(&op));
+    }
 
     /// Helper: create a temporary RedbDatabase.
     fn temp_db() -> (Arc<RedbDatabase>, tempfile::TempDir) {
@@ -505,7 +568,12 @@ mod tests {
 
         // Insert 10 UTXOs — cache should be capped at 5 after eviction.
         let entries: Vec<(OutPoint, UtxoEntry)> = (0u8..10)
-            .map(|i| (make_outpoint(i, 0), make_entry(1_000 * i as u64, i as u64, false)))
+            .map(|i| {
+                (
+                    make_outpoint(i, 0),
+                    make_entry(1_000 * i as u64, i as u64, false),
+                )
+            })
             .collect();
 
         let update = UtxoSetUpdate {
@@ -633,8 +701,14 @@ mod tests {
             .unwrap();
 
         assert!(utxo_set.get_utxo(&op1).is_none());
-        assert_eq!(utxo_set.get_utxo(&op2).unwrap().txout.value.as_sat(), 20_000);
-        assert_eq!(utxo_set.get_utxo(&op3).unwrap().txout.value.as_sat(), 30_000);
+        assert_eq!(
+            utxo_set.get_utxo(&op2).unwrap().txout.value.as_sat(),
+            20_000
+        );
+        assert_eq!(
+            utxo_set.get_utxo(&op3).unwrap().txout.value.as_sat(),
+            30_000
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -713,10 +787,9 @@ mod tests {
             created: vec![],
         });
 
-        // The cache no longer has it, but get_utxo falls through to DB
-        // and re-loads it. This is expected behavior — the cached spend
-        // only takes full effect after flush.
-        // Verify a fresh instance still sees it in DB.
+        // The live view must hide the spent output immediately, even though
+        // a separate reader still sees the last committed database snapshot.
+        assert!(utxo_set.get_utxo(&op).is_none());
         {
             let fresh = PersistentUtxoSet::new(Arc::clone(&db));
             assert!(fresh.get_utxo(&op).is_some());
@@ -790,9 +863,14 @@ mod tests {
         let (db, _dir) = temp_db();
         let mut utxo_set = PersistentUtxoSet::with_cache_limit(Arc::clone(&db), 3);
 
-        // Insert 5 UTXOs through cached path — cache should be capped at 3.
+        // Dirty entries must survive the cache limit until they are flushed.
         let entries: Vec<(OutPoint, UtxoEntry)> = (0u8..5)
-            .map(|i| (make_outpoint(0x70 + i, 0), make_entry(i as u64 * 100, i as u64, false)))
+            .map(|i| {
+                (
+                    make_outpoint(0x70 + i, 0),
+                    make_entry(i as u64 * 100, i as u64, false),
+                )
+            })
             .collect();
 
         utxo_set.apply_update_cached(&UtxoSetUpdate {
@@ -800,7 +878,15 @@ mod tests {
             created: entries.clone(),
         });
 
+        for (op, entry) in &entries {
+            assert_eq!(utxo_set.get_utxo(op).as_ref(), Some(entry));
+        }
+        utxo_set.flush_cache().unwrap();
         assert!(utxo_set.cache_len() <= 3);
+        let fresh = PersistentUtxoSet::new(db);
+        for (op, entry) in &entries {
+            assert_eq!(fresh.get_utxo(op).as_ref(), Some(entry));
+        }
     }
 
     // -----------------------------------------------------------------------

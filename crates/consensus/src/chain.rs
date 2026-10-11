@@ -232,7 +232,9 @@ impl ChainState {
 
     /// Return the best (most-work) header entry.
     pub fn best_header(&self) -> &HeaderEntry {
-        self.headers.get(&self.best_header).expect("best header must exist")
+        self.headers
+            .get(&self.best_header)
+            .expect("best header must exist")
     }
 
     /// Height of the best chain tip.
@@ -288,7 +290,7 @@ impl ChainState {
     }
 
     /// Compute the median time of the previous `MEDIAN_TIME_SPAN` blocks.
-    fn median_time_past(&self, tip: &HeaderEntry) -> u32 {
+    pub fn median_time_past(&self, tip: &HeaderEntry) -> u32 {
         let mut times = Vec::with_capacity(MEDIAN_TIME_SPAN);
         let mut current = tip.clone();
         for _ in 0..MEDIAN_TIME_SPAN {
@@ -343,7 +345,11 @@ impl ChainState {
     }
 
     /// Walk backwards from `entry` to the ancestor at `target_height`.
-    fn get_ancestor<'a>(&'a self, entry: &'a HeaderEntry, target_height: u64) -> Option<&'a HeaderEntry> {
+    fn get_ancestor<'a>(
+        &'a self,
+        entry: &'a HeaderEntry,
+        target_height: u64,
+    ) -> Option<&'a HeaderEntry> {
         if entry.height < target_height {
             return None;
         }
@@ -353,7 +359,6 @@ impl ChainState {
         }
         Some(current)
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -857,7 +862,10 @@ mod tests {
         // First entry must be the tip.
         assert_eq!(locators[0], chain.best_header().header.block_hash());
         // Last entry must be genesis.
-        assert_eq!(*locators.last().unwrap(), ChainParams::regtest().genesis_hash);
+        assert_eq!(
+            *locators.last().unwrap(),
+            ChainParams::regtest().genesis_hash
+        );
         // With 20 blocks we should get more than 10 locators but fewer than 20
         // because of exponential backoff.
         assert!(locators.len() > 10);
@@ -928,17 +936,14 @@ mod tests {
 
         // The tip should have more cumulative work than genesis.
         let genesis = chain.get_header_by_height(0).unwrap();
-        assert!(
-            compare_u256(&tip_work, &genesis.cumulative_work) == std::cmp::Ordering::Greater
-        );
+        assert!(compare_u256(&tip_work, &genesis.cumulative_work) == std::cmp::Ordering::Greater);
 
         // Each subsequent block should have more cumulative work.
         for h in 0..3 {
             let a = chain.get_header_by_height(h).unwrap();
             let b = chain.get_header_by_height(h + 1).unwrap();
             assert!(
-                compare_u256(&b.cumulative_work, &a.cumulative_work)
-                    == std::cmp::Ordering::Greater,
+                compare_u256(&b.cumulative_work, &a.cumulative_work) == std::cmp::Ordering::Greater,
                 "block at height {} should have more work than height {}",
                 h + 1,
                 h
@@ -1005,7 +1010,11 @@ mod tests {
         // on actual vs expected timespan — this is correct signet behavior.
         let expected_at_retarget = chain.get_next_work_required(2016, &dummy_header, &genesis);
         // Just verify it returns something valid (non-zero)
-        assert_ne!(expected_at_retarget.to_u32(), 0, "retarget should produce valid difficulty");
+        assert_ne!(
+            expected_at_retarget.to_u32(),
+            0,
+            "retarget should produce valid difficulty"
+        );
     }
 
     // ---- Test: duplicate header rejection ----
@@ -1135,7 +1144,10 @@ mod tests {
     fn test_chain_accessors() {
         let chain = regtest_chain();
         // Test params() and checkpoints()
-        assert_eq!(chain.params().network, btc_primitives::network::Network::Regtest);
+        assert_eq!(
+            chain.params().network,
+            btc_primitives::network::Network::Regtest
+        );
         let _cp = chain.checkpoints();
     }
 
@@ -1243,7 +1255,12 @@ mod tests {
     fn test_difficulty_clamped_to_pow_limit() {
         let params = ChainParams::mainnet();
         // Use MAX_TARGET as old target and very long timespan => result clamped
-        let new_target = calculate_next_target(0, params.pow_target_timespan * 4, CompactTarget::MAX_TARGET, &params);
+        let new_target = calculate_next_target(
+            0,
+            params.pow_target_timespan * 4,
+            CompactTarget::MAX_TARGET,
+            &params,
+        );
         // Should be clamped to pow_limit
         assert!(new_target.to_u32() <= CompactTarget::MAX_TARGET.to_u32());
     }

@@ -22,10 +22,8 @@ const BLOCK_INDEX: TableDefinition<&[u8], &[u8]> = TableDefinition::new(TABLE_BL
 const TRANSACTIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new(TABLE_TRANSACTIONS);
 const UTXOS: TableDefinition<&[u8], &[u8]> = TableDefinition::new(TABLE_UTXOS);
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new(TABLE_META);
-const TX_BLOCK_INDEX: TableDefinition<&[u8], &[u8]> =
-    TableDefinition::new(TABLE_TX_BLOCK_INDEX);
-const ADDRESS_INDEX: TableDefinition<&[u8], &[u8]> =
-    TableDefinition::new(TABLE_ADDRESS_INDEX);
+const TX_BLOCK_INDEX: TableDefinition<&[u8], &[u8]> = TableDefinition::new(TABLE_TX_BLOCK_INDEX);
+const ADDRESS_INDEX: TableDefinition<&[u8], &[u8]> = TableDefinition::new(TABLE_ADDRESS_INDEX);
 
 /// Concrete redb-backed database implementing the `Database` trait.
 pub struct RedbDatabase {
@@ -124,7 +122,12 @@ fn outpoint_key(outpoint: &OutPoint) -> [u8; 36] {
 
 /// Encode an address-index key: script_hash(32) + height(8 BE) + tx_position(4 BE) + output_index(4 BE) = 48 bytes.
 /// This gives lexicographic ordering by (script_hash, height, tx_position, output_index).
-fn address_index_key(script_hash: &[u8; 32], height: u64, tx_position: u32, output_index: u32) -> [u8; 48] {
+fn address_index_key(
+    script_hash: &[u8; 32],
+    height: u64,
+    tx_position: u32,
+    output_index: u32,
+) -> [u8; 48] {
     let mut key = [0u8; 48];
     key[..32].copy_from_slice(script_hash);
     key[32..40].copy_from_slice(&height.to_be_bytes());
@@ -153,7 +156,10 @@ fn decode_tx_block_location(data: &[u8]) -> Result<TxBlockLocation, StorageError
     let mut pos_buf = [0u8; 4];
     pos_buf.copy_from_slice(&data[32..36]);
     let tx_position = u32::from_le_bytes(pos_buf);
-    Ok(TxBlockLocation { block_hash, tx_position })
+    Ok(TxBlockLocation {
+        block_hash,
+        tx_position,
+    })
 }
 
 /// Encode an AddressIndexValue for storage.
@@ -366,7 +372,10 @@ impl DbTx for RedbTx {
         }
     }
 
-    fn get_address_txs(&self, script_hash: &[u8; 32]) -> Result<Vec<AddressIndexValue>, StorageError> {
+    fn get_address_txs(
+        &self,
+        script_hash: &[u8; 32],
+    ) -> Result<Vec<AddressIndexValue>, StorageError> {
         let table = self
             .inner
             .open_table(ADDRESS_INDEX)
@@ -584,7 +593,10 @@ impl DbTx for RedbTxMut {
         }
     }
 
-    fn get_address_txs(&self, script_hash: &[u8; 32]) -> Result<Vec<AddressIndexValue>, StorageError> {
+    fn get_address_txs(
+        &self,
+        script_hash: &[u8; 32],
+    ) -> Result<Vec<AddressIndexValue>, StorageError> {
         let table = self
             .inner
             .open_table(ADDRESS_INDEX)
@@ -631,11 +643,7 @@ impl DbTx for RedbTxMut {
 }
 
 impl DbTxMut for RedbTxMut {
-    fn put_block_header(
-        &self,
-        hash: &BlockHash,
-        header: &BlockHeader,
-    ) -> Result<(), StorageError> {
+    fn put_block_header(&self, hash: &BlockHash, header: &BlockHeader) -> Result<(), StorageError> {
         let mut table = self
             .inner
             .open_table(HEADERS)
@@ -648,11 +656,7 @@ impl DbTxMut for RedbTxMut {
         Ok(())
     }
 
-    fn put_block_hash_by_height(
-        &self,
-        height: u64,
-        hash: &BlockHash,
-    ) -> Result<(), StorageError> {
+    fn put_block_hash_by_height(&self, height: u64, hash: &BlockHash) -> Result<(), StorageError> {
         let mut table = self
             .inner
             .open_table(BLOCK_INDEX)
@@ -747,7 +751,12 @@ impl DbTxMut for RedbTxMut {
             .inner
             .open_table(ADDRESS_INDEX)
             .map_err(|e| StorageError::Database(e.to_string()))?;
-        let key = address_index_key(script_hash, entry.height, entry.tx_position, entry.output_index);
+        let key = address_index_key(
+            script_hash,
+            entry.height,
+            entry.tx_position,
+            entry.output_index,
+        );
         let value = encode_address_index_value(entry);
         table
             .insert(key.as_slice(), value.as_slice())
@@ -1044,9 +1053,7 @@ mod tests {
         assert_eq!(loaded, Some(transaction));
 
         // Missing txid.
-        let missing = tx
-            .get_transaction(&TxHash::from_bytes([0xee; 32]))
-            .unwrap();
+        let missing = tx.get_transaction(&TxHash::from_bytes([0xee; 32])).unwrap();
         assert_eq!(missing, None);
 
         tx.commit().unwrap();
@@ -1134,9 +1141,7 @@ mod tests {
     fn test_transaction_missing() {
         let (db, _dir) = temp_db();
         let tx = db.tx().unwrap();
-        let missing = tx
-            .get_transaction(&TxHash::from_bytes([0xfe; 32]))
-            .unwrap();
+        let missing = tx.get_transaction(&TxHash::from_bytes([0xfe; 32])).unwrap();
         assert_eq!(missing, None);
     }
 

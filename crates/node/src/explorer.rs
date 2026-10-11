@@ -358,9 +358,7 @@ mod tests {
         m.mempool_size.store(1234, Ordering::Relaxed);
         m.mempool_bytes.store(567_890, Ordering::Relaxed);
         m.set_sync_progress(1.0);
-        m.set_best_block_hash(
-            "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5",
-        );
+        m.set_best_block_hash("0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5");
         m
     }
 
@@ -468,7 +466,7 @@ mod tests {
     fn test_route_block_detail() {
         let hash = "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5";
         assert_eq!(
-            match_explorer_route(&format!("/block/{}", hash)),
+            match_explorer_route(&format!("/block/{hash}")),
             Some(ExplorerRoute::BlockDetail(hash.into()))
         );
     }
@@ -477,7 +475,7 @@ mod tests {
     fn test_route_tx_detail() {
         let txid = "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b";
         assert_eq!(
-            match_explorer_route(&format!("/tx/{}", txid)),
+            match_explorer_route(&format!("/tx/{txid}")),
             Some(ExplorerRoute::TxDetail(txid.into()))
         );
     }
@@ -531,7 +529,7 @@ mod tests {
     fn test_handle_block_detail_page() {
         let m = make_metrics();
         let hash = "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5";
-        let resp = handle_explorer_request(&make_request(&format!("/block/{}", hash)), &m);
+        let resp = handle_explorer_request(&make_request(&format!("/block/{hash}")), &m);
         assert_eq!(resp.status, 200);
         let body = std::str::from_utf8(&resp.body).unwrap();
         assert!(body.contains(hash));
@@ -543,7 +541,7 @@ mod tests {
     fn test_handle_tx_detail_page() {
         let m = make_metrics();
         let txid = "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b";
-        let resp = handle_explorer_request(&make_request(&format!("/tx/{}", txid)), &m);
+        let resp = handle_explorer_request(&make_request(&format!("/tx/{txid}")), &m);
         assert_eq!(resp.status, 200);
         let body = std::str::from_utf8(&resp.body).unwrap();
         assert!(body.contains(txid));
@@ -578,7 +576,7 @@ mod tests {
     #[test]
     fn test_route_trailing_slash_block() {
         let hash = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
-        let route = match_explorer_route(&format!("/block/{}/", hash));
+        let route = match_explorer_route(&format!("/block/{hash}/"));
         // This should still match since trailing slash is stripped
         assert!(route.is_some());
     }
@@ -595,7 +593,7 @@ mod tests {
     #[test]
     fn test_explorer_route_debug() {
         let route = ExplorerRoute::Index;
-        let debug = format!("{:?}", route);
+        let debug = format!("{route:?}");
         assert!(debug.contains("Index"));
     }
 

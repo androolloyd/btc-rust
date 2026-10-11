@@ -2,6 +2,8 @@
 
 A modular Rust Bitcoin full node and development platform. Built from scratch with no dependency on `rust-bitcoin` — we own our encoding, hashing, serialization, and consensus implementation.
 
+Development status: several runtime backends remain experimental. See [the review](docs/REVIEW.md), [remaining build work](docs/BUILD_PLAN.md), and [BIP roadmap](docs/BIP_ROADMAP.md) for verified capabilities and acceptance gaps.
+
 Inspired by [reth](https://github.com/paradigmxyz/reth)'s architecture: pipeline/stages sync, trait-based database abstraction, type-state node builder, and execution extensions (ExEx) plugin system.
 
 ## Quick Start
@@ -298,7 +300,7 @@ btc-node decode-tx <invalid> --json; echo "exit: $?"
 
 ## Architecture
 
-11 crates in a Cargo workspace, each independently importable:
+12 crates in a Cargo workspace, each independently importable:
 
 ```
 btc-primitives   → Hash, encode, script, transaction, block, address, bech32, PSBT
@@ -312,6 +314,7 @@ btc-exex         → Execution Extensions plugin system (ordinals indexer includ
 btc-electrum     → Embedded Electrum protocol server (14 methods)
 btc-test         → In-process regtest harness for BIP development
 btc-node         → CLI, NodeBuilder, sync manager, Esplora REST, Prometheus, ZMQ
+btc-forge        → Script builders, debugger, transaction tooling, Miniscript
 ```
 
 ## Features

@@ -2,7 +2,7 @@
 //!
 //! Usage: cargo run --example decode_transaction -- <hex>
 
-use btc_primitives::{Transaction, decode};
+use btc_primitives::{decode, Transaction};
 
 fn main() {
     let hex_str = std::env::args().nth(1).unwrap_or_else(|| {
@@ -23,7 +23,7 @@ fn main() {
     println!("Version:  {}", tx.version);
     println!("Inputs:   {}", tx.inputs.len());
     for (i, input) in tx.inputs.iter().enumerate() {
-        println!("  Input {}:", i);
+        println!("  Input {i}:");
         println!("    prev txid: {}", input.previous_output.txid);
         println!("    prev vout: {}", input.previous_output.vout);
         println!("    script_sig: {} bytes", input.script_sig.len());
@@ -31,7 +31,7 @@ fn main() {
     }
     println!("Outputs:  {}", tx.outputs.len());
     for (i, output) in tx.outputs.iter().enumerate() {
-        println!("  Output {}:", i);
+        println!("  Output {i}:");
         println!("    value: {} sats", output.value.as_sat());
         println!("    script_pubkey: {} bytes", output.script_pubkey.len());
     }
