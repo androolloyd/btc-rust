@@ -355,7 +355,13 @@ impl<'a> ScriptEngine<'a> {
         // We need to track byte positions as we iterate instructions.
         // Use a manual position tracker alongside the instruction iterator.
         let mut byte_pos: usize = 0;
-        for instruction in script.instructions() {
+        for (index, instruction) in script.instructions().enumerate() {
+            // Check after each opcode, including conditional/skipped ones. A
+            // witness-v0 initial stack is checked after its first opcode (Core
+            // permits that opcode to reduce it); tapscript checks it earlier.
+            if index != 0 && self.stack.len() + self.altstack.len() > MAX_STACK_SIZE {
+                return Err(ScriptError::StackOverflow);
+            }
             let instruction = instruction?;
             // Calculate the size of this instruction in bytes
             let _instr_start = byte_pos;
@@ -528,6 +534,9 @@ impl<'a> ScriptEngine<'a> {
             }
         }
 
+        if self.stack.len() + self.altstack.len() > MAX_STACK_SIZE {
+            return Err(ScriptError::StackOverflow);
+        }
         if !exec_stack.is_empty() {
             return Err(ScriptError::UnbalancedConditional);
         }
@@ -537,66 +546,85 @@ impl<'a> ScriptEngine<'a> {
 
     /// Execute a tapscript (BIP342).
     ///
-    /// This first scans the raw script bytes for OP_SUCCESS opcodes. Per BIP342,
-    /// if any OP_SUCCESS opcode is found anywhere in the script (even in
-    /// unexecuted branches, even inside push data when parsed as raw bytes),
-    /// the script immediately succeeds.
+    /// This first decodes opcode positions for OP_SUCCESS, including in
+    /// unexecuted branches but excluding push data. A malformed push before
+    /// OP_SUCCESS fails; bytes after OP_SUCCESS are not interpreted.
     ///
     /// If no OP_SUCCESS is found, the script is executed normally with
     /// tapscript-specific rules applied (via `tapscript_mode`).
     pub fn execute_tapscript(&mut self, script: &Script) -> Result<(), ScriptError> {
-        // BIP342: Scan the raw script for OP_SUCCESS opcodes BEFORE execution.
-        // We must parse the script properly - OP_SUCCESS is only checked for
-        // actual opcode positions, not inside push data.
-        let script_bytes = script.as_bytes();
-        let mut pos = 0;
-        while pos < script_bytes.len() {
-            let byte = script_bytes[pos];
-            // Check if this byte is at an opcode position
-            if byte == 0 {
-                // OP_0 - single byte
-                pos += 1;
-            } else if (1..=75).contains(&byte) {
-                // Direct push: skip opcode + data
-                pos += 1 + byte as usize;
-            } else if byte == Opcode::OP_PUSHDATA1 as u8 {
-                if pos + 1 >= script_bytes.len() {
-                    break;
-                }
-                let len = script_bytes[pos + 1] as usize;
-                pos += 2 + len;
-            } else if byte == Opcode::OP_PUSHDATA2 as u8 {
-                if pos + 2 >= script_bytes.len() {
-                    break;
-                }
-                let len =
-                    u16::from_le_bytes([script_bytes[pos + 1], script_bytes[pos + 2]]) as usize;
-                pos += 3 + len;
-            } else if byte == Opcode::OP_PUSHDATA4 as u8 {
-                if pos + 4 >= script_bytes.len() {
-                    break;
-                }
-                let len = u32::from_le_bytes([
-                    script_bytes[pos + 1],
-                    script_bytes[pos + 2],
-                    script_bytes[pos + 3],
-                    script_bytes[pos + 4],
-                ]) as usize;
-                pos += 5 + len;
-            } else {
-                // This is an opcode byte
-                if is_op_success(byte) {
-                    // OP_SUCCESS: script immediately succeeds
-                    // Push OP_TRUE so success() returns true
-                    self.push(encode_num(1))?;
-                    return Ok(());
-                }
-                pos += 1;
+        if Self::tapscript_has_op_success(script)? {
+            // Represent the unconditional outcome for this standalone engine
+            // API without imposing a stack limit on OP_SUCCESS itself.
+            self.stack = vec![encode_num(1)];
+            return Ok(());
+        }
+        self.execute(script)
+    }
+
+    /// Execute a witness script with its actual argument bytes. Witness data
+    /// is not a synthetic script: it has no push-encoding or 10 kB script limit.
+    /// BIP141/BIP342 require exactly one true result regardless of CLEANSTACK.
+    pub fn verify_witness_script<'b>(
+        &mut self,
+        script: &Script,
+        arguments: impl IntoIterator<Item = &'b [u8]>,
+    ) -> Result<(), ScriptError> {
+        if self.tapscript_mode && Self::tapscript_has_op_success(script)? {
+            return Ok(());
+        }
+        self.stack.clear();
+        self.altstack.clear();
+        for item in arguments {
+            if item.len() > MAX_PUSH_SIZE {
+                return Err(ScriptError::PushSizeLimit);
+            }
+            self.stack.push(item.to_vec());
+            if self.tapscript_mode && self.stack.len() > MAX_STACK_SIZE {
+                return Err(ScriptError::StackOverflow);
             }
         }
+        self.execute(script)?;
+        if self.stack.len() != 1 {
+            return Err(ScriptError::CleanStack);
+        }
+        if !self.success() {
+            return Err(ScriptError::EvalFalse);
+        }
+        Ok(())
+    }
 
-        // No OP_SUCCESS found, execute normally with tapscript rules
-        self.execute(script)
+    fn tapscript_has_op_success(script: &Script) -> Result<bool, ScriptError> {
+        let bytes = script.as_bytes();
+        let mut pos = 0;
+        while pos < bytes.len() {
+            let opcode = bytes[pos];
+            pos += 1;
+            if is_op_success(opcode) {
+                return Ok(true);
+            }
+            let length = match opcode {
+                1..=75 => usize::from(opcode),
+                76..=78 => {
+                    let width = 1usize << (opcode - 76);
+                    let header = bytes
+                        .get(pos..pos + width)
+                        .ok_or(btc_primitives::encode::EncodeError::UnexpectedEof)?;
+                    pos += width;
+                    let mut length = [0u8; 4];
+                    length[..width].copy_from_slice(header);
+                    u32::from_le_bytes(length) as usize
+                }
+                _ => 0,
+            };
+            // Compare the remaining length before advancing, including on
+            // 32-bit hosts, so a hostile PUSHDATA4 cannot overflow the cursor.
+            if length > bytes.len() - pos {
+                return Err(btc_primitives::encode::EncodeError::UnexpectedEof.into());
+            }
+            pos += length;
+        }
+        Ok(false)
     }
 
     /// Get the script code for sighash computation.

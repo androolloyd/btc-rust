@@ -232,10 +232,6 @@ pub fn verify_script_path(
     if leaf_version == TAPSCRIPT_LEAF_VERSION {
         let script = Script::from_bytes(tapscript);
 
-        if script.is_empty() {
-            return Err(TaprootError::TapscriptError("empty tapscript".into()));
-        }
-
         // Calculate total witness size for signature budget
         let mut witness_size: usize = 0;
         for i in 0..witness.len() {
@@ -256,22 +252,12 @@ pub fn verify_script_path(
         engine.set_witness_execution(true);
         engine.set_tapscript_mode(leaf_hash, prevouts.to_vec(), annex.clone(), witness_size);
 
-        // Push witness items (everything before the script and control block)
-        // onto the stack. These are the "script arguments."
-        for i in 0..(effective_len - 2) {
-            let item = witness.get(i).ok_or(TaprootError::EmptyWitness)?;
-            engine.push_item(item.to_vec())?;
-        }
-
-        // Execute the tapscript through the engine with BIP342 rules
-        engine.execute_tapscript(script)?;
-
-        // Check that execution succeeded (top of stack is true)
-        if !engine.success() {
-            return Err(TaprootError::TapscriptError(
-                "tapscript execution failed: stack result is false".into(),
-            ));
-        }
+        // OP_SUCCESS is decoded before initial-stack limits. Otherwise BIP342
+        // requires one true result, even with the legacy CLEANSTACK flag off.
+        engine.verify_witness_script(
+            script,
+            witness.iter().take(effective_len - 2).map(Vec::as_slice),
+        )?;
 
         Ok(())
     } else {
@@ -401,6 +387,86 @@ mod tests {
         let (output_key, parity) =
             compute_taprootoutput_key(&internal_key, Some(&merkle_root)).unwrap();
         (internal_key, output_key, parity)
+    }
+
+    #[cfg(feature = "segwit")]
+    #[test]
+    fn tapscript_completion_limits_and_op_success_order() {
+        use crate::sig_verify::Secp256k1Verifier;
+        use btc_primitives::{
+            amount::Amount,
+            hash::TxHash,
+            transaction::{OutPoint, TxIn},
+        };
+        let verifier = Secp256k1Verifier;
+        let internal =
+            hex::decode("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let mut tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::from_bytes([1; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: u32::MAX,
+            }],
+            outputs: vec![],
+            witness: vec![],
+            lock_time: 0,
+        };
+        for (script, arguments, expected) in [
+            (vec![0x51], vec![], true),
+            (vec![0x51], vec![vec![1]], false),
+            (vec![], vec![vec![1]], true),
+            (vec![], vec![], false),
+            (vec![], vec![vec![0x80]], false),
+            (vec![0x75, 0x51], vec![vec![0; 520]], true),
+            (vec![0x75, 0x51], vec![vec![0; 521]], false),
+            (vec![0x75, 0x51], vec![vec![]; 1001], false),
+            (vec![0xbb], vec![vec![]; 1001], true),
+            (vec![0xbb, 0x4d], vec![vec![0; 521]], true),
+            (vec![0x01, 0xbb], vec![], true), // ordinary true push, not OP_SUCCESS
+            (vec![0x01, 0xbb], vec![vec![0; 521]], false),
+            (vec![0x01, 0xbb, 0x00], vec![], false),
+            (vec![0x02, 0xbb], vec![], false), // truncated push before success byte
+            (vec![0x4c, 0x02, 0xbb], vec![], false),
+            (vec![0x4d, 0x02, 0x00, 0xbb], vec![], false),
+            (vec![0x4e, 0xff, 0xff, 0xff, 0xff, 0xbb], vec![], false),
+            (vec![0x00, 0x63, 0xbb, 0x68], vec![], true), // unexecuted branch
+        ] {
+            let leaf = tap_leaf_hash(TAPSCRIPT_LEAF_VERSION, &script);
+            let (output, parity) = compute_taprootoutput_key(&internal, Some(&leaf)).unwrap();
+            let previous = TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::p2tr(&output),
+            };
+            let mut items = arguments;
+            items.push(script);
+            items.push([vec![TAPSCRIPT_LEAF_VERSION | parity], internal.to_vec()].concat());
+            tx.witness = vec![Witness::from_items(items)];
+            let flags = ScriptFlags::consensus();
+            let result = crate::witness::verify_input_with_prevouts(
+                &tx,
+                0,
+                &[previous.clone()],
+                &verifier,
+                &flags,
+            );
+            assert_eq!(
+                result.is_ok(),
+                expected,
+                "witness={:?}: {result:?}",
+                tx.witness
+            );
+            // An annex is excluded from the initial stack and final result.
+            tx.witness[0].push(vec![0x50, 0x01]);
+            assert_eq!(
+                crate::witness::verify_input_with_prevouts(&tx, 0, &[previous], &verifier, &flags)
+                    .is_ok(),
+                expected
+            );
+        }
     }
 
     #[test]

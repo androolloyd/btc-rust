@@ -146,17 +146,24 @@ def signed_wallet_spend(core_port, coin=None, fee=0.00002):
     return signed["hex"], coin
 
 
-def legacy_multisig_address(core_port):
+def runtime_script_addresses(core_port):
     root = next(d["desc"] for d in core_rpc(core_port, "listdescriptors", [True])["descriptors"]
                 if d["active"] and not d["internal"] and d["desc"].startswith("wpkh("))
     key = root.split("#")[0][5:-1]
     assert key.endswith("/0/*")
-    descriptor = f"sh(multi(2,{key},{key[:-4]}/1/*))"
-    checksum = core_rpc(core_port, "getdescriptorinfo", [descriptor])["checksum"]
-    descriptor += "#" + checksum
-    imported = core_rpc(core_port, "importdescriptors", [[{"desc": descriptor, "timestamp": "now", "range": [0, 1]}]])
-    assert all(item["success"] for item in imported)
-    return core_rpc(core_port, "deriveaddresses", [descriptor, [0, 0]])[0]
+    nums = "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0"
+    addresses = {}
+    for kind, descriptor in {
+        "p2sh": f"sh(multi(2,{key},{key[:-4]}/1/*))",
+        "p2wsh": f"wsh(pk({key}))",
+        "taproot": f"tr({nums},pk({key}))",
+    }.items():
+        checksum = core_rpc(core_port, "getdescriptorinfo", [descriptor])["checksum"]
+        descriptor += "#" + checksum
+        imported = core_rpc(core_port, "importdescriptors", [[{"desc": descriptor, "timestamp": "now", "range": [0, 1]}]])
+        assert all(item["success"] for item in imported)
+        addresses[kind] = core_rpc(core_port, "deriveaddresses", [descriptor, [0, 0]])[0]
+    return addresses
 
 
 def compact_size(n):
@@ -261,10 +268,132 @@ def check_p2sh_runtime(core_port, rust_port, p2p_port, outbound, encrypted, cloc
     assert core_rpc(core_port, "getrawmempool", []) == rust_rpc(rust_port, "getrawmempool", []) == []
 
 
+def read_compact_size(data, pos):
+    first = data[pos]
+    width = {253: 2, 254: 4, 255: 8}.get(first, 0)
+    if not width:
+        return first, pos + 1
+    return int.from_bytes(data[pos + 1:pos + 1 + width], "little"), pos + 1 + width
+
+
+def witness_transaction_parts(raw):
+    data = bytes.fromhex(raw)
+    assert data[4:6] == b"\x00\x01"
+    count, pos = read_compact_size(data, 6)
+    assert count == 1
+    for _ in range(count):
+        pos += 36
+        size, pos = read_compact_size(data, pos)
+        pos += size + 4
+    outputs, pos = read_compact_size(data, pos)
+    for _ in range(outputs):
+        pos += 8
+        size, pos = read_compact_size(data, pos)
+        pos += size
+    witness_pos = pos
+    count, pos = read_compact_size(data, pos)
+    items = []
+    for _ in range(count):
+        size, pos = read_compact_size(data, pos)
+        items.append(data[pos:pos + size])
+        pos += size
+    assert pos + 4 == len(data)
+    base = data[:4] + data[6:witness_pos] + data[-4:]
+    return data[:witness_pos], items, data[-4:], base
+
+
+def replace_witness(raw, items):
+    prefix, _, locktime, _ = witness_transaction_parts(raw)
+    return (prefix + compact_size(len(items)) + b"".join(compact_size(len(item)) + item for item in items) + locktime).hex()
+
+
+def check_witness_runtime(core_port, rust_port, p2p_port, outbound, encrypted, clock, address, destination, kind):
+    funding = core_rpc(core_port, "sendtoaddress", [destination, 1.0])
+    wait_for_tx_relay(core_port, rust_port, clock, funding, from_core=True)
+    funded_tip = core_rpc(core_port, "generatetoaddress", [1, address])[-1]
+    wait_until(lambda: rust_rpc(rust_port, "getbestblockhash", []) == funded_tip)
+    coin = next(c for c in core_rpc(core_port, "listunspent", [1]) if c["txid"] == funding and c["address"] == destination)
+    raw, _ = signed_wallet_spend(core_port, coin)
+    _, items, _, base = witness_transaction_parts(raw)
+    assert len(items) == (3 if kind == "taproot" else 2)
+    malformed = [replace_witness(raw, [extra] + items) for extra in [b"", b"\x01", bytes(521)]]
+    if kind == "p2wpkh":
+        # Same curve equation, but a redundant leading zero violates BIP66.
+        signature = bytearray(items[0])
+        assert signature[0] == 0x30 and signature[2] == 2
+        signature[1] += 1
+        signature[3] += 1
+        signature.insert(4, 0)
+        malformed.append(replace_witness(raw, [bytes(signature)] + items[1:]))
+    for bad in malformed:
+        # Preserve the unsigned transaction. Added arguments keep every
+        # signature/script/proof; the DER mutation preserves its curve equation.
+        assert witness_transaction_parts(bad)[3] == base
+        before = rust_rpc(rust_port, "getrawmempool", [])
+        assert core_rpc(core_port, "testmempoolaccept", [[bad]])[0]["allowed"] is False
+        assert rust_rpc(rust_port, "testmempoolaccept", [[bad]])[0]["allowed"] is False
+        try:
+            rust_rpc(rust_port, "sendrawtransaction", [bad])
+        except RuntimeError as error:
+            assert error.args[0]["code"] == -26
+        else:
+            raise AssertionError(f"Rust accepted invalid {kind} witness stack")
+        assert rust_rpc(rust_port, "getrawmempool", []) == before
+        assert rust_rpc(rust_port, "gettxout", [coin["txid"], coin["vout"], False])["value"] == coin["amount"]
+    expected = core_rpc(core_port, "testmempoolaccept", [[raw]])[0]
+    actual = rust_rpc(rust_port, "testmempoolaccept", [[raw]])[0]
+    assert expected["allowed"] == actual["allowed"] is True
+    assert expected["vsize"] == actual["vsize"] and expected["fees"]["base"] == actual["fees"]["base"]
+    txid = rust_rpc(rust_port, "sendrawtransaction", [raw])
+    wait_for_tx_relay(core_port, rust_port, clock, txid, from_core=False)
+    core_rpc(core_port, "setnetworkactive", [False])
+    wait_until(lambda: not rust_rpc(rust_port, "getpeerinfo", []))
+    valid_tip = rust_rpc(rust_port, "generatetoaddress", [1, address])[-1]
+    block = bytes.fromhex(rust_rpc(rust_port, "getblock", [valid_tip, 0]))
+    txids = rust_rpc(rust_port, "getblock", [valid_tip])["tx"]
+    assert len(txids) == 2 and txids[1] == txid and block[80] == 2 and block.endswith(bytes.fromhex(raw))
+    original_coinbase = block[81:-len(bytes.fromhex(raw))]
+    assert witness_transaction_parts(original_coinbase.hex())[1] == [bytes(32)]
+    original_commitment = sha256d(sha256d(bytes(32) + sha256d(bytes.fromhex(raw))) + bytes(32))
+    for bad in malformed:
+        # Rebuild both commitments and PoW. A changed witness with an unchanged
+        # commitment would only test the block commitment check, not execution.
+        new_commitment = sha256d(sha256d(bytes(32) + sha256d(bytes.fromhex(bad))) + bytes(32))
+        old_script = bytes.fromhex("6a24aa21a9ed") + original_commitment
+        assert original_coinbase.count(old_script) == 1
+        coinbase = original_coinbase.replace(old_script, bytes.fromhex("6a24aa21a9ed") + new_commitment)
+        coinbase_id = sha256d(witness_transaction_parts(coinbase.hex())[3])
+        header = bytearray(block[:80])
+        header[36:68] = sha256d(coinbase_id + sha256d(base))
+        bits = int.from_bytes(header[72:76], "little")
+        target = (bits & 0x7fffff) << (8 * ((bits >> 24) - 3))
+        for nonce in range(1_000_000):
+            header[76:80] = nonce.to_bytes(4, "little")
+            if int.from_bytes(sha256d(header), "little") <= target:
+                break
+        else:
+            raise AssertionError("regtest PoW search exhausted")
+        bad_block = (header + b"\x02" + coinbase + bytes.fromhex(bad)).hex()
+        for port, rpc, tip in [(core_port, core_rpc, funded_tip), (rust_port, rust_rpc, valid_tip)]:
+            coin_before = rpc(port, "gettxout", [coin["txid"], coin["vout"], False])
+            rejected = rpc(port, "submitblock", [bad_block])
+            assert isinstance(rejected, str) and "script" in rejected.lower(), (kind, rejected)
+            assert rpc(port, "getbestblockhash", []) == tip
+            assert rpc(port, "gettxout", [coin["txid"], coin["vout"], False]) == coin_before
+    core_rpc(core_port, "setnetworkactive", [True])
+    if not outbound:
+        core_rpc(core_port, "addnode", [f"127.0.0.1:{p2p_port}", "onetry", encrypted])
+    wait_until(lambda: core_rpc(core_port, "getbestblockhash", []) == valid_tip, timeout=60)
+    assert core_rpc(core_port, "getblock", [valid_tip, 0]) == block.hex()
+    assert core_rpc(core_port, "getrawmempool", []) == rust_rpc(rust_port, "getrawmempool", []) == []
+    print(f"PASSED: {kind} valid relay/mining and invalid witness transaction/block rejection", flush=True)
+
+
 def check_reorg_and_mempool(core_port, rust_port, p2p_port, outbound, encrypted, clock):
     core_rpc(core_port, "createwallet", ["interop-wallet"])
-    multisig = legacy_multisig_address(core_port)
+    scripts = runtime_script_addresses(core_port)
     address = core_rpc(core_port, "getnewaddress", ["", "bech32"])
+    scripts["p2wpkh"] = address
     hashes = core_rpc(core_port, "generatetoaddress", [105, address], timeout=30)
     wait_until(lambda: rust_rpc(rust_port, "getbestblockhash", []) == hashes[-1], timeout=60)
     # Core -> Rust wtxid announcement and actual signature-checked admission.
@@ -315,7 +444,9 @@ def check_reorg_and_mempool(core_port, rust_port, p2p_port, outbound, encrypted,
     raw_immature = core_rpc(core_port, "signrawtransactionwithwallet", [raw_immature])["hex"]
     assert core_rpc(core_port, "testmempoolaccept", [[raw_immature]])[0]["allowed"] is False
     assert rust_rpc(rust_port, "testmempoolaccept", [[raw_immature]])[0]["allowed"] is False
-    check_p2sh_runtime(core_port, rust_port, p2p_port, outbound, encrypted, clock, address, multisig)
+    check_p2sh_runtime(core_port, rust_port, p2p_port, outbound, encrypted, clock, address, scripts["p2sh"])
+    for kind in ["p2wpkh", "p2wsh", "taproot"]:
+        check_witness_runtime(core_port, rust_port, p2p_port, outbound, encrypted, clock, address, scripts[kind], kind)
     # Separate branches, including a real spend in the branch to be disconnected.
     core_rpc(core_port, "setnetworkactive", [False])
     wait_until(lambda: not rust_rpc(rust_port, "getpeerinfo", []))

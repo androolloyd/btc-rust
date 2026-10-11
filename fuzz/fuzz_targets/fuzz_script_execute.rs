@@ -7,7 +7,7 @@ use btc_consensus::script_engine::{ScriptEngine, ScriptFlags};
 use btc_consensus::sig_verify::Secp256k1Verifier;
 use btc_consensus::witness::verify_input_with_prevouts;
 use btc_primitives::amount::Amount;
-use btc_primitives::hash::{hash160, TxHash};
+use btc_primitives::hash::{hash160, sha256, TxHash};
 use btc_primitives::script::ScriptBuf;
 use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut, Witness};
 
@@ -79,6 +79,55 @@ fuzz_target!(|data: &[u8]| {
             flags.verify_witness = mask & 2 != 0;
             flags.verify_cleanstack = mask & 8 != 0;
             let _ = verify_input_with_prevouts(&tx, 0, &[previous], &verifier, &flags);
+
+            // Exercise native witness initialization/completion and the
+            // tapscript OP_SUCCESS pre-scan through actual committed outputs.
+            let items = if mask & 16 != 0 {
+                arguments.chunks(1).map(<[u8]>::to_vec).collect::<Vec<_>>()
+            } else {
+                vec![arguments.to_vec()]
+            };
+            let mut witness_tx = tx.clone();
+            witness_tx.inputs[0].script_sig = ScriptBuf::new();
+            witness_tx.witness = vec![Witness::from_items(
+                [items.clone(), vec![redeem.to_vec()]].concat(),
+            )];
+            let previous = TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::p2wsh(&sha256(redeem)),
+            };
+            let _ = verify_input_with_prevouts(
+                &witness_tx,
+                0,
+                &[previous],
+                &verifier,
+                &ScriptFlags::consensus(),
+            );
+            use btc_consensus::taproot::{compute_taprootoutput_key, tap_leaf_hash};
+            let internal = [
+                0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce, 0x87,
+                0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81, 0x5b,
+                0x16, 0xf8, 0x17, 0x98,
+            ];
+            if let Ok((output, parity)) =
+                compute_taprootoutput_key(&internal, Some(&tap_leaf_hash(0xc0, redeem)))
+            {
+                let control = [vec![0xc0 | parity], internal.to_vec()].concat();
+                witness_tx.witness = vec![Witness::from_items(
+                    [items, vec![redeem.to_vec(), control]].concat(),
+                )];
+                let previous = TxOut {
+                    value: Amount::from_sat(50_000),
+                    script_pubkey: ScriptBuf::p2tr(&output),
+                };
+                let _ = verify_input_with_prevouts(
+                    &witness_tx,
+                    0,
+                    &[previous],
+                    &verifier,
+                    &ScriptFlags::consensus(),
+                );
+            }
         }
     }));
 

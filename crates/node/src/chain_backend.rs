@@ -1574,6 +1574,121 @@ mod tests {
     }
 
     #[test]
+    fn invalid_witness_results_preserve_pool_coins_and_durable_tip() {
+        use btc_primitives::{
+            hash::{sha256, sha256d},
+            transaction::Witness,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let key = TestKeyPair::from_secret(secp256k1::SecretKey::from_slice(&[18; 32]).unwrap());
+        let script = vec![0x75, 0x51]; // DROP TRUE
+        for taproot in [false, true] {
+            let path = dir.path().join(format!("witness-{taproot}.redb"));
+            let backend = NodeChainBackend::open(&path, NodeState::new(Network::Regtest)).unwrap();
+            let (address, tail) = if taproot {
+                use btc_consensus::taproot::{compute_taprootoutput_key, tap_leaf_hash};
+                let internal =
+                    hex::decode("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+                        .unwrap()
+                        .try_into()
+                        .unwrap();
+                let (output, parity) =
+                    compute_taprootoutput_key(&internal, Some(&tap_leaf_hash(0xc0, &script)))
+                        .unwrap();
+                (
+                    Address::P2tr {
+                        output_key: output,
+                        network: Network::Regtest,
+                    },
+                    vec![
+                        script.clone(),
+                        [vec![0xc0 | parity], internal.to_vec()].concat(),
+                    ],
+                )
+            } else {
+                (
+                    Address::P2wsh {
+                        hash: sha256(&script),
+                        network: Network::Regtest,
+                    },
+                    vec![script.clone()],
+                )
+            };
+            let hashes = backend
+                .call("generatetoaddress", json!([100, address.to_string()]))
+                .unwrap();
+            let first = backend
+                .block(&BlockHash::from_hex(hashes[0].as_str().unwrap()).unwrap())
+                .unwrap()
+                .unwrap();
+            let op = OutPoint::new(first.transactions[0].txid(), 0);
+            let mut valid = signed_spend(&key, op, &first.transactions[0].outputs[0], 1000);
+            valid.inputs[0].script_sig = ScriptBuf::new();
+            valid.witness = vec![Witness::from_items([vec![vec![1]], tail.clone()].concat())];
+            let tip = backend.tip().unwrap();
+            let coin = backend
+                .call("gettxout", json!([op.txid.to_hex(), 0, false]))
+                .unwrap();
+            for arguments in [vec![vec![1], vec![1]], vec![vec![0; 521]]] {
+                let mut bad = valid.clone();
+                bad.witness[0] = Witness::from_items([arguments, tail.clone()].concat());
+                assert!(backend.submit_transaction(bad.clone()).is_err());
+                let mut block = backend.candidate(key.p2pkh_script()).unwrap();
+                block.transactions.push(bad);
+                // Give the invalid block a correct independent witness
+                // commitment and real PoW so it reaches script validation.
+                let root = sha256d(&[[0u8; 32], block.transactions[1].wtxid().to_bytes()].concat());
+                let commitment = sha256d(&[root, [0u8; 32]].concat());
+                block.transactions[0].outputs.push(TxOut {
+                    value: Amount::ZERO,
+                    script_pubkey: ScriptBuf::from_bytes(
+                        [
+                            vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed],
+                            commitment.to_vec(),
+                        ]
+                        .concat(),
+                    ),
+                });
+                block.transactions[0].witness = vec![Witness::from_items(vec![vec![0; 32]])];
+                mine(&mut block);
+                assert!(backend
+                    .submit_block(&block)
+                    .unwrap_err()
+                    .message
+                    .contains("script"));
+                assert_eq!(backend.tip().unwrap(), tip);
+                assert_eq!(
+                    backend
+                        .call("gettxout", json!([op.txid.to_hex(), 0, false]))
+                        .unwrap(),
+                    coin
+                );
+                assert!(backend.mempool_transactions().unwrap().is_empty());
+                assert!(backend.block(&block.block_hash()).unwrap().is_none());
+            }
+            drop(backend);
+            let backend = NodeChainBackend::open(&path, NodeState::new(Network::Regtest)).unwrap();
+            assert_eq!(backend.tip().unwrap(), tip);
+            assert_eq!(
+                backend
+                    .call("gettxout", json!([op.txid.to_hex(), 0, false]))
+                    .unwrap(),
+                coin
+            );
+            backend.submit_transaction(valid.clone()).unwrap();
+            let mut block = backend.candidate(key.p2pkh_script()).unwrap();
+            mine(&mut block);
+            assert_eq!(block.transactions[1], valid);
+            assert!(backend.submit_block(&block).unwrap().active);
+            assert!(backend.mempool_transactions().unwrap().is_empty());
+            assert!(backend
+                .call("gettxout", json!([op.txid.to_hex(), 0, false]))
+                .unwrap()
+                .is_null());
+        }
+    }
+
+    #[test]
     fn p2sh_invalid_signatures_cannot_enter_pool_or_commit_block_coins() {
         use btc_primitives::hash::hash160;
         use btc_primitives::script::Opcode;

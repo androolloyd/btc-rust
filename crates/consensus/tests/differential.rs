@@ -735,6 +735,48 @@ fn released_core_p2sh_cases_use_runtime_dispatcher() {
     }
 }
 
+#[cfg(feature = "segwit")]
+#[test]
+fn released_core_witness_cases_use_runtime_dispatcher() {
+    let data: serde_json::Value =
+        serde_json::from_str(include_str!("../../../testdata/core29_witness.json")).unwrap();
+    let cases = data["vectors"].as_array().unwrap();
+    assert_eq!(cases.len(), 48);
+    for case in cases {
+        let script_sig = parse_core_script(case["script_sig"].as_str().unwrap());
+        let script_pubkey = parse_core_script(case["script_pubkey"].as_str().unwrap());
+        let flags = parse_flags(case["flags"].as_str().unwrap());
+        assert!(!flags.verify_cleanstack);
+        let amount = case["amount_sat"].as_i64().unwrap();
+        let mut tx = build_mock_tx(&script_sig, &script_pubkey, amount);
+        tx.witness = vec![btc_primitives::transaction::Witness::from_items(
+            case["witness"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| hex::decode(item.as_str().unwrap()).unwrap())
+                .collect(),
+        )];
+        let result = btc_consensus::witness::verify_input_with_prevouts(
+            &tx,
+            0,
+            &[TxOut {
+                value: Amount::from_sat(amount),
+                script_pubkey,
+            }],
+            &Secp256k1Verifier,
+            &flags,
+        );
+        assert_eq!(
+            result.is_ok(),
+            case["expected"] == "OK",
+            "Core row {}: {:?}",
+            case["core_row"],
+            result
+        );
+    }
+}
+
 /// Verify our script engine matches Bitcoin Core for every test in script_tests.json.
 ///
 /// Test vector format (two forms):
