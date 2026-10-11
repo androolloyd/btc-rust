@@ -38,3 +38,29 @@ jobs:
       - uses: actions/checkout@v4
       - run: docker build -f devnet/Dockerfile -t btc-rust:ci .
       - run: docker run --rm btc-rust:ci --help
+  core-interop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.88.0 --profile minimal
+      - run: cargo build --release --locked --package btc-node
+      - name: Fetch checksum-verified Bitcoin Core v29
+        shell: python
+        run: |
+          import hashlib, os, pathlib, tarfile, urllib.request
+          directory = pathlib.Path(os.environ["RUNNER_TEMP"]) / "btc-core29"
+          directory.mkdir()
+          name = "bitcoin-29.0-x86_64-linux-gnu.tar.gz"
+          base = "https://bitcoincore.org/bin/bitcoin-core-29.0/"
+          with urllib.request.urlopen(base + "SHA256SUMS", timeout=60) as source:
+              manifest = source.read().decode()
+          expected = next(line.split()[0] for line in manifest.splitlines() if line.endswith(name))
+          with urllib.request.urlopen(base + name, timeout=60) as source:
+              data = source.read()
+          assert hashlib.sha256(data).hexdigest() == expected, "Core checksum mismatch"
+          archive = directory / name
+          archive.write_bytes(data)
+          with tarfile.open(archive) as source:
+              source.extractall(directory, filter="data")
+      - run: python3 scripts/check_core_p2p.py --bitcoind "$RUNNER_TEMP/btc-core29/bitcoin-29.0/bin/bitcoind"

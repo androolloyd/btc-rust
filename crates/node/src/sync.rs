@@ -433,6 +433,8 @@ pub struct SyncManager {
     snapshot_height: Option<u64>,
     validated_tip: Option<(u64, BlockHash)>,
     chain_backend: Option<Arc<crate::chain_backend::NodeChainBackend>>,
+    peer_table: Option<Arc<crate::p2p::PeerTable>>,
+    outbound_peer: Option<crate::p2p::PeerGuard>,
 }
 
 impl SyncManager {
@@ -462,6 +464,8 @@ impl SyncManager {
             snapshot_height: None,
             validated_tip: None,
             chain_backend: None,
+            peer_table: None,
+            outbound_peer: None,
         }
     }
 
@@ -504,6 +508,8 @@ impl SyncManager {
             snapshot_height: None,
             validated_tip: None,
             chain_backend: None,
+            peer_table: None,
+            outbound_peer: None,
         }
     }
 
@@ -536,6 +542,10 @@ impl SyncManager {
     /// sub-systems (RPC, HTTP, metrics, etc.).
     pub fn set_node_state(&mut self, state: NodeState) {
         self.node_state = Some(state);
+    }
+
+    pub fn set_peer_table(&mut self, table: Arc<crate::p2p::PeerTable>) {
+        self.peer_table = Some(table);
     }
 
     /// Return a reference to the reorg manager (for testing / inspection).
@@ -808,13 +818,20 @@ impl SyncManager {
 
             let handshake_result = tokio::time::timeout(
                 std::time::Duration::from_secs(10),
-                conn.perform_handshake(self.network, our_height),
+                conn.perform_handshake_with_relay(self.network, our_height, false),
             )
             .await;
 
             match handshake_result {
                 Ok(Ok(handshake)) => {
                     if let Some(ver) = handshake.peer_version() {
+                        if let Some(table) = &self.peer_table {
+                            self.outbound_peer = Some(
+                                table
+                                    .register(*addr, false, &conn, ver)
+                                    .map_err(|e| SyncError::Aborted(e.to_string()))?,
+                            );
+                        }
                         let peer_info = btc_network::peer::PeerInfo {
                             addr: *addr,
                             state: btc_network::peer::PeerState::Ready,

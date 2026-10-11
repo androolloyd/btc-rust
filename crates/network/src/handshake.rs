@@ -73,7 +73,7 @@ impl Handshake {
 
         let version = VersionMessage {
             version: ProtocolVersion::CURRENT.0,
-            services: ServiceFlags::NETWORK.0 | ServiceFlags::WITNESS.0,
+            services: ServiceFlags::node_services().0,
             timestamp,
             receiver: NetAddress::default(),
             sender: NetAddress::default(),
@@ -164,10 +164,7 @@ mod tests {
         match msg {
             NetworkMessage::Version(v) => {
                 assert_eq!(v.version, ProtocolVersion::CURRENT.0);
-                assert_eq!(
-                    v.services,
-                    ServiceFlags::NETWORK.0 | ServiceFlags::WITNESS.0
-                );
+                assert_eq!(v.services, ServiceFlags::node_services().0);
                 assert_eq!(v.user_agent, USER_AGENT);
                 assert_eq!(v.start_height, 800_000);
                 assert!(v.relay);

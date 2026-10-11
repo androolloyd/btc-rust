@@ -37,6 +37,7 @@ pub struct NodeChainBackend {
     data: Mutex<ValidatedChain>,
     db: Arc<RedbDatabase>,
     state: NodeState,
+    block_events: tokio::sync::broadcast::Sender<BlockHash>,
 }
 
 pub struct AcceptedBlock {
@@ -94,7 +95,74 @@ impl NodeChainBackend {
             data: Mutex::new(ValidatedChain { headers, utxos }),
             db,
             state,
+            block_events: tokio::sync::broadcast::channel(256).0,
         })
+    }
+
+    pub fn subscribe_blocks(&self) -> tokio::sync::broadcast::Receiver<BlockHash> {
+        self.block_events.subscribe()
+    }
+    pub fn locator_hashes(&self) -> Result<Vec<BlockHash>, RpcError> {
+        Ok(self.lock()?.headers.get_locator_hashes())
+    }
+
+    pub fn header(&self, hash: &BlockHash) -> Result<Option<BlockHeader>, RpcError> {
+        Ok(self
+            .lock()?
+            .headers
+            .get_header(hash)
+            .map(|entry| entry.header))
+    }
+
+    pub fn headers_after(
+        &self,
+        locator: &[BlockHash],
+        stop: BlockHash,
+        limit: usize,
+    ) -> Result<Vec<BlockHeader>, RpcError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let data = self.lock()?;
+        let headers = &data.headers;
+        if locator.is_empty() {
+            return Ok(headers
+                .get_header(&stop)
+                .map(|e| vec![e.header])
+                .unwrap_or_default());
+        }
+        let start = locator
+            .iter()
+            .find_map(|hash| headers.get_header(hash).map(|e| e.height))
+            .unwrap_or(0);
+        let mut result = Vec::new();
+        for height in start + 1..=headers.best_height() {
+            let header = headers
+                .get_header_by_height(height)
+                .ok_or_else(|| internal("header index incomplete"))?
+                .header;
+            result.push(header);
+            if result.len() >= limit.min(2000) || header.block_hash() == stop {
+                break;
+            }
+        }
+        Ok(result)
+    }
+
+    pub fn block(&self, hash: &BlockHash) -> Result<Option<Block>, RpcError> {
+        self.db
+            .tx()
+            .map_err(internal)?
+            .get_block(hash)
+            .map_err(internal)
+    }
+
+    pub fn transaction(&self, hash: &TxHash) -> Result<Option<Transaction>, RpcError> {
+        self.db
+            .tx()
+            .map_err(internal)?
+            .get_transaction(hash)
+            .map_err(internal)
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, ValidatedChain>, RpcError> {
@@ -196,6 +264,7 @@ impl NodeChainBackend {
                 other => rejection(other),
             })?;
         self.state.update_chain_tip(height, &hash.to_string());
+        let _ = self.block_events.send(hash);
         Ok(AcceptedBlock {
             height,
             hash,

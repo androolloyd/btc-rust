@@ -31,6 +31,14 @@ impl ServiceFlags {
     pub const WITNESS: ServiceFlags = ServiceFlags(1 << 3);
     pub const COMPACT_FILTERS: ServiceFlags = ServiceFlags(1 << 6);
     pub const NETWORK_LIMITED: ServiceFlags = ServiceFlags(1 << 10);
+    pub const P2P_V2: ServiceFlags = ServiceFlags(1 << 11);
+
+    pub fn node_services() -> Self {
+        let flags = Self::NETWORK.0 | Self::WITNESS.0;
+        #[cfg(feature = "v2")]
+        let flags = flags | Self::P2P_V2.0;
+        Self(flags)
+    }
 
     pub fn has(self, flag: ServiceFlags) -> bool {
         self.0 & flag.0 == flag.0

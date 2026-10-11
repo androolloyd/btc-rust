@@ -88,7 +88,7 @@ pub struct DatabaseHandle {
     pub path: PathBuf,
 }
 
-/// Placeholder for the P2P networking component.
+/// Configuration for the P2P listener opened at node startup.
 #[derive(Debug)]
 pub struct NetworkHandle {
     pub port: u16,
@@ -218,7 +218,6 @@ impl Node {
         );
 
         info!(path = %self.database.path.display(), "database opened");
-        info!(port = self.network.port, "p2p network ready");
 
         // -----------------------------------------------------------------
         // 1. Create shared NodeState (single source of truth)
@@ -232,6 +231,9 @@ impl Node {
             &self.config.datadir.join("utxo.redb"),
             node_state.clone(),
         )?);
+
+        let p2p_listener = tokio::net::TcpListener::bind(("0.0.0.0", self.network.port)).await?;
+        let peer_table = Arc::new(crate::p2p::PeerTable::new(node_state.peer_count.clone()));
 
         // -----------------------------------------------------------------
         // 2. Create ExExManager for chain event notifications
@@ -278,22 +280,40 @@ impl Node {
         // -----------------------------------------------------------------
         // 6. Initialize RPC server with shared state from NodeState
         // -----------------------------------------------------------------
-        let rpc_handler = Arc::new(
-            btc_rpc::handler::RpcHandler::new_with_state(
-                Arc::clone(&node_state.chain_height),
-                Arc::clone(&node_state.best_hash),
-                node_state.rpc_network_name(),
-                Arc::clone(&node_state.peer_count),
-                Arc::clone(&node_state.mempool_size),
-                Arc::clone(&node_state.mempool_bytes),
-            )
-            .with_chain_backend(chain_backend.clone()),
-        );
+        let mut rpc_handler = btc_rpc::handler::RpcHandler::new_with_state(
+            node_state.chain_height.clone(),
+            node_state.best_hash.clone(),
+            node_state.rpc_network_name(),
+            node_state.peer_count.clone(),
+            node_state.mempool_size.clone(),
+            node_state.mempool_bytes.clone(),
+        )
+        .with_chain_backend(chain_backend.clone());
+        let rpc_peers = peer_table.clone();
+        rpc_handler.register_fallible("getpeerinfo", move |_| rpc_peers.snapshot());
+        let rpc_peers = peer_table.clone();
+        rpc_handler.register_fallible("getnetworkinfo", move |_| rpc_peers.network_info());
+        let rpc_handler = Arc::new(rpc_handler);
         let rpc = RpcServer::new(self.config.rpc_port);
         let rpc_handler_clone = rpc_handler.clone();
 
         // Spawn RPC server
         let mut rpc_handle = tokio::spawn(async move { rpc.run(rpc_handler_clone).await });
+
+        let p2p_backend = chain_backend.clone();
+        let p2p_peers = peer_table.clone();
+        let p2p_shutdown = rpc_handler.clone();
+        let p2p_network = self.config.network;
+        let mut p2p_handle = tokio::spawn(async move {
+            crate::p2p::P2pServer::run(
+                p2p_listener,
+                p2p_network,
+                p2p_backend,
+                p2p_peers,
+                p2p_shutdown,
+            )
+            .await
+        });
 
         // -----------------------------------------------------------------
         // 7. Initialize consensus chain state
@@ -320,6 +340,7 @@ impl Node {
         )?;
         sync_mgr.set_exex_sender(exex_manager.sender().clone());
         sync_mgr.set_node_state(node_state.clone());
+        sync_mgr.set_peer_table(peer_table);
 
         info!("starting initial block download");
 
@@ -334,6 +355,9 @@ impl Node {
         let result = tokio::select! {
             result = tokio::signal::ctrl_c() => result.map_err(Into::into),
             _ = rpc_handler.wait_for_shutdown() => Ok(()),
+            result = &mut p2p_handle => match result {
+                Ok(result) => result, Err(error) => Err(error.into()),
+            },
             result = &mut rpc_handle => match result {
                 Ok(result) => result,
                 Err(error) => Err(error.into()),
@@ -345,6 +369,10 @@ impl Node {
         if !rpc_handle.is_finished() {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut rpc_handle).await;
         }
+        if !p2p_handle.is_finished() {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut p2p_handle).await;
+        }
+        p2p_handle.abort();
         rpc_handle.abort();
         http_handle.abort();
         explorer_handle.abort();

@@ -21,6 +21,19 @@ pub async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
     network: Network,
     initiating: bool,
 ) -> io::Result<V2Codec> {
+    handshake_with_prefix(stream, network, initiating, &[]).await
+}
+
+/// Resume responder key exchange after transport detection consumed a prefix.
+pub(crate) async fn handshake_with_prefix<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    network: Network,
+    initiating: bool,
+    received_prefix: &[u8],
+) -> io::Result<V2Codec> {
+    if received_prefix.len() > 16 || (initiating && !received_prefix.is_empty()) {
+        return Err(invalid("invalid key exchange prefix"));
+    }
     let mut transport = V2Transport::new_encrypted(initiating);
     transport.set_network(network);
     // A responder waits for the first mismatching v1-prefix byte before replying.
@@ -28,21 +41,25 @@ pub async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
     if !initiating {
         let mut prefix = network.magic().to_vec();
         prefix.extend_from_slice(b"version\0\0\0\0\0");
-        let mut read = 0;
-        while read < prefix.len() {
+        let mut read = received_prefix.len();
+        peer[..read].copy_from_slice(received_prefix);
+        while read < prefix.len() && peer[..read] == prefix[..read] {
             stream.read_exact(&mut peer[read..read + 1]).await?;
             read += 1;
             if peer[read - 1] != prefix[read - 1] {
                 break;
             }
         }
-        if read == prefix.len() {
+        if read == prefix.len() && peer[..read] == prefix {
             return Err(invalid("peer requested v1 transport"));
         }
         stream.write_all(transport.our_pubkey()).await?;
         stream.write_all(transport.garbage()).await?;
         stream.flush().await?;
         stream.read_exact(&mut peer[read..]).await?;
+        if peer[4..16] == prefix[4..16] {
+            return Err(invalid("v1 peer uses a different network"));
+        }
     } else {
         stream.write_all(transport.our_pubkey()).await?;
         stream.write_all(transport.garbage()).await?;
