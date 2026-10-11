@@ -103,7 +103,9 @@ fuzz_target!(|data: &[u8]| {
                 &verifier,
                 &ScriptFlags::consensus(),
             );
-            use btc_consensus::taproot::{compute_taprootoutput_key, tap_leaf_hash};
+            use btc_consensus::taproot::{
+                compute_taprootoutput_key, tap_branch_hash, tap_leaf_hash,
+            };
             let internal = [
                 0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce, 0x87,
                 0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81, 0x5b,
@@ -127,6 +129,32 @@ fuzz_target!(|data: &[u8]| {
                     &verifier,
                     &ScriptFlags::consensus(),
                 );
+            }
+            // Treat the prefix as an arbitrary control proof and derive its
+            // real output point. This reaches control-depth/shape checks on
+            // the production path rather than only using depth-zero proofs.
+            if mask & 32 != 0 && arguments.len() >= 33 {
+                let internal: [u8; 32] = arguments[1..33].try_into().unwrap();
+                let mut root = tap_leaf_hash(arguments[0] & 0xfe, redeem);
+                for node in arguments[33..].chunks_exact(32) {
+                    root = tap_branch_hash(&root, &node.try_into().unwrap());
+                }
+                if let Ok((output, parity)) = compute_taprootoutput_key(&internal, Some(&root)) {
+                    let mut control = arguments.to_vec();
+                    control[0] = (control[0] & 0xfe) | parity;
+                    witness_tx.witness = vec![Witness::from_items(vec![redeem.to_vec(), control])];
+                    let previous = TxOut {
+                        value: Amount::from_sat(50_000),
+                        script_pubkey: ScriptBuf::p2tr(&output),
+                    };
+                    let _ = verify_input_with_prevouts(
+                        &witness_tx,
+                        0,
+                        &[previous],
+                        &verifier,
+                        &ScriptFlags::consensus(),
+                    );
+                }
             }
         }
     }));

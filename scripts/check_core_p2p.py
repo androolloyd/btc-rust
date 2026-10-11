@@ -41,12 +41,23 @@ def wait_until(check, timeout=30, description="condition", on_retry=None):
     raise WaitTimeout(f"{description} timed out: last observation: {last}")
 
 
-def free_port(span=1, excluded=()):
+class ReservedPorts:
+    def __init__(self, port, sockets):
+        self.port = port
+        self.sockets = sockets
+
+    def close(self):
+        for item in self.sockets:
+            item.close()
+        self.sockets.clear()
+
+
+def reserve_ports(span=1, excluded=()):
     for _ in range(100):
         held = []
         try:
             first = socket.socket()
-            first.bind(("127.0.0.1", 0))
+            first.bind(("0.0.0.0", 0))
             held.append(first)
             port = first.getsockname()[1]
             if port + span > 65536 or any(value in excluded for value in range(port, port + span)):
@@ -54,14 +65,24 @@ def free_port(span=1, excluded=()):
             for offset in range(1, span):
                 other = socket.socket()
                 held.append(other)
-                other.bind(("127.0.0.1", port + offset))
-            return port
+                other.bind(("0.0.0.0", port + offset))
+            reservation = ReservedPorts(port, held)
+            held = []  # Ownership moves to the caller until process launch.
+            return reservation
         except OSError:
             pass
         finally:
             for item in held:
                 item.close()
     raise RuntimeError("no available port range")
+
+
+def free_port(span=1, excluded=()):
+    reservation = reserve_ports(span, excluded)
+    try:
+        return reservation.port
+    finally:
+        reservation.close()
 
 
 def core_rpc(port, method, params, timeout=10):
@@ -475,7 +496,7 @@ def check_taproot_execution(core_port, rust_port, p2p_port, clock, address):
     core_rpc(core_port, "addnode", [f"127.0.0.1:{p2p_port}", "onetry", False])
     wait_until(lambda: core_rpc(core_port, "getbestblockhash", []) == rust_tip, timeout=60)
     assert core_rpc(core_port, "getblock", [rust_tip, 0]) == empty.hex()
-    print(f"PASSED: {len(tests)} independently signed Core Taproot script/key blocks with exact consensus outcomes", flush=True)
+    print(f"PASSED: {len(tests)} Core reference Taproot script/key blocks with exact consensus outcomes", flush=True)
 
 
 def check_reorg_and_mempool(core_port, rust_port, p2p_port, outbound, encrypted, clock):
@@ -572,11 +593,16 @@ def scenario(args, encrypted, outbound):
         core_data, rust_data = root / "core", root / "rust"
         core_data.mkdir()
         rust_data.mkdir()
-        core_port = free_port()
+        core_reservation = reserve_ports()
+        core_port = core_reservation.port
         clock = CoreClock(core_port)
-        rust_port = free_port(3, {core_port})
-        p2p_port = free_port(excluded={core_port, *range(rust_port, rust_port + 3)})
-        core_p2p = free_port(excluded={core_port, p2p_port, *range(rust_port, rust_port + 3)})
+        rust_reservation = reserve_ports(3, {core_port})
+        rust_port = rust_reservation.port
+        p2p_reservation = reserve_ports(excluded={core_port, *range(rust_port, rust_port + 3)})
+        p2p_port = p2p_reservation.port
+        core_p2p_reservation = reserve_ports(excluded={core_port, p2p_port, *range(rust_port, rust_port + 3)})
+        core_p2p = core_p2p_reservation.port
+        reservations = [core_reservation, rust_reservation, p2p_reservation, core_p2p_reservation]
         processes = []
         with (root / "core.log").open("w") as core_log, (root / "rust.log").open("w") as rust_log:
             try:
@@ -589,6 +615,9 @@ def scenario(args, encrypted, outbound):
                 ]
                 if outbound:
                     core_command += [f"-bind=127.0.0.1:{core_p2p}", f"-port={core_p2p}"]
+                core_reservation.close()
+                if outbound:
+                    core_p2p_reservation.close()
                 core = subprocess.Popen(core_command, stdout=core_log, stderr=core_log)
                 processes.append(core)
                 wait_until(lambda: core_rpc(core_port, "getblockchaininfo", []))
@@ -603,6 +632,10 @@ def scenario(args, encrypted, outbound):
                 if outbound:
                     rust_command += ["--connect", f"127.0.0.1:{core_p2p}"]
                 rust_command += ["run"]
+                # Keep the future Rust endpoints unavailable to Core/RPC
+                # ephemeral clients while Core starts and mines initial history.
+                rust_reservation.close()
+                p2p_reservation.close()
                 rust = subprocess.Popen(rust_command, stdout=rust_log, stderr=rust_log)
                 processes.append(rust)
                 wait_until(lambda: rust_rpc(rust_port, "getblockchaininfo", []))
@@ -678,6 +711,8 @@ def scenario(args, encrypted, outbound):
                 print(debug.read_text()[-20000:] if debug.exists() else (root / "core.log").read_text())
                 raise
             finally:
+                for reservation in reservations:
+                    reservation.close()
                 for process in processes:
                     if process.poll() is None:
                         process.terminate()

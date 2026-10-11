@@ -276,7 +276,7 @@ fn parse_control_block(
         return Err(TaprootError::ControlBlockTooShort);
     }
 
-    if (control_block.len() - 33) % 32 != 0 {
+    if control_block.len() > 33 + 32 * 128 || (control_block.len() - 33) % 32 != 0 {
         return Err(TaprootError::ControlBlockInvalidLength);
     }
 
@@ -293,11 +293,6 @@ fn parse_control_block(
         let mut node = [0u8; 32];
         node.copy_from_slice(&control_block[start..start + 32]);
         merkle_path.push(node);
-    }
-
-    // Max merkle path depth is 128
-    if merkle_path.len() > 128 {
-        return Err(TaprootError::ControlBlockInvalidLength);
     }
 
     Ok((leaf_version, internal_key, merkle_path))

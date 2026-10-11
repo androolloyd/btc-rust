@@ -16,7 +16,7 @@ fn core_reference_taproot_execution_and_digest_cases() {
     let data: serde_json::Value =
         serde_json::from_str(include_str!("../../../testdata/core29_tapscript.json")).unwrap();
     let cases = data["vectors"].as_array().unwrap();
-    assert_eq!(cases.len(), 51);
+    assert_eq!(cases.len(), 64);
     for case in cases {
         let bytes = hex::decode(case["transaction"].as_str().unwrap()).unwrap();
         let mut wire = bytes.as_slice();

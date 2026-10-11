@@ -78,6 +78,56 @@ const MAX_OPS_PER_SCRIPT: usize = 201;
 const MAX_PUSH_SIZE: usize = 520;
 const MAX_SCRIPT_NUM_LENGTH: usize = 4;
 
+/// Only the depth and first inactive condition are observable. Conditions
+/// above an inactive ancestor cannot execute and disappear before that ancestor
+/// can be removed. This keeps all four conditional operations O(1), including
+/// for BIP342 scripts without the legacy script-size/opcode limits.
+#[derive(Default)]
+struct ConditionStack {
+    depth: usize,
+    first_false: Option<usize>,
+}
+
+impl ConditionStack {
+    fn is_empty(&self) -> bool {
+        self.depth == 0
+    }
+
+    fn all_true(&self) -> bool {
+        self.first_false.is_none()
+    }
+
+    fn push(&mut self, value: bool) {
+        if !value && self.first_false.is_none() {
+            self.first_false = Some(self.depth);
+        }
+        self.depth += 1;
+    }
+
+    fn pop(&mut self) -> Result<(), ScriptError> {
+        if self.is_empty() {
+            return Err(ScriptError::UnbalancedConditional);
+        }
+        self.depth -= 1;
+        if self.first_false == Some(self.depth) {
+            self.first_false = None;
+        }
+        Ok(())
+    }
+
+    fn toggle_top(&mut self) -> Result<(), ScriptError> {
+        if self.is_empty() {
+            return Err(ScriptError::UnbalancedConditional);
+        }
+        match self.first_false {
+            None => self.first_false = Some(self.depth - 1),
+            Some(index) if index == self.depth - 1 => self.first_false = None,
+            _ => {} // The top is hidden by an inactive ancestor.
+        }
+        Ok(())
+    }
+}
+
 /// BIP342: Check if an opcode byte is an OP_SUCCESS opcode.
 /// These opcodes cause immediate script success in tapscript context.
 /// They are: 80, 98, 126-129, 131-134, 137-138, 141-142, 149-153, 187-254.
@@ -356,8 +406,7 @@ impl<'a> ScriptEngine<'a> {
         self.tapscript_codeseparator_pos = u32::MAX;
 
         let mut op_count = 0;
-        let mut exec_stack: Vec<bool> = Vec::new(); // for IF/ELSE/ENDIF
-        let executing = |exec_stack: &[bool]| -> bool { exec_stack.iter().all(|&b| b) };
+        let mut exec_stack = ConditionStack::default();
 
         // We need to track byte positions as we iterate instructions.
         // Use a manual position tracker alongside the instruction iterator.
@@ -404,13 +453,13 @@ impl<'a> ScriptEngine<'a> {
 
                     // MINIMALDATA: reject non-minimal push encodings
                     if self.flags.verify_minimaldata
-                        && executing(&exec_stack)
+                        && exec_stack.all_true()
                         && !is_minimal_push(data, push_opcode_byte)
                     {
                         return Err(ScriptError::MinimalData);
                     }
 
-                    if executing(&exec_stack) {
+                    if exec_stack.all_true() {
                         self.push(data.to_vec())?;
                     }
                 }
@@ -435,7 +484,7 @@ impl<'a> ScriptEngine<'a> {
                     }
 
                     // BIP342: OP_CHECKMULTISIG and OP_CHECKMULTISIGVERIFY are disabled in tapscript
-                    if self.tapscript_mode && executing(&exec_stack) {
+                    if self.tapscript_mode && exec_stack.all_true() {
                         match op {
                             Opcode::OP_CHECKMULTISIG | Opcode::OP_CHECKMULTISIGVERIFY => {
                                 return Err(ScriptError::TapscriptCheckmultisigDisabled);
@@ -448,7 +497,7 @@ impl<'a> ScriptEngine<'a> {
                     match op {
                         Opcode::OP_IF | Opcode::OP_NOTIF => {
                             let mut val = false;
-                            if executing(&exec_stack) {
+                            if exec_stack.all_true() {
                                 let top = self.pop()?;
                                 // BIP342 makes MINIMALIF mandatory in tapscript;
                                 // witness-v0 enforces it only under its policy flag.
@@ -468,18 +517,11 @@ impl<'a> ScriptEngine<'a> {
                             continue;
                         }
                         Opcode::OP_ELSE => {
-                            if exec_stack.is_empty() {
-                                return Err(ScriptError::UnbalancedConditional);
-                            }
-                            let last = exec_stack.last_mut().unwrap();
-                            *last = !*last;
+                            exec_stack.toggle_top()?;
                             continue;
                         }
                         Opcode::OP_ENDIF => {
-                            if exec_stack.is_empty() {
-                                return Err(ScriptError::UnbalancedConditional);
-                            }
-                            exec_stack.pop();
+                            exec_stack.pop()?;
                             continue;
                         }
                         _ => {}
@@ -491,7 +533,7 @@ impl<'a> ScriptEngine<'a> {
                     // the ones that remain (OP_LEFT=0x80 etc.) are OP_SUCCESS and
                     // would have caused immediate success. The ones that are NOT
                     // OP_SUCCESS stay disabled.
-                    if !executing(&exec_stack) {
+                    if !exec_stack.all_true() {
                         match op {
                             Opcode::OP_CAT
                             | Opcode::OP_SUBSTR
@@ -1869,6 +1911,81 @@ mod tests {
     fn make_engine() -> ScriptEngine<'static> {
         static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
         ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none())
+    }
+
+    #[test]
+    fn conditional_state_matches_boolean_model_over_nested_else_sequences() {
+        for mut operations in 0..(1u32 << 14) {
+            let mut state = ConditionStack::default();
+            let mut model = Vec::new();
+            for _ in 0..7 {
+                match operations & 3 {
+                    0 | 1 => {
+                        let value = operations & 3 == 1;
+                        state.push(value);
+                        model.push(value);
+                    }
+                    2 => {
+                        assert_eq!(state.pop().is_ok(), model.pop().is_some());
+                    }
+                    _ => {
+                        let expected = if let Some(top) = model.last_mut() {
+                            *top = !*top;
+                            true
+                        } else {
+                            false
+                        };
+                        assert_eq!(state.toggle_top().is_ok(), expected);
+                    }
+                }
+                assert_eq!(state.is_empty(), model.is_empty());
+                assert_eq!(state.all_true(), model.iter().all(|v| *v));
+                operations >>= 2;
+            }
+        }
+    }
+
+    #[test]
+    fn tapscript_large_conditional_scripts_execute_without_a_depth_limit() {
+        let verifier = Secp256k1Verifier;
+        let depth = 250_000;
+        let prefixes = [
+            [vec![0x51, 0x63].repeat(depth), vec![0x68; depth]].concat(),
+            [
+                vec![0x00, 0x63],
+                vec![0x63; depth],
+                vec![0x68; depth],
+                vec![0x67, 0x68],
+            ]
+            .concat(),
+            [
+                vec![0x51, 0x63].repeat(depth),
+                vec![0x00, 0x63, 0x67, 0x67, 0x68],
+                vec![0x68; depth],
+            ]
+            .concat(),
+        ];
+        for mut script in prefixes {
+            script.push(0x51);
+            let mut engine = ScriptEngine::new_without_tx(&verifier, ScriptFlags::consensus());
+            engine.set_witness_execution(true);
+            engine.set_tapscript_mode([0; 32], vec![], None, script.len());
+            engine
+                .verify_witness_script(Script::from_bytes(&script), std::iter::empty::<&[u8]>())
+                .unwrap();
+            script.pop(); // Remove the final TRUE.
+            script.pop(); // Leave the outermost condition unclosed.
+            script.push(0x51);
+            let mut engine = ScriptEngine::new_without_tx(&verifier, ScriptFlags::consensus());
+            engine.set_tapscript_mode([0; 32], vec![], None, script.len());
+            assert!(matches!(
+                engine.verify_witness_script(
+                    Script::from_bytes(&script),
+                    std::iter::empty::<&[u8]>()
+                ),
+                Err(ScriptError::UnbalancedConditional)
+            ));
+        }
     }
 
     #[test]
