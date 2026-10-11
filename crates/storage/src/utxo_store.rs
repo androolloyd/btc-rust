@@ -17,7 +17,7 @@ use btc_primitives::amount::Amount;
 use btc_primitives::block::Block;
 use btc_primitives::hash::BlockHash;
 use btc_primitives::script::ScriptBuf;
-use btc_primitives::transaction::{OutPoint, TxOut};
+use btc_primitives::transaction::{OutPoint, Transaction, TxOut};
 
 use crate::traits::{Database, DbTx, DbTxMut, StorageError};
 
@@ -49,6 +49,19 @@ pub struct PersistentUtxoSet<DB: Database> {
     /// Outpoints that were spent via `apply_update_cached` and need to be
     /// deleted from the DB on the next `flush_cache()`.
     pending_deletes: HashSet<OutPoint>,
+}
+
+/// One atomic active-chain transition, including undo and the revalidated pool.
+pub struct ChainTransition<'a> {
+    pub incoming: &'a Block,
+    pub height: u64,
+    pub undo: &'a UtxoSetUpdate,
+    pub detached: &'a [(u64, Block)],
+    pub attached: &'a [(u64, Block)],
+    pub coins: &'a HashMap<OutPoint, Option<UtxoEntry>>,
+    pub tip: Option<(u64, BlockHash)>,
+    pub old_height: u64,
+    pub mempool: &'a [Transaction],
 }
 
 impl<DB: Database> PersistentUtxoSet<DB> {
@@ -93,6 +106,59 @@ impl<DB: Database> PersistentUtxoSet<DB> {
         self.apply_update_inner(update, Some((block, height)))
     }
 
+    /// Side-branch data stays durable without changing active coins. A winning
+    /// branch commits coin undo/reconnect, indices, pool and tip in one transaction.
+    pub fn commit_chain_transition(
+        &mut self,
+        change: ChainTransition<'_>,
+    ) -> Result<(), StorageError> {
+        self.flush_cache()?;
+        let tx = self.db.tx_mut()?;
+        let hash = change.incoming.block_hash();
+        tx.put_block_header(&hash, &change.incoming.header)?;
+        tx.put_block(&hash, change.incoming)?;
+        tx.put_block_undo(&hash, &crate::undo::encode_undo(hash, change.undo))?;
+        for transaction in &change.incoming.transactions {
+            tx.put_transaction(&transaction.txid(), transaction)?;
+        }
+        for (_, block) in change.detached {
+            for transaction in &block.transactions {
+                let txid = transaction.txid();
+                if tx
+                    .get_tx_block_index(&txid)?
+                    .is_some_and(|loc| loc.block_hash == block.block_hash())
+                {
+                    tx.delete_tx_block_index(&txid)?;
+                }
+            }
+        }
+        for (height, block) in change.attached {
+            tx.put_block_hash_by_height(*height, &block.block_hash())?;
+            for (position, transaction) in block.transactions.iter().enumerate() {
+                tx.put_tx_block_index(&transaction.txid(), &block.block_hash(), position as u32)?;
+            }
+        }
+        for (outpoint, value) in change.coins {
+            if let Some(entry) = value {
+                tx.put_utxo(outpoint, &entry.txout)?;
+                self.put_utxo_meta(&tx, outpoint, entry)?;
+            } else if tx.get_utxo(outpoint)?.is_some() {
+                tx.delete_utxo(outpoint)?;
+                self.delete_utxo_meta(&tx, outpoint)?;
+            }
+        }
+        if let Some((height, tip)) = change.tip {
+            for h in height + 1..=change.old_height {
+                tx.delete_block_hash_by_height(h)?;
+            }
+            tx.set_best_block(height, &tip)?;
+            tx.replace_mempool(change.mempool)?;
+        }
+        tx.commit()?;
+        self.cache.get_mut().clear();
+        Ok(())
+    }
+
     fn apply_update_inner(
         &mut self,
         update: &UtxoSetUpdate,
@@ -126,6 +192,7 @@ impl<DB: Database> PersistentUtxoSet<DB> {
             tx.put_block_header(&hash, &block.header)?;
             tx.put_block_hash_by_height(height, &hash)?;
             tx.put_block(&hash, block)?;
+            tx.put_block_undo(&hash, &crate::undo::encode_undo(hash, update))?;
             for (position, transaction) in block.transactions.iter().enumerate() {
                 let txid = transaction.txid();
                 tx.put_transaction(&txid, transaction)?;
@@ -374,7 +441,7 @@ mod tests {
     use btc_primitives::amount::Amount;
     use btc_primitives::hash::TxHash;
     use btc_primitives::script::ScriptBuf;
-    use btc_primitives::transaction::{OutPoint, TxOut};
+    use btc_primitives::transaction::{OutPoint, Transaction, TxOut};
 
     struct FailCommitDb {
         inner: Arc<RedbDatabase>,
@@ -398,6 +465,9 @@ mod tests {
         }
     }
     impl DbTx for FailCommitTx {
+        fn get_block_undo(&self, hash: &BlockHash) -> Result<Option<Vec<u8>>, StorageError> {
+            self.inner.get_block_undo(hash)
+        }
         fn get_block(&self, hash: &BlockHash) -> Result<Option<Block>, StorageError> {
             self.inner.get_block(hash)
         }
@@ -439,6 +509,18 @@ mod tests {
         }
     }
     impl DbTxMut for FailCommitTx {
+        fn put_block_undo(&self, hash: &BlockHash, bytes: &[u8]) -> Result<(), StorageError> {
+            self.inner.put_block_undo(hash, bytes)
+        }
+        fn delete_block_hash_by_height(&self, height: u64) -> Result<(), StorageError> {
+            self.inner.delete_block_hash_by_height(height)
+        }
+        fn delete_tx_block_index(&self, txid: &btc_primitives::TxHash) -> Result<(), StorageError> {
+            self.inner.delete_tx_block_index(txid)
+        }
+        fn replace_mempool(&self, transactions: &[Transaction]) -> Result<(), StorageError> {
+            self.inner.replace_mempool(transactions)
+        }
         fn put_block(&self, hash: &BlockHash, block: &Block) -> Result<(), StorageError> {
             self.inner.put_block(hash, block)
         }
@@ -555,6 +637,103 @@ mod tests {
             db.tx().unwrap().get_block(&block.block_hash()).unwrap(),
             Some(block)
         );
+    }
+
+    #[test]
+    fn reorg_commit_failure_leaves_coins_indices_undo_tip_and_pool_unchanged() {
+        let (db, _dir) = temp_db();
+        let mut initial = PersistentUtxoSet::new(db.clone());
+        let old_coin = make_outpoint(0x51, 0);
+        let new_coin = make_outpoint(0x52, 0);
+        let old_entry = make_entry(500, 1, false);
+        initial
+            .apply_update(&UtxoSetUpdate {
+                spent: vec![],
+                created: vec![(old_coin, old_entry.clone())],
+            })
+            .unwrap();
+        let old = Block {
+            header: btc_primitives::block::BlockHeader {
+                version: 4,
+                prev_blockhash: BlockHash::ZERO,
+                merkle_root: TxHash::ZERO,
+                time: 1,
+                bits: btc_primitives::compact::CompactTarget(0x207fffff),
+                nonce: 0,
+            },
+            transactions: vec![],
+        };
+        let mut next = old.clone();
+        next.header.nonce = 1;
+        let write = db.tx_mut().unwrap();
+        write.put_block(&old.block_hash(), &old).unwrap();
+        write
+            .put_block_hash_by_height(1, &old.block_hash())
+            .unwrap();
+        write
+            .put_tx_block_index(&old_coin.txid, &old.block_hash(), 0)
+            .unwrap();
+        write.set_best_block(1, &old.block_hash()).unwrap();
+        write.commit().unwrap();
+        let update = UtxoSetUpdate {
+            spent: vec![(old_coin, old_entry.clone())],
+            created: vec![(new_coin, make_entry(400, 1, false))],
+        };
+        let coins = HashMap::from([
+            (old_coin, None),
+            (new_coin, Some(make_entry(400, 1, false))),
+        ]);
+        let mut set = PersistentUtxoSet::new(Arc::new(FailCommitDb {
+            inner: db.clone(),
+            fail: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }));
+        let detached = vec![(1, old.clone())];
+        let attached = vec![(1, next.clone())];
+        let transition = || ChainTransition {
+            incoming: &next,
+            height: 1,
+            undo: &update,
+            detached: &detached,
+            attached: &attached,
+            coins: &coins,
+            tip: Some((1, next.block_hash())),
+            old_height: 1,
+            mempool: &[],
+        };
+        assert!(set.commit_chain_transition(transition()).is_err());
+        assert_eq!(set.get_utxo(&old_coin), Some(old_entry));
+        assert!(!set.contains(&new_coin));
+        let reader = db.tx().unwrap();
+        assert_eq!(reader.get_best_block_hash().unwrap(), old.block_hash());
+        assert_eq!(
+            reader.get_block_hash_by_height(1).unwrap(),
+            Some(old.block_hash())
+        );
+        assert!(reader.get_block_undo(&next.block_hash()).unwrap().is_none());
+        assert!(reader.get_block(&next.block_hash()).unwrap().is_none());
+        assert_eq!(
+            reader
+                .get_tx_block_index(&old_coin.txid)
+                .unwrap()
+                .unwrap()
+                .block_hash,
+            old.block_hash()
+        );
+        drop(reader);
+        set.commit_chain_transition(transition()).unwrap();
+        let fresh = PersistentUtxoSet::new(db.clone());
+        assert_eq!(fresh.validated_tip().unwrap(), Some((1, next.block_hash())));
+        assert!(!fresh.contains(&old_coin));
+        assert!(fresh.contains(&new_coin));
+        let raw = db
+            .tx()
+            .unwrap()
+            .get_block_undo(&next.block_hash())
+            .unwrap()
+            .unwrap();
+        let decoded = crate::undo::decode_undo(next.block_hash(), &raw).unwrap();
+        assert_eq!(decoded.spent, update.spent);
+        assert_eq!(decoded.created, update.created);
     }
 
     #[test]

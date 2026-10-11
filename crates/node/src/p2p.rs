@@ -96,7 +96,7 @@ impl PeerTable {
         Ok(
             json!({ "version": 10000, "subversion": btc_network::protocol::USER_AGENT,
             "protocolversion": ProtocolVersion::CURRENT.0,
-            "localrelay": false,
+            "localrelay": true,
             "localservices": format!("{:016x}", btc_network::protocol::ServiceFlags::node_services().0),
             "connections": peers.len(), "connections_in": inbound, "connections_out": peers.len() - inbound }),
         )
@@ -164,6 +164,31 @@ async fn request_headers(
     .await
 }
 
+async fn retry_orphans(
+    backend: &Arc<NodeChainBackend>,
+    orphans: &mut HashMap<TxHash, btc_primitives::Transaction>,
+) -> eyre::Result<()> {
+    loop {
+        let count = orphans.len();
+        let ids: Vec<_> = orphans.keys().copied().collect();
+        for id in ids {
+            let tx = orphans.remove(&id).unwrap();
+            let worker = backend.clone();
+            let submitted = tx.clone();
+            if matches!(
+                tokio::task::spawn_blocking(move || worker.submit_transaction(submitted)).await?,
+                Err(RpcError { code: -25, .. })
+            ) {
+                orphans.insert(id, tx);
+            }
+        }
+        if orphans.len() == count {
+            break;
+        }
+    }
+    Ok(())
+}
+
 async fn serve_peer(
     stream: TcpStream,
     address: SocketAddr,
@@ -177,7 +202,7 @@ async fn serve_peer(
     let height = i32::try_from(backend.tip()?.0)?;
     let handshake = tokio::time::timeout(
         IO_TIMEOUT,
-        connection.perform_inbound_handshake(network, height, false),
+        connection.perform_inbound_handshake(network, height, true),
     )
     .await??;
     let version = handshake
@@ -193,10 +218,15 @@ pub(crate) async fn run_peer_session(
     connection: &mut Connection,
     backend: Arc<NodeChainBackend>,
     shutdown: Option<Arc<RpcHandler>>,
-    exex: Option<broadcast::Sender<btc_exex::ExExNotification>>,
+    sync_state: Option<crate::state::NodeState>,
     announce_tip: bool,
 ) -> eyre::Result<()> {
     let mut events = backend.subscribe_blocks();
+    let mut transactions = backend.subscribe_transactions();
+    let relay_transactions = connection.peer_relay();
+    let wtxid_relay = connection.peer_wtxid_relay();
+    let mut pending_txs = HashSet::new();
+    let mut orphan_txs = HashMap::<TxHash, btc_primitives::Transaction>::new();
     send(connection, NetworkMessage::SendHeaders).await?;
     request_headers(connection, &backend).await?;
     // RPC/inbound commits during outbound IBD preceded this subscription. Make
@@ -225,12 +255,29 @@ pub(crate) async fn run_peer_session(
                     std::future::pending::<()>().await;
                 }
             } => return Ok(()),
+            event = transactions.recv(), if relay_transactions => {
+                let ids = match event {
+                    Ok(id) => vec![id],
+                    Err(broadcast::error::RecvError::Lagged(_)) => backend.mempool_transactions().map_err(|e| eyre::eyre!(e.message))?.iter().map(|tx| tx.txid()).collect(),
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                };
+                let mut items = Vec::new();
+                for id in ids {
+                    if let Some(tx) = backend.mempool_transaction(id, false).map_err(|e| eyre::eyre!(e.message))? {
+                        items.push(InvItem { inv_type: if wtxid_relay { InvType::WtxId } else { InvType::Tx },
+                            hash: Hash256::from_bytes(if wtxid_relay { tx.wtxid() } else { tx.txid() }.to_bytes()) });
+                    }
+                }
+                if !items.is_empty() { send(connection, NetworkMessage::Inv(items)).await?; }
+                continue;
+            }
             event = events.recv() => {
                 let hash = match event {
                     Ok(hash) => hash,
                     Err(broadcast::error::RecvError::Lagged(_)) => backend.tip()?.1,
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
                 };
+                retry_orphans(&backend, &mut orphan_txs).await?;
                 if send_headers {
                     if let Some(header) = backend.header(&hash).map_err(|e| eyre::eyre!(e.message))? {
                         send(connection, NetworkMessage::Headers(vec![header])).await?;
@@ -292,10 +339,14 @@ pub(crate) async fn run_peer_session(
                                 missing.push(item);
                             }
                         }
-                        InvType::Tx | InvType::WitnessTx => {
-                            let transaction = backend
-                                .transaction(&TxHash::from_bytes(item.hash.to_bytes()))
-                                .map_err(|e| eyre::eyre!(e.message))?;
+                        InvType::Tx | InvType::WitnessTx | InvType::WtxId => {
+                            let id = TxHash::from_bytes(item.hash.to_bytes());
+                            let transaction = if item.inv_type == InvType::WtxId {
+                                backend.mempool_transaction(id, true)
+                            } else {
+                                backend.transaction(&id)
+                            }
+                            .map_err(|e| eyre::eyre!(e.message))?;
                             if let Some(mut tx) = transaction {
                                 if item.inv_type == InvType::Tx {
                                     tx.witness.clear();
@@ -317,7 +368,31 @@ pub(crate) async fn run_peer_session(
                 // blocks. Fetch the connecting headers before requesting bodies
                 // (BIP130); otherwise the tip body looks like an unsupported fork.
                 let mut unknown_block = false;
+                let mut tx_requests = Vec::new();
                 for item in items {
+                    if matches!(
+                        item.inv_type,
+                        InvType::Tx | InvType::WitnessTx | InvType::WtxId
+                    ) {
+                        let id = TxHash::from_bytes(item.hash.to_bytes());
+                        if pending_txs.len() < 128
+                            && !pending_txs.contains(&id)
+                            && backend
+                                .mempool_transaction(id, item.inv_type == InvType::WtxId)
+                                .map_err(|e| eyre::eyre!(e.message))?
+                                .is_none()
+                        {
+                            pending_txs.insert(id);
+                            tx_requests.push(InvItem {
+                                inv_type: if item.inv_type == InvType::WtxId {
+                                    InvType::WtxId
+                                } else {
+                                    InvType::WitnessTx
+                                },
+                                hash: item.hash,
+                            });
+                        }
+                    }
                     if matches!(item.inv_type, InvType::Block | InvType::WitnessBlock) {
                         let hash = BlockHash::from_bytes(item.hash.to_bytes());
                         if backend
@@ -328,12 +403,14 @@ pub(crate) async fn run_peer_session(
                             && !queued.contains_key(&hash)
                         {
                             unknown_block = true;
-                            break;
                         }
                     }
                 }
                 if unknown_block {
                     request_headers(connection, &backend).await?;
+                }
+                if !tx_requests.is_empty() {
+                    send(connection, NetworkMessage::GetData(tx_requests)).await?;
                 }
             }
             NetworkMessage::Headers(headers) => {
@@ -377,6 +454,10 @@ pub(crate) async fn run_peer_session(
                 }
                 if !requests.is_empty() {
                     send(connection, NetworkMessage::GetData(requests)).await?;
+                } else if pending.is_empty() && queued.is_empty() {
+                    if let Some(state) = &sync_state {
+                        state.syncing.store(false, Ordering::SeqCst);
+                    }
                 }
             }
             NetworkMessage::Block(block) => {
@@ -410,10 +491,17 @@ pub(crate) async fn run_peer_session(
                     for hash in known {
                         queued.remove(&hash);
                     }
-                    let tip = backend.tip()?.1;
-                    let next = queued.iter().find_map(|(hash, block)| {
-                        (block.header.prev_blockhash == tip).then_some(*hash)
-                    });
+                    let mut next = None;
+                    for (hash, block) in &queued {
+                        if backend
+                            .header(&block.header.prev_blockhash)
+                            .map_err(|e| eyre::eyre!(e.message))?
+                            .is_some()
+                        {
+                            next = Some(*hash);
+                            break;
+                        }
+                    }
                     let Some(next) = next else {
                         break;
                     };
@@ -423,31 +511,21 @@ pub(crate) async fn run_peer_session(
                     match tokio::task::spawn_blocking(move || worker.submit_block(&submitted))
                         .await?
                     {
-                        Ok(accepted) => {
-                            if let Some(sender) = &exex {
-                                let _ = sender.send(btc_exex::ExExNotification::BlockCommitted {
-                                    height: accepted.height,
-                                    hash: accepted.hash,
-                                    block,
-                                    utxo_changes: accepted.update,
-                                });
-                            }
-                        }
+                        Ok(_) => {}
                         Err(error) if error.code == -27 => {}
                         Err(error) => return Err(eyre::eyre!(error.message)),
                     }
                 }
                 if pending.is_empty() {
                     if !queued.is_empty() {
-                        return Err(eyre::eyre!(
-                            "persistent fork/reorg integration is unavailable"
-                        ));
+                        return Err(eyre::eyre!("peer supplied blocks with missing ancestry"));
                     }
                     request_headers(connection, &backend).await?;
                 }
             }
             NetworkMessage::NotFound(items) => {
                 for item in items {
+                    pending_txs.remove(&TxHash::from_bytes(item.hash.to_bytes()));
                     if matches!(item.inv_type, InvType::Block | InvType::WitnessBlock)
                         && pending.contains(&BlockHash::from_bytes(item.hash.to_bytes()))
                     {
@@ -458,7 +536,63 @@ pub(crate) async fn run_peer_session(
             NetworkMessage::Version(_) | NetworkMessage::Verack => {
                 return Err(eyre::eyre!("duplicate handshake message"))
             }
-            NetworkMessage::Tx(_) => return Err(eyre::eyre!("mempool admission is unavailable")),
+            NetworkMessage::MemPool if relay_transactions => {
+                let items = backend
+                    .mempool_transactions()
+                    .map_err(|e| eyre::eyre!(e.message))?
+                    .iter()
+                    .map(|tx| InvItem {
+                        inv_type: if wtxid_relay {
+                            InvType::WtxId
+                        } else {
+                            InvType::Tx
+                        },
+                        hash: Hash256::from_bytes(
+                            if wtxid_relay { tx.wtxid() } else { tx.txid() }.to_bytes(),
+                        ),
+                    })
+                    .take(50_000)
+                    .collect();
+                send(connection, NetworkMessage::Inv(items)).await?;
+            }
+            NetworkMessage::Tx(tx) => {
+                pending_txs.remove(&tx.txid());
+                pending_txs.remove(&tx.wtxid());
+                let worker = backend.clone();
+                let submitted = tx.clone();
+                match tokio::task::spawn_blocking(move || worker.submit_transaction(submitted))
+                    .await?
+                {
+                    Ok(_) | Err(RpcError { code: -27, .. }) => {}
+                    Err(RpcError { code: -25, .. }) => {
+                        if orphan_txs.len() < 64
+                            && orphan_txs.values().map(|tx| tx.weight()).sum::<usize>()
+                                + tx.weight()
+                                <= 4_000_000
+                        {
+                            let mut parents = Vec::new();
+                            for input in &tx.inputs {
+                                let id = input.previous_output.txid;
+                                if pending_txs.len() < 128 && pending_txs.insert(id) {
+                                    parents.push(InvItem {
+                                        inv_type: InvType::WitnessTx,
+                                        hash: Hash256::from_bytes(id.to_bytes()),
+                                    });
+                                }
+                            }
+                            orphan_txs.insert(tx.txid(), tx);
+                            if !parents.is_empty() {
+                                send(connection, NetworkMessage::GetData(parents)).await?;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::debug!(reason = %error.message, "rejected peer transaction")
+                    }
+                }
+                retry_orphans(&backend, &mut orphan_txs).await?;
+            }
+            NetworkMessage::WtxidRelay => return Err(eyre::eyre!("late wtxidrelay message")),
             _ => {}
         }
     }

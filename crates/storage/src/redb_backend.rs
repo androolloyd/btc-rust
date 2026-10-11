@@ -17,6 +17,8 @@ use crate::traits::{AddressIndexValue, Database, DbTx, DbTxMut, StorageError, Tx
 /// Table definitions for redb.
 /// All tables use `&[u8]` keys and `&[u8]` values — serialization is handled
 /// in the trait implementations using btc_primitives::encode.
+const UNDO: TableDefinition<&[u8], &[u8]> = TableDefinition::new("BlockUndoV1");
+const MEMPOOL: TableDefinition<&[u8], &[u8]> = TableDefinition::new("Mempool");
 const HEADERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new(TABLE_HEADERS);
 const BLOCKS: TableDefinition<&[u8], &[u8]> = TableDefinition::new(TABLE_BLOCKS);
 const BLOCK_INDEX: TableDefinition<&[u8], &[u8]> = TableDefinition::new(TABLE_BLOCK_INDEX);
@@ -43,6 +45,12 @@ impl RedbDatabase {
         let write_txn = self
             .db
             .begin_write()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        write_txn
+            .open_table(UNDO)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        write_txn
+            .open_table(MEMPOOL)
             .map_err(|e| StorageError::Database(e.to_string()))?;
         // Opening a table inside a write-transaction creates it if missing.
         write_txn
@@ -73,6 +81,63 @@ impl RedbDatabase {
             .commit()
             .map_err(|e| StorageError::Database(e.to_string()))?;
         Ok(())
+    }
+    pub fn coin_count(&self) -> Result<usize, StorageError> {
+        let tx = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let table = tx
+            .open_table(UTXOS)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let mut count = 0;
+        for row in table
+            .iter()
+            .map_err(|e| StorageError::Database(e.to_string()))?
+        {
+            let (key, _) = row.map_err(|e| StorageError::Database(e.to_string()))?;
+            if key.value().len() != 36 {
+                return Err(StorageError::Corruption("invalid coin key".into()));
+            }
+            if key.value()[35] & 0x80 == 0 {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+    pub fn stored_headers(&self) -> Result<Vec<BlockHeader>, StorageError> {
+        let tx = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let table = tx
+            .open_table(HEADERS)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        table
+            .iter()
+            .map_err(|e| StorageError::Database(e.to_string()))?
+            .map(|row| {
+                let (_, value) = row.map_err(|e| StorageError::Database(e.to_string()))?;
+                decode(value.value()).map_err(|e| StorageError::Corruption(e.to_string()))
+            })
+            .collect()
+    }
+    pub fn mempool_transactions(&self) -> Result<Vec<Transaction>, StorageError> {
+        let tx = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let table = tx
+            .open_table(MEMPOOL)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        table
+            .iter()
+            .map_err(|e| StorageError::Database(e.to_string()))?
+            .map(|row| {
+                let (_, value) = row.map_err(|e| StorageError::Database(e.to_string()))?;
+                decode(value.value()).map_err(|e| StorageError::Corruption(e.to_string()))
+            })
+            .collect()
     }
 }
 
@@ -232,6 +297,16 @@ pub struct RedbTx {
 unsafe impl Sync for RedbTx {}
 
 impl DbTx for RedbTx {
+    fn get_block_undo(&self, hash: &BlockHash) -> Result<Option<Vec<u8>>, StorageError> {
+        let table = self
+            .inner
+            .open_table(UNDO)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let value = table
+            .get(hash.as_bytes().as_slice())
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(value.map(|v| v.value().to_vec()))
+    }
     fn get_block(&self, hash: &BlockHash) -> Result<Option<Block>, StorageError> {
         let table = self
             .inner
@@ -462,6 +537,16 @@ pub struct RedbTxMut {
 unsafe impl Sync for RedbTxMut {}
 
 impl DbTx for RedbTxMut {
+    fn get_block_undo(&self, hash: &BlockHash) -> Result<Option<Vec<u8>>, StorageError> {
+        let table = self
+            .inner
+            .open_table(UNDO)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let value = table
+            .get(hash.as_bytes().as_slice())
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(value.map(|v| v.value().to_vec()))
+    }
     fn get_block(&self, hash: &BlockHash) -> Result<Option<Block>, StorageError> {
         let table = self
             .inner
@@ -671,6 +756,46 @@ impl DbTx for RedbTxMut {
 }
 
 impl DbTxMut for RedbTxMut {
+    fn put_block_undo(&self, hash: &BlockHash, bytes: &[u8]) -> Result<(), StorageError> {
+        self.inner
+            .open_table(UNDO)
+            .map_err(|e| StorageError::Database(e.to_string()))?
+            .insert(hash.as_bytes().as_slice(), bytes)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(())
+    }
+    fn delete_block_hash_by_height(&self, height: u64) -> Result<(), StorageError> {
+        self.inner
+            .open_table(BLOCK_INDEX)
+            .map_err(|e| StorageError::Database(e.to_string()))?
+            .remove(height_key(height).as_slice())
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(())
+    }
+    fn delete_tx_block_index(&self, txid: &TxHash) -> Result<(), StorageError> {
+        self.inner
+            .open_table(TX_BLOCK_INDEX)
+            .map_err(|e| StorageError::Database(e.to_string()))?
+            .remove(txid.as_bytes().as_slice())
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(())
+    }
+    fn replace_mempool(&self, transactions: &[Transaction]) -> Result<(), StorageError> {
+        let mut table = self
+            .inner
+            .open_table(MEMPOOL)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        table
+            .retain(|_, _| false)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        for transaction in transactions {
+            let raw = encode(transaction);
+            table
+                .insert(transaction.txid().as_bytes().as_slice(), raw.as_slice())
+                .map_err(|e| StorageError::Database(e.to_string()))?;
+        }
+        Ok(())
+    }
     fn put_block(&self, hash: &BlockHash, block: &Block) -> Result<(), StorageError> {
         let mut table = self
             .inner

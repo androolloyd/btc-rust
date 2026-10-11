@@ -545,6 +545,11 @@ impl SyncManager {
 
     /// Set the ExEx broadcast sender so that block commit events are emitted.
     pub fn set_exex_sender(&mut self, sender: broadcast::Sender<ExExNotification>) {
+        if let Some(backend) = &self.chain_backend {
+            if let Err(error) = backend.set_exex_sender(sender.clone()) {
+                warn!(error = %error.message, "could not attach ExEx sender");
+            }
+        }
         self.exex_sender = Some(sender);
     }
 
@@ -636,12 +641,22 @@ impl SyncManager {
 
     /// Return the current sync state.
     pub fn state(&self) -> &SyncState {
+        if self.chain_backend.is_some()
+            && matches!(self.sync_state, SyncState::DownloadingHeaders { .. })
+            && self
+                .node_state
+                .as_ref()
+                .is_some_and(|state| !state.syncing.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            static SYNCED: SyncState = SyncState::Synced;
+            return &SYNCED;
+        }
         &self.sync_state
     }
 
     /// Return the sync progress as a fraction in `[0.0, 1.0]`.
     pub fn progress(&self) -> f64 {
-        compute_progress(&self.sync_state)
+        compute_progress(self.state())
     }
 
     /// Return the network this manager operates on.
@@ -667,19 +682,32 @@ impl SyncManager {
             let mut pm = self.peer_manager.write().await;
             pm.bootstrap().await;
         }
-        if let Some(backend) = &self.chain_backend {
-            *self.chain_state.write().await = backend
-                .header_chain()
-                .map_err(|e| SyncError::Aborted(e.to_string()))?;
-            self.validated_tip = Some(
-                backend
-                    .tip()
-                    .map_err(|e| SyncError::Aborted(e.to_string()))?,
-            );
-        }
 
         // Phase 2 -- connect to peers and handshake.
         let mut conn = self.connect_to_peer().await?;
+        if self.chain_backend.is_some() {
+            // Shared sessions stream bounded bodies from the durable locator,
+            // including competing branches, without a separate header-only tip.
+            // Zero means the remote header target is still unknown. Only the
+            // shared session's caught-up signal can expose Synced via state().
+            let height = self
+                .chain_backend
+                .as_ref()
+                .unwrap()
+                .tip()
+                .map_err(|e| SyncError::Aborted(e.to_string()))?
+                .0;
+            self.sync_state = SyncState::DownloadingHeaders {
+                progress: height,
+                target: 0,
+            };
+            if let Some(state) = &self.node_state {
+                state
+                    .syncing
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            return self.steady_state_loop(&mut conn).await;
+        }
 
         // Phase 3 -- determine the remote tip height.
         let best_height = {
@@ -780,7 +808,7 @@ impl SyncManager {
             peer,
             backend,
             self.shutdown.clone(),
-            self.exex_sender.clone(),
+            self.node_state.clone(),
             true,
         )
         .await
@@ -834,14 +862,21 @@ impl SyncManager {
                 }
             };
 
-            let our_height = {
-                let cs = self.chain_state.read().await;
-                cs.best_height() as i32
+            let our_height = if let Some(backend) = &self.chain_backend {
+                i32::try_from(
+                    backend
+                        .tip()
+                        .map_err(|e| SyncError::Aborted(e.to_string()))?
+                        .0,
+                )
+                .map_err(|e| SyncError::Aborted(e.to_string()))?
+            } else {
+                self.chain_state.read().await.best_height() as i32
             };
 
             let handshake_result = tokio::time::timeout(
                 std::time::Duration::from_secs(10),
-                conn.perform_handshake_with_relay(self.network, our_height, false),
+                conn.perform_handshake_with_relay(self.network, our_height, true),
             )
             .await;
 

@@ -42,6 +42,9 @@ pub struct NodeConfig {
     pub rpc_port: u16,
     pub p2p_port: u16,
     pub connect_peers: Vec<std::net::SocketAddr>,
+    pub full_rbf: bool,
+    pub mempool_policy: btc_mempool::policy::TxValidationPolicy,
+    pub mempool_flags: btc_consensus::script_engine::ScriptFlags,
     pub log_level: String,
 }
 
@@ -55,6 +58,9 @@ impl NodeConfig {
             rpc_port,
             p2p_port,
             connect_peers: Vec::new(),
+            full_rbf: true,
+            mempool_policy: btc_mempool::policy::TxValidationPolicy::default(),
+            mempool_flags: btc_consensus::script_engine::ScriptFlags::all(),
             log_level: "info".to_string(),
         }
     }
@@ -239,6 +245,14 @@ impl Node {
             &self.config.datadir.join("utxo.redb"),
             node_state.clone(),
         )?);
+
+        chain_backend
+            .configure_mempool(
+                self.config.full_rbf,
+                self.config.mempool_policy.clone(),
+                self.config.mempool_flags,
+            )
+            .map_err(|error| eyre::eyre!(error.message))?;
 
         let p2p_listener = tokio::net::TcpListener::bind(("0.0.0.0", self.network.port)).await?;
         let peer_table = Arc::new(crate::p2p::PeerTable::new(node_state.peer_count.clone()));

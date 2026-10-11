@@ -40,6 +40,7 @@ pub enum HandshakeState {
 pub struct Handshake {
     state: HandshakeState,
     peer_version: Option<VersionMessage>,
+    peer_wtxid_relay: bool,
 }
 
 impl Handshake {
@@ -47,6 +48,7 @@ impl Handshake {
         Handshake {
             state: HandshakeState::Init,
             peer_version: None,
+            peer_wtxid_relay: false,
         }
     }
 
@@ -56,6 +58,10 @@ impl Handshake {
 
     pub fn peer_version(&self) -> Option<&VersionMessage> {
         self.peer_version.as_ref()
+    }
+
+    pub fn peer_wtxid_relay(&self) -> bool {
+        self.peer_wtxid_relay
     }
 
     pub fn is_ready(&self) -> bool {
@@ -123,6 +129,19 @@ impl Handshake {
                         // Unexpected state; still store it and move on
                         self.state = HandshakeState::VerackSent;
                     }
+                }
+            }
+            NetworkMessage::WtxidRelay => {
+                if self.state == HandshakeState::VerackSent
+                    && !self.peer_wtxid_relay
+                    && self
+                        .peer_version
+                        .as_ref()
+                        .is_some_and(|version| version.version >= ProtocolVersion::WTXID_RELAY.0)
+                {
+                    self.peer_wtxid_relay = true;
+                } else {
+                    self.state = HandshakeState::Failed;
                 }
             }
             NetworkMessage::Verack => {

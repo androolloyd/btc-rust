@@ -295,7 +295,7 @@ async fn main() -> eyre::Result<()> {
 }
 
 async fn cmd_run(
-    config: NodeConfig,
+    mut config: NodeConfig,
     format: OutputFormat,
     interactive: bool,
     policy: &str,
@@ -325,6 +325,25 @@ async fn cmd_run(
     let full_rbf = !no_full_rbf;
     let effective_op_return_limit =
         op_return_limit.unwrap_or(btc_mempool::policy::MAX_OP_RETURN_SIZE);
+
+    config.full_rbf = full_rbf;
+    config.mempool_flags = match policy {
+        "consensus" => ScriptFlags::consensus(),
+        "all" => ScriptFlags::all(),
+        _ => ScriptFlags::core_compliant(),
+    };
+    config.mempool_flags.verify_nullfail &= !no_nullfail;
+    if policy != "consensus" {
+        config.mempool_flags.verify_discourage_upgradable_nops = true;
+        config
+            .mempool_flags
+            .verify_discourage_upgradable_witness_program = true;
+    }
+    if let Some(value) = dust_limit {
+        config.mempool_policy.dust_limit = btc_primitives::Amount::from_sat(i64::try_from(value)?);
+    }
+    config.mempool_policy.max_op_return_size =
+        datacarrier_size.unwrap_or(effective_op_return_limit);
 
     // Collect ZMQ topics from CLI flags
     let mut zmq_topics: Vec<String> = Vec::new();

@@ -9,3 +9,5 @@ pub mod p2p;
 pub mod state;
 pub mod sync;
 pub mod zmq;
+
+mod mempool;

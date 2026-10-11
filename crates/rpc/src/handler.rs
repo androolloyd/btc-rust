@@ -93,6 +93,11 @@ pub const CHAIN_METHODS: &[&str] = &[
     METHOD_GETMININGINFO,
     METHOD_GETNETWORKHASHPS,
     METHOD_GENERATETOADDRESS,
+    "sendrawtransaction",
+    "testmempoolaccept",
+    "getrawmempool",
+    "getmempoolentry",
+    "getmempoolinfo",
 ];
 
 impl RpcError {
@@ -209,26 +214,6 @@ impl RpcHandler {
                     }));
                 }
                 serde_json::json!(arr)
-            });
-        }
-
-        // --- getmempoolinfo ---
-        {
-            let mp_size = handler.mempool_size.clone();
-            let mp_bytes = handler.mempool_bytes.clone();
-            handler.register(METHOD_GETMEMPOOLINFO, move |_params| {
-                let size = mp_size.load(Ordering::SeqCst);
-                let bytes = mp_bytes.load(Ordering::SeqCst);
-                serde_json::json!({
-                    "loaded": true,
-                    "size": size,
-                    "bytes": bytes,
-                    "usage": bytes,
-                    "maxmempool": 300000000_u64,
-                    "mempoolminfee": 0.00001,
-                    "minrelaytxfee": 0.00001,
-                    "unbroadcastcount": 0
-                })
             });
         }
 
@@ -613,14 +598,11 @@ mod tests {
     }
 
     #[test]
-    fn test_dispatch_getmempoolinfo() {
+    fn test_dispatch_getmempoolinfo_requires_backend() {
         let handler = RpcHandler::new();
-        let req = make_request(METHOD_GETMEMPOOLINFO, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let result = resp.result.unwrap();
-        assert_eq!(result["size"], 0);
-        assert_eq!(result["loaded"], true);
+        let resp = handler.handle(&make_request(METHOD_GETMEMPOOLINFO, serde_json::json!([])));
+        assert!(resp.result.is_none());
+        assert_eq!(resp.error.unwrap().code, INTERNAL_ERROR);
     }
 
     #[test]
@@ -719,15 +701,14 @@ mod tests {
     #[test]
     fn test_update_mempool_stats() {
         let handler = RpcHandler::new();
-
-        // Update mempool
         handler.update_mempool_stats(10, 5000);
-
-        let req = make_request(METHOD_GETMEMPOOLINFO, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        let result = resp.result.unwrap();
-        assert_eq!(result["size"], 10);
-        assert_eq!(result["bytes"], 5000);
+        assert_eq!(handler.mempool_size.load(Ordering::SeqCst), 10);
+        assert_eq!(handler.mempool_bytes.load(Ordering::SeqCst), 5000);
+        let resp = handler.handle(&make_request(METHOD_GETMEMPOOLINFO, serde_json::json!([])));
+        assert!(
+            resp.result.is_none(),
+            "metrics do not establish a loaded mempool backend"
+        );
     }
 
     #[test]
@@ -1036,20 +1017,20 @@ mod tests {
     }
 
     #[test]
-    fn test_getmempoolinfo_all_fields() {
+    fn mempool_methods_require_backend_even_with_nonzero_metrics() {
         let handler = RpcHandler::new();
         handler.update_mempool_stats(42, 123456);
-        let req = make_request(METHOD_GETMEMPOOLINFO, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        let result = resp.result.unwrap();
-        assert_eq!(result["loaded"], true);
-        assert_eq!(result["size"], 42);
-        assert_eq!(result["bytes"], 123456);
-        assert_eq!(result["usage"], 123456);
-        assert_eq!(result["maxmempool"], 300000000_u64);
-        assert!(result["mempoolminfee"].as_f64().unwrap() > 0.0);
-        assert!(result["minrelaytxfee"].as_f64().unwrap() > 0.0);
-        assert_eq!(result["unbroadcastcount"], 0);
+        for method in [
+            "getmempoolinfo",
+            "getrawmempool",
+            "getmempoolentry",
+            "sendrawtransaction",
+            "testmempoolaccept",
+        ] {
+            let resp = handler.handle(&make_request(method, serde_json::json!([])));
+            assert!(resp.result.is_none());
+            assert_eq!(resp.error.unwrap().code, INTERNAL_ERROR);
+        }
     }
 
     #[test]

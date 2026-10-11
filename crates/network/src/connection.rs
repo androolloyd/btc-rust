@@ -25,6 +25,8 @@ pub enum ConnectionError {
 /// A Bitcoin P2P connection wrapping a framed TCP stream.
 pub struct Connection {
     framed: Transport,
+    peer_wtxid_relay: bool,
+    peer_relay: bool,
 }
 
 enum Transport {
@@ -54,6 +56,8 @@ impl Connection {
                             .await?;
                     return Ok(Self {
                         framed: Transport::V2(Framed::new(stream, codec)),
+                        peer_wtxid_relay: false,
+                        peer_relay: true,
                     });
                 }
                 #[cfg(not(feature = "v2"))]
@@ -66,7 +70,16 @@ impl Connection {
         framed.read_buffer_mut().extend_from_slice(&prefix);
         Ok(Self {
             framed: Transport::V1(framed),
+            peer_wtxid_relay: false,
+            peer_relay: true,
         })
+    }
+
+    pub fn peer_wtxid_relay(&self) -> bool {
+        self.peer_wtxid_relay
+    }
+    pub fn peer_relay(&self) -> bool {
+        self.peer_relay
     }
 
     pub fn session_id(&self) -> Option<[u8; 32]> {
@@ -111,7 +124,14 @@ impl Connection {
                 self.send_message(response).await?;
             }
             if hs.is_ready() {
+                self.peer_wtxid_relay = hs.peer_wtxid_relay();
+                self.peer_relay = hs.peer_version().is_some_and(|version| version.relay);
                 return Ok(hs);
+            }
+            if hs.state() == HandshakeState::Failed {
+                return Err(ConnectionError::HandshakeFailed(
+                    "invalid handshake negotiation".into(),
+                ));
             }
         }
     }
@@ -126,6 +146,8 @@ impl Connection {
         let framed = Framed::new(stream, codec);
         Ok(Connection {
             framed: Transport::V1(framed),
+            peer_wtxid_relay: false,
+            peer_relay: true,
         })
     }
 
@@ -161,6 +183,8 @@ impl Connection {
         let codec = crate::v2codec::handshake(&mut stream, network, initiating).await?;
         Ok(Self {
             framed: Transport::V2(Framed::new(stream, codec)),
+            peer_wtxid_relay: false,
+            peer_relay: true,
         })
     }
     pub fn is_encrypted(&self) -> bool {
@@ -177,6 +201,8 @@ impl Connection {
         let framed = Framed::new(stream, codec);
         Connection {
             framed: Transport::V1(framed),
+            peer_wtxid_relay: false,
+            peer_relay: true,
         }
     }
 
@@ -244,12 +270,13 @@ impl Connection {
             }
 
             if hs.is_ready() {
+                self.peer_wtxid_relay = hs.peer_wtxid_relay();
+                self.peer_relay = hs.peer_version().is_some_and(|version| version.relay);
                 return Ok(hs);
             }
-
             if hs.state() == HandshakeState::Failed {
                 return Err(ConnectionError::HandshakeFailed(
-                    "handshake state machine entered failed state".into(),
+                    "invalid handshake negotiation".into(),
                 ));
             }
         }

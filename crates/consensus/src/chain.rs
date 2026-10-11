@@ -249,6 +249,28 @@ impl ChainState {
     // Accessors
     // ------------------------------------------------------------------
 
+    /// Select an already validated branch for contextual validation or durable
+    /// restoration. Callers must commit its matching coins before publishing it.
+    pub fn select_tip(&mut self, hash: BlockHash) -> Result<(), ChainError> {
+        let entry = self
+            .headers
+            .get(&hash)
+            .ok_or(ChainError::PrevBlockNotFound(hash))?;
+        self.best_height = entry.height;
+        self.best_header = hash;
+        self.height_index.clear();
+        let mut current = hash;
+        loop {
+            let entry = &self.headers[&current];
+            self.height_index.insert(entry.height, current);
+            if entry.height == 0 {
+                break;
+            }
+            current = entry.header.prev_blockhash;
+        }
+        Ok(())
+    }
+
     /// Look up a header entry by block hash.
     pub fn get_header(&self, hash: &BlockHash) -> Option<&HeaderEntry> {
         self.headers.get(hash)
@@ -290,6 +312,22 @@ impl ChainState {
         candidate.prev_blockhash = prev.header.block_hash();
         candidate.time = time;
         self.get_next_work_required(prev.height + 1, &candidate, prev)
+    }
+
+    /// MTP including a validated candidate header without cloning/inserting a
+    /// complete chain merely to evaluate next-block mempool lock points.
+    pub fn median_time_past_with_header(&self, header: &BlockHeader) -> Option<u32> {
+        let mut times = vec![header.time];
+        let mut current = self.get_header(&header.prev_blockhash)?;
+        for _ in 1..MEDIAN_TIME_SPAN {
+            times.push(current.header.time);
+            if current.height == 0 {
+                break;
+            }
+            current = self.get_header(&current.header.prev_blockhash)?;
+        }
+        times.sort_unstable();
+        Some(times[times.len() / 2])
     }
 
     /// Build a set of block locator hashes for the `getheaders` P2P message.

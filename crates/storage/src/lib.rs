@@ -2,6 +2,7 @@ pub mod provider;
 pub mod pruning;
 pub mod tables;
 pub mod traits;
+pub mod undo;
 pub mod utxo_store;
 
 #[cfg(feature = "redb")]

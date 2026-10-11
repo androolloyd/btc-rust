@@ -436,7 +436,7 @@ node.mine_block(vec![my_tx]);
 
 ## CLI
 
-For a private regtest peer, run `btc-node --network regtest --port 19444 --rpc-port 19450 --connect 127.0.0.1:18444 run`. The node negotiates v2 with v1 fallback, validates downloaded blocks against the shared chain backend, relays committed blocks and retries disconnected outbound sessions. Persistent reorgs and mempool admission remain unfinished.
+For a private regtest peer, run `btc-node --network regtest --port 19444 --rpc-port 19450 --connect 127.0.0.1:18444 run`. The node negotiates v2 with v1 fallback, validates downloaded blocks against the shared chain backend, relays committed blocks and retries disconnected outbound sessions. Validated side branches can replace the active chain by accumulated work using durable undo. Signed transactions enter a persistent, dependency-aware mempool through RPC/P2P; relay, RBF, mining and reorg revalidation are wired. Full consensus/policy parity, package admission and dynamic fee estimation/eviction remain unfinished.
 
 ```
 btc-node run          Start syncing

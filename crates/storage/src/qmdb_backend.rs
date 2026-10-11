@@ -104,7 +104,12 @@ impl QmdbDatabase {
             .to_str()
             .ok_or_else(|| StorageError::Database("path is not valid UTF-8".into()))?;
 
-        let config = Config::from_dir(dir);
+        let mut config = Config::from_dir(dir);
+        // Upstream's 512-thread benchmark default exhausts ordinary hosts and
+        // parallel test runners. Bound prefetch work to available CPU capacity.
+        config.prefetcher_thread_count = std::thread::available_parallelism()
+            .map(|count| count.get().min(8))
+            .unwrap_or(1);
         // init_dir is now idempotent (patched in androolloyd/qmdb) —
         // it skips initialization if the data directory already exists.
         AdsCore::init_dir(&config);

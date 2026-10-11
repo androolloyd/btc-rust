@@ -55,6 +55,11 @@ pub struct AddressIndexValue {
 
 /// Read-only database transaction
 pub trait DbTx: Send + Sync {
+    fn get_block_undo(&self, _hash: &BlockHash) -> Result<Option<Vec<u8>>, StorageError> {
+        Err(StorageError::Database(
+            "undo records unsupported by this backend".into(),
+        ))
+    }
     fn get_block(&self, _hash: &BlockHash) -> Result<Option<Block>, StorageError> {
         Err(StorageError::Database(
             "block bodies unsupported by this backend".into(),
@@ -79,6 +84,26 @@ pub trait DbTx: Send + Sync {
 
 /// Read-write database transaction
 pub trait DbTxMut: DbTx {
+    fn put_block_undo(&self, _hash: &BlockHash, _bytes: &[u8]) -> Result<(), StorageError> {
+        Err(StorageError::Database(
+            "undo records unsupported by this backend".into(),
+        ))
+    }
+    fn delete_block_hash_by_height(&self, _height: u64) -> Result<(), StorageError> {
+        Err(StorageError::Database(
+            "height deletion unsupported by this backend".into(),
+        ))
+    }
+    fn delete_tx_block_index(&self, _txid: &TxHash) -> Result<(), StorageError> {
+        Err(StorageError::Database(
+            "transaction index deletion unsupported by this backend".into(),
+        ))
+    }
+    fn replace_mempool(&self, _transactions: &[Transaction]) -> Result<(), StorageError> {
+        Err(StorageError::Database(
+            "mempool persistence unsupported by this backend".into(),
+        ))
+    }
     fn put_block(&self, _hash: &BlockHash, _block: &Block) -> Result<(), StorageError> {
         Err(StorageError::Database(
             "block bodies unsupported by this backend".into(),

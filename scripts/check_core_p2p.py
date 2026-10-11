@@ -78,6 +78,87 @@ def rust_rpc(port, method, params):
     return result["result"]
 
 
+def signed_wallet_spend(core_port, coin=None, fee=0.00002):
+    # Core supplies a real mature wallet coin and independently signs SegWit.
+    if coin is None:
+        coins = core_rpc(core_port, "listunspent", [100])
+        assert coins, "expected a mature Core wallet coin"
+        coin = coins[0]
+    address = core_rpc(core_port, "getnewaddress", ["", "bech32"])
+    amount = round(coin["amount"] - fee, 8)
+    raw = core_rpc(core_port, "createrawtransaction", [[{"txid": coin["txid"], "vout": coin["vout"]}], {address: amount}])
+    signed = core_rpc(core_port, "signrawtransactionwithwallet", [raw])
+    assert signed["complete"] is True
+    return signed["hex"], coin
+
+
+def check_reorg_and_mempool(core_port, rust_port, p2p_port, outbound, encrypted):
+    core_rpc(core_port, "createwallet", ["interop-wallet"])
+    address = core_rpc(core_port, "getnewaddress", ["", "bech32"])
+    hashes = core_rpc(core_port, "generatetoaddress", [105, address])
+    wait_until(lambda: rust_rpc(rust_port, "getbestblockhash", []) == hashes[-1], timeout=60)
+    # Core -> Rust wtxid announcement and actual signature-checked admission.
+    parent_id = core_rpc(core_port, "sendtoaddress", ["mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn", 0.25])
+    wait_until(lambda: parent_id in rust_rpc(rust_port, "getrawmempool", []))
+    raw, replacement_coin = signed_wallet_spend(core_port)
+    core_accept = core_rpc(core_port, "testmempoolaccept", [[raw]])[0]
+    rust_accept = rust_rpc(rust_port, "testmempoolaccept", [[raw]])[0]
+    assert core_accept["allowed"] == rust_accept["allowed"] is True
+    assert core_accept["vsize"] == rust_accept["vsize"]
+    assert core_accept["fees"]["base"] == rust_accept["fees"]["base"]
+    assert core_rpc(core_port, "testmempoolaccept", [[raw], 0.00001])[0]["allowed"] is False
+    assert rust_rpc(rust_port, "testmempoolaccept", [[raw], 0.00001])[0]["allowed"] is False
+    # Rust -> Core relay lets Core independently verify the same witness tx.
+    child_id = rust_rpc(rust_port, "sendrawtransaction", [raw])
+    wait_until(lambda: child_id in core_rpc(core_port, "getrawmempool", []))
+    replacement, _ = signed_wallet_spend(core_port, replacement_coin, 0.00008)
+    assert core_rpc(core_port, "testmempoolaccept", [[replacement]])[0]["allowed"] is True
+    assert rust_rpc(rust_port, "testmempoolaccept", [[replacement]])[0]["allowed"] is True
+    replaced_id = child_id
+    child_id = rust_rpc(rust_port, "sendrawtransaction", [replacement])
+    wait_until(lambda: child_id in core_rpc(core_port, "getrawmempool", []))
+    assert replaced_id not in core_rpc(core_port, "getrawmempool", [])
+    assert replaced_id not in rust_rpc(rust_port, "getrawmempool", [])
+    assert rust_rpc(rust_port, "getmempoolinfo", [])["size"] == 2
+    hashes = rust_rpc(rust_port, "generatetoaddress", [1, address])
+    wait_until(lambda: core_rpc(core_port, "getbestblockhash", []) == hashes[-1])
+    assert core_rpc(core_port, "getrawmempool", []) == rust_rpc(rust_port, "getrawmempool", []) == []
+    mined = core_rpc(core_port, "getblock", [hashes[-1]])
+    assert parent_id in mined["tx"] and child_id in mined["tx"]
+    assert core_rpc(core_port, "getblock", [hashes[-1], 0]) == rust_rpc(rust_port, "getblock", [hashes[-1], 0])
+    # A real signed immature coinbase spend is rejected by both validators.
+    coinbase = core_rpc(core_port, "getblock", [hashes[-1], 2])["tx"][0]
+    immature = {"txid": coinbase["txid"], "vout": 0, "amount": coinbase["vout"][0]["value"]}
+    raw_immature = core_rpc(core_port, "createrawtransaction", [[{"txid": immature["txid"], "vout": immature["vout"]}], {address: round(immature["amount"] - 0.00002, 8)}])
+    raw_immature = core_rpc(core_port, "signrawtransactionwithwallet", [raw_immature])["hex"]
+    assert core_rpc(core_port, "testmempoolaccept", [[raw_immature]])[0]["allowed"] is False
+    assert rust_rpc(rust_port, "testmempoolaccept", [[raw_immature]])[0]["allowed"] is False
+    # Separate branches, including a real spend in the branch to be disconnected.
+    core_rpc(core_port, "setnetworkactive", [False])
+    wait_until(lambda: not rust_rpc(rust_port, "getpeerinfo", []))
+    raw_fork, coin = signed_wallet_spend(core_port)
+    fork_txid = rust_rpc(rust_port, "sendrawtransaction", [raw_fork])
+    old_hashes = rust_rpc(rust_port, "generatetoaddress", [2, address])
+    assert rust_rpc(rust_port, "gettxout", [coin["txid"], coin["vout"], False]) is None
+    new_hashes = core_rpc(core_port, "generatetoaddress", [3, address])
+    core_rpc(core_port, "setnetworkactive", [True])
+    if not outbound:
+        core_rpc(core_port, "addnode", [f"127.0.0.1:{p2p_port}", "onetry", encrypted])
+    wait_until(lambda: rust_rpc(rust_port, "getbestblockhash", []) == new_hashes[-1], timeout=60)
+    assert rust_rpc(rust_port, "getblockheader", [old_hashes[-1]])["confirmations"] == -1
+    restored = rust_rpc(rust_port, "gettxout", [coin["txid"], coin["vout"], False])
+    assert restored["value"] == coin["amount"]
+    assert restored["confirmations"] == core_rpc(core_port, "gettxout", [coin["txid"], coin["vout"], False])["confirmations"]
+    assert fork_txid in rust_rpc(rust_port, "getrawmempool", [])
+    wait_until(lambda: fork_txid in core_rpc(core_port, "getrawmempool", []))
+    final = rust_rpc(rust_port, "generatetoaddress", [1, address])[-1]
+    wait_until(lambda: core_rpc(core_port, "getbestblockhash", []) == final)
+    assert fork_txid in core_rpc(core_port, "getblock", [final])["tx"]
+    assert core_rpc(core_port, "getblock", [final, 0]) == rust_rpc(rust_port, "getblock", [final, 0])
+    assert rust_rpc(rust_port, "getrawmempool", []) == []
+    return final, old_hashes[-1]
+
+
 def scenario(args, encrypted, outbound):
     mode = "v2" if encrypted else "v1"
     direction = "outbound" if outbound else "inbound"
@@ -97,7 +178,7 @@ def scenario(args, encrypted, outbound):
                     str(args.bitcoind), "-regtest", f"-datadir={core_data}", "-server", f"-listen={int(outbound)}",
                     "-dnsseed=0", "-discover=0", "-connect=0", "-listenonion=0", "-par=1",
                     f"-rpcport={core_port}", "-rpcbind=127.0.0.1", "-rpcallowip=127.0.0.1",
-                    "-rpcuser=interop", "-rpcpassword=regtest-only", f"-v2transport={int(encrypted)}",
+                    "-rpcuser=interop", "-rpcpassword=regtest-only", "-fallbackfee=0.00002", f"-v2transport={int(encrypted)}",
                 ]
                 if outbound:
                     core_command += [f"-bind=127.0.0.1:{core_p2p}", f"-port={core_p2p}"]
@@ -129,7 +210,7 @@ def scenario(args, encrypted, outbound):
                 assert rust_peers[0]["inbound"] is (not outbound)
                 assert core_peers[0]["inbound"] is outbound
                 wait_until(lambda: rust_rpc(rust_port, "getblockcount", []) == initial_height)
-                assert core_peers[0]["relaytxes"] is False
+                assert core_peers[0]["relaytxes"] is True
                 if encrypted:
                     assert core_peers[0]["session_id"] == rust_peers[0]["session_id"]
                     assert int(core_peers[0]["services"], 16) & (1 << 11)
@@ -167,11 +248,20 @@ def scenario(args, encrypted, outbound):
                     rust_hashes = rust_rpc(rust_port, "generatetoaddress", [1, address])
                     wait_until(lambda: core_rpc(core_port, "getbestblockhash", []) == rust_hashes[-1])
                     assert core_rpc(core_port, "getblock", [rust_hashes[-1], 0]) == rust_rpc(rust_port, "getblock", [rust_hashes[-1], 0])
+                final, stale = check_reorg_and_mempool(core_port, rust_port, p2p_port, outbound, encrypted)
+                rust_rpc(rust_port, "stop", [])
+                assert rust.wait(10) == 0
+                wait_until(lambda: not core_rpc(core_port, "getpeerinfo", []))
+                rust = subprocess.Popen(rust_command, stdout=rust_log, stderr=rust_log)
+                processes.append(rust)
+                wait_until(lambda: rust_rpc(rust_port, "getbestblockhash", []) == final)
+                assert rust_rpc(rust_port, "getblockheader", [stale])["confirmations"] == -1
+                assert rust_rpc(rust_port, "getrawmempool", []) == []
                 rust_rpc(rust_port, "stop", [])
                 core_rpc(core_port, "stop", [])
                 assert rust.wait(10) == core.wait(10) == 0
                 print(f"{direction} {mode}: Core/Rust sessions, real blocks both ways, "
-                      + ("IBD, reconnect/restart, " if outbound else "") + "and shutdown passed")
+                      + ("IBD, reconnect/restart, " if outbound else "") + "signed mempool relay/mining, spend reorg/undo, restart, and shutdown passed")
             except Exception:
                 print((root / "rust.log").read_text())
                 debug = core_data / "regtest" / "debug.log"
