@@ -31,6 +31,9 @@ final fields do not prove that a transaction can spend its inputs. Submit extrac
 transactions through the validated mempool or an independent validating node.
 The tools do not sign, derive wallet keys, choose coins, or automatically finalize
 partial signatures.
+Inspection exposes the declared `sighash_type`, per-key partial-signature types,
+the Taproot key-signature type and script-signature key/leaf/type records.
+An implicit 64-byte Taproot signature reports type zero (DEFAULT).
 
 V2 serialization excludes the global unsigned transaction and includes transaction
 version, counts, per-input prevouts, and per-output amounts/scripts. Optional
@@ -40,6 +43,10 @@ Unknown modification flag bits are preserved. Conversion keeps the transaction,
 signatures, derivations and unknown/proprietary fields. V2 to v0 necessarily
 collapses construction permissions and input locktime requirements into the fixed
 transaction. V0 to v2 gives no new permission to modify that transaction.
+When partial signatures use SIGHASH_SINGLE, conversion sets the v2 pairing flag.
+V2 partial signatures forbid input modification unless ANYONECANPAY is set,
+forbid output modification unless NONE is used, and require the SINGLE pairing
+flag when applicable. Unknown flag bits are retained.
 
 The parser checks canonical CompactSize keys and lengths, unique raw keys in each
 map, singleton key shapes, fixed field lengths, unsigned v0 transaction scripts,
@@ -105,9 +112,22 @@ data are deferred. These public commitments do not prove signature equations,
 key derivations, confirmation, unspentness or script satisfaction. Sorted branch
 hashing permits exchanging complete sibling subtrees without changing the root.
 
-Parsing does not validate signature equations, sighash semantics, full claimed key
+Partial ECDSA signature records require strict DER, nonzero scalars below the
+curve order and one of the six defined legacy sighash bytes. High S remains
+representable and is preserved; this parser does not impose low-S policy.
+Taproot records require 64 bytes for DEFAULT, or 65 bytes with a defined nonzero
+type. Their r must be below the BIP340 field modulus and s below the curve order.
+Explicit DEFAULT, unsupported/draft types and out-of-range values fail.
+Present partial signatures must match a declared type exactly, including the
+distinction between Taproot DEFAULT and ALL. Known non-Taproot inputs cannot use
+DEFAULT, and known Taproot inputs cannot carry ECDSA partial signatures. Taproot
+SINGLE signatures require a corresponding output. Combining complementary
+records validates these relationships before changing the receiver.
+
+These checks validate encoding and metadata consistency. Parsing does not
+validate signature equations, complete sighash context, full claimed key
 derivations or script satisfactions. Remaining
-BIP174 DER/sighash and full key-origin verification, witness-only legacy signing restrictions,
+BIP174/371 signature/context and full key-origin verification, witness-only legacy signing restrictions,
 active-chain/unspentness checks, wallet signing/finalization,
 descriptor operations and MuSig2 remain unfinished. Empty v2 creator maps can be
 represented; converting an empty-input creator to v0 is rejected by the legacy
@@ -166,3 +186,21 @@ Primary specifications: [BIP174](https://github.com/bitcoin/bips/blob/master/bip
 [BIP371](https://github.com/bitcoin/bips/blob/master/bip-0371.mediawiki),
 [BIP341 and wallet vectors](https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki),
 and [Core v29 PSBT RPCs](https://github.com/bitcoin/bitcoin/blob/v29.0/src/rpc/rawtransaction.cpp).
+
+`psbt-signatures.json` retains 20 single-push Core v29 DER/STRICTENC/LOW_S cases
+and all 19 BIP340 signature bodies, with source hashes and 58 independently
+serialized PSBT envelopes. Numeric encoding validity is kept separate from
+BIP340 equation verification; encodings of wrong-key/message signatures remain
+representable. Core's PSBT decoder is more permissive about partial signatures
+than its script validator, and those differences are explicit in acceptance.
+Real Core-signed legacy, witness-v0 and Taproot key/script spends cover the six
+defined ECDSA and seven Taproot types, including DEFAULT, NONE, SINGLE and
+ANYONECANPAY. Metadata/encoding substitution fails the compiled tools; unchanged
+valid signatures survive conversion and independent Core finalization/admission.
+Final scriptSig/witness fields remain opaque external records. Their signature
+encoding, declared-type agreement and equations are not verified by extraction.
+
+Signature references: [BIP66 strict DER](https://github.com/bitcoin/bips/blob/master/bip-0066.mediawiki),
+[BIP340 vectors](https://github.com/bitcoin/bips/blob/master/bip-0340/test-vectors.csv),
+[Core v29 script vectors](https://github.com/bitcoin/bitcoin/blob/v29.0/src/test/data/script_tests.json),
+and the BIP174/BIP341/BIP370 signing rules linked above.

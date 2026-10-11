@@ -103,6 +103,14 @@ fn tap_derivations_json(
         .collect::<Vec<_>>())
 }
 
+fn tap_signature_hash_type(signature: &[u8]) -> u8 {
+    if signature.len() == 64 {
+        0
+    } else {
+        signature[64]
+    }
+}
+
 /// Inspect PSBT spending data. Signatures, key derivations and active-chain status remain unverified.
 pub fn decode_psbt(hex_str: &str) -> eyre::Result<serde_json::Value> {
     let psbt = parse_psbt_hex(hex_str)?;
@@ -153,9 +161,18 @@ pub fn decode_psbt(hex_str: &str) -> eyre::Result<serde_json::Value> {
                     "txid_linked": input.non_witness_utxo.is_some(),
                 })),
                 "partial_signatures": input.partial_sigs.len(),
+                "sighash_type": input.sighash_type,
+                "partial_signature_records": input.partial_sigs.iter().map(|(key, sig)| serde_json::json!({
+                    "pubkey": hex::encode(key), "sighash_type": sig[sig.len() - 1],
+                })).collect::<Vec<_>>(),
                 "bip32_derivation": key_derivations_json(&input.bip32_derivation),
                 "has_tap_key_signature": input.tap_key_sig.is_some(),
+                "tap_key_signature_sighash_type": input.tap_key_sig.as_ref().map(|sig| tap_signature_hash_type(sig)),
                 "tap_script_signatures": input.tap_script_sigs.len(),
+                "tap_script_signature_records": input.tap_script_sigs.iter().map(|(key, sig)| serde_json::json!({
+                    "pubkey": hex::encode(&key[..32]), "leaf_hash": hex::encode(&key[32..]),
+                    "sighash_type": tap_signature_hash_type(sig),
+                })).collect::<Vec<_>>(),
                 "tap_internal_key": input.tap_internal_key.as_ref().map(hex::encode),
                 "tap_merkle_root": input.tap_merkle_root.map(hex::encode),
                 "tap_leaf_scripts": input.tap_leaf_scripts.iter().map(|(control, leaf)| serde_json::json!({

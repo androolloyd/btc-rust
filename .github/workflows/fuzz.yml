@@ -26,9 +26,9 @@ jobs:
           import json, pathlib
           corpus = pathlib.Path("fuzz/corpus/fuzz_psbt_decode")
           corpus.mkdir(parents=True, exist_ok=True)
-          for name in ["bip174-utxo", "bip370", "bip371", "bip341-commitments", "bip32-keys"]:
+          for name in ["bip174-utxo", "bip370", "bip371", "bip341-commitments", "bip32-keys", "psbt-signatures"]:
               source = pathlib.Path(f"crates/primitives/tests/data/{name}.json")
-              key = "psbt_vectors" if name in ["bip341-commitments", "bip32-keys"] else "vectors"
+              key = "psbt_vectors" if name in ["bip341-commitments", "bip32-keys", "psbt-signatures"] else "vectors"
               for i, vector in enumerate(json.loads(source.read_text())[key]):
                   (corpus / f"{name}-{i}").write_bytes(bytes.fromhex(vector["hex"]))
       - run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=30 -rss_limit_mb=2048

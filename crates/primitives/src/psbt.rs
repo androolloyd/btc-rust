@@ -349,11 +349,108 @@ fn check_global_xpub(data: &[u8], source: &KeySource) -> Result<(), PsbtError> {
     Ok(())
 }
 
-fn tap_signature_shape(signature: &[u8]) -> Result<(), PsbtError> {
-    if !matches!(signature.len(), 64 | 65) {
-        return Err(PsbtError::Other(
-            "Taproot signature must be 64 or 65 bytes".into(),
-        ));
+fn defined_sighash(hash_type: u32) -> bool {
+    matches!(hash_type, 1 | 2 | 3 | 0x81 | 0x82 | 0x83)
+}
+
+/// Canonical DER and nonzero in-range scalars, without verifying the equation.
+/// Preserve high S: this wallet encoding check does not impose low-S policy.
+fn ecdsa_signature_type(signature: &[u8]) -> Result<u8, &'static str> {
+    if !(9..=73).contains(&signature.len()) {
+        return Err("ECDSA partial signature has invalid DER length");
+    }
+    let hash_type = signature[signature.len() - 1];
+    if !defined_sighash(u32::from(hash_type)) {
+        return Err("unsupported ECDSA partial signature sighash type");
+    }
+    let der = &signature[..signature.len() - 1];
+    let parsed = secp256k1::ecdsa::Signature::from_der(der)
+        .map_err(|_| "ECDSA partial signature is not strict DER")?;
+    if parsed.serialize_der().as_ref() != der {
+        return Err("ECDSA partial signature is noncanonical or has an out-of-range scalar");
+    }
+    let compact = parsed.serialize_compact();
+    if compact[..32] == [0; 32] || compact[32..] == [0; 32] {
+        return Err("ECDSA partial signature has a zero scalar");
+    }
+    Ok(hash_type)
+}
+
+/// BIP340 numeric bounds and BIP341's 64/65-byte sighash encoding. A valid
+/// encoding can still fail signature verification for the actual key/message.
+fn tap_signature_type(signature: &[u8]) -> Result<u8, &'static str> {
+    let hash_type = match signature.len() {
+        64 => 0,
+        65 if defined_sighash(u32::from(signature[64])) => signature[64],
+        65 => return Err("unsupported or explicit-default Taproot signature sighash type"),
+        _ => return Err("Taproot signature must be 64 or 65 bytes"),
+    };
+    const FIELD: [u8; 32] = [
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, 0xff, 0xff,
+        0xfc, 0x2f,
+    ];
+    if signature[..32] >= FIELD[..] {
+        return Err("Taproot signature r is outside the field");
+    }
+    if secp256k1::Scalar::from_be_bytes(signature[32..64].try_into().unwrap()).is_err() {
+        return Err("Taproot signature s is outside the curve order");
+    }
+    Ok(hash_type)
+}
+
+fn input_signature_types(input: &PsbtInput) -> Result<Vec<u8>, &'static str> {
+    let mut types = Vec::new();
+    for (_, sig) in &input.partial_sigs {
+        types.push(ecdsa_signature_type(sig)?);
+    }
+    for sig in input
+        .tap_key_sig
+        .iter()
+        .chain(input.tap_script_sigs.iter().map(|(_, sig)| sig))
+    {
+        types.push(tap_signature_type(sig)?);
+    }
+    Ok(types)
+}
+
+fn check_input_signatures(
+    input: &PsbtInput,
+    utxo: Option<&TxOut>,
+    index: usize,
+    outputs: usize,
+) -> Result<(), &'static str> {
+    if input
+        .sighash_type
+        .is_some_and(|value| value != 0 && !defined_sighash(value))
+    {
+        return Err("unsupported declared sighash type");
+    }
+    if let Some(utxo) = utxo {
+        if utxo.script_pubkey.is_p2tr() {
+            if !input.partial_sigs.is_empty() {
+                return Err("ECDSA partial signatures cannot describe a Taproot input");
+            }
+        } else if input.sighash_type == Some(0) {
+            return Err("SIGHASH_DEFAULT cannot describe a known non-Taproot input");
+        }
+    }
+    for hash_type in input_signature_types(input)? {
+        if input
+            .sighash_type
+            .is_some_and(|declared| declared != u32::from(hash_type))
+        {
+            return Err("partial signature sighash disagrees with declared sighash type");
+        }
+    }
+    for sig in input
+        .tap_key_sig
+        .iter()
+        .chain(input.tap_script_sigs.iter().map(|(_, sig)| sig))
+    {
+        if tap_signature_type(sig)? & 0x7f == 3 && index >= outputs {
+            return Err("Taproot SIGHASH_SINGLE has no corresponding output");
+        }
     }
     Ok(())
 }
@@ -1133,6 +1230,8 @@ impl Psbt {
                 PSBT_IN_WITNESS_UTXO => inp.witness_utxo = Some(txout_from_bytes(&value)?),
                 PSBT_IN_PARTIAL_SIG => {
                     public_key_shape(key_data)?;
+                    ecdsa_signature_type(&value)
+                        .map_err(|reason| PsbtError::Other(reason.into()))?;
                     inp.partial_sigs.push((key_data.to_vec(), value));
                 }
                 PSBT_IN_SIGHASH_TYPE => inp.sighash_type = Some(u32::from_le_bytes(fixed(&value)?)),
@@ -1170,13 +1269,13 @@ impl Psbt {
                     inp.required_height_lock_time = Some(u32::from_le_bytes(fixed(&value)?));
                 }
                 PSBT_IN_TAP_KEY_SIG => {
-                    tap_signature_shape(&value)?;
+                    tap_signature_type(&value).map_err(|reason| PsbtError::Other(reason.into()))?;
                     inp.tap_key_sig = Some(value);
                 }
                 PSBT_IN_TAP_SCRIPT_SIG => {
                     fixed::<64>(key_data)?;
                     xonly_public_key(&key_data[..32])?;
-                    tap_signature_shape(&value)?;
+                    tap_signature_type(&value).map_err(|reason| PsbtError::Other(reason.into()))?;
                     inp.tap_script_sigs.push((key_data.to_vec(), value));
                 }
                 PSBT_IN_TAP_LEAF_SCRIPT => {
@@ -1349,6 +1448,8 @@ impl Psbt {
                 public_key_shape(key)?;
             }
             let utxo = self.input_utxo(index)?;
+            check_input_signatures(input, utxo, index, self.unsigned_tx.outputs.len())
+                .map_err(|reason| PsbtError::InconsistentInput { index, reason })?;
             check_script_commitments(
                 utxo.map(|output| &output.script_pubkey),
                 input.redeem_script.as_ref(),
@@ -1388,6 +1489,28 @@ impl Psbt {
                 }
             }
             2 => {
+                let flags = self.tx_modifiable.unwrap_or(0);
+                for input in &self.inputs {
+                    for hash_type in input_signature_types(input)
+                        .map_err(|reason| PsbtError::Other(reason.into()))?
+                    {
+                        if hash_type & 0x80 == 0 && flags & 1 != 0 {
+                            return Err(PsbtError::Other(
+                                "v2 signature forbids input modification".into(),
+                            ));
+                        }
+                        if hash_type & 0x7f != 2 && flags & 2 != 0 {
+                            return Err(PsbtError::Other(
+                                "v2 signature forbids output modification".into(),
+                            ));
+                        }
+                        if hash_type & 0x7f == 3 && flags & 4 == 0 {
+                            return Err(PsbtError::Other(
+                                "v2 SIGHASH_SINGLE signature requires its pairing flag".into(),
+                            ));
+                        }
+                    }
+                }
                 if determine_lock_time(&self.inputs, self.fallback_lock_time)?
                     != self.unsigned_tx.lock_time
                 {
@@ -1425,7 +1548,14 @@ impl Psbt {
                 result.fallback_lock_time = Some(self.unsigned_tx.lock_time);
                 // This conversion commits to the existing transaction. It does
                 // not grant permission to modify signed inputs or outputs.
-                result.tx_modifiable = Some(0);
+                let mut single = false;
+                for input in &self.inputs {
+                    single |= input_signature_types(input)
+                        .map_err(|reason| PsbtError::Other(reason.into()))?
+                        .iter()
+                        .any(|hash_type| hash_type & 0x7f == 3);
+                }
+                result.tx_modifiable = Some(if single { 4 } else { 0 });
             }
             2 => {}
             _ => {
@@ -1665,6 +1795,249 @@ fn merge_output(mine: &mut PsbtOutput, theirs: &PsbtOutput) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn signature_vectors() -> serde_json::Value {
+        serde_json::from_str(include_str!("../tests/data/psbt-signatures.json")).unwrap()
+    }
+
+    fn test_ecdsa_signature(hash_type: u8) -> Vec<u8> {
+        let fixture = signature_vectors();
+        let vector = fixture["ecdsa"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["encoding_valid"] == true)
+            .unwrap();
+        let mut sig = hex::decode(vector["signature"].as_str().unwrap()).unwrap();
+        *sig.last_mut().unwrap() = hash_type;
+        sig
+    }
+
+    fn test_tap_signature(hash_type: u8) -> Vec<u8> {
+        let fixture = signature_vectors();
+        let mut sig = hex::decode(fixture["schnorr"][0]["signature"].as_str().unwrap()).unwrap();
+        if hash_type != 0 {
+            sig.push(hash_type);
+        }
+        sig
+    }
+
+    fn signature_model(kind: u8, hash_type: u8) -> Psbt {
+        let mut model = Psbt::from_unsigned_tx(make_unsigned_tx()).unwrap();
+        match kind {
+            0 => model.inputs[0]
+                .partial_sigs
+                .push((test_public_key(2), test_ecdsa_signature(hash_type))),
+            1 => model.inputs[0].tap_key_sig = Some(test_tap_signature(hash_type)),
+            2 => model.inputs[0]
+                .tap_script_sigs
+                .push((test_tap_sig_key(), test_tap_signature(hash_type))),
+            _ => unreachable!(),
+        }
+        model
+    }
+
+    fn reject_signature_model(mut bad: Psbt) {
+        bad.inputs[0].final_script_sig = Some(ScriptBuf::from_bytes(vec![0x51]));
+        assert!(bad.try_serialize().is_err());
+        assert!(bad
+            .convert_version(if bad.version == 0 { 2 } else { 0 })
+            .is_err());
+        assert!(!matches!(
+            bad.finalize(),
+            Ok(_) | Err(PsbtError::NotFinalized { .. })
+        ));
+        let mut wire = Vec::new();
+        bad.serialize_to(&mut wire).unwrap();
+        assert!(Psbt::deserialize(&wire).is_err());
+        let mut receiver = Psbt::from_unsigned_tx(bad.unsigned_tx.clone())
+            .unwrap()
+            .convert_version(bad.version)
+            .unwrap();
+        receiver.tx_modifiable = bad.tx_modifiable;
+        let before = receiver.clone();
+        assert!(receiver.merge(&bad).is_err());
+        assert_eq!(receiver, before);
+    }
+
+    #[test]
+    fn independent_signature_encoding_vectors_reach_psbt_boundaries() {
+        let fixture = signature_vectors();
+        assert_eq!(fixture["ecdsa"].as_array().unwrap().len(), 20);
+        assert_eq!(fixture["schnorr"].as_array().unwrap().len(), 19);
+        for v in fixture["ecdsa"].as_array().unwrap() {
+            let sig = hex::decode(v["signature"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                ecdsa_signature_type(&sig).is_ok(),
+                v["encoding_valid"].as_bool().unwrap(),
+                "{}",
+                v["case"]
+            );
+        }
+        for v in fixture["schnorr"].as_array().unwrap() {
+            let sig = hex::decode(v["signature"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                tap_signature_type(&sig).is_ok(),
+                v["encoding_valid"].as_bool().unwrap(),
+                "{}",
+                v["index"]
+            );
+        }
+        // An invalid equation with valid encoding remains metadata. This check
+        // deliberately does not confuse BIP340's verification result with ours.
+        assert_eq!(fixture["schnorr"][6]["verification_result"], false);
+        assert_eq!(fixture["schnorr"][6]["encoding_valid"], true);
+        assert_eq!(fixture["psbt_vectors"].as_array().unwrap().len(), 58);
+        for v in fixture["psbt_vectors"].as_array().unwrap() {
+            let decoded = Psbt::deserialize(&hex::decode(v["hex"].as_str().unwrap()).unwrap());
+            if v["status"] == "invalid" {
+                assert!(decoded.is_err(), "{}", v["case"]);
+            } else {
+                let model = decoded.unwrap();
+                for version in [0, 2] {
+                    let converted = model.convert_version(version).unwrap();
+                    assert_eq!(
+                        Psbt::deserialize(&converted.try_serialize().unwrap()).unwrap(),
+                        converted
+                    );
+                    assert_eq!(converted.convert_version(0).unwrap(), model);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_signature_records_and_declared_types_fail_every_boundary() {
+        for kind in 0..=2 {
+            for version in [0, 2] {
+                let good = signature_model(kind, 1).convert_version(version).unwrap();
+                let mut invalid = Vec::new();
+                for declared in [0, 2, 0x41, 0x80, 0x01000001, u32::MAX] {
+                    let mut bad = good.clone();
+                    bad.inputs[0].sighash_type = Some(declared);
+                    invalid.push(bad);
+                }
+                for byte in [0, 4, 0x40, 0x41, 0x80, 0xff] {
+                    let mut bad = good.clone();
+                    match kind {
+                        0 => *bad.inputs[0].partial_sigs[0].1.last_mut().unwrap() = byte,
+                        1 => {
+                            *bad.inputs[0]
+                                .tap_key_sig
+                                .as_mut()
+                                .unwrap()
+                                .last_mut()
+                                .unwrap() = byte
+                        }
+                        2 => *bad.inputs[0].tap_script_sigs[0].1.last_mut().unwrap() = byte,
+                        _ => unreachable!(),
+                    }
+                    invalid.push(bad);
+                }
+                for length in [0, 1, 8, 63, 66, 74, 1024] {
+                    let mut bad = good.clone();
+                    match kind {
+                        0 => bad.inputs[0].partial_sigs[0].1 = vec![0; length],
+                        1 => bad.inputs[0].tap_key_sig = Some(vec![0; length]),
+                        2 => bad.inputs[0].tap_script_sigs[0].1 = vec![0; length],
+                        _ => unreachable!(),
+                    }
+                    invalid.push(bad);
+                }
+                if kind == 0 {
+                    for sig in ["300602010002010101", "300602010102010001"] {
+                        let mut bad = good.clone();
+                        bad.inputs[0].partial_sigs[0].1 = hex::decode(sig).unwrap();
+                        invalid.push(bad);
+                    }
+                }
+                for bad in invalid {
+                    reject_signature_model(bad);
+                }
+            }
+        }
+        // No UTXO: the default declaration can remain incomplete. Once the
+        // actual non-Taproot spending program is supplied it is contradictory.
+        let mut unknown = Psbt::from_unsigned_tx(make_unsigned_tx()).unwrap();
+        unknown.inputs[0].sighash_type = Some(0);
+        unknown.try_serialize().unwrap();
+        unknown.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(10000),
+            script_pubkey: ScriptBuf::p2wpkh(&[0; 20]),
+        });
+        reject_signature_model(unknown);
+        let mut wrong_kind = signature_model(0, 1);
+        wrong_kind.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(10000),
+            script_pubkey: ScriptBuf::p2tr(&test_xonly_key().try_into().unwrap()),
+        });
+        reject_signature_model(wrong_kind);
+        for kind in [1, 2] {
+            for hash_type in [3, 0x83] {
+                let mut bad = signature_model(kind, hash_type);
+                bad.unsigned_tx.outputs.clear();
+                bad.outputs.clear();
+                reject_signature_model(bad);
+            }
+        }
+    }
+
+    #[test]
+    fn complementary_sighash_records_combine_atomically() {
+        for kind in 0..=2 {
+            for version in [0, 2] {
+                let signature_type = if kind == 0 { 1 } else { 0 };
+                let left = signature_model(kind, signature_type)
+                    .convert_version(version)
+                    .unwrap();
+                let mut right = left.clone();
+                right.inputs[0].partial_sigs.clear();
+                right.inputs[0].tap_key_sig = None;
+                right.inputs[0].tap_script_sigs.clear();
+                right.inputs[0].sighash_type = Some(if signature_type == 1 { 2 } else { 1 });
+                right.try_serialize().unwrap();
+                let mut receiver = left.clone();
+                assert!(
+                    matches!(receiver.merge(&right), Err(PsbtError::InconsistentInput { reason, .. }) if reason.contains("sighash"))
+                );
+                assert_eq!(receiver, left);
+                right.inputs[0].sighash_type = Some(u32::from(signature_type));
+                receiver.merge(&right).unwrap();
+                let once = receiver.clone();
+                receiver.merge(&right).unwrap();
+                assert_eq!(receiver, once);
+            }
+        }
+    }
+
+    #[test]
+    fn v2_signature_permissions_and_single_pairing_follow_bip370() {
+        for kind in 0..=2 {
+            for hash_type in [0, 1, 2, 3, 0x81, 0x82, 0x83] {
+                if kind == 0 && hash_type == 0 {
+                    continue;
+                }
+                let v0 = signature_model(kind, hash_type);
+                let v2 = v0.convert_version(2).unwrap();
+                assert_eq!(
+                    v2.tx_modifiable,
+                    Some(if hash_type & 0x7f == 3 { 4 } else { 0 })
+                );
+                for flags in 0..=7 {
+                    let mut model = v2.clone();
+                    model.tx_modifiable = Some(flags | 0x80);
+                    let permitted = (hash_type & 0x80 != 0 || flags & 1 == 0)
+                        && (hash_type & 0x7f == 2 || flags & 2 == 0)
+                        && (hash_type & 0x7f != 3 || flags & 4 != 0);
+                    if permitted {
+                        model.try_serialize().unwrap();
+                    } else {
+                        reject_signature_model(model);
+                    }
+                }
+            }
+        }
+    }
 
     fn key_vectors() -> serde_json::Value {
         serde_json::from_str(include_str!("../tests/data/bip32-keys.json")).unwrap()
@@ -2686,8 +3059,8 @@ mod tests {
         // Add some data to exercise more paths
         psbt.inputs[0].sighash_type = Some(1);
         psbt.inputs[0].partial_sigs.push((
-            test_public_key(2), // compressed pubkey
-            vec![0x30; 72],     // DER sig placeholder
+            test_public_key(2),      // compressed pubkey
+            test_ecdsa_signature(1), // reference DER encoding; equation remains unverified
         ));
         psbt.inputs[0].bip32_derivation.push((
             test_public_key(2),
@@ -2760,14 +3133,14 @@ mod tests {
 
         // Signer A adds their sig
         let pubkey_a = test_public_key(2);
-        let sig_a = vec![0x30; 72];
+        let sig_a = test_ecdsa_signature(1);
         psbt_a.inputs[0]
             .partial_sigs
             .push((pubkey_a.clone(), sig_a.clone()));
 
         // Signer B adds their sig
         let pubkey_b = test_public_key(3);
-        let sig_b = vec![0x45; 72];
+        let sig_b = test_ecdsa_signature(2);
         psbt_b.inputs[0]
             .partial_sigs
             .push((pubkey_b.clone(), sig_b.clone()));
@@ -2804,7 +3177,7 @@ mod tests {
         let mut psbt = Psbt::from_unsigned_tx(tx.clone()).unwrap();
         psbt.inputs[0]
             .partial_sigs
-            .push((test_public_key(2), vec![0xAB; 64]));
+            .push((test_public_key(2), test_ecdsa_signature(1)));
 
         let copy = psbt.clone();
         psbt.merge(&copy).unwrap();
@@ -2858,7 +3231,7 @@ mod tests {
         let tx = make_unsigned_tx();
         let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
 
-        psbt.inputs[0].tap_key_sig = Some(vec![0xAB; 64]);
+        psbt.inputs[0].tap_key_sig = Some(test_tap_signature(0));
         psbt.inputs[0].tap_internal_key = Some(test_xonly_key());
         psbt.inputs[0].tap_merkle_root = Some([0xEF; 32]);
         psbt.inputs[0]

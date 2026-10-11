@@ -291,6 +291,72 @@ def check_published_key_vectors(args, port):
     print("PASSED: 27 BIP32/BIP174 PSBT key cases, Core curve-key rejection and explicit origin/version checks", flush=True)
 
 
+def check_published_signature_vectors(args, port):
+    fixture = Path(__file__).resolve().parents[1] / "crates/primitives/tests/data/psbt-signatures.json"
+    for vector in json.loads(fixture.read_text())["psbt_vectors"]:
+        raw = vector["hex"]
+        # Core's PSBT decoder accepts these partial-signature bytes as metadata;
+        # parsing is not validation of their DER/scalars/equation.
+        independent = core_rpc(port, "decodepsbt", [encode64(raw)])
+        if vector["status"] == "invalid":
+            reject_spending_data(args, raw, "signature")
+        else:
+            decoded = cli(args.node, "decode-psbt", raw)
+            assert decoded["signatures_verified"] is False
+            converted = cli(args.node, "convert-psbt", raw, "--version", "2")
+            restored = cli(args.node, "convert-psbt", converted["psbt_hex"], "--version", "0")
+            assert core_rpc(port, "decodepsbt", [encode64(restored["psbt_hex"])]) == independent
+    print("PASSED: 58 independent signature-encoding PSBT cases; equation status remains unverified", flush=True)
+
+
+def check_signed_sighash_variants(args, port, unsigned, kind):
+    names = [("ALL",1),("NONE",2),("SINGLE",3),
+             ("ALL|ANYONECANPAY",0x81),("NONE|ANYONECANPAY",0x82),("SINGLE|ANYONECANPAY",0x83)]
+    if kind in ["bech32m", "taproot-script"]:
+        names.insert(0, ("DEFAULT",0))
+    for name, hash_type in names:
+        result = core_rpc(port, "walletprocesspsbt", [unsigned, True, name, True, False])
+        # finalize=False intentionally keeps partial records; Core's complete
+        # status can be false until they have been finalized. Require the real
+        # signature records and independently validated final transaction below.
+        maps = psbt_maps(base64.b64decode(result["psbt"]).hex())
+        maps[1][b"\x03"] = hash_type.to_bytes(4, "little")
+        raw = encode_maps(maps)
+        finalized = core_rpc(port, "finalizepsbt", [encode64(raw)])
+        assert finalized["complete"] is True, (kind, name)
+        assert core_rpc(port, "testmempoolaccept", [[finalized["hex"]]])[0]["allowed"] is True
+        decoded = cli(args.node, "decode-psbt", raw)
+        fields = decoded["inputs"][0]
+        assert fields["sighash_type"] == hash_type and decoded["signatures_verified"] is False
+        types = [record["sighash_type"] for record in fields["partial_signature_records"]]
+        types += [record["sighash_type"] for record in fields["tap_script_signature_records"]]
+        if fields["tap_key_signature_sighash_type"] is not None:
+            types.append(fields["tap_key_signature_sighash_type"])
+        assert types and all(value == hash_type for value in types), (kind, name, types)
+        converted = cli(args.node, "convert-psbt", raw, "--version", "2")
+        v2 = cli(args.node, "decode-psbt", converted["psbt_hex"])
+        assert v2["tx_modifiable"] == (4 if hash_type & 0x7f == 3 else 0)
+        restored = cli(args.node, "convert-psbt", converted["psbt_hex"], "--version", "0")
+        assert core_rpc(port, "finalizepsbt", [encode64(restored["psbt_hex"])])["hex"] == finalized["hex"]
+        # Declarations are outside the transaction; substitution leaves the
+        # same unsigned bytes/signatures but must fail our tool boundary.
+        bad = psbt_maps(raw)
+        bad[1][b"\x03"] = (2 if hash_type != 2 else 1).to_bytes(4,"little")
+        corrupted = encode_maps(bad)
+        core_rpc(port, "decodepsbt", [encode64(corrupted)])
+        reject_spending_data(args, corrupted, "sighash")
+        for key, sig in maps[1].items():
+            if key[0] == 2:
+                bad = psbt_maps(raw); bad[1][key] = b"\x31" + sig[1:]
+                reject_spending_data(args, encode_maps(bad), "signature")
+            elif key[0] in (0x13, 0x14):
+                bad = psbt_maps(raw); bad[1][key] = sig[:64] + b"\x00"
+                reject_spending_data(args, encode_maps(bad), "signature")
+                bad = psbt_maps(raw); bad[1][key] = b"\xff"*32 + sig[32:]
+                reject_spending_data(args, encode_maps(bad), "signature")
+    print(f"PASSED: Core {kind} {len(names)} real sighash variants, declared-type rejection and v2 permissions", flush=True)
+
+
 def check_taproot_substitutions(args, raw):
     maps = psbt_maps(raw)
     generator = bytes.fromhex("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
@@ -356,6 +422,8 @@ def check_wallet(args, port, kind, script_pair=None):
     original = core_rpc(port, "createpsbt", [[{"txid": coin["txid"], "vout": coin["vout"],
                                                "sequence": 0xfffffffd}],
                                              {destination: round(coin["amount"] - 0.00002, 8)}, 23])
+    if kind in ["legacy", "bech32", "bech32m", "taproot-script"]:
+        check_signed_sighash_variants(args, port, original, kind)
     # Keep the real signatures/derivations in the PSBT for the conversion check.
     signed = core_rpc(port, "walletprocesspsbt", [original, True, "ALL", True, False])["psbt"]
     original_hex = base64.b64decode(signed, validate=True).hex()
@@ -443,6 +511,7 @@ def main():
                 check_published_taproot_vectors(args, port)
                 check_published_spending_vectors(args, port)
                 check_published_key_vectors(args, port)
+                check_published_signature_vectors(args, port)
                 check_published_commitment_vectors(args, port)
                 for kind in ["legacy", "p2sh-segwit", "bech32", "wsh", "sh-wsh", "bech32m", "taproot-script"]:
                     check_wallet(args, port, kind, script_pairs.get(kind))
