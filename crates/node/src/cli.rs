@@ -89,9 +89,12 @@ fn tap_derivations_json(
         .collect::<Vec<_>>())
 }
 
-/// Inspect actual PSBT fields. Signatures, derivation claims and commitments remain unverified.
+/// Inspect PSBT spending data. Signatures, derivations and Taproot commitments remain unverified.
 pub fn decode_psbt(hex_str: &str) -> eyre::Result<serde_json::Value> {
     let psbt = parse_psbt_hex(hex_str)?;
+    let utxos = (0..psbt.inputs.len())
+        .map(|index| psbt.input_utxo(index))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(serde_json::json!({
         "psbt_version": psbt.version,
         "tx_version": psbt.unsigned_tx.version,
@@ -112,6 +115,12 @@ pub fn decode_psbt(hex_str: &str) -> eyre::Result<serde_json::Value> {
                 "required_height_locktime": input.required_height_lock_time,
                 "has_non_witness_utxo": input.non_witness_utxo.is_some(),
                 "has_witness_utxo": input.witness_utxo.is_some(),
+                "utxo": utxos[i].map(|output| serde_json::json!({
+                    "value_sat": output.value.as_sat(),
+                    "script_pubkey": hex::encode(output.script_pubkey.as_bytes()),
+                    "source": if input.non_witness_utxo.is_some() { "non_witness_utxo" } else { "witness_utxo" },
+                    "txid_linked": input.non_witness_utxo.is_some(),
+                })),
                 "partial_signatures": input.partial_sigs.len(),
                 "has_tap_key_signature": input.tap_key_sig.is_some(),
                 "tap_script_signatures": input.tap_script_sigs.len(),
@@ -753,6 +762,34 @@ mod tests {
             })
             .unwrap();
         assert!(decode_psbt(invalid["hex"].as_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn psbt_cli_resolves_linked_prevouts_and_rejects_script_substitutions() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../primitives/tests/data/bip174-utxo.json"))
+                .unwrap();
+        let cases = fixture["vectors"].as_array().unwrap();
+        let first = cases[0]["hex"].as_str().unwrap();
+        let decoded = decode_psbt(first).unwrap();
+        assert_eq!(decoded["inputs"][0]["utxo"]["source"], "non_witness_utxo");
+        assert_eq!(decoded["inputs"][0]["utxo"]["txid_linked"], true);
+        assert_eq!(
+            decoded["inputs"][0]["utxo"]["script_pubkey"]
+                .as_str()
+                .unwrap()
+                .len(),
+            50
+        );
+        for case in cases
+            .iter()
+            .filter(|case| case["status"] == "script_mismatch")
+        {
+            let raw = case["hex"].as_str().unwrap();
+            assert!(decode_psbt(raw).is_err());
+            assert!(convert_psbt(raw, 2).is_err());
+            assert!(extract_psbt(raw).is_err());
+        }
     }
 
     #[test]

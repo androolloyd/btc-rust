@@ -94,6 +94,8 @@ pub enum PsbtError {
     NotFinalized { index: usize },
     #[error("duplicate key: {0:?}")]
     DuplicateKey(Vec<u8>),
+    #[error("inconsistent PSBT input {index}: {reason}")]
+    InconsistentInput { index: usize, reason: &'static str },
     #[error("{0}")]
     Other(String),
 }
@@ -326,6 +328,32 @@ fn xonly_public_key(key: &[u8]) -> Result<(), PsbtError> {
     fixed::<32>(key)?;
     secp256k1::XOnlyPublicKey::from_slice(key)
         .map_err(|_| PsbtError::Other("invalid PSBT x-only curve key".into()))?;
+    Ok(())
+}
+
+/// Check known script commitments without executing the spending script. With a
+/// missing P2SH redeem script, the witness-script check must wait for an updater.
+fn check_script_commitments(
+    script_pubkey: Option<&ScriptBuf>,
+    redeem_script: Option<&ScriptBuf>,
+    witness_script: Option<&ScriptBuf>,
+) -> Result<(), &'static str> {
+    if let (Some(output), Some(redeem)) = (script_pubkey, redeem_script) {
+        if *output != ScriptBuf::p2sh(&crate::hash::hash160(redeem.as_bytes())) {
+            return Err("redeem script does not match output HASH160 commitment");
+        }
+    }
+    if let Some(witness) = witness_script {
+        let program = redeem_script.or(script_pubkey);
+        if let Some(program) = program {
+            if redeem_script.is_none() && program.is_p2sh() {
+                return Ok(()); // incomplete metadata: the inner witness program is not known
+            }
+            if *program != ScriptBuf::p2wsh(&crate::hash::sha256(witness.as_bytes())) {
+                return Err("witness script does not match SHA256 witness program");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -573,7 +601,7 @@ impl Psbt {
             .expect("invalid PSBT model; use try_serialize for fallible serialization")
     }
 
-    /// Serialize after checking map counts, version rules and wire structure.
+    /// Serialize after checking counts, version rules, spending data and wire structure.
     pub fn try_serialize(&self) -> Result<Vec<u8>, PsbtError> {
         self.validate_structure()?;
         let mut buf = Vec::new();
@@ -788,7 +816,7 @@ impl Psbt {
     // Deserialize
     // =====================================================================
 
-    /// Deserialize a bounded, complete PSBT. This checks format, not signatures.
+    /// Decode a bounded, complete PSBT, checking known spending data but not signatures.
     pub fn deserialize(data: &[u8]) -> Result<Self, PsbtError> {
         if data.len() > MAX_PSBT_SIZE {
             return Err(PsbtError::Other("PSBT exceeds parser size limit".into()));
@@ -1100,6 +1128,48 @@ impl Psbt {
         Ok((out, txout))
     }
 
+    /// Resolve supplied spending data. A full parent is linked to the outpoint's
+    /// txid; a witness-only record remains a claim by the updater. Neither proves
+    /// confirmation, unspentness, parent consensus validity or a valid signature.
+    pub fn input_utxo(&self, index: usize) -> Result<Option<&TxOut>, PsbtError> {
+        let error = |reason| PsbtError::InconsistentInput { index, reason };
+        let input = self
+            .inputs
+            .get(index)
+            .ok_or_else(|| error("missing input map"))?;
+        let txin = self
+            .unsigned_tx
+            .inputs
+            .get(index)
+            .ok_or_else(|| error("missing transaction input"))?;
+        let parent_output = if let Some(parent) = &input.non_witness_utxo {
+            // BIP174/Core require the txid, not the witness transaction hash.
+            if parent.txid() != txin.previous_output.txid {
+                return Err(error("non-witness UTXO txid differs from outpoint"));
+            }
+            Some(
+                parent
+                    .outputs
+                    .get(txin.previous_output.vout as usize)
+                    .ok_or_else(|| error("previous output index does not exist"))?,
+            )
+        } else {
+            None
+        };
+        if let (Some(parent), Some(witness)) = (parent_output, input.witness_utxo.as_ref()) {
+            if parent != witness {
+                return Err(error("witness UTXO differs from referenced parent output"));
+            }
+        }
+        let output = parent_output.or(input.witness_utxo.as_ref());
+        if output.is_some_and(|output| {
+            output.value.as_sat() < 0 || output.value.as_sat() > Amount::MAX_MONEY.as_sat()
+        }) {
+            return Err(error("previous output amount is out of range"));
+        }
+        Ok(output)
+    }
+
     fn validate_structure(&self) -> Result<(), PsbtError> {
         if self.inputs.len() != self.unsigned_tx.inputs.len() {
             return Err(PsbtError::InputCountMismatch {
@@ -1126,6 +1196,25 @@ impl Psbt {
             output.value.as_sat() < 0 || output.value.as_sat() > Amount::MAX_MONEY.as_sat()
         }) {
             return Err(PsbtError::Other("PSBT output value out of range".into()));
+        }
+        for (index, input) in self.inputs.iter().enumerate() {
+            let utxo = self.input_utxo(index)?;
+            check_script_commitments(
+                utxo.map(|output| &output.script_pubkey),
+                input.redeem_script.as_ref(),
+                input.witness_script.as_ref(),
+            )
+            .map_err(|reason| PsbtError::InconsistentInput { index, reason })?;
+        }
+        for (index, output) in self.outputs.iter().enumerate() {
+            check_script_commitments(
+                Some(&self.unsigned_tx.outputs[index].script_pubkey),
+                output.redeem_script.as_ref(),
+                output.witness_script.as_ref(),
+            )
+            .map_err(|reason| {
+                PsbtError::Other(format!("inconsistent PSBT output {index}: {reason}"))
+            })?;
         }
         match self.version {
             0 => {
@@ -1418,6 +1507,237 @@ fn merge_output(mine: &mut PsbtOutput, theirs: &PsbtOutput) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn script_psbt() -> Psbt {
+        let witness = ScriptBuf::from_bytes(vec![0x51]);
+        let redeem = ScriptBuf::p2wsh(&crate::hash::sha256(witness.as_bytes()));
+        let mut parent = make_unsigned_tx();
+        parent.outputs[0] = TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: ScriptBuf::p2sh(&crate::hash::hash160(redeem.as_bytes())),
+        };
+        let mut tx = make_unsigned_tx();
+        tx.inputs[0].previous_output = OutPoint::new(parent.txid(), 0);
+        tx.outputs[0].script_pubkey = parent.outputs[0].script_pubkey.clone();
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(parent.outputs[0].clone());
+        psbt.inputs[0].non_witness_utxo = Some(parent);
+        psbt.inputs[0].redeem_script = Some(redeem.clone());
+        psbt.inputs[0].witness_script = Some(witness.clone());
+        psbt.outputs[0].redeem_script = Some(redeem);
+        psbt.outputs[0].witness_script = Some(witness);
+        psbt
+    }
+
+    fn unchecked_wire(psbt: &Psbt) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        psbt.serialize_to(&mut bytes).unwrap();
+        bytes
+    }
+
+    fn assert_inconsistent_input(psbt: &Psbt) {
+        assert!(matches!(
+            Psbt::deserialize(&unchecked_wire(psbt)),
+            Err(PsbtError::InconsistentInput { .. })
+        ));
+        assert!(matches!(
+            psbt.try_serialize(),
+            Err(PsbtError::InconsistentInput { .. })
+        ));
+        assert!(matches!(
+            psbt.convert_version(0),
+            Err(PsbtError::InconsistentInput { .. })
+        ));
+        assert!(matches!(
+            psbt.clone().finalize(),
+            Err(PsbtError::InconsistentInput { .. })
+        ));
+    }
+
+    #[test]
+    fn published_bip174_utxo_and_script_cases() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/data/bip174-utxo.json")).unwrap();
+        let cases = fixture["vectors"].as_array().unwrap();
+        assert_eq!(cases.len(), 11);
+        for case in cases {
+            let name = case["case"].as_str().unwrap();
+            let parsed = Psbt::deserialize(&hex::decode(case["hex"].as_str().unwrap()).unwrap());
+            if case["status"] == "script_mismatch" {
+                assert!(
+                    matches!(parsed, Err(PsbtError::InconsistentInput { .. })),
+                    "{name}: {parsed:?}"
+                );
+            } else {
+                let psbt = parsed.unwrap_or_else(|error| panic!("{name}: {error}"));
+                assert_eq!(
+                    Psbt::deserialize(&psbt.try_serialize().unwrap()).unwrap(),
+                    psbt,
+                    "{name}"
+                );
+                assert_eq!(
+                    psbt.convert_version(2).unwrap().convert_version(0).unwrap(),
+                    psbt,
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn supplied_parent_must_match_txid_index_and_witness_record() {
+        for version in [0, 2] {
+            let base = script_psbt().convert_version(version).unwrap();
+            assert_eq!(
+                base.input_utxo(0).unwrap(),
+                base.inputs[0].witness_utxo.as_ref()
+            );
+            assert!(base.input_utxo(usize::MAX).is_err());
+            let mut bad = base.clone();
+            bad.unsigned_tx.inputs[0].previous_output.txid = TxHash::from_bytes([0; 32]);
+            assert_inconsistent_input(&bad);
+            bad = base.clone();
+            bad.unsigned_tx.inputs[0].previous_output.vout = u32::MAX;
+            assert_inconsistent_input(&bad);
+            bad = base.clone();
+            bad.inputs[0].non_witness_utxo.as_mut().unwrap().lock_time ^= 1;
+            assert_inconsistent_input(&bad);
+            bad = base.clone();
+            bad.inputs[0].witness_utxo.as_mut().unwrap().value = Amount::from_sat(100_001);
+            assert_inconsistent_input(&bad);
+            bad = base.clone();
+            bad.inputs[0].witness_utxo.as_mut().unwrap().script_pubkey = ScriptBuf::new();
+            assert_inconsistent_input(&bad);
+            let mut witnessed_parent = base.clone();
+            witnessed_parent.inputs[0]
+                .non_witness_utxo
+                .as_mut()
+                .unwrap()
+                .witness = vec![Witness::from_items(vec![vec![1]])];
+            assert_ne!(
+                witnessed_parent.inputs[0]
+                    .non_witness_utxo
+                    .as_ref()
+                    .unwrap()
+                    .wtxid(),
+                witnessed_parent.unsigned_tx.inputs[0].previous_output.txid
+            );
+            assert!(witnessed_parent.try_serialize().is_ok());
+            let mut missing = base;
+            missing.inputs[0].non_witness_utxo = None;
+            assert!(missing.try_serialize().is_ok()); // witness-only remains an updater claim
+            missing.inputs[0].witness_utxo = None;
+            assert_eq!(missing.input_utxo(0).unwrap(), None);
+            assert!(missing.try_serialize().is_ok()); // known redeem/witness commitments still agree
+        }
+    }
+
+    #[test]
+    fn supplied_prevout_amounts_are_bounded() {
+        let check_amount = |bad: &Psbt| {
+            // The wire TxOut decoder already rejects bad amounts. The public
+            // in-memory model must also fail before serializing/extracting.
+            assert!(matches!(Psbt::deserialize(&unchecked_wire(bad)),
+                Err(PsbtError::Encode(EncodeError::InvalidData(message))) if message == "invalid output value"));
+            assert!(matches!(
+                bad.input_utxo(0),
+                Err(PsbtError::InconsistentInput { .. })
+            ));
+            assert!(matches!(
+                bad.try_serialize(),
+                Err(PsbtError::InconsistentInput { .. })
+            ));
+            assert!(matches!(
+                bad.clone().finalize(),
+                Err(PsbtError::InconsistentInput { .. })
+            ));
+        };
+        for amount in [-1, Amount::MAX_MONEY.as_sat() + 1] {
+            let mut bad = script_psbt();
+            bad.inputs[0].non_witness_utxo = None;
+            bad.inputs[0].witness_utxo.as_mut().unwrap().value = Amount::from_sat(amount);
+            check_amount(&bad);
+            let mut bad = script_psbt();
+            bad.inputs[0].witness_utxo = None;
+            let parent = bad.inputs[0].non_witness_utxo.as_mut().unwrap();
+            parent.outputs[0].value = Amount::from_sat(amount);
+            bad.unsigned_tx.inputs[0].previous_output.txid = parent.txid();
+            check_amount(&bad);
+        }
+    }
+
+    #[test]
+    fn known_redeem_and_witness_commitments_cannot_be_substituted() {
+        for version in [0, 2] {
+            let base = script_psbt().convert_version(version).unwrap();
+            for redeem in [true, false] {
+                let mut bad = base.clone();
+                let field = if redeem {
+                    &mut bad.inputs[0].redeem_script
+                } else {
+                    &mut bad.inputs[0].witness_script
+                };
+                *field = Some(ScriptBuf::from_bytes(vec![0x52]));
+                assert_inconsistent_input(&bad);
+                let mut bad = base.clone();
+                let field = if redeem {
+                    &mut bad.outputs[0].redeem_script
+                } else {
+                    &mut bad.outputs[0].witness_script
+                };
+                *field = Some(ScriptBuf::from_bytes(vec![0x52]));
+                assert!(bad.try_serialize().is_err());
+                assert!(Psbt::deserialize(&unchecked_wire(&bad)).is_err());
+            }
+            let mut native = base.clone();
+            native.inputs[0].non_witness_utxo = None;
+            let redeem = native.inputs[0].redeem_script.take().unwrap();
+            native.inputs[0]
+                .witness_utxo
+                .as_mut()
+                .unwrap()
+                .script_pubkey = redeem;
+            assert!(native.try_serialize().is_ok());
+            native.inputs[0].witness_script = Some(ScriptBuf::new());
+            assert_inconsistent_input(&native);
+            let mut deferred = base.clone();
+            deferred.inputs[0].redeem_script = None;
+            deferred.inputs[0].witness_script = Some(ScriptBuf::new());
+            assert!(deferred.try_serialize().is_ok()); // P2SH hides the missing witness program
+            deferred.inputs[0].redeem_script = base.inputs[0].redeem_script.clone();
+            assert_inconsistent_input(&deferred);
+        }
+    }
+
+    #[test]
+    fn combining_complementary_spending_data_fails_atomically_on_conflict() {
+        let complete = script_psbt();
+        let mut parent_only = complete.clone();
+        parent_only.inputs[0].witness_utxo = None;
+        let mut witness_only = complete.clone();
+        witness_only.inputs[0].non_witness_utxo = None;
+        witness_only.inputs[0].witness_utxo.as_mut().unwrap().value = Amount::from_sat(100_001);
+        assert!(parent_only.try_serialize().is_ok());
+        assert!(witness_only.try_serialize().is_ok());
+        for (mut receiver, other) in [
+            (parent_only.clone(), witness_only.clone()),
+            (witness_only, parent_only),
+        ] {
+            let before = receiver.clone();
+            assert!(matches!(
+                receiver.merge(&other),
+                Err(PsbtError::InconsistentInput { .. })
+            ));
+            assert_eq!(receiver, before);
+        }
+        let mut deferred = complete.clone();
+        deferred.inputs[0].redeem_script = None;
+        deferred.inputs[0].witness_script = Some(ScriptBuf::new());
+        assert!(deferred.try_serialize().is_ok());
+        let before = deferred.clone();
+        assert!(deferred.merge(&complete).is_err());
+        assert_eq!(deferred, before);
+    }
 
     fn test_xonly_key() -> Vec<u8> {
         // Generator point, a real x-only key (secret scalar 1).
@@ -2037,16 +2357,7 @@ mod tests {
 
     #[test]
     fn test_roundtrip_with_redeem_witness_scripts() {
-        let tx = make_unsigned_tx();
-        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
-
-        let redeem = ScriptBuf::from_bytes(vec![0x51, 0x21, 0x02]);
-        let witness_s = ScriptBuf::from_bytes(vec![0x52, 0x21]);
-
-        psbt.inputs[0].redeem_script = Some(redeem.clone());
-        psbt.inputs[0].witness_script = Some(witness_s.clone());
-        psbt.outputs[0].redeem_script = Some(redeem.clone());
-        psbt.outputs[0].witness_script = Some(witness_s.clone());
+        let psbt = script_psbt();
 
         let bytes = psbt.serialize();
         let psbt2 = Psbt::deserialize(&bytes).unwrap();
@@ -2244,19 +2555,11 @@ mod tests {
 
     #[test]
     fn test_merge_with_all_fields_populated() {
-        let tx = make_unsigned_tx();
-        let mut psbt_a = Psbt::from_unsigned_tx(tx.clone()).unwrap();
-        let mut psbt_b = Psbt::from_unsigned_tx(tx).unwrap();
+        let mut psbt_b = script_psbt();
+        let mut psbt_a = Psbt::from_unsigned_tx(psbt_b.unsigned_tx.clone()).unwrap();
 
-        // Fill psbt_b with fields that psbt_a doesn't have
-        psbt_b.inputs[0].non_witness_utxo = Some(make_unsigned_tx());
-        psbt_b.inputs[0].witness_utxo = Some(TxOut {
-            value: Amount::from_sat(100_000),
-            script_pubkey: ScriptBuf::p2wpkh(&[0xBB; 20]),
-        });
+        // Fill fields not already covered by the hash-matching spending fixture.
         psbt_b.inputs[0].sighash_type = Some(1);
-        psbt_b.inputs[0].redeem_script = Some(ScriptBuf::from_bytes(vec![0x51]));
-        psbt_b.inputs[0].witness_script = Some(ScriptBuf::from_bytes(vec![0x52]));
         psbt_b.inputs[0].final_script_sig = Some(ScriptBuf::from_bytes(vec![0x53]));
         psbt_b.inputs[0].final_script_witness = Some(vec![vec![0x54]]);
         psbt_b.inputs[0].tap_key_sig = Some(vec![0x55; 64]);
@@ -2284,8 +2587,6 @@ mod tests {
         psbt_b.inputs[0]
             .unknown
             .push((vec![0xFD, 0x01, 0x01], vec![0x60]));
-        psbt_b.outputs[0].redeem_script = Some(ScriptBuf::from_bytes(vec![0x61]));
-        psbt_b.outputs[0].witness_script = Some(ScriptBuf::from_bytes(vec![0x62]));
         psbt_b.outputs[0].tap_internal_key = Some(test_xonly_key());
         psbt_b.outputs[0].tap_tree = Some(vec![TapTreeLeaf {
             depth: 0,
@@ -2386,9 +2687,8 @@ mod tests {
 
     #[test]
     fn test_serialize_with_non_witness_utxo() {
-        let tx = make_unsigned_tx();
-        let mut psbt = Psbt::from_unsigned_tx(tx.clone()).unwrap();
-        psbt.inputs[0].non_witness_utxo = Some(tx);
+        let mut psbt = script_psbt();
+        psbt.inputs[0].witness_utxo = None;
 
         let bytes = psbt.serialize();
         let psbt2 = Psbt::deserialize(&bytes).unwrap();
@@ -2529,10 +2829,7 @@ mod tests {
 
     #[test]
     fn test_roundtrip_output_redeem_and_witness_scripts() {
-        let tx = make_unsigned_tx();
-        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
-        psbt.outputs[0].redeem_script = Some(ScriptBuf::from_bytes(vec![0x01, 0x02]));
-        psbt.outputs[0].witness_script = Some(ScriptBuf::from_bytes(vec![0x03, 0x04]));
+        let psbt = script_psbt();
 
         let bytes = psbt.serialize();
         let psbt2 = Psbt::deserialize(&bytes).unwrap();

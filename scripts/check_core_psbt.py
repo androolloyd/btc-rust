@@ -7,6 +7,7 @@ transactions; the Rust converter does not claim to verify or create signatures.
 """
 import argparse
 import base64
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -58,16 +59,22 @@ def check_taproot_metadata(decoded, independent):
         assert tree == core_tree
 
 
-def taproot_script_addresses(port):
+def script_addresses(port, kind):
     # The BIP341 NUMS point has no known secret; the wallet must spend a leaf.
     nums = "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0"
     descriptors = core_rpc(port, "listdescriptors", [True])["descriptors"]
+    prefix = "tr(" if kind == "taproot-script" else "wpkh("
     original = next(d["desc"] for d in descriptors
-                    if d["active"] and not d["internal"] and d["desc"].startswith("tr("))
-    key = original.split("#")[0][3:-1]
+                    if d["active"] and not d["internal"] and d["desc"].startswith(prefix))
+    key = original.split("#")[0][len(prefix):-1]
     assert key.endswith("/0/*")
-    second = key[:-4] + "/1/*"
-    private = f"tr({nums},{{pk({key}),pk({second})}})"
+    if kind == "taproot-script":
+        second = key[:-4] + "/1/*"
+        private = f"tr({nums},{{pk({key}),pk({second})}})"
+    else:
+        private = f"wsh(pk({key}))"
+        if kind == "sh-wsh":
+            private = f"sh({private})"
     info = core_rpc(port, "getdescriptorinfo", [private])
     checked_private = private + "#" + info["checksum"]
     imported = core_rpc(port, "importdescriptors", [[{
@@ -77,6 +84,89 @@ def taproot_script_addresses(port):
     # These wallet root keys include hardened paths; their public serialization
     # cannot derive those paths. Core derives the test addresses with its private keys.
     return core_rpc(port, "deriveaddresses", [checked_private, [0, 1]])
+
+
+def compact_size(n):
+    if n < 253:
+        return bytes([n])
+    size = 2 if n <= 0xffff else 4 if n <= 0xffffffff else 8
+    return bytes([{2: 253, 4: 254, 8: 255}[size]]) + n.to_bytes(size, "little")
+
+
+def psbt_maps(raw):
+    stream = io.BytesIO(bytes.fromhex(raw))
+    assert stream.read(5) == b"psbt\xff"
+
+    def count():
+        first = stream.read(1)[0]
+        return first if first < 253 else int.from_bytes(stream.read({253: 2, 254: 4, 255: 8}[first]), "little")
+
+    maps = []
+    while stream.tell() < len(stream.getvalue()):
+        records = {}
+        while (size := count()):
+            key = stream.read(size)
+            records[key] = stream.read(count())
+        maps.append(records)
+    assert len(maps) == 3  # these real spends have one input and one output
+    return maps
+
+
+def encode_maps(maps):
+    wire = bytearray(b"psbt\xff")
+    for records in maps:
+        for key, value in records.items():
+            wire.extend(compact_size(len(key)) + key + compact_size(len(value)) + value)
+        wire.append(0)
+    return wire.hex()
+
+
+def reject_spending_data(args, raw, reason):
+    for command, extra in [("decode-psbt", []), ("convert-psbt", ["--version", "2"]), ("extract-psbt", [])]:
+        result = subprocess.run([str(args.node), "--json", command, raw, *extra],
+                                capture_output=True, text=True, timeout=30)
+        assert result.returncode != 0 and reason in result.stderr, (command, result.stderr)
+
+
+def check_spending_data(args, port, raw, finalized, coin, expected_tx):
+    parent = bytes.fromhex(core_rpc(port, "gettransaction", [coin["txid"]])["hex"])
+    actual = core_rpc(port, "gettxout", [coin["txid"], coin["vout"]])
+    amount = round(actual["value"] * 100_000_000)
+    script = bytes.fromhex(actual["scriptPubKey"]["hex"])
+    witness = amount.to_bytes(8, "little") + compact_size(len(script)) + script
+    for original in [raw, finalized]:
+        maps = psbt_maps(original)
+        maps[1][b"\x00"] = parent
+        good = encode_maps(maps)
+        info = cli(args.node, "decode-psbt", good)["inputs"][0]["utxo"]
+        assert info == {"value_sat": amount, "script_pubkey": script.hex(),
+                        "source": "non_witness_utxo", "txid_linked": True}
+        restored = cli(args.node, "convert-psbt", cli(args.node, "convert-psbt", good, "--version", "2")["psbt_hex"], "--version", "0")
+        result = core_rpc(port, "finalizepsbt", [encode64(restored["psbt_hex"])])
+        assert result["complete"] is True and result["hex"] == expected_tx
+        if original == finalized:
+            assert cli(args.node, "extract-psbt", restored["psbt_hex"])["tx_hex"] == expected_tx
+        # Mutating the parent's locktime changes its txid even when outputs agree.
+        corrupted = psbt_maps(good)
+        corrupted[1][b"\x00"] = parent[:-4] + (int.from_bytes(parent[-4:], "little") ^ 1).to_bytes(4, "little")
+        reject_spending_data(args, encode_maps(corrupted), "non-witness UTXO txid differs")
+        try:
+            core_rpc(port, "decodepsbt", [encode64(encode_maps(corrupted))])
+        except RuntimeError as error:
+            assert error.args[0]["code"] == -22
+        else:
+            raise AssertionError("Core accepted substituted parent transaction")
+        # Both records must describe precisely the same output, not just an amount.
+        for replacement in [(amount + 1).to_bytes(8, "little") + witness[8:], witness[:-1] + bytes([witness[-1] ^ 1])]:
+            corrupted = psbt_maps(good)
+            corrupted[1][b"\x01"] = replacement
+            reject_spending_data(args, encode_maps(corrupted), "witness UTXO differs")
+        # Alter an actual supplied input/output script, including wrapped P2WSH.
+        for scope, key in [(1, b"\x04"), (1, b"\x05"), (2, b"\x00"), (2, b"\x01")]:
+            if key in maps[scope]:
+                corrupted = psbt_maps(good)
+                corrupted[scope][key] += b"\x00"
+                reject_spending_data(args, encode_maps(corrupted), "does not match")
 
 
 def check_published_taproot_vectors(args, port):
@@ -103,9 +193,24 @@ def check_published_taproot_vectors(args, port):
     print("PASSED: all 17 published BIP371 cases agree with Core v29", flush=True)
 
 
-def check_wallet(args, port, kind):
-    if kind == "taproot-script":
-        address, destination = taproot_script_addresses(port)
+def check_published_spending_vectors(args, port):
+    fixture = Path(__file__).resolve().parents[1] / "crates/primitives/tests/data/bip174-utxo.json"
+    for vector in json.loads(fixture.read_text())["vectors"]:
+        raw = vector["hex"]
+        if vector["status"] == "script_mismatch":
+            reject_spending_data(args, raw, "does not match")
+        else:
+            before = core_rpc(port, "decodepsbt", [encode64(raw)])
+            converted = cli(args.node, "convert-psbt", raw, "--version", "2")
+            restored = cli(args.node, "convert-psbt", converted["psbt_hex"], "--version", "0")
+            assert core_rpc(port, "decodepsbt", [encode64(restored["psbt_hex"])]) == before
+    print("PASSED: 8 published BIP174 spends preserve Core data; 3 signer-script failures rejected", flush=True)
+
+
+def check_wallet(args, port, kind, script_pair=None):
+    if kind in ["taproot-script", "wsh", "sh-wsh"]:
+        assert script_pair is not None
+        address, destination = script_pair
     else:
         address = core_rpc(port, "getnewaddress", ["", kind])
         destination = core_rpc(port, "getnewaddress", ["", kind])
@@ -156,6 +261,7 @@ def check_wallet(args, port, kind):
     # Already-finalized witnesses must survive the same conversion as well.
     final_psbt = core_rpc(port, "finalizepsbt", [signed, False])["psbt"]
     final_hex = base64.b64decode(final_psbt, validate=True).hex()
+    check_spending_data(args, port, original_hex, final_hex, coin, expected["hex"])
     v2_final = cli(args.node, "convert-psbt", final_hex, "--version", "2")
     final_restored = cli(args.node, "convert-psbt", v2_final["psbt_hex"], "--version", "0")
     assert core_rpc(port, "finalizepsbt", [encode64(final_restored["psbt_hex"])])["hex"] == expected["hex"]
@@ -193,9 +299,14 @@ def main():
             try:
                 wait_until(lambda: core_rpc(port, "getblockchaininfo", []))
                 core_rpc(port, "createwallet", ["psbt-interop"])
+                # Import before mining: only genesis needs scanning, and all
+                # subsequent test coins are observed as their blocks arrive.
+                script_pairs = {kind: script_addresses(port, kind)
+                                for kind in ["wsh", "sh-wsh", "taproot-script"]}
                 check_published_taproot_vectors(args, port)
-                for kind in ["bech32", "bech32m", "taproot-script"]:
-                    check_wallet(args, port, kind)
+                check_published_spending_vectors(args, port)
+                for kind in ["legacy", "p2sh-segwit", "bech32", "wsh", "sh-wsh", "bech32m", "taproot-script"]:
+                    check_wallet(args, port, kind, script_pairs.get(kind))
                 core_rpc(port, "stop", [])
                 core.wait(timeout=15)
                 assert core.returncode == 0

@@ -26,7 +26,7 @@ jobs:
           import json, pathlib
           corpus = pathlib.Path("fuzz/corpus/fuzz_psbt_decode")
           corpus.mkdir(parents=True, exist_ok=True)
-          for name in ["bip370", "bip371"]:
+          for name in ["bip174-utxo", "bip370", "bip371"]:
               source = pathlib.Path(f"crates/primitives/tests/data/{name}.json")
               for i, vector in enumerate(json.loads(source.read_text())["vectors"]):
                   (corpus / f"{name}-{i}").write_bytes(bytes.fromhex(vector["hex"]))
