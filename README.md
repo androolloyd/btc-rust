@@ -450,6 +450,9 @@ btc-node rpc METHOD   Send RPC command
 btc-node decode-tx    Decode raw transaction hex
 btc-node decode-script  Decode raw script hex
 btc-node decode-header  Decode raw block header hex
+btc-node decode-psbt    Inspect PSBT v0/v2 hex
+btc-node convert-psbt   Convert PSBT hex with --version 0 or 2
+btc-node extract-psbt   Extract externally finalized PSBT fields
 btc-node watch ADDR   Watch address for transactions
 btc-node simulate-tx  Simulate transaction (dry run)
 btc-node compile      Compile miniscript policy to script
@@ -474,11 +477,16 @@ Run flags:
   --datacarrier-size BYTES    (custom OP_RETURN data limit)
 ```
 
+PSBT CLI tools use hexadecimal input and support BIP174 v0 and BIP370 v2.
+See [PSBT tools and verification scope](docs/PSBT.md) for usage, resource limits
+and the distinction between extraction and signature verification.
+
 ## Testing
 
 ```bash
-cargo test                    # 909 tests, 0 failures
-cargo test -p btc-consensus   # Consensus tests (267 tests)
+./scripts/check.sh            # Full workspace, feature, lint and release gate
+cargo test                    # Default workspace tests
+cargo test -p btc-consensus   # Consensus tests
 cargo test -p btc-primitives  # Primitives + Core test vectors
 cargo test -p btc-network     # P2P codec + discovery
 cargo test -p btc-test        # Test harness

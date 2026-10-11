@@ -154,6 +154,20 @@ enum Commands {
         hex: String,
     },
 
+    /// Inspect PSBT v0/v2 hex (format checks; no signing or signature verification)
+    DecodePsbt { hex: String },
+
+    /// Convert PSBT hex between v0/v2, preserving the transaction and wallet metadata
+    ConvertPsbt {
+        hex: String,
+        /// Target PSBT version: 0 or 2
+        #[arg(long, value_parser = ["0", "2"])]
+        version: String,
+    },
+
+    /// Extract externally finalized PSBT fields (does not verify signatures)
+    ExtractPsbt { hex: String },
+
     /// Decode a raw script hex
     DecodeScript {
         /// Raw script hex
@@ -284,6 +298,18 @@ async fn main() -> eyre::Result<()> {
         Some(Commands::Version) => cmd_version(format),
         Some(Commands::Rpc { method, params }) => cmd_rpc(config, format, &method, &params).await,
         Some(Commands::DecodeTx { hex }) => cmd_decode_tx(&hex, format),
+        Some(Commands::DecodePsbt { hex }) => {
+            output::emit(format, &cli::decode_psbt(&hex)?);
+            Ok(())
+        }
+        Some(Commands::ConvertPsbt { hex, version }) => {
+            output::emit(format, &cli::convert_psbt(&hex, version.parse()?)?);
+            Ok(())
+        }
+        Some(Commands::ExtractPsbt { hex }) => {
+            output::emit(format, &cli::extract_psbt(&hex)?);
+            Ok(())
+        }
         Some(Commands::DecodeScript { hex }) => cmd_decode_script(&hex, format),
         Some(Commands::DecodeHeader { hex }) => cmd_decode_header(&hex, format),
         Some(Commands::Playground) => cmd_playground(),

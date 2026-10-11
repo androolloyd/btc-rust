@@ -64,3 +64,4 @@ jobs:
           with tarfile.open(archive) as source:
               source.extractall(directory, filter="data")
       - run: python3 scripts/check_core_p2p.py --bitcoind "$RUNNER_TEMP/btc-core29/bitcoin-29.0/bin/bitcoind"
+      - run: python3 scripts/check_core_psbt.py --bitcoind "$RUNNER_TEMP/btc-core29/bitcoin-29.0/bin/bitcoind"

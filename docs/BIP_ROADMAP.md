@@ -7,7 +7,7 @@ The [canonical BIP index](https://github.com/bitcoin/bips/blob/master/README.med
 | Immediate | 324 | Deployed | Inbound/outbound transport implemented; Core v29 inbound/outbound v1/v2 handshakes, matching v2 session IDs, live block/transaction relay, initial sync, signed mempool/RBF admission, spend reorg/undo, reconnect and restart pass. Expand long-session, hostile-peer and additional-version coverage. |
 | Immediate | 352 | Complete | Real address/sender/receiver vectors now pass; integrate wallet coin selection, scanning and backups. |
 | Immediate | 325 | Complete | Real challenge verification implemented; replay public Signet blocks. |
-| Next | 370, 371 | Deployed | Audit current PSBT v0, then add v2 and all Taproot PSBT fields using rejection and roundtrip vectors. |
+| Next | 370, 371 | Deployed | PSBT v0/v2 parsing/conversion and external-final-field extraction now have all 47 BIP370 vectors and real Core v29 signed SegWit/Taproot CLI interoperability. Finish semantic BIP174/371 checks, remaining typed Taproot fields and wallet signing/finalization before MuSig2. |
 | Next | 327, 373 | Deployed; Complete | MuSig2 and PSBT integration, including strict nonce lifecycle and malicious-participant vectors. |
 | Follow | 374–376, 392 | Draft | DLEQ and silent-payment PSBT/descriptors after base wallet interoperability. |
 | Follow | 353 | Complete | Authenticated DNS payment instructions and address-resolution errors. |

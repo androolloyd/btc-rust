@@ -65,6 +65,76 @@ pub fn script_type(script: &Script) -> &str {
 // Decode helpers
 // ---------------------------------------------------------------------------
 
+fn parse_psbt_hex(hex_str: &str) -> eyre::Result<btc_primitives::psbt::Psbt> {
+    if hex_str.len() > btc_primitives::psbt::MAX_PSBT_SIZE * 2 {
+        eyre::bail!("PSBT exceeds parser size limit");
+    }
+    Ok(btc_primitives::psbt::Psbt::deserialize(&hex::decode(
+        hex_str,
+    )?)?)
+}
+
+/// Inspect an actual PSBT. Neither decoding nor extraction verifies signatures.
+pub fn decode_psbt(hex_str: &str) -> eyre::Result<serde_json::Value> {
+    let psbt = parse_psbt_hex(hex_str)?;
+    Ok(serde_json::json!({
+        "psbt_version": psbt.version,
+        "tx_version": psbt.unsigned_tx.version,
+        "locktime": psbt.unsigned_tx.lock_time,
+        "fallback_locktime": psbt.fallback_lock_time,
+        "tx_modifiable": psbt.tx_modifiable,
+        "unsigned_tx_hex": hex::encode(btc_primitives::encode(&psbt.unsigned_tx)),
+        "unsigned_txid": psbt.unsigned_tx.txid().to_hex(),
+        "psbt_id": psbt.unique_id()?.to_hex(),
+        "signatures_verified": false,
+        "inputs": psbt.inputs.iter().enumerate().map(|(i, input)| {
+            let txin = &psbt.unsigned_tx.inputs[i];
+            serde_json::json!({
+                "txid": txin.previous_output.txid.to_hex(),
+                "vout": txin.previous_output.vout,
+                "sequence": txin.sequence,
+                "required_time_locktime": input.required_time_lock_time,
+                "required_height_locktime": input.required_height_lock_time,
+                "has_non_witness_utxo": input.non_witness_utxo.is_some(),
+                "has_witness_utxo": input.witness_utxo.is_some(),
+                "partial_signatures": input.partial_sigs.len(),
+                "has_final_fields": input.final_script_sig.is_some() || input.final_script_witness.is_some(),
+                "unknown_fields": input.unknown.len(),
+            })
+        }).collect::<Vec<_>>(),
+        "outputs": psbt.unsigned_tx.outputs.iter().map(|output| serde_json::json!({
+            "value_sat": output.value.as_sat(),
+            "script_pubkey": hex::encode(output.script_pubkey.as_bytes()),
+        })).collect::<Vec<_>>(),
+        "global_xpubs": psbt.xpub.len(),
+        "unknown_global_fields": psbt.unknown.len(),
+        "proprietary_global_fields": psbt.proprietary.len(),
+    }))
+}
+
+/// Convert version encoding without changing the transaction being signed.
+pub fn convert_psbt(hex_str: &str, version: u32) -> eyre::Result<serde_json::Value> {
+    let original = parse_psbt_hex(hex_str)?;
+    let converted = original.convert_version(version)?;
+    Ok(serde_json::json!({
+        "psbt_version": converted.version,
+        "psbt_hex": hex::encode(converted.try_serialize()?),
+        "unsigned_txid": converted.unsigned_tx.txid().to_hex(),
+        "signatures_verified": false,
+        "construction_fields_collapsed": original.version == 2 && version == 0,
+    }))
+}
+
+/// Extract externally finalized fields; submission still requires full validation.
+pub fn extract_psbt(hex_str: &str) -> eyre::Result<serde_json::Value> {
+    let tx = parse_psbt_hex(hex_str)?.finalize()?;
+    Ok(serde_json::json!({
+        "tx_hex": hex::encode(btc_primitives::encode(&tx)),
+        "txid": tx.txid().to_hex(),
+        "signatures_verified": false,
+    }))
+}
+
 /// Decode a raw transaction hex string and return a JSON representation.
 pub fn decode_tx(hex_str: &str) -> eyre::Result<serde_json::Value> {
     let bytes = hex::decode(hex_str)?;
@@ -583,6 +653,31 @@ mod tests {
     // -----------------------------------------------------------------------
     // parse_network
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn psbt_cli_inspects_and_converts_published_vector() {
+        let fixtures: serde_json::Value =
+            serde_json::from_str(include_str!("../../primitives/tests/data/bip370.json")).unwrap();
+        let vector = fixtures["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["status"] == "valid")
+            .unwrap();
+        let original = vector["hex"].as_str().unwrap();
+        let decoded = decode_psbt(original).unwrap();
+        assert_eq!(decoded["psbt_version"], 2);
+        assert_eq!(decoded["inputs"].as_array().unwrap().len(), 1);
+        assert_eq!(decoded["outputs"].as_array().unwrap().len(), 2);
+        assert_eq!(decoded["signatures_verified"], false);
+        let converted = convert_psbt(original, 0).unwrap();
+        assert_eq!(converted["construction_fields_collapsed"], true);
+        let v0 = decode_psbt(converted["psbt_hex"].as_str().unwrap()).unwrap();
+        assert_eq!(decoded["unsigned_tx_hex"], v0["unsigned_tx_hex"]);
+        assert_eq!(v0["psbt_version"], 0);
+        assert!(convert_psbt(original, 1).is_err());
+        assert!(decode_psbt("70736274ff010000").is_err());
+    }
 
     #[test]
     fn test_parse_network_mainnet() {

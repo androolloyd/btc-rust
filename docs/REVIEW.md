@@ -4,6 +4,8 @@ This is an experimental implementation. A green unit suite does not establish Bi
 
 ## Fixed findings
 
+- **P1 — false PSBT v2 support and unsafe wallet parsing:** the former parser always required a global unsigned transaction and its serializer emitted that field even for v2. BIP370 now reconstructs the actual transaction from required v2 map fields, excludes v0/v2-incompatible fields and resolves input locktime requirements. Canonical CompactSize key types, raw-key uniqueness, singleton/fixed lengths and full consumption are checked. Lengths/counts are bounded before allocation; corrupted model counts cannot panic extraction. Combining validates an isolated result before mutation and uses linear key unions. Compiled CLI inspection/conversion/extraction has all published BIP370 cases plus real Core v29 signed/finalized SegWit/Taproot acceptance. These tools do not claim to verify signatures or sign wallet transactions; complete BIP174/371 semantics remain tracked.
+
 - **P0 — Taproot signature bypass:** the generic witness dispatcher returned success for any nonempty Taproot witness. It now runs the real key/script-path verifier. Parallel block verification supplies every prevout required by BIP341; the regression proves a valid two-input signature fails when another prevout amount changes.
 - **P0 — double spending:** block connection reused entries from the immutable external UTXO view. It now tracks all spent outpoints, rejecting duplicate inputs and cross-transaction double spends.
 - **P0 — UTXO resurrection:** cached deletions fell through to the database before a flush. Tombstones now hide those entries immediately. Outputs created and spent within a block are omitted from forward state and undo restoration.
@@ -45,7 +47,11 @@ RPC chain operations require the installed node backend. The transport is still 
 
 The inbound P2P listener supports v1/BIP324 and committed-chain block relay with bounded handshakes and buffering. It enables transaction relay through the validated mempool and records BIP339 txid/wtxid negotiation. Outbound steady-state integration, explicit peer connections and reconnect from the durable tip are now implemented. Persistent branch/reorg handling and bounded transaction relay are implemented. Package admission, dynamic fee estimation/eviction and fee-optimized package mining remain unfinished; complete Core consensus and policy parity is still unverified. BIP324 authenticates packets with the negotiated keys; it does not authenticate the peer's identity. The released-Core tests cover small regtest chains and are not a full-chain replay claim.
 
+PSBT exposes optional BIP370 construction fields and a checked `try_serialize` API; invalid public models return errors there. The existing `serialize` convenience method panics on invalid models. CLI tools use hex explicitly and report `signatures_verified: false`. The legacy `finalize` method extracts externally finalized fields without verifying their spending conditions. See [PSBT.md](PSBT.md) for the verified scope and remaining wallet work.
+
 ## Primary references
+
+- [BIP174 PSBT](https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki), [BIP370 v2 and vectors](https://github.com/bitcoin/bips/blob/master/bip-0370.mediawiki), [BIP371 Taproot fields](https://github.com/bitcoin/bips/blob/master/bip-0371.mediawiki), and [Core v29 PSBT RPCs](https://github.com/bitcoin/bitcoin/blob/v29.0/src/rpc/rawtransaction.cpp)
 
 - [Bitcoin Core serialization](https://github.com/bitcoin/bitcoin/blob/master/src/serialize.h)
 - [Core v29 chain parameters](https://github.com/bitcoin/bitcoin/blob/v29.0/src/kernel/chainparams.cpp), [CScript integer encoding](https://github.com/bitcoin/bitcoin/blob/v29.0/src/script/script.h), and [mining RPCs](https://github.com/bitcoin/bitcoin/blob/master/src/rpc/mining.cpp)

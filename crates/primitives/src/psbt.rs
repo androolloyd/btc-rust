@@ -5,9 +5,12 @@
 //! magic bytes `0x70736274ff` ("psbt" + 0xff separator) followed by key-value
 //! maps: one global map, then per-input and per-output maps separated by 0x00.
 
+use crate::amount::Amount;
 use crate::encode::{Decodable, Encodable, EncodeError, VarInt};
+use crate::hash::TxHash;
 use crate::script::ScriptBuf;
-use crate::transaction::{Transaction, TxOut, Witness};
+use crate::transaction::{OutPoint, Transaction, TxIn, TxOut, Witness};
+use std::collections::HashSet;
 use std::io::{self, Cursor, Read, Write};
 use thiserror::Error;
 
@@ -17,41 +20,49 @@ use thiserror::Error;
 
 /// PSBT magic bytes: "psbt" (0x70 0x73 0x62 0x74) followed by 0xff separator.
 const PSBT_MAGIC: [u8; 5] = [0x70, 0x73, 0x62, 0x74, 0xff];
+/// Resource bound for the in-memory parser, not a Bitcoin consensus limit.
+pub const MAX_PSBT_SIZE: usize = 32 * 1024 * 1024;
+const MAX_PSBT_MAPS: usize = 100_000;
 
 // ---------------------------------------------------------------------------
 // Global key types (BIP174)
 // ---------------------------------------------------------------------------
 
-const PSBT_GLOBAL_UNSIGNED_TX: u8 = 0x00;
-const PSBT_GLOBAL_XPUB: u8 = 0x01;
-const PSBT_GLOBAL_VERSION: u8 = 0xFB;
+const PSBT_GLOBAL_UNSIGNED_TX: u64 = 0x00;
+const PSBT_GLOBAL_XPUB: u64 = 0x01;
+const PSBT_GLOBAL_TX_VERSION: u64 = 0x02;
+const PSBT_GLOBAL_FALLBACK_LOCKTIME: u64 = 0x03;
+const PSBT_GLOBAL_INPUT_COUNT: u64 = 0x04;
+const PSBT_GLOBAL_OUTPUT_COUNT: u64 = 0x05;
+const PSBT_GLOBAL_TX_MODIFIABLE: u64 = 0x06;
+const PSBT_GLOBAL_VERSION: u64 = 0xFB;
 
 // ---------------------------------------------------------------------------
 // Per-input key types (BIP174 / BIP371)
 // ---------------------------------------------------------------------------
 
-const PSBT_IN_NON_WITNESS_UTXO: u8 = 0x00;
-const PSBT_IN_WITNESS_UTXO: u8 = 0x01;
-const PSBT_IN_PARTIAL_SIG: u8 = 0x02;
-const PSBT_IN_SIGHASH_TYPE: u8 = 0x03;
-const PSBT_IN_REDEEM_SCRIPT: u8 = 0x04;
-const PSBT_IN_WITNESS_SCRIPT: u8 = 0x05;
-const PSBT_IN_BIP32_DERIVATION: u8 = 0x06;
-const PSBT_IN_FINAL_SCRIPTSIG: u8 = 0x07;
-const PSBT_IN_FINAL_SCRIPTWITNESS: u8 = 0x08;
-const PSBT_IN_TAP_KEY_SIG: u8 = 0x13;
-const PSBT_IN_TAP_SCRIPT_SIG: u8 = 0x14;
-const PSBT_IN_TAP_INTERNAL_KEY: u8 = 0x17;
-const PSBT_IN_TAP_MERKLE_ROOT: u8 = 0x18;
+const PSBT_IN_NON_WITNESS_UTXO: u64 = 0x00;
+const PSBT_IN_WITNESS_UTXO: u64 = 0x01;
+const PSBT_IN_PARTIAL_SIG: u64 = 0x02;
+const PSBT_IN_SIGHASH_TYPE: u64 = 0x03;
+const PSBT_IN_REDEEM_SCRIPT: u64 = 0x04;
+const PSBT_IN_WITNESS_SCRIPT: u64 = 0x05;
+const PSBT_IN_BIP32_DERIVATION: u64 = 0x06;
+const PSBT_IN_FINAL_SCRIPTSIG: u64 = 0x07;
+const PSBT_IN_FINAL_SCRIPTWITNESS: u64 = 0x08;
+const PSBT_IN_TAP_KEY_SIG: u64 = 0x13;
+const PSBT_IN_TAP_SCRIPT_SIG: u64 = 0x14;
+const PSBT_IN_TAP_INTERNAL_KEY: u64 = 0x17;
+const PSBT_IN_TAP_MERKLE_ROOT: u64 = 0x18;
 
 // ---------------------------------------------------------------------------
 // Per-output key types (BIP174 / BIP371)
 // ---------------------------------------------------------------------------
 
-const PSBT_OUT_REDEEM_SCRIPT: u8 = 0x00;
-const PSBT_OUT_WITNESS_SCRIPT: u8 = 0x01;
-const PSBT_OUT_BIP32_DERIVATION: u8 = 0x02;
-const PSBT_OUT_TAP_INTERNAL_KEY: u8 = 0x05;
+const PSBT_OUT_REDEEM_SCRIPT: u64 = 0x00;
+const PSBT_OUT_WITNESS_SCRIPT: u64 = 0x01;
+const PSBT_OUT_BIP32_DERIVATION: u64 = 0x02;
+const PSBT_OUT_TAP_INTERNAL_KEY: u64 = 0x05;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -107,6 +118,9 @@ pub struct PsbtInput {
     pub bip32_derivation: Vec<(Vec<u8>, KeySource)>,
     pub final_script_sig: Option<ScriptBuf>,
     pub final_script_witness: Option<Vec<Vec<u8>>>,
+    /// BIP370 requirements; present only in PSBT v2.
+    pub required_time_lock_time: Option<u32>,
+    pub required_height_lock_time: Option<u32>,
     // Taproot fields (BIP371)
     pub tap_key_sig: Option<Vec<u8>>,
     pub tap_script_sigs: Vec<(Vec<u8>, Vec<u8>)>,
@@ -142,6 +156,10 @@ pub struct Psbt {
     pub unsigned_tx: Transaction,
     /// PSBT version (0 for BIP174, 2 for BIP370).
     pub version: u32,
+    /// BIP370 fallback when no input specifies a locktime requirement.
+    pub fallback_lock_time: Option<u32>,
+    /// BIP370 constructor permissions, including undefined bits for forwarding.
+    pub tx_modifiable: Option<u8>,
     /// Global extended public keys with derivation info.
     pub xpub: Vec<(Vec<u8>, KeySource)>,
     /// Per-input maps (length must equal `unsigned_tx.inputs.len()`).
@@ -178,28 +196,141 @@ fn write_kv<W: Write>(writer: &mut W, key: &[u8], value: &[u8]) -> Result<(), Ps
 }
 
 /// Read a single PSBT key. Returns `None` when the separator (0x00) is hit.
-fn read_key<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>, PsbtError> {
+fn read_key(reader: &mut Cursor<&[u8]>) -> Result<Option<Vec<u8>>, PsbtError> {
     let key_len = read_compact_size(reader)?;
     if key_len == 0 {
         return Ok(None); // separator
     }
-    let mut key = vec![0u8; key_len as usize];
-    reader.read_exact(&mut key)?;
-    Ok(Some(key))
+    Ok(Some(read_blob(reader, key_len)?))
 }
 
 /// Read a PSBT value blob.
-fn read_value<R: Read>(reader: &mut R) -> Result<Vec<u8>, PsbtError> {
+fn read_value(reader: &mut Cursor<&[u8]>) -> Result<Vec<u8>, PsbtError> {
     let val_len = read_compact_size(reader)?;
-    let mut val = vec![0u8; val_len as usize];
-    reader.read_exact(&mut val)?;
-    Ok(val)
+    read_blob(reader, val_len)
+}
+
+fn remaining(reader: &Cursor<&[u8]>) -> usize {
+    reader
+        .get_ref()
+        .len()
+        .saturating_sub(reader.position() as usize)
+}
+
+fn read_blob(reader: &mut Cursor<&[u8]>, len: u64) -> Result<Vec<u8>, PsbtError> {
+    if len > remaining(reader) as u64 {
+        return Err(PsbtError::Other(
+            "PSBT length exceeds remaining bytes".into(),
+        ));
+    }
+    let mut value = vec![0; len as usize];
+    reader.read_exact(&mut value)?;
+    Ok(value)
+}
+
+/// Key type is a canonical CompactSize integer, not necessarily one byte.
+fn split_key(key: &[u8]) -> Result<(u64, &[u8]), PsbtError> {
+    let mut cursor = Cursor::new(key);
+    let kind = read_compact_size(&mut cursor)?;
+    Ok((kind, &key[cursor.position() as usize..]))
+}
+
+fn singleton(key_data: &[u8]) -> Result<(), PsbtError> {
+    if !key_data.is_empty() {
+        return Err(PsbtError::Other("singleton PSBT key has key data".into()));
+    }
+    Ok(())
+}
+
+fn fixed<const N: usize>(value: &[u8]) -> Result<[u8; N], PsbtError> {
+    value
+        .try_into()
+        .map_err(|_| PsbtError::Other(format!("expected {N}-byte PSBT value")))
+}
+
+fn v2_only(version: u32) -> Result<(), PsbtError> {
+    if version != 2 {
+        return Err(PsbtError::Other(
+            "BIP370 field is excluded in PSBT v0".into(),
+        ));
+    }
+    Ok(())
+}
+
+type Map = Vec<(Vec<u8>, Vec<u8>)>;
+
+fn read_map(r: &mut Cursor<&[u8]>, budget: &mut usize) -> Result<Map, PsbtError> {
+    let mut seen = HashSet::new();
+    let mut map = Vec::new();
+    while let Some(key) = read_key(r)? {
+        *budget = budget
+            .checked_sub(1)
+            .ok_or_else(|| PsbtError::Other("too many PSBT key-value pairs".into()))?;
+        split_key(&key)?;
+        if !seen.insert(key.clone()) {
+            return Err(PsbtError::DuplicateKey(key));
+        }
+        map.push((key, read_value(r)?));
+    }
+    Ok(map)
+}
+
+fn public_key_shape(key: &[u8]) -> Result<(), PsbtError> {
+    if !((key.len() == 33 && matches!(key[0], 2 | 3)) || (key.len() == 65 && key[0] == 4)) {
+        return Err(PsbtError::Other("invalid PSBT public key encoding".into()));
+    }
+    Ok(())
+}
+
+fn tap_signature_shape(signature: &[u8]) -> Result<(), PsbtError> {
+    if !matches!(signature.len(), 64 | 65) {
+        return Err(PsbtError::Other(
+            "Taproot signature must be 64 or 65 bytes".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn determine_lock_time(inputs: &[PsbtInput], fallback: Option<u32>) -> Result<u32, PsbtError> {
+    let mut max_height = 0;
+    let mut max_time = 0;
+    let mut height_possible = true;
+    let mut time_possible = true;
+    for input in inputs {
+        if let Some(height) = input.required_height_lock_time {
+            if height == 0 || height >= 500_000_000 {
+                return Err(PsbtError::Other("invalid required height locktime".into()));
+            }
+            max_height = max_height.max(height);
+        }
+        if let Some(time) = input.required_time_lock_time {
+            if time < 500_000_000 {
+                return Err(PsbtError::Other("invalid required time locktime".into()));
+            }
+            max_time = max_time.max(time);
+        }
+        if input.required_height_lock_time.is_some() || input.required_time_lock_time.is_some() {
+            height_possible &= input.required_height_lock_time.is_some();
+            time_possible &= input.required_time_lock_time.is_some();
+        }
+    }
+    if max_height == 0 && max_time == 0 {
+        Ok(fallback.unwrap_or(0))
+    } else if height_possible {
+        Ok(max_height)
+    } else if time_possible {
+        Ok(max_time)
+    } else {
+        Err(PsbtError::Other(
+            "incompatible PSBT input locktime requirements".into(),
+        ))
+    }
 }
 
 /// Build a key from its type byte and optional extra data.
-fn make_key(key_type: u8, extra: &[u8]) -> Vec<u8> {
+fn make_key(key_type: u64, extra: &[u8]) -> Vec<u8> {
     let mut k = Vec::with_capacity(1 + extra.len());
-    k.push(key_type);
+    VarInt(key_type).encode(&mut k).expect("Vec write");
     k.extend_from_slice(extra);
     k
 }
@@ -276,6 +407,8 @@ impl Psbt {
         Ok(Psbt {
             unsigned_tx: tx,
             version: 0,
+            fallback_lock_time: None,
+            tx_modifiable: None,
             xpub: Vec::new(),
             inputs: vec![PsbtInput::default(); num_inputs],
             outputs: vec![PsbtOutput::default(); num_outputs],
@@ -290,10 +423,23 @@ impl Psbt {
 
     /// Serialize the PSBT to its binary representation.
     pub fn serialize(&self) -> Vec<u8> {
+        self.try_serialize()
+            .expect("invalid PSBT model; use try_serialize for fallible serialization")
+    }
+
+    /// Serialize after checking map counts, version rules and wire structure.
+    pub fn try_serialize(&self) -> Result<Vec<u8>, PsbtError> {
+        self.validate_structure()?;
         let mut buf = Vec::new();
-        self.serialize_to(&mut buf)
-            .expect("serializing to Vec should not fail");
-        buf
+        self.serialize_to(&mut buf)?;
+        // Also catches duplicate keys introduced through the public collections,
+        // including collisions of unknown fields with fields managed here.
+        if Self::deserialize(&buf)? != *self {
+            return Err(PsbtError::Other(
+                "PSBT model contains a managed field in an unknown collection".into(),
+            ));
+        }
+        Ok(buf)
     }
 
     fn serialize_to<W: Write>(&self, w: &mut W) -> Result<(), PsbtError> {
@@ -302,8 +448,39 @@ impl Psbt {
 
         // -- Global map --
         // Unsigned tx (key type 0x00, no key data)
-        let tx_bytes = tx_to_bytes(&self.unsigned_tx);
-        write_kv(w, &[PSBT_GLOBAL_UNSIGNED_TX], &tx_bytes)?;
+        if self.version == 0 {
+            write_kv(
+                w,
+                &[PSBT_GLOBAL_UNSIGNED_TX as u8],
+                &tx_to_bytes(&self.unsigned_tx),
+            )?;
+        } else {
+            write_kv(
+                w,
+                &[PSBT_GLOBAL_TX_VERSION as u8],
+                &self.unsigned_tx.version.to_le_bytes(),
+            )?;
+            if let Some(locktime) = self.fallback_lock_time {
+                write_kv(
+                    w,
+                    &[PSBT_GLOBAL_FALLBACK_LOCKTIME as u8],
+                    &locktime.to_le_bytes(),
+                )?;
+            }
+            write_kv(
+                w,
+                &[PSBT_GLOBAL_INPUT_COUNT as u8],
+                &crate::encode::encode(&VarInt(self.inputs.len() as u64)),
+            )?;
+            write_kv(
+                w,
+                &[PSBT_GLOBAL_OUTPUT_COUNT as u8],
+                &crate::encode::encode(&VarInt(self.outputs.len() as u64)),
+            )?;
+            if let Some(flags) = self.tx_modifiable {
+                write_kv(w, &[PSBT_GLOBAL_TX_MODIFIABLE as u8], &[flags])?;
+            }
+        }
 
         // Xpubs
         for (xpub_data, key_source) in &self.xpub {
@@ -316,7 +493,7 @@ impl Psbt {
         if self.version != 0 {
             let mut val = Vec::with_capacity(4);
             val.extend_from_slice(&self.version.to_le_bytes());
-            write_kv(w, &[PSBT_GLOBAL_VERSION], &val)?;
+            write_kv(w, &[PSBT_GLOBAL_VERSION as u8], &val)?;
         }
 
         // Proprietary
@@ -333,13 +510,32 @@ impl Psbt {
         w.write_all(&[0x00])?;
 
         // -- Per-input maps --
-        for input in &self.inputs {
+        for (index, input) in self.inputs.iter().enumerate() {
+            if self.version == 2 {
+                let txin = &self.unsigned_tx.inputs[index];
+                write_kv(w, &[0x0e], txin.previous_output.txid.as_bytes())?;
+                write_kv(w, &[0x0f], &txin.previous_output.vout.to_le_bytes())?;
+                if txin.sequence != u32::MAX {
+                    write_kv(w, &[0x10], &txin.sequence.to_le_bytes())?;
+                }
+                if let Some(locktime) = input.required_time_lock_time {
+                    write_kv(w, &[0x11], &locktime.to_le_bytes())?;
+                }
+                if let Some(locktime) = input.required_height_lock_time {
+                    write_kv(w, &[0x12], &locktime.to_le_bytes())?;
+                }
+            }
             self.serialize_input(w, input)?;
             w.write_all(&[0x00])?;
         }
 
         // -- Per-output maps --
-        for output in &self.outputs {
+        for (index, output) in self.outputs.iter().enumerate() {
+            if self.version == 2 {
+                let txout = &self.unsigned_tx.outputs[index];
+                write_kv(w, &[0x03], &txout.value.as_sat().to_le_bytes())?;
+                write_kv(w, &[0x04], txout.script_pubkey.as_bytes())?;
+            }
             self.serialize_output(w, output)?;
             w.write_all(&[0x00])?;
         }
@@ -349,48 +545,48 @@ impl Psbt {
 
     fn serialize_input<W: Write>(&self, w: &mut W, inp: &PsbtInput) -> Result<(), PsbtError> {
         if let Some(ref tx) = inp.non_witness_utxo {
-            write_kv(w, &[PSBT_IN_NON_WITNESS_UTXO], &tx_to_bytes(tx))?;
+            write_kv(w, &[PSBT_IN_NON_WITNESS_UTXO as u8], &tx_to_bytes(tx))?;
         }
         if let Some(ref txo) = inp.witness_utxo {
-            write_kv(w, &[PSBT_IN_WITNESS_UTXO], &txout_to_bytes(txo))?;
+            write_kv(w, &[PSBT_IN_WITNESS_UTXO as u8], &txout_to_bytes(txo))?;
         }
         for (pubkey, sig) in &inp.partial_sigs {
             let key = make_key(PSBT_IN_PARTIAL_SIG, pubkey);
             write_kv(w, &key, sig)?;
         }
         if let Some(sht) = inp.sighash_type {
-            write_kv(w, &[PSBT_IN_SIGHASH_TYPE], &sht.to_le_bytes())?;
+            write_kv(w, &[PSBT_IN_SIGHASH_TYPE as u8], &sht.to_le_bytes())?;
         }
         if let Some(ref rs) = inp.redeem_script {
-            write_kv(w, &[PSBT_IN_REDEEM_SCRIPT], rs.as_bytes())?;
+            write_kv(w, &[PSBT_IN_REDEEM_SCRIPT as u8], rs.as_bytes())?;
         }
         if let Some(ref ws) = inp.witness_script {
-            write_kv(w, &[PSBT_IN_WITNESS_SCRIPT], ws.as_bytes())?;
+            write_kv(w, &[PSBT_IN_WITNESS_SCRIPT as u8], ws.as_bytes())?;
         }
         for (pubkey, ks) in &inp.bip32_derivation {
             let key = make_key(PSBT_IN_BIP32_DERIVATION, pubkey);
             write_kv(w, &key, &encode_key_source(ks))?;
         }
         if let Some(ref fs) = inp.final_script_sig {
-            write_kv(w, &[PSBT_IN_FINAL_SCRIPTSIG], fs.as_bytes())?;
+            write_kv(w, &[PSBT_IN_FINAL_SCRIPTSIG as u8], fs.as_bytes())?;
         }
         if let Some(ref fw) = inp.final_script_witness {
             let val = encode_witness_stack(fw);
-            write_kv(w, &[PSBT_IN_FINAL_SCRIPTWITNESS], &val)?;
+            write_kv(w, &[PSBT_IN_FINAL_SCRIPTWITNESS as u8], &val)?;
         }
         // Taproot
         if let Some(ref tks) = inp.tap_key_sig {
-            write_kv(w, &[PSBT_IN_TAP_KEY_SIG], tks)?;
+            write_kv(w, &[PSBT_IN_TAP_KEY_SIG as u8], tks)?;
         }
         for (key_data, sig) in &inp.tap_script_sigs {
             let key = make_key(PSBT_IN_TAP_SCRIPT_SIG, key_data);
             write_kv(w, &key, sig)?;
         }
         if let Some(ref tik) = inp.tap_internal_key {
-            write_kv(w, &[PSBT_IN_TAP_INTERNAL_KEY], tik)?;
+            write_kv(w, &[PSBT_IN_TAP_INTERNAL_KEY as u8], tik)?;
         }
         if let Some(ref tmr) = inp.tap_merkle_root {
-            write_kv(w, &[PSBT_IN_TAP_MERKLE_ROOT], tmr)?;
+            write_kv(w, &[PSBT_IN_TAP_MERKLE_ROOT as u8], tmr)?;
         }
         // Unknown
         for (key, val) in &inp.unknown {
@@ -401,17 +597,17 @@ impl Psbt {
 
     fn serialize_output<W: Write>(&self, w: &mut W, out: &PsbtOutput) -> Result<(), PsbtError> {
         if let Some(ref rs) = out.redeem_script {
-            write_kv(w, &[PSBT_OUT_REDEEM_SCRIPT], rs.as_bytes())?;
+            write_kv(w, &[PSBT_OUT_REDEEM_SCRIPT as u8], rs.as_bytes())?;
         }
         if let Some(ref ws) = out.witness_script {
-            write_kv(w, &[PSBT_OUT_WITNESS_SCRIPT], ws.as_bytes())?;
+            write_kv(w, &[PSBT_OUT_WITNESS_SCRIPT as u8], ws.as_bytes())?;
         }
         for (pubkey, ks) in &out.bip32_derivation {
             let key = make_key(PSBT_OUT_BIP32_DERIVATION, pubkey);
             write_kv(w, &key, &encode_key_source(ks))?;
         }
         if let Some(ref tik) = out.tap_internal_key {
-            write_kv(w, &[PSBT_OUT_TAP_INTERNAL_KEY], tik)?;
+            write_kv(w, &[PSBT_OUT_TAP_INTERNAL_KEY as u8], tik)?;
         }
         // Unknown
         for (key, val) in &out.unknown {
@@ -424,205 +620,404 @@ impl Psbt {
     // Deserialize
     // =====================================================================
 
-    /// Deserialize a PSBT from its binary representation.
+    /// Deserialize a bounded, complete PSBT. This checks format, not signatures.
     pub fn deserialize(data: &[u8]) -> Result<Self, PsbtError> {
-        let mut cursor = Cursor::new(data);
-        Self::deserialize_from(&mut cursor)
-    }
-
-    fn deserialize_from<R: Read>(r: &mut R) -> Result<Self, PsbtError> {
-        // -- Magic --
+        if data.len() > MAX_PSBT_SIZE {
+            return Err(PsbtError::Other("PSBT exceeds parser size limit".into()));
+        }
+        let mut r = Cursor::new(data);
         let mut magic = [0u8; 5];
         r.read_exact(&mut magic)?;
         if magic != PSBT_MAGIC {
             return Err(PsbtError::InvalidMagic);
         }
-
-        // -- Global map --
-        let mut unsigned_tx: Option<Transaction> = None;
-        let mut version: u32 = 0;
-        let mut xpub: Vec<(Vec<u8>, KeySource)> = Vec::new();
-        let mut proprietary: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        let mut unknown: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-
-        loop {
-            let key = match read_key(r)? {
-                Some(k) => k,
-                None => break, // separator
-            };
-            let value = read_value(r)?;
-
-            if key.is_empty() {
-                return Err(PsbtError::Other("empty key in global map".into()));
-            }
-            let key_type = key[0];
-            let key_data = &key[1..];
-
-            match key_type {
+        let mut pair_budget = MAX_PSBT_MAPS;
+        let mut unsigned_tx = None;
+        let mut version = 0;
+        let mut tx_version = None;
+        let mut fallback_lock_time = None;
+        let mut input_count = None;
+        let mut output_count = None;
+        let mut tx_modifiable = None;
+        let mut xpub = Vec::new();
+        let mut proprietary = Vec::new();
+        let mut unknown = Vec::new();
+        for (key, value) in read_map(&mut r, &mut pair_budget)? {
+            let (kind, key_data) = split_key(&key)?;
+            match kind {
                 PSBT_GLOBAL_UNSIGNED_TX => {
-                    if unsigned_tx.is_some() {
-                        return Err(PsbtError::DuplicateKey(key));
-                    }
+                    singleton(key_data)?;
                     unsigned_tx = Some(tx_from_bytes(&value)?);
                 }
                 PSBT_GLOBAL_XPUB => {
-                    let ks = decode_key_source(&value)?;
-                    xpub.push((key_data.to_vec(), ks));
+                    if key_data.len() != 78 {
+                        return Err(PsbtError::Other("global xpub must be 78 bytes".into()));
+                    }
+                    xpub.push((key_data.to_vec(), decode_key_source(&value)?));
                 }
                 PSBT_GLOBAL_VERSION => {
-                    if value.len() != 4 {
-                        return Err(PsbtError::Other("invalid PSBT version length".into()));
-                    }
-                    version = u32::from_le_bytes([value[0], value[1], value[2], value[3]]);
+                    singleton(key_data)?;
+                    version = u32::from_le_bytes(fixed(&value)?);
                 }
-                _ => {
-                    // Proprietary keys start with 0xFC
-                    if key_type == 0xFC {
-                        proprietary.push((key.clone(), value));
+                PSBT_GLOBAL_TX_VERSION => {
+                    singleton(key_data)?;
+                    tx_version = Some(i32::from_le_bytes(fixed(&value)?));
+                }
+                PSBT_GLOBAL_FALLBACK_LOCKTIME => {
+                    singleton(key_data)?;
+                    fallback_lock_time = Some(u32::from_le_bytes(fixed(&value)?));
+                }
+                PSBT_GLOBAL_INPUT_COUNT | PSBT_GLOBAL_OUTPUT_COUNT => {
+                    singleton(key_data)?;
+                    let count: VarInt = crate::encode::decode(&value)?;
+                    let count = usize::try_from(count.0)
+                        .map_err(|_| PsbtError::Other("PSBT map count overflow".into()))?;
+                    if kind == PSBT_GLOBAL_INPUT_COUNT {
+                        input_count = Some(count);
                     } else {
-                        unknown.push((key.clone(), value));
+                        output_count = Some(count);
                     }
                 }
+                PSBT_GLOBAL_TX_MODIFIABLE => {
+                    singleton(key_data)?;
+                    tx_modifiable = Some(fixed::<1>(&value)?[0]);
+                }
+                0xfc => proprietary.push((key, value)),
+                _ => unknown.push((key, value)),
             }
         }
-
-        let tx = unsigned_tx.ok_or(PsbtError::MissingUnsignedTx)?;
-        let num_inputs = tx.inputs.len();
-        let num_outputs = tx.outputs.len();
-
-        // -- Per-input maps --
+        let (mut tx, num_inputs, num_outputs) = match version {
+            0 => {
+                if tx_version.is_some()
+                    || fallback_lock_time.is_some()
+                    || input_count.is_some()
+                    || output_count.is_some()
+                    || tx_modifiable.is_some()
+                {
+                    return Err(PsbtError::Other(
+                        "BIP370 global fields are excluded in PSBT v0".into(),
+                    ));
+                }
+                let tx = unsigned_tx.ok_or(PsbtError::MissingUnsignedTx)?;
+                let counts = (tx.inputs.len(), tx.outputs.len());
+                (tx, counts.0, counts.1)
+            }
+            2 => {
+                if unsigned_tx.is_some() {
+                    return Err(PsbtError::Other(
+                        "unsigned transaction is excluded in PSBT v2".into(),
+                    ));
+                }
+                let version = tx_version
+                    .ok_or_else(|| PsbtError::Other("missing v2 transaction version".into()))?;
+                let ni =
+                    input_count.ok_or_else(|| PsbtError::Other("missing v2 input count".into()))?;
+                let no = output_count
+                    .ok_or_else(|| PsbtError::Other("missing v2 output count".into()))?;
+                (
+                    Transaction {
+                        version,
+                        inputs: Vec::new(),
+                        outputs: Vec::new(),
+                        witness: Vec::new(),
+                        lock_time: 0,
+                    },
+                    ni,
+                    no,
+                )
+            }
+            _ => {
+                return Err(PsbtError::Other(format!(
+                    "unsupported PSBT version {version}"
+                )))
+            }
+        };
+        let count = num_inputs
+            .checked_add(num_outputs)
+            .ok_or_else(|| PsbtError::Other("PSBT map count overflow".into()))?;
+        // Each map requires at least a separator. Bound before capacity allocation.
+        if count > MAX_PSBT_MAPS || count > remaining(&r) {
+            return Err(PsbtError::Other(
+                "PSBT map count exceeds available bytes or resource limit".into(),
+            ));
+        }
         let mut inputs = Vec::with_capacity(num_inputs);
-        for _ in 0..num_inputs {
-            inputs.push(Self::deserialize_input(r)?);
-        }
-
-        // -- Per-output maps --
         let mut outputs = Vec::with_capacity(num_outputs);
-        for _ in 0..num_outputs {
-            outputs.push(Self::deserialize_output(r)?);
+        for _ in 0..num_inputs {
+            let (input, txin) = Self::deserialize_input(&mut r, version, &mut pair_budget)?;
+            inputs.push(input);
+            if let Some(txin) = txin {
+                tx.inputs.push(txin);
+            }
         }
-
-        Ok(Psbt {
+        for _ in 0..num_outputs {
+            let (output, txout) = Self::deserialize_output(&mut r, version, &mut pair_budget)?;
+            outputs.push(output);
+            if let Some(txout) = txout {
+                tx.outputs.push(txout);
+            }
+        }
+        if remaining(&r) != 0 {
+            return Err(PsbtError::Other("trailing PSBT bytes".into()));
+        }
+        if version == 2 {
+            tx.lock_time = determine_lock_time(&inputs, fallback_lock_time)?;
+        }
+        let psbt = Psbt {
             unsigned_tx: tx,
             version,
+            fallback_lock_time,
+            tx_modifiable,
             xpub,
             inputs,
             outputs,
             proprietary,
             unknown,
-        })
+        };
+        psbt.validate_structure()?;
+        Ok(psbt)
     }
 
-    fn deserialize_input<R: Read>(r: &mut R) -> Result<PsbtInput, PsbtError> {
+    fn deserialize_input(
+        r: &mut Cursor<&[u8]>,
+        version: u32,
+        pair_budget: &mut usize,
+    ) -> Result<(PsbtInput, Option<TxIn>), PsbtError> {
         let mut inp = PsbtInput::default();
-
-        loop {
-            let key = match read_key(r)? {
-                Some(k) => k,
-                None => break,
-            };
-            let value = read_value(r)?;
-
-            if key.is_empty() {
-                return Err(PsbtError::Other("empty key in input map".into()));
+        let mut previous_txid = None;
+        let mut output_index = None;
+        let mut sequence = u32::MAX;
+        for (key, value) in read_map(r, pair_budget)? {
+            let (kind, key_data) = split_key(&key)?;
+            // All recognized input types except signatures/derivations are singletons.
+            if matches!(kind, 0x00 | 0x01 | 0x03..=0x05 | 0x07 | 0x08 | 0x0e..=0x13 | 0x17 | 0x18) {
+                singleton(key_data)?;
             }
-            let key_type = key[0];
-            let key_data = &key[1..];
-
-            match key_type {
-                PSBT_IN_NON_WITNESS_UTXO => {
-                    inp.non_witness_utxo = Some(tx_from_bytes(&value)?);
-                }
-                PSBT_IN_WITNESS_UTXO => {
-                    inp.witness_utxo = Some(txout_from_bytes(&value)?);
-                }
+            match kind {
+                PSBT_IN_NON_WITNESS_UTXO => inp.non_witness_utxo = Some(tx_from_bytes(&value)?),
+                PSBT_IN_WITNESS_UTXO => inp.witness_utxo = Some(txout_from_bytes(&value)?),
                 PSBT_IN_PARTIAL_SIG => {
+                    public_key_shape(key_data)?;
                     inp.partial_sigs.push((key_data.to_vec(), value));
                 }
-                PSBT_IN_SIGHASH_TYPE => {
-                    if value.len() != 4 {
-                        return Err(PsbtError::Other("invalid sighash_type length".into()));
-                    }
-                    inp.sighash_type =
-                        Some(u32::from_le_bytes([value[0], value[1], value[2], value[3]]));
-                }
-                PSBT_IN_REDEEM_SCRIPT => {
-                    inp.redeem_script = Some(ScriptBuf::from_bytes(value));
-                }
-                PSBT_IN_WITNESS_SCRIPT => {
-                    inp.witness_script = Some(ScriptBuf::from_bytes(value));
-                }
+                PSBT_IN_SIGHASH_TYPE => inp.sighash_type = Some(u32::from_le_bytes(fixed(&value)?)),
+                PSBT_IN_REDEEM_SCRIPT => inp.redeem_script = Some(ScriptBuf::from_bytes(value)),
+                PSBT_IN_WITNESS_SCRIPT => inp.witness_script = Some(ScriptBuf::from_bytes(value)),
                 PSBT_IN_BIP32_DERIVATION => {
-                    let ks = decode_key_source(&value)?;
-                    inp.bip32_derivation.push((key_data.to_vec(), ks));
+                    public_key_shape(key_data)?;
+                    inp.bip32_derivation
+                        .push((key_data.to_vec(), decode_key_source(&value)?));
                 }
                 PSBT_IN_FINAL_SCRIPTSIG => {
-                    inp.final_script_sig = Some(ScriptBuf::from_bytes(value));
+                    inp.final_script_sig = Some(ScriptBuf::from_bytes(value))
                 }
                 PSBT_IN_FINAL_SCRIPTWITNESS => {
-                    inp.final_script_witness = Some(decode_witness_stack(&value)?);
+                    inp.final_script_witness = Some(decode_witness_stack(&value)?)
+                }
+                0x0e => {
+                    v2_only(version)?;
+                    previous_txid = Some(TxHash::from_bytes(fixed(&value)?));
+                }
+                0x0f => {
+                    v2_only(version)?;
+                    output_index = Some(u32::from_le_bytes(fixed(&value)?));
+                }
+                0x10 => {
+                    v2_only(version)?;
+                    sequence = u32::from_le_bytes(fixed(&value)?);
+                }
+                0x11 => {
+                    v2_only(version)?;
+                    inp.required_time_lock_time = Some(u32::from_le_bytes(fixed(&value)?));
+                }
+                0x12 => {
+                    v2_only(version)?;
+                    inp.required_height_lock_time = Some(u32::from_le_bytes(fixed(&value)?));
                 }
                 PSBT_IN_TAP_KEY_SIG => {
+                    tap_signature_shape(&value)?;
                     inp.tap_key_sig = Some(value);
                 }
                 PSBT_IN_TAP_SCRIPT_SIG => {
+                    fixed::<64>(key_data)?;
+                    tap_signature_shape(&value)?;
                     inp.tap_script_sigs.push((key_data.to_vec(), value));
                 }
                 PSBT_IN_TAP_INTERNAL_KEY => {
+                    fixed::<32>(&value)?;
                     inp.tap_internal_key = Some(value);
                 }
-                PSBT_IN_TAP_MERKLE_ROOT => {
-                    if value.len() != 32 {
-                        return Err(PsbtError::Other("invalid tap_merkle_root length".into()));
-                    }
-                    let mut root = [0u8; 32];
-                    root.copy_from_slice(&value);
-                    inp.tap_merkle_root = Some(root);
-                }
-                _ => {
-                    inp.unknown.push((key.clone(), value));
-                }
+                PSBT_IN_TAP_MERKLE_ROOT => inp.tap_merkle_root = Some(fixed(&value)?),
+                _ => inp.unknown.push((key, value)),
             }
         }
-        Ok(inp)
+        let txin = if version == 2 {
+            Some(TxIn {
+                previous_output: OutPoint::new(
+                    previous_txid
+                        .ok_or_else(|| PsbtError::Other("missing v2 previous txid".into()))?,
+                    output_index
+                        .ok_or_else(|| PsbtError::Other("missing v2 output index".into()))?,
+                ),
+                script_sig: ScriptBuf::new(),
+                sequence,
+            })
+        } else {
+            None
+        };
+        Ok((inp, txin))
     }
 
-    fn deserialize_output<R: Read>(r: &mut R) -> Result<PsbtOutput, PsbtError> {
+    fn deserialize_output(
+        r: &mut Cursor<&[u8]>,
+        version: u32,
+        pair_budget: &mut usize,
+    ) -> Result<(PsbtOutput, Option<TxOut>), PsbtError> {
         let mut out = PsbtOutput::default();
-
-        loop {
-            let key = match read_key(r)? {
-                Some(k) => k,
-                None => break,
-            };
-            let value = read_value(r)?;
-
-            if key.is_empty() {
-                return Err(PsbtError::Other("empty key in output map".into()));
+        let mut amount = None;
+        let mut script = None;
+        for (key, value) in read_map(r, pair_budget)? {
+            let (kind, key_data) = split_key(&key)?;
+            if matches!(kind, 0x00 | 0x01 | 0x03..=0x05) {
+                singleton(key_data)?;
             }
-            let key_type = key[0];
-            let key_data = &key[1..];
-
-            match key_type {
-                PSBT_OUT_REDEEM_SCRIPT => {
-                    out.redeem_script = Some(ScriptBuf::from_bytes(value));
-                }
-                PSBT_OUT_WITNESS_SCRIPT => {
-                    out.witness_script = Some(ScriptBuf::from_bytes(value));
-                }
+            match kind {
+                PSBT_OUT_REDEEM_SCRIPT => out.redeem_script = Some(ScriptBuf::from_bytes(value)),
+                PSBT_OUT_WITNESS_SCRIPT => out.witness_script = Some(ScriptBuf::from_bytes(value)),
                 PSBT_OUT_BIP32_DERIVATION => {
-                    let ks = decode_key_source(&value)?;
-                    out.bip32_derivation.push((key_data.to_vec(), ks));
+                    public_key_shape(key_data)?;
+                    out.bip32_derivation
+                        .push((key_data.to_vec(), decode_key_source(&value)?));
+                }
+                0x03 => {
+                    v2_only(version)?;
+                    amount = Some(Amount::from_sat(i64::from_le_bytes(fixed(&value)?)));
+                }
+                0x04 => {
+                    v2_only(version)?;
+                    script = Some(ScriptBuf::from_bytes(value));
                 }
                 PSBT_OUT_TAP_INTERNAL_KEY => {
+                    fixed::<32>(&value)?;
                     out.tap_internal_key = Some(value);
                 }
-                _ => {
-                    out.unknown.push((key.clone(), value));
-                }
+                _ => out.unknown.push((key, value)),
             }
         }
-        Ok(out)
+        let txout = if version == 2 {
+            Some(TxOut {
+                value: amount.ok_or_else(|| PsbtError::Other("missing v2 output amount".into()))?,
+                script_pubkey: script
+                    .ok_or_else(|| PsbtError::Other("missing v2 output script".into()))?,
+            })
+        } else {
+            None
+        };
+        Ok((out, txout))
+    }
+
+    fn validate_structure(&self) -> Result<(), PsbtError> {
+        if self.inputs.len() != self.unsigned_tx.inputs.len() {
+            return Err(PsbtError::InputCountMismatch {
+                psbt: self.inputs.len(),
+                tx: self.unsigned_tx.inputs.len(),
+            });
+        }
+        if self.outputs.len() != self.unsigned_tx.outputs.len() {
+            return Err(PsbtError::OutputCountMismatch {
+                psbt: self.outputs.len(),
+                tx: self.unsigned_tx.outputs.len(),
+            });
+        }
+        if self
+            .unsigned_tx
+            .inputs
+            .iter()
+            .any(|i| !i.script_sig.is_empty())
+            || self.unsigned_tx.is_segwit()
+        {
+            return Err(PsbtError::NonEmptyScriptSig);
+        }
+        if self.unsigned_tx.outputs.iter().any(|output| {
+            output.value.as_sat() < 0 || output.value.as_sat() > Amount::MAX_MONEY.as_sat()
+        }) {
+            return Err(PsbtError::Other("PSBT output value out of range".into()));
+        }
+        match self.version {
+            0 => {
+                if self.fallback_lock_time.is_some()
+                    || self.tx_modifiable.is_some()
+                    || self.inputs.iter().any(|i| {
+                        i.required_time_lock_time.is_some() || i.required_height_lock_time.is_some()
+                    })
+                {
+                    return Err(PsbtError::Other(
+                        "BIP370 fields are excluded in PSBT v0".into(),
+                    ));
+                }
+            }
+            2 => {
+                if determine_lock_time(&self.inputs, self.fallback_lock_time)?
+                    != self.unsigned_tx.lock_time
+                {
+                    return Err(PsbtError::Other(
+                        "v2 fields disagree with transaction locktime".into(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(PsbtError::Other(format!(
+                    "unsupported PSBT version {}",
+                    self.version
+                )))
+            }
+        }
+        Ok(())
+    }
+
+    /// Convert v0/v2 encoding while retaining signatures and unknown metadata.
+    /// V2 construction permissions and per-input locktime requirements are
+    /// necessarily collapsed into the actual transaction when converting to v0.
+    pub fn convert_version(&self, version: u32) -> Result<Self, PsbtError> {
+        self.try_serialize()?;
+        let mut result = self.clone();
+        match version {
+            0 => {
+                result.fallback_lock_time = None;
+                result.tx_modifiable = None;
+                for input in &mut result.inputs {
+                    input.required_time_lock_time = None;
+                    input.required_height_lock_time = None;
+                }
+            }
+            2 if self.version == 0 => {
+                result.fallback_lock_time = Some(self.unsigned_tx.lock_time);
+                // This conversion commits to the existing transaction. It does
+                // not grant permission to modify signed inputs or outputs.
+                result.tx_modifiable = Some(0);
+            }
+            2 => {}
+            _ => {
+                return Err(PsbtError::Other(format!(
+                    "unsupported PSBT version {version}"
+                )))
+            }
+        }
+        result.version = version;
+        result.try_serialize()?;
+        Ok(result)
+    }
+
+    /// BIP370 identity uses zero sequences, distinct from the extracted txid.
+    pub fn unique_id(&self) -> Result<TxHash, PsbtError> {
+        self.validate_structure()?;
+        let mut tx = self.unsigned_tx.clone();
+        if self.version == 2 {
+            for input in &mut tx.inputs {
+                input.sequence = 0;
+            }
+        }
+        Ok(tx.txid())
     }
 
     // =====================================================================
@@ -635,53 +1030,46 @@ impl Psbt {
     /// signatures and derivation information are combined; fields already
     /// present in `self` are kept when both PSBTs contain the same key.
     pub fn merge(&mut self, other: &Psbt) -> Result<(), PsbtError> {
+        self.try_serialize()?;
+        other.try_serialize()?;
+        if self.version != other.version
+            || self.fallback_lock_time != other.fallback_lock_time
+            || self.tx_modifiable != other.tx_modifiable
+            || self.inputs.iter().zip(&other.inputs).any(|(a, b)| {
+                a.required_time_lock_time != b.required_time_lock_time
+                    || a.required_height_lock_time != b.required_height_lock_time
+            })
+        {
+            return Err(PsbtError::Other(
+                "convert versions and reconcile v2 construction fields before combining".into(),
+            ));
+        }
         if self.unsigned_tx != other.unsigned_tx {
             return Err(PsbtError::TxMismatch);
         }
 
+        let mut combined = self.clone();
         // Merge global xpubs
-        for (xpub, ks) in &other.xpub {
-            if !self.xpub.iter().any(|(x, _)| x == xpub) {
-                self.xpub.push((xpub.clone(), ks.clone()));
-            }
-        }
+        merge_keyed(&mut combined.xpub, &other.xpub);
 
         // Merge proprietary
-        for (k, v) in &other.proprietary {
-            if !self.proprietary.iter().any(|(ek, _)| ek == k) {
-                self.proprietary.push((k.clone(), v.clone()));
-            }
-        }
+        merge_keyed(&mut combined.proprietary, &other.proprietary);
 
         // Merge unknown
-        for (k, v) in &other.unknown {
-            if !self.unknown.iter().any(|(ek, _)| ek == k) {
-                self.unknown.push((k.clone(), v.clone()));
-            }
-        }
+        merge_keyed(&mut combined.unknown, &other.unknown);
 
         // Merge inputs
-        if self.inputs.len() != other.inputs.len() {
-            return Err(PsbtError::InputCountMismatch {
-                psbt: self.inputs.len(),
-                tx: other.inputs.len(),
-            });
-        }
-        for (mine, theirs) in self.inputs.iter_mut().zip(other.inputs.iter()) {
+        for (mine, theirs) in combined.inputs.iter_mut().zip(other.inputs.iter()) {
             merge_input(mine, theirs);
         }
 
         // Merge outputs
-        if self.outputs.len() != other.outputs.len() {
-            return Err(PsbtError::OutputCountMismatch {
-                psbt: self.outputs.len(),
-                tx: other.outputs.len(),
-            });
-        }
-        for (mine, theirs) in self.outputs.iter_mut().zip(other.outputs.iter()) {
+        for (mine, theirs) in combined.outputs.iter_mut().zip(other.outputs.iter()) {
             merge_output(mine, theirs);
         }
 
+        combined.try_serialize()?;
+        *self = combined;
         Ok(())
     }
 
@@ -689,11 +1077,13 @@ impl Psbt {
     // Finalize
     // =====================================================================
 
-    /// Finalize the PSBT and extract a complete, signed `Transaction`.
+    /// Extract a transaction from fields populated by an external finalizer.
     ///
     /// Each input must have `final_script_sig` and/or `final_script_witness`
     /// populated (the Finalizer role is expected to have filled these in).
+    /// This does not verify signatures or whether those scripts spend the UTXOs.
     pub fn finalize(&mut self) -> Result<Transaction, PsbtError> {
+        self.try_serialize()?;
         let mut tx = self.unsigned_tx.clone();
         let mut witnesses: Vec<Witness> = Vec::with_capacity(tx.inputs.len());
         let mut has_witness = false;
@@ -746,13 +1136,19 @@ fn encode_witness_stack(items: &[Vec<u8>]) -> Vec<u8> {
 /// Decode a witness stack from PSBT value bytes.
 fn decode_witness_stack(data: &[u8]) -> Result<Vec<Vec<u8>>, PsbtError> {
     let mut cursor = Cursor::new(data);
-    let count = read_compact_size(&mut cursor)? as usize;
+    let count = read_compact_size(&mut cursor)?;
+    if count > remaining(&cursor) as u64 || count > MAX_PSBT_MAPS as u64 {
+        return Err(PsbtError::Other(
+            "witness count exceeds available bytes or resource limit".into(),
+        ));
+    }
+    let count = count as usize;
     let mut items = Vec::with_capacity(count);
     for _ in 0..count {
-        let len = read_compact_size(&mut cursor)? as usize;
-        let mut item = vec![0u8; len];
-        cursor.read_exact(&mut item)?;
-        items.push(item);
+        items.push(read_value(&mut cursor)?);
+    }
+    if remaining(&cursor) != 0 {
+        return Err(PsbtError::Other("trailing final witness bytes".into()));
     }
     Ok(items)
 }
@@ -760,6 +1156,15 @@ fn decode_witness_stack(data: &[u8]) -> Result<Vec<Vec<u8>>, PsbtError> {
 // =========================================================================
 // Merge helpers
 // =========================================================================
+
+fn merge_keyed<T: Clone>(mine: &mut Vec<(Vec<u8>, T)>, theirs: &[(Vec<u8>, T)]) {
+    let mut keys: HashSet<Vec<u8>> = mine.iter().map(|(key, _)| key.clone()).collect();
+    for (key, value) in theirs {
+        if keys.insert(key.clone()) {
+            mine.push((key.clone(), value.clone()));
+        }
+    }
+}
 
 fn merge_input(mine: &mut PsbtInput, theirs: &PsbtInput) {
     if mine.non_witness_utxo.is_none() {
@@ -769,11 +1174,7 @@ fn merge_input(mine: &mut PsbtInput, theirs: &PsbtInput) {
         mine.witness_utxo = theirs.witness_utxo.clone();
     }
     // Merge partial sigs — add any we don't already have
-    for (pk, sig) in &theirs.partial_sigs {
-        if !mine.partial_sigs.iter().any(|(k, _)| k == pk) {
-            mine.partial_sigs.push((pk.clone(), sig.clone()));
-        }
-    }
+    merge_keyed(&mut mine.partial_sigs, &theirs.partial_sigs);
     if mine.sighash_type.is_none() {
         mine.sighash_type = theirs.sighash_type;
     }
@@ -783,11 +1184,7 @@ fn merge_input(mine: &mut PsbtInput, theirs: &PsbtInput) {
     if mine.witness_script.is_none() {
         mine.witness_script = theirs.witness_script.clone();
     }
-    for (pk, ks) in &theirs.bip32_derivation {
-        if !mine.bip32_derivation.iter().any(|(k, _)| k == pk) {
-            mine.bip32_derivation.push((pk.clone(), ks.clone()));
-        }
-    }
+    merge_keyed(&mut mine.bip32_derivation, &theirs.bip32_derivation);
     if mine.final_script_sig.is_none() {
         mine.final_script_sig = theirs.final_script_sig.clone();
     }
@@ -798,11 +1195,7 @@ fn merge_input(mine: &mut PsbtInput, theirs: &PsbtInput) {
     if mine.tap_key_sig.is_none() {
         mine.tap_key_sig = theirs.tap_key_sig.clone();
     }
-    for (k, v) in &theirs.tap_script_sigs {
-        if !mine.tap_script_sigs.iter().any(|(ek, _)| ek == k) {
-            mine.tap_script_sigs.push((k.clone(), v.clone()));
-        }
-    }
+    merge_keyed(&mut mine.tap_script_sigs, &theirs.tap_script_sigs);
     if mine.tap_internal_key.is_none() {
         mine.tap_internal_key = theirs.tap_internal_key.clone();
     }
@@ -810,11 +1203,7 @@ fn merge_input(mine: &mut PsbtInput, theirs: &PsbtInput) {
         mine.tap_merkle_root = theirs.tap_merkle_root;
     }
     // Unknown
-    for (k, v) in &theirs.unknown {
-        if !mine.unknown.iter().any(|(ek, _)| ek == k) {
-            mine.unknown.push((k.clone(), v.clone()));
-        }
-    }
+    merge_keyed(&mut mine.unknown, &theirs.unknown);
 }
 
 fn merge_output(mine: &mut PsbtOutput, theirs: &PsbtOutput) {
@@ -824,20 +1213,12 @@ fn merge_output(mine: &mut PsbtOutput, theirs: &PsbtOutput) {
     if mine.witness_script.is_none() {
         mine.witness_script = theirs.witness_script.clone();
     }
-    for (pk, ks) in &theirs.bip32_derivation {
-        if !mine.bip32_derivation.iter().any(|(k, _)| k == pk) {
-            mine.bip32_derivation.push((pk.clone(), ks.clone()));
-        }
-    }
+    merge_keyed(&mut mine.bip32_derivation, &theirs.bip32_derivation);
     if mine.tap_internal_key.is_none() {
         mine.tap_internal_key = theirs.tap_internal_key.clone();
     }
     // Unknown
-    for (k, v) in &theirs.unknown {
-        if !mine.unknown.iter().any(|(ek, _)| ek == k) {
-            mine.unknown.push((k.clone(), v.clone()));
-        }
-    }
+    merge_keyed(&mut mine.unknown, &theirs.unknown);
 }
 
 // =========================================================================
@@ -850,6 +1231,196 @@ mod tests {
     use crate::amount::Amount;
     use crate::hash::TxHash;
     use crate::transaction::{OutPoint, TxIn};
+
+    #[test]
+    fn bip370_published_vectors() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/data/bip370.json")).unwrap();
+        let vectors = fixture["vectors"].as_array().unwrap();
+        assert_eq!(vectors.len(), 47);
+        for vector in vectors {
+            let bytes = hex::decode(vector["hex"].as_str().unwrap()).unwrap();
+            let parsed = Psbt::deserialize(&bytes);
+            let name = vector["case"].as_str().unwrap();
+            if vector["status"] != "valid" {
+                assert!(parsed.is_err(), "accepted {name}");
+                continue;
+            }
+            let psbt = parsed.unwrap_or_else(|error| panic!("{name}: {error}"));
+            if let Some(locktime) = vector["locktime"].as_u64() {
+                assert_eq!(psbt.unsigned_tx.lock_time as u64, locktime, "{name}");
+            }
+            assert_eq!(
+                Psbt::deserialize(&psbt.try_serialize().unwrap()).unwrap(),
+                psbt,
+                "{name}"
+            );
+            let v0 = psbt.convert_version(0).unwrap();
+            assert_eq!(v0.unsigned_tx, psbt.unsigned_tx, "{name}");
+            let v2 = v0.convert_version(2).unwrap();
+            assert_eq!(v2.unsigned_tx, psbt.unsigned_tx, "{name}");
+            assert_eq!(v2.unique_id().unwrap(), psbt.unique_id().unwrap(), "{name}");
+        }
+        // Independent unsigned transaction specified by the first valid vector.
+        let first = vectors.iter().find(|v| v["status"] == "valid").unwrap();
+        let psbt =
+            Psbt::deserialize(&hex::decode(first["hex"].as_str().unwrap()).unwrap()).unwrap();
+        assert_eq!(hex::encode(tx_to_bytes(&psbt.unsigned_tx)),
+            "02000000010b0ad921419c1c8719735d72dc739f9ea9e0638d1fe4c1eef0f9944084815fc80000000000ffffffff020008af2f00000000160014c430f64c4756da310dbd1a085572ef299926272c8bbdeb0b000000001600144dd193ac964a56ac1b9e1cca8454fe2f474f851300000000");
+    }
+
+    fn raw_maps(
+        globals: &[(Vec<u8>, Vec<u8>)],
+        inputs: &[(Vec<u8>, Vec<u8>)],
+        outputs: &[(Vec<u8>, Vec<u8>)],
+    ) -> Vec<u8> {
+        let mut bytes = PSBT_MAGIC.to_vec();
+        for map in [globals, inputs, outputs] {
+            for (key, value) in map {
+                write_kv(&mut bytes, key, value).unwrap();
+            }
+            bytes.push(0);
+        }
+        bytes
+    }
+
+    #[test]
+    fn strict_map_keys_and_complete_buffers() {
+        let global = vec![(vec![0], tx_to_bytes(&make_unsigned_tx()))];
+        for map in 0..3 {
+            let mut maps = [global.clone(), vec![], vec![]];
+            // This multi-byte unknown type must be preserved, and be unique.
+            let pair = (make_key(0x100, &[1]), vec![2]);
+            maps[map].extend([pair.clone(), pair]);
+            assert!(matches!(
+                Psbt::deserialize(&raw_maps(&maps[0], &maps[1], &maps[2])),
+                Err(PsbtError::DuplicateKey(_))
+            ));
+        }
+        // Singletons with distinct key data may not masquerade as distinct keys.
+        let bad_global = vec![(vec![0, 1], tx_to_bytes(&make_unsigned_tx()))];
+        assert!(Psbt::deserialize(&raw_maps(&bad_global, &[], &[])).is_err());
+        assert!(Psbt::deserialize(&raw_maps(&global, &[(vec![3, 1], vec![1; 4])], &[])).is_err());
+        // Noncanonical CompactSize type and truncated type.
+        for key in [vec![0xfd, 1, 0], vec![0xfe, 1]] {
+            assert!(Psbt::deserialize(&raw_maps(&global, &[(key, vec![])], &[])).is_err());
+        }
+        let mut psbt = Psbt::from_unsigned_tx(make_unsigned_tx()).unwrap();
+        psbt.unknown.push((make_key(0x100, &[0xfc]), vec![1, 2]));
+        let mut bytes = psbt.try_serialize().unwrap();
+        assert_eq!(Psbt::deserialize(&bytes).unwrap(), psbt);
+        bytes.push(0);
+        assert!(Psbt::deserialize(&bytes).is_err());
+        let mut signed = make_unsigned_tx();
+        signed.inputs[0].script_sig = ScriptBuf::from_bytes(vec![0x51]);
+        assert!(matches!(
+            Psbt::deserialize(&raw_maps(&[(vec![0], tx_to_bytes(&signed))], &[], &[])),
+            Err(PsbtError::NonEmptyScriptSig)
+        ));
+    }
+
+    #[test]
+    fn hostile_lengths_and_counts_are_rejected_before_allocation() {
+        let huge = crate::encode::encode(&VarInt(u64::MAX));
+        let mut bytes = PSBT_MAGIC.to_vec();
+        bytes.extend_from_slice(&huge);
+        assert!(Psbt::deserialize(&bytes).is_err());
+        bytes = PSBT_MAGIC.to_vec();
+        bytes.extend_from_slice(&[1, 0x20]); // unknown key
+        bytes.extend_from_slice(&huge);
+        assert!(Psbt::deserialize(&bytes).is_err());
+        assert!(decode_witness_stack(&huge).is_err());
+        let mut witness = vec![1];
+        witness.extend_from_slice(&huge);
+        assert!(decode_witness_stack(&witness).is_err());
+        assert!(decode_witness_stack(&[0, 0]).is_err());
+        // Valid v2 metadata but attacker-controlled map counts.
+        let mut bytes = PSBT_MAGIC.to_vec();
+        for (key, value) in [
+            (0xfb, 2u32.to_le_bytes().to_vec()),
+            (2, 2i32.to_le_bytes().to_vec()),
+            (4, huge),
+            (5, vec![0]),
+        ] {
+            write_kv(&mut bytes, &[key], &value).unwrap();
+        }
+        bytes.push(0);
+        assert!(Psbt::deserialize(&bytes).is_err());
+        assert!(Psbt::deserialize(&vec![0; MAX_PSBT_SIZE + 1]).is_err());
+    }
+
+    #[test]
+    fn malformed_models_fail_atomically() {
+        let mut base = Psbt::from_unsigned_tx(make_unsigned_tx()).unwrap();
+        let mut other = base.clone();
+        other.unknown.push((make_key(0x100, &[]), vec![1]));
+        other.inputs.clear();
+        let before = base.clone();
+        assert!(base.merge(&other).is_err());
+        assert_eq!(base, before);
+        assert!(other.finalize().is_err());
+        other.inputs = vec![PsbtInput::default(); 2];
+        assert!(other.finalize().is_err());
+        let mut duplicate = base.clone();
+        duplicate
+            .unknown
+            .push((vec![0], tx_to_bytes(&duplicate.unsigned_tx)));
+        assert!(duplicate.try_serialize().is_err());
+        let mut managed = base.clone();
+        managed.inputs[0]
+            .unknown
+            .push((vec![3], 1u32.to_le_bytes().to_vec()));
+        assert!(managed.try_serialize().is_err());
+        let v2 = base.convert_version(2).unwrap();
+        assert!(base.merge(&v2).is_err());
+        assert_eq!(base, before);
+        base.version = 1;
+        assert!(base.try_serialize().is_err());
+    }
+
+    #[test]
+    fn merge_resource_failure_preserves_receiver() {
+        let mut left = Psbt::from_unsigned_tx(make_unsigned_tx()).unwrap();
+        let mut right = left.clone();
+        for i in 0..60_000 {
+            left.unknown.push((make_key(0x1000 + i, &[]), vec![]));
+            right
+                .unknown
+                .push((make_key(0x1000 + 60_000 + i, &[]), vec![]));
+        }
+        let before = left.clone();
+        assert!(left.merge(&right).is_err());
+        assert_eq!(left, before);
+    }
+
+    #[test]
+    fn v2_empty_creator_and_unique_identifier() {
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![],
+            outputs: vec![],
+            witness: vec![],
+            lock_time: 123,
+        };
+        let mut creator = Psbt::from_unsigned_tx(tx).unwrap();
+        creator.version = 2;
+        creator.fallback_lock_time = Some(123);
+        creator.tx_modifiable = Some(3);
+        assert_eq!(
+            Psbt::deserialize(&creator.try_serialize().unwrap()).unwrap(),
+            creator
+        );
+        let mut a = Psbt::from_unsigned_tx(make_unsigned_tx())
+            .unwrap()
+            .convert_version(2)
+            .unwrap();
+        let mut b = a.clone();
+        b.unsigned_tx.inputs[0].sequence = 1;
+        assert_eq!(a.unique_id().unwrap(), b.unique_id().unwrap());
+        assert_ne!(a.unsigned_tx.txid(), b.unsigned_tx.txid());
+        a.unsigned_tx.lock_time = 1;
+        assert!(a.try_serialize().is_err());
+    }
 
     /// Helper: build a minimal unsigned transaction.
     fn make_unsigned_tx() -> Transaction {
@@ -1338,16 +1909,16 @@ mod tests {
             .push((vec![0x58; 64], vec![0x59; 65]));
         psbt_b.inputs[0]
             .unknown
-            .push((vec![0xFE, 0x01], vec![0x60]));
+            .push((vec![0xFD, 0x01, 0x01], vec![0x60]));
         psbt_b.outputs[0].redeem_script = Some(ScriptBuf::from_bytes(vec![0x61]));
         psbt_b.outputs[0].witness_script = Some(ScriptBuf::from_bytes(vec![0x62]));
         psbt_b.outputs[0].tap_internal_key = Some(vec![0x63; 32]);
         psbt_b.outputs[0]
             .unknown
-            .push((vec![0xFE, 0x02], vec![0x64]));
+            .push((vec![0xFD, 0x02, 0x01], vec![0x64]));
         psbt_b.xpub.push((vec![0x04; 78], ([0xAA; 4], vec![44])));
         psbt_b.proprietary.push((vec![0xFC, 0x01], vec![0x70]));
-        psbt_b.unknown.push((vec![0xFD, 0x01], vec![0x80]));
+        psbt_b.unknown.push((vec![0xFD, 0x00, 0x01], vec![0x80]));
 
         psbt_a.merge(&psbt_b).unwrap();
 
@@ -1388,7 +1959,7 @@ mod tests {
         psbt_a.proprietary.push(common_prop.clone());
         psbt_b.proprietary.push(common_prop);
 
-        let common_unknown = (vec![0xFD, 0x01], vec![0x80]);
+        let common_unknown = (vec![0xFD, 0x00, 0x01], vec![0x80]);
         psbt_a.unknown.push(common_unknown.clone());
         psbt_b.unknown.push(common_unknown);
 
@@ -1431,9 +2002,13 @@ mod tests {
         let tx = make_unsigned_tx();
         let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
         psbt.proprietary.push((vec![0xFC, 0x01, 0x02], vec![0x03]));
-        psbt.unknown.push((vec![0xFD, 0x01], vec![0x04]));
-        psbt.inputs[0].unknown.push((vec![0xFE, 0x01], vec![0x05]));
-        psbt.outputs[0].unknown.push((vec![0xFE, 0x02], vec![0x06]));
+        psbt.unknown.push((vec![0xFD, 0x00, 0x01], vec![0x04]));
+        psbt.inputs[0]
+            .unknown
+            .push((vec![0xFD, 0x01, 0x01], vec![0x05]));
+        psbt.outputs[0]
+            .unknown
+            .push((vec![0xFD, 0x02, 0x01], vec![0x06]));
 
         let bytes = psbt.serialize();
         let psbt2 = Psbt::deserialize(&bytes).unwrap();
@@ -1473,10 +2048,10 @@ mod tests {
         buf.extend_from_slice(&PSBT_MAGIC);
         // Write global map with unsigned tx
         let tx_bytes = crate::encode::encode(&psbt.unsigned_tx);
-        write_kv(&mut buf, &[PSBT_GLOBAL_UNSIGNED_TX], &tx_bytes).unwrap();
+        write_kv(&mut buf, &[PSBT_GLOBAL_UNSIGNED_TX as u8], &tx_bytes).unwrap();
         buf.push(0x00); // global separator
                         // Write input map with bad sighash
-        write_kv(&mut buf, &[PSBT_IN_SIGHASH_TYPE], &bad_data).unwrap();
+        write_kv(&mut buf, &[PSBT_IN_SIGHASH_TYPE as u8], &bad_data).unwrap();
         buf.push(0x00); // input separator
                         // Output separator
         buf.push(0x00);
@@ -1493,10 +2068,10 @@ mod tests {
         let mut buf = Vec::new();
         buf.extend_from_slice(&PSBT_MAGIC);
         let tx_bytes = crate::encode::encode(&psbt.unsigned_tx);
-        write_kv(&mut buf, &[PSBT_GLOBAL_UNSIGNED_TX], &tx_bytes).unwrap();
+        write_kv(&mut buf, &[PSBT_GLOBAL_UNSIGNED_TX as u8], &tx_bytes).unwrap();
         buf.push(0x00);
         // Bad tap_merkle_root (not 32 bytes)
-        write_kv(&mut buf, &[PSBT_IN_TAP_MERKLE_ROOT], &[0xAA; 16]).unwrap();
+        write_kv(&mut buf, &[PSBT_IN_TAP_MERKLE_ROOT as u8], &[0xAA; 16]).unwrap();
         buf.push(0x00);
         buf.push(0x00);
 
@@ -1512,9 +2087,9 @@ mod tests {
         let mut buf = Vec::new();
         buf.extend_from_slice(&PSBT_MAGIC);
         let tx_bytes = crate::encode::encode(&psbt.unsigned_tx);
-        write_kv(&mut buf, &[PSBT_GLOBAL_UNSIGNED_TX], &tx_bytes).unwrap();
+        write_kv(&mut buf, &[PSBT_GLOBAL_UNSIGNED_TX as u8], &tx_bytes).unwrap();
         // Bad version (3 bytes instead of 4)
-        write_kv(&mut buf, &[PSBT_GLOBAL_VERSION], &[0x01, 0x02, 0x03]).unwrap();
+        write_kv(&mut buf, &[PSBT_GLOBAL_VERSION as u8], &[0x01, 0x02, 0x03]).unwrap();
         buf.push(0x00);
         buf.push(0x00);
         buf.push(0x00);

@@ -8,3 +8,6 @@ tarpaulin-report.json
 *.swo
 .DS_Store
 .env
+
+# Python interoperability tools
+__pycache__/

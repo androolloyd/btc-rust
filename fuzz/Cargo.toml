@@ -67,3 +67,9 @@ name = "fuzz_block_template"
 path = "fuzz_targets/fuzz_block_template.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_psbt_decode"
+path = "fuzz_targets/fuzz_psbt_decode.rs"
+test = false
+doc = false
