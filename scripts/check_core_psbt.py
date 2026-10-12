@@ -919,7 +919,10 @@ def check_large_threshold_wallet(args, port, kind, pair):
                                              {destination: round(coin["amount"] - 0.0005, 8)}, 23])
     started = time.monotonic()
     print(f"RUNNING: Core {kind} large wallet signer", flush=True)
-    signed = core_rpc(port, "walletprocesspsbt", [unsigned, True, "ALL", True, False], timeout=180)["psbt"]
+    # Core's private descriptor/provider signing work grows sharply at 999
+    # keys; shared CI runners exceeded 180s despite an identical run passing.
+    # Keep the exact keys, equations and complete-spend checks, with CPU margin.
+    signed = core_rpc(port, "walletprocesspsbt", [unsigned, True, "ALL", True, False], timeout=600)["psbt"]
     print(f"SIGNED: Core {kind} in {time.monotonic() - started:.1f}s", flush=True)
     raw = base64.b64decode(signed).hex()
     assert len(raw) > 60_000  # force actual compiled binary-file input
@@ -928,7 +931,7 @@ def check_large_threshold_wallet(args, port, kind, pair):
     maps = psbt_maps(raw)
     keys = [key for key in maps[1] if key[0] == 0x14]
     assert len(keys) == n
-    independent = core_rpc(port, "finalizepsbt", [signed], timeout=180)
+    independent = core_rpc(port, "finalizepsbt", [signed], timeout=600)
     assert independent["complete"]
     for version in [0, 2]:
         encoded = raw if version == 0 else cli(args.node, "convert-psbt", raw, "--version", "2")["psbt_hex"]
@@ -955,7 +958,7 @@ def check_large_threshold_wallet(args, port, kind, pair):
         insufficient[1].pop(key)
     partial = cli(args.node, "verify-psbt", encode_maps(insufficient), "--partial")
     assert partial["signatures_checked"] == threshold - 1
-    assert core_rpc(port, "finalizepsbt", [encode64(encode_maps(insufficient))], timeout=180)["complete"] is False
+    assert core_rpc(port, "finalizepsbt", [encode64(encode_maps(insufficient))], timeout=600)["complete"] is False
     reject_finalization(args, encode_maps(insufficient), "missing supported Taproot script satisfaction")
     # A populated witness is never allowed to omit one of its key slots.
     final_maps = psbt_maps(result["psbt_hex"])
