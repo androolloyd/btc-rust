@@ -178,6 +178,9 @@ pub fn sighash_anyprevout(
 /// 4. Handle SIGHASH_NONE, SIGHASH_SINGLE, SIGHASH_ANYONECANPAY
 /// 5. Serialize and append hash type as u32 LE
 /// 6. Double-SHA256 the result
+///
+/// The caller supplies the executed post-separator subscript with the current
+/// operation's signatures removed. This function strips remaining separators.
 pub fn sighash_legacy(
     tx: &Transaction,
     input_index: usize,
@@ -672,71 +675,70 @@ pub fn sighash_taproot_with_codeseparator(
 /// because data pushes may contain bytes that happen to equal the opcode value
 /// (e.g., 0xab inside push data is NOT an OP_CODESEPARATOR).
 ///
-/// Returns `Cow::Borrowed` when no matching opcodes are found (avoiding allocation).
-fn find_and_delete<'a>(script: &'a [u8], opcode: btc_primitives::script::Opcode) -> Cow<'a, [u8]> {
-    let target = opcode.to_u8();
-    // Quick scan: if the byte doesn't appear at all, nothing to delete.
-    if !script.contains(&target) {
-        return Cow::Borrowed(script);
+/// Returns `Cow::Borrowed` when no matching opcodes are found.
+fn find_and_delete(script: &[u8], opcode: btc_primitives::script::Opcode) -> Cow<'_, [u8]> {
+    find_and_delete_bytes(script, &[opcode.to_u8()]).0
+}
+
+/// Core's FindAndDelete: remove an exact byte sequence only at opcode boundaries.
+/// Preserve push contents/nonminimal encodings and stop parsing at a malformed
+/// push, keeping its remaining bytes. Matches can repeat at the same boundary.
+pub(crate) fn find_and_delete_bytes<'a>(
+    script: &'a [u8],
+    pattern: &[u8],
+) -> (Cow<'a, [u8]>, usize) {
+    if pattern.is_empty() || !script.contains(&pattern[0]) {
+        return (Cow::Borrowed(script), 0);
     }
-
-    let mut out = Vec::with_capacity(script.len());
-    let mut found = false;
-    let mut pos: usize = 0;
-
-    while pos < script.len() {
-        let byte = script[pos];
-        let instr_start = pos;
-        pos += 1;
-
-        // Determine instruction length (mirrors ScriptInstructions::next in script.rs)
-        if byte == 0 {
-            // OP_0: single-byte opcode, pos already advanced
-        } else if (1..=75).contains(&byte) {
-            // Direct push: next `byte` bytes are data
-            pos += byte as usize;
-        } else if byte == btc_primitives::script::Opcode::OP_PUSHDATA1.to_u8() {
-            if pos < script.len() {
-                let len = script[pos] as usize;
-                pos += 1 + len;
-            }
-        } else if byte == btc_primitives::script::Opcode::OP_PUSHDATA2.to_u8() {
-            if pos + 2 <= script.len() {
-                let len = u16::from_le_bytes([script[pos], script[pos + 1]]) as usize;
-                pos += 2 + len;
-            }
-        } else if byte == btc_primitives::script::Opcode::OP_PUSHDATA4.to_u8()
-            && pos + 4 <= script.len()
-        {
-            let len = u32::from_le_bytes([
-                script[pos],
-                script[pos + 1],
-                script[pos + 2],
-                script[pos + 3],
-            ]) as usize;
-            pos += 4 + len;
+    let mut output = Vec::with_capacity(script.len());
+    let mut pos = 0;
+    let mut retained = 0;
+    let mut count = 0;
+    loop {
+        while script[pos..].starts_with(pattern) {
+            output.extend_from_slice(&script[retained..pos]);
+            pos += pattern.len();
+            retained = pos;
+            count += 1;
         }
-        // else: regular single-byte opcode, pos already advanced by 1.
-
-        // Clamp to script length to avoid out-of-bounds on malformed scripts
-        let end = pos.min(script.len());
-
-        // A single-byte non-push instruction matching the target should be skipped.
-        let is_single_byte_opcode = (end - instr_start) == 1 && !(1..=75).contains(&byte);
-        let skip = is_single_byte_opcode && byte == target;
-
-        if skip {
-            found = true;
-        } else {
-            out.extend_from_slice(&script[instr_start..end]);
-        }
+        // GetOp accepts all opcode bytes, including undefined ones. Only push
+        // lengths can prevent it from reaching a later boundary.
+        let Some(end) = opcode_end(script, pos) else {
+            break;
+        };
+        pos = end;
     }
-
-    if found {
-        Cow::Owned(out)
+    if count == 0 {
+        (Cow::Borrowed(script), 0)
     } else {
-        Cow::Borrowed(script)
+        output.extend_from_slice(&script[retained..]);
+        (Cow::Owned(output), count)
     }
+}
+
+fn opcode_end(script: &[u8], pos: usize) -> Option<usize> {
+    let opcode = *script.get(pos)?;
+    let mut end = pos + 1;
+    let length = match opcode {
+        1..=75 => usize::from(opcode),
+        0x4c => {
+            let size = usize::from(*script.get(end)?);
+            end += 1;
+            size
+        }
+        0x4d => {
+            let bytes = script.get(end..end.checked_add(2)?)?;
+            end += 2;
+            usize::from(u16::from_le_bytes(bytes.try_into().ok()?))
+        }
+        0x4e => {
+            let bytes = script.get(end..end.checked_add(4)?)?;
+            end += 4;
+            usize::try_from(u32::from_le_bytes(bytes.try_into().ok()?)).ok()?
+        }
+        _ => 0,
+    };
+    end.checked_add(length).filter(|end| *end <= script.len())
 }
 
 /// Helper: compute the script code for P2WPKH spending
@@ -1230,6 +1232,39 @@ mod tests {
         // Should return Borrowed (no allocation)
         assert!(matches!(result, std::borrow::Cow::Borrowed(_)));
         assert_eq!(result.as_ref(), &script[..]);
+    }
+
+    #[test]
+    fn exact_finddelete_respects_boundaries_repetitions_and_malformed_tails() {
+        let pattern = [1, 0xaa];
+        let code = [2, 1, 0xaa, 1, 0xaa, 1, 0xaa, 0x4c, 1, 0xaa];
+        let (changed, count) = find_and_delete_bytes(&code, &pattern);
+        assert_eq!(count, 2);
+        // The same bytes inside data or a nonminimal push are retained.
+        assert_eq!(changed.as_ref(), &[2, 1, 0xaa, 0x4c, 1, 0xaa]);
+        for tail in [
+            &[2, 0xaa][..],
+            &[0x4c, 3, 0xaa],
+            &[0x4d, 3],
+            &[0x4e, 0xff, 0xff, 0xff, 0xff],
+        ] {
+            let mut code = pattern.to_vec();
+            code.extend(tail);
+            let (changed, count) = find_and_delete_bytes(&code, &pattern);
+            assert_eq!(count, 1);
+            assert_eq!(changed.as_ref(), tail);
+        }
+        // Undefined opcodes are boundaries, not parse errors in Core GetOp.
+        let (changed, count) = find_and_delete_bytes(&[0xff, 1, 0xaa], &pattern);
+        assert_eq!(changed.as_ref(), &[0xff]);
+        assert_eq!(count, 1);
+        assert!(matches!(
+            find_and_delete_bytes(&code, &[]),
+            (Cow::Borrowed(_), 0)
+        ));
+        let (changed, count) = find_and_delete_bytes(&[0, 0, 1, 0], &[0]);
+        assert_eq!(count, 2);
+        assert_eq!(changed.as_ref(), &[1, 0]);
     }
 
     #[test]

@@ -1,7 +1,8 @@
 use crate::opcode_plugin::{OpcodeExecContext, OpcodeRegistry};
 use crate::sig_verify::SignatureVerifier;
 use crate::sighash::{
-    sighash_legacy, sighash_segwit_v0, sighash_taproot_with_codeseparator, SighashType,
+    find_and_delete_bytes, sighash_legacy, sighash_segwit_v0, sighash_taproot_with_codeseparator,
+    SighashType,
 };
 use btc_primitives::hash::{hash160, sha256, sha256d};
 use btc_primitives::script::{Instruction, Opcode, Script};
@@ -70,6 +71,10 @@ pub enum ScriptError {
     TapscriptSigBudgetExceeded,
     #[error("schnorr signature verification failed (non-empty invalid sig)")]
     SchnorrSigFailed,
+    #[error("constant scriptCode: legacy OP_CODESEPARATOR is forbidden")]
+    ConstScriptCode,
+    #[error("constant scriptCode: signature removal changed the legacy script")]
+    SigFindAndDelete,
 }
 
 const MAX_STACK_SIZE: usize = 1000;
@@ -277,6 +282,7 @@ impl ScriptFlags {
             verify_minimaldata: true,
             verify_nullfail: true,
             verify_minimalif: true,
+            verify_const_scriptcode: true,
             ..ScriptFlags::default()
         }
     }
@@ -419,33 +425,21 @@ impl<'a> ScriptEngine<'a> {
                 return Err(ScriptError::StackOverflow);
             }
             let instruction = instruction?;
-            // Calculate the size of this instruction in bytes
-            let _instr_start = byte_pos;
+            let instr_start = byte_pos;
             match &instruction {
                 Instruction::PushBytes(data) => {
                     let len = data.len();
                     // Determine the opcode byte used for this push (for MINIMALDATA checking)
-                    let push_opcode_byte = script_bytes[_instr_start];
-                    if len == 0 {
-                        // Could be OP_0 (1 byte) or OP_PUSHDATA1 with len=0 (2 bytes), etc.
-                        if push_opcode_byte == Opcode::OP_PUSHDATA1 as u8 {
-                            byte_pos += 2; // opcode + length byte
-                        } else if push_opcode_byte == Opcode::OP_PUSHDATA2 as u8 {
-                            byte_pos += 3; // opcode + 2 length bytes
-                        } else if push_opcode_byte == Opcode::OP_PUSHDATA4 as u8 {
-                            byte_pos += 5; // opcode + 4 length bytes
-                        } else {
-                            byte_pos += 1; // OP_0
-                        }
-                    } else if len <= 75 {
-                        byte_pos += 1 + len;
-                    } else if len <= 0xff {
-                        byte_pos += 2 + len; // OP_PUSHDATA1 + 1 byte len
-                    } else if len <= 0xffff {
-                        byte_pos += 3 + len; // OP_PUSHDATA2 + 2 byte len
-                    } else {
-                        byte_pos += 5 + len; // OP_PUSHDATA4 + 4 byte len
-                    };
+                    let push_opcode_byte = script_bytes[instr_start];
+                    // The actual prefix matters even when a nonminimal push
+                    // appears in a skipped branch or is consensus-valid.
+                    byte_pos += len
+                        + match push_opcode_byte {
+                            0x4c => 2,
+                            0x4d => 3,
+                            0x4e => 5,
+                            _ => 1,
+                        };
 
                     if data.len() > MAX_PUSH_SIZE {
                         return Err(ScriptError::PushSizeLimit);
@@ -466,6 +460,17 @@ impl<'a> ScriptEngine<'a> {
                 Instruction::Op(op) => {
                     byte_pos += 1; // opcodes are 1 byte
                     let op = *op;
+
+                    // Core rejects a legacy separator under this policy flag
+                    // even in a branch that does not execute. Witness v0 and
+                    // tapscript retain their distinct separator semantics.
+                    if op == Opcode::OP_CODESEPARATOR
+                        && !self.use_segwit_sighash
+                        && !self.tapscript_mode
+                        && self.flags.verify_const_scriptcode
+                    {
+                        return Err(ScriptError::ConstScriptCode);
+                    }
 
                     // Conditionals always counted towards opcount (in non-tapscript mode)
                     if op as u8 > Opcode::OP_16 as u8 && !self.tapscript_mode {
@@ -684,15 +689,35 @@ impl<'a> ScriptEngine<'a> {
         }
     }
 
-    /// Verify a single signature against a public key using the transaction context.
-    ///
-    /// The signature byte slice must end with a sighash type byte. The preceding
-    /// bytes are the DER-encoded ECDSA signature. The sighash is computed using
-    /// `sighash_legacy()` over the current script code and the transaction.
-    ///
-    /// Returns Ok(false) for empty sigs or verification failure,
-    /// Ok(true) for valid signature.
-    fn verify_signature(&self, sig: &[u8], pubkey: &[u8]) -> Result<bool, ScriptError> {
+    /// Prepare legacy/BIP143 scriptCode for this signature operation.
+    fn signature_script_code(&self, signatures: &[&[u8]]) -> Result<Vec<u8>, ScriptError> {
+        let mut code = self.get_script_code();
+        if !self.use_segwit_sighash {
+            // CHECKMULTISIG removes every supplied signature from the same
+            // scriptCode before any equation. Witness v0 never removes them.
+            for sig in signatures {
+                let mut pushed = btc_primitives::script::ScriptBuf::new();
+                if sig.is_empty() {
+                    pushed.push_opcode(Opcode::OP_0);
+                } else {
+                    pushed.push_slice(sig);
+                }
+                let (changed, found) = find_and_delete_bytes(&code, pushed.as_bytes());
+                if found > 0 && self.flags.verify_const_scriptcode {
+                    return Err(ScriptError::SigFindAndDelete);
+                }
+                code = changed.into_owned();
+            }
+        }
+        Ok(code)
+    }
+
+    fn verify_signature(
+        &self,
+        sig: &[u8],
+        pubkey: &[u8],
+        script_code: &[u8],
+    ) -> Result<bool, ScriptError> {
         // Empty signature always fails (not an error, just false)
         if sig.is_empty() {
             return Ok(false);
@@ -741,20 +766,19 @@ impl<'a> ScriptEngine<'a> {
         let der_sig = &sig[..sig.len() - 1];
 
         let hash_type = SighashType::from_u8(hash_type_byte);
-        let script_code = self.get_script_code();
 
         // Compute the sighash — use BIP143 segwit digest when in segwit mode
         let sighash = if self.use_segwit_sighash {
             sighash_segwit_v0(
                 tx,
                 self.input_index,
-                &script_code,
+                script_code,
                 self.input_amount,
                 hash_type,
             )
             .map_err(|e| ScriptError::SigVerify(e.to_string()))?
         } else {
-            sighash_legacy(tx, self.input_index, &script_code, hash_type)
+            sighash_legacy(tx, self.input_index, script_code, hash_type)
                 .map_err(|e| ScriptError::SigVerify(e.to_string()))?
         };
 
@@ -1214,7 +1238,8 @@ impl<'a> ScriptEngine<'a> {
                     let result = self.verify_tapscript_signature(&sig, &pubkey)?;
                     self.push(if result { encode_num(1) } else { encode_num(0) })?;
                 } else {
-                    let result = self.verify_signature(&sig, &pubkey)?;
+                    let script_code = self.signature_script_code(&[&sig])?;
+                    let result = self.verify_signature(&sig, &pubkey, &script_code)?;
                     // NULLFAIL: non-empty signature that fails must error
                     if !result && !sig.is_empty() && self.flags.verify_nullfail {
                         return Err(ScriptError::NullFail);
@@ -1232,7 +1257,8 @@ impl<'a> ScriptEngine<'a> {
                         return Err(ScriptError::CheckSigFailed);
                     }
                 } else {
-                    let result = self.verify_signature(&sig, &pubkey)?;
+                    let script_code = self.signature_script_code(&[&sig])?;
+                    let result = self.verify_signature(&sig, &pubkey, &script_code)?;
                     if !result {
                         // NULLFAIL: non-empty signature that fails must give NULLFAIL error
                         if !sig.is_empty() && self.flags.verify_nullfail {
@@ -1521,6 +1547,8 @@ impl<'a> ScriptEngine<'a> {
                 for _ in 0..n_sigs {
                     sigs.push(self.pop()?);
                 }
+                let script_code = self
+                    .signature_script_code(&sigs.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
 
                 // Pop dummy element (off-by-one bug compatibility with Bitcoin Core)
                 let dummy = self.pop()?;
@@ -1554,7 +1582,7 @@ impl<'a> ScriptEngine<'a> {
                         break;
                     }
 
-                    let result = self.verify_signature(sig, &pubkeys[key_idx])?;
+                    let result = self.verify_signature(sig, &pubkeys[key_idx], &script_code)?;
                     if result {
                         sig_idx += 1;
                         n_sigs_remaining -= 1;
@@ -2153,49 +2181,8 @@ mod tests {
 
         let tx = make_test_tx();
 
-        // We need to know the full script to compute sighash, but the full script
-        // contains the signature which we haven't computed yet. To break the
-        // circular dependency, we pre-compute the script_code as the full script
-        // bytes with a placeholder signature of the expected length, then sign
-        // that. But actually, the simpler approach: compute sighash over the
-        // full_script bytes. Since the DER sig length can vary, we build the
-        // full_script first with a dummy sig, compute its size, then use a
-        // two-pass approach.
-        //
-        // Alternatively, the correct approach for Bitcoin: the script_code is
-        // the executed script (full_script), and sighash is computed over it.
-        // We can pre-build the full_script with a placeholder, compute sighash,
-        // sign, rebuild, and the sighash will match because sighash_legacy strips
-        // the signature from script_code via FindAndDelete.
-        //
-        // Actually, in Bitcoin consensus, the sighash computation does NOT
-        // FindAndDelete the signature from the script_code. It only strips
-        // OP_CODESEPARATOR. The script_code IS the full executing script.
-        //
-        // For a simple test, let's just compute sighash over the known full_script:
-        // <sig> <pubkey> OP_CHECKSIG. Since we don't know sig yet, we sign over
-        // the script without the sig push. This works because the engine's
-        // script_code_bytes is set to the full script INCLUDING the sig push,
-        // but the sighash is also computed over that same data.
-        //
-        // The simplest correct approach: use the FULL script as script_code.
-        // Build it, compute sighash, sign, rebuild. Since DER sig length may vary,
-        // do two passes. In practice, we just build with a fixed-length dummy.
-
-        // Build full_script to get its bytes for sighash
-        // But we have a chicken-and-egg: sig is part of script, sighash is over script.
-        // Solution: compute sighash over the full_script bytes, which includes the sig.
-        // Since we don't have the sig yet, we use a fixed placeholder of the same length.
-
-        // Actually, the cleanest test approach: sign the sighash over just the
-        // pubkey-script portion (what would be the scriptPubKey in real Bitcoin).
-        // Then in the engine, the script_code_bytes is the full combined script.
-        // The sighash won't match because the engine computes it over full_script.
-        //
-        // The real fix: in actual Bitcoin, scriptSig and scriptPubKey are executed
-        // separately. The engine's script_code_bytes should be set when executing
-        // the scriptPubKey, not the scriptSig. Let's test by executing the scripts
-        // in two phases: first execute scriptSig (push sig), then execute scriptPubKey.
+        // The signature checks in scriptPubKey; scriptSig is executed first
+        // only to supply its stack arguments. Hash that actual scriptPubKey.
 
         // Phase 1: Build scriptSig (just pushes) and scriptPubKey separately
         // scriptPubKey: <pubkey> OP_CHECKSIG
@@ -4599,10 +4586,6 @@ mod tests {
 
     #[test]
     fn test_const_scriptcode_rejects_codeseparator() {
-        // When verify_const_scriptcode is set and NOT in segwit mode,
-        // OP_CODESEPARATOR should be rejected.
-        // Currently the code doesn't enforce this - testing what it does.
-        // OP_CODESEPARATOR just sets position; the flag needs to be checked.
         static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
         let flags = ScriptFlags {
             verify_const_scriptcode: true,
@@ -4613,11 +4596,50 @@ mod tests {
         let mut script = ScriptBuf::new();
         script.push_opcode(Opcode::OP_1);
         script.push_opcode(Opcode::OP_CODESEPARATOR);
-        // Currently OP_CODESEPARATOR just sets position without checking the flag
-        // Just verify the engine runs - the flag is defined but enforcement
-        // may be in the outer verification layer
-        engine.execute(script.as_script()).unwrap();
+        assert!(matches!(
+            engine.execute(script.as_script()),
+            Err(ScriptError::ConstScriptCode)
+        ));
+        let skipped = ScriptBuf::from_bytes(vec![0, 0x63, 0xab, 0x68, 0x51]);
+        let mut engine = ScriptEngine::new_without_tx(&VERIFIER, flags);
+        assert!(matches!(
+            engine.execute(skipped.as_script()),
+            Err(ScriptError::ConstScriptCode)
+        ));
+        let mut engine = ScriptEngine::new_without_tx(&VERIFIER, flags);
+        engine.set_segwit_sighash(true);
+        engine.execute(skipped.as_script()).unwrap();
         assert!(engine.success());
+    }
+
+    #[test]
+    fn nonminimal_pushes_track_the_actual_separator_byte_position() {
+        for prefix in [0x4c, 0x4d, 0x4e] {
+            for length in [0usize, 2, 75, 76, 255, 256, 520] {
+                if prefix == 0x4c && length > 255 {
+                    continue;
+                }
+                let width = match prefix {
+                    0x4c => 1,
+                    0x4d => 2,
+                    _ => 4,
+                };
+                let mut bytes = vec![prefix];
+                bytes.extend_from_slice(&(length as u32).to_le_bytes()[..width]);
+                bytes.extend(vec![0xab; length]);
+                bytes.extend([Opcode::OP_DROP as u8, Opcode::OP_CODESEPARATOR as u8]);
+                bytes.extend([0x51, 0x75, 0x51]);
+                let mut engine = make_engine();
+                engine.execute(Script::from_bytes(&bytes)).unwrap();
+                assert_eq!(engine.get_script_code(), [0x51, 0x75, 0x51]);
+                let mut skipped = vec![0, 0x63];
+                skipped.extend_from_slice(&bytes[..bytes.len() - 3]);
+                skipped.extend([0x68, 0xab, 0x51]);
+                let mut engine = make_engine();
+                engine.execute(Script::from_bytes(&skipped)).unwrap();
+                assert_eq!(engine.get_script_code(), [0x51]);
+            }
+        }
     }
 
     // ========== Coverage: Tapscript mode paths ==========

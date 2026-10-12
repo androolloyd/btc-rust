@@ -78,6 +78,7 @@ fuzz_target!(|data: &[u8]| {
             flags.verify_p2sh = mask & 1 != 0;
             flags.verify_witness = mask & 2 != 0;
             flags.verify_cleanstack = mask & 8 != 0;
+            flags.verify_const_scriptcode = mask & 64 != 0;
             let _ = verify_input_with_prevouts(&tx, 0, &[previous], &verifier, &flags);
 
             // Exercise native witness initialization/completion and the
