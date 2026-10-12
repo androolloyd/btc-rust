@@ -319,7 +319,7 @@ btc-mempool      → Fee-sorted pool, RBF (BIP125), cluster mempool, fee estimat
 btc-stages       → Pipeline: Headers → Bodies → Execution → Indexing → AddressIndex
 btc-rpc          → JSON-RPC 2.0 server with Bitcoin Core-compatible methods
 btc-exex         → Execution Extensions plugin system (ordinals indexer included)
-btc-electrum     → Embedded Electrum protocol server (14 methods)
+btc-electrum     → Opt-in validated Electrum chain/transaction subset
 btc-test         → In-process regtest harness for BIP development
 btc-node         → CLI, NodeBuilder, sync manager, Esplora REST, Prometheus, ZMQ
 btc-forge        → Script builders, debugger, transaction tooling, Miniscript
@@ -385,7 +385,7 @@ Built-in example plugins:
 
 ### APIs
 - **JSON-RPC** — 9 Bitcoin Core-compatible methods wired to real chain state
-- **Electrum protocol** — 14 methods, embedded server, no separate Electrs needed
+- **Experimental Electrum subset** — opt-in loopback chain/transaction queries, verified admission, merkle proofs and header notifications; wallet indexing and full protocol negotiation remain unfinished. See [supported methods and setup](docs/ELECTRUM.md).
 - **Esplora REST** — 9 endpoints matching Blockstream's API format
 - **Prometheus** — `/metrics` endpoint with 7 gauges (chain height, peers, mempool, sync progress, etc.)
 - **ZMQ notifications** — hashblock, hashtx, rawblock, rawtx, sequence via ExEx
