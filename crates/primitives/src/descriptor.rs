@@ -354,7 +354,9 @@ impl fmt::Display for Descriptor {
 
 /// Bound recursion before parsing, and prevent mismatched delimiter underflow.
 fn check_structure(s: &str) -> Result<(), DescriptorError> {
-    if s.len() > 65_536 || !s.is_ascii() {
+    // Fixed budget before checksum/recursion; accommodates 999 annotated
+    // compressed or ordinary extended-key expressions.
+    if s.len() > 262_144 || !s.is_ascii() {
         return Err(DescriptorError::Expansion(
             "descriptor size/character limit",
         ));

@@ -1,7 +1,7 @@
 # PSBT wallet tools
 
-The compiled `btc-node` CLI parses BIP174 v0 and BIP370 v2. Input/output arguments
-are hexadecimal PSBT bytes; convert Core's base64 representation explicitly when
+The compiled `btc-node` CLI parses BIP174 v0 and BIP370 v2. Inline input and
+output use hexadecimal PSBT bytes; convert Core's base64 representation explicitly when
 exchanging data with Core RPC.
 
 ```sh
@@ -13,7 +13,14 @@ btc-node --json verify-psbt "$FINALIZED_PSBT_HEX"
 btc-node --json verify-psbt "$PARTIALLY_SIGNED_PSBT_HEX" --partial
 btc-node --json finalize-psbt "$PARTIALLY_SIGNED_PSBT_HEX"
 btc-node --json verify-psbt-derivations "$PSBT_WITH_XPUB_ANCHORS_HEX"
+btc-node --json finalize-psbt @partially-signed.psbt
 ```
+
+Every PSBT tool also accepts `@path` to a regular file containing binary PSBT
+bytes. This handles large updater maps that exceed operating-system argument
+limits. The file is read without modification; the 32 MiB parser limit is checked
+before allocation and during reading, including a file that grows during the read.
+Hex text and Core base64 files require explicit decoding to binary first.
 
 Inspection reports the actual unsigned transaction, PSBT version, resolved
 locktime, prevouts, sequences, output values/scripts, available UTXO/final fields
@@ -44,7 +51,7 @@ bare canonical multisig, legacy P2SH with those known redeem templates,
 native/wrapped P2WPKH, native/wrapped P2WSH with P2PK,
 P2PKH or canonical multisig scripts, Taproot key paths, and version-c0 single-key
 `<32-byte key> CHECKSIG` Taproot leaves and canonical BIP387 CHECKSIGADD threshold
-leaves with up to twenty curve-valid x-only keys. Threshold witnesses contain
+leaves with up to 999 curve-valid x-only keys. Threshold witnesses contain
 one reversed-order slot per script key, empty slots for unused keys, and exactly
 the specified number of nonempty signatures. An annex is included in the Taproot digest.
 Arbitrary witness/tapscript programs, future witness/leaf/key versions,

@@ -15,13 +15,23 @@ import re
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 
 from check_core_p2p import core_rpc, free_port, wait_until
 
 
+def run_cli(node, command, psbt, *extra):
+    # Linux limits a single argv string to ~128 KiB, below real 999-key
+    # updater maps. The compiled tool reads the same bounded binary PSBT.
+    if command in ["decode-psbt", "convert-psbt", "extract-psbt", "verify-psbt", "finalize-psbt", "verify-psbt-derivations"] and len(psbt) > 60_000:
+        with tempfile.NamedTemporaryFile(prefix="btc-psbt-input-", suffix=".psbt") as file:
+            file.write(bytes.fromhex(psbt)); file.flush()
+            return run_cli(node, command, "@" + file.name, *extra)
+    return subprocess.run([str(node), "--json", command, psbt, *extra], capture_output=True, text=True, timeout=30)
+
+
 def cli(node, command, psbt, *extra):
-    result = subprocess.run([str(node), "--json", command, psbt, *extra],
-                            capture_output=True, text=True, timeout=30)
+    result = run_cli(node, command, psbt, *extra)
     assert result.returncode == 0, (command, result.stderr)
     return json.loads(result.stdout)
 
@@ -73,7 +83,12 @@ def script_addresses(port, kind, descriptors):
     assert key.endswith("/0/*")
     if kind.startswith("taproot-"):
         second = key[:-4] + "/1/*"
-        if "multisig" in kind or kind == "taproot-threshold-unbalanced":
+        if kind.startswith("taproot-large-"):
+            threshold, count = map(int, kind.rsplit("-", 1)[1].split("of"))
+            keys = [key[:-4] + f"/{i}/*" for i in range(count)]
+            name = "sortedmulti_a" if threshold == 2 else "multi_a"
+            private = f"tr({nums},{name}({threshold}," + ",".join(reversed(keys)) + "))"
+        elif "multisig" in kind or kind == "taproot-threshold-unbalanced":
             count = 20 if kind.endswith("17of20") else 3
             threshold = 17 if count == 20 else 2
             keys = [key[:-4] + f"/{i}/*" for i in range(count)]
@@ -103,8 +118,8 @@ def script_addresses(port, kind, descriptors):
     info = core_rpc(port, "getdescriptorinfo", [private])
     checked_private = private + "#" + info["checksum"]
     imported = core_rpc(port, "importdescriptors", [[{
-        "desc": checked_private, "timestamp": "now", "range": [0, 10],
-    }]])
+        "desc": checked_private, "timestamp": "now", "range": [0, 1 if kind.startswith("taproot-large-") else 10],
+    }]], timeout=60 if kind.startswith("taproot-large-") else 10)
     assert all(item["success"] for item in imported), imported
     # These wallet root keys include hardened paths; their public serialization
     # cannot derive those paths. Core derives the test addresses with its private keys.
@@ -278,7 +293,7 @@ def public_xpub_records(port):
 
 
 def reject_derivations(args, raw, reason):
-    result = subprocess.run([str(args.node), "--json", "verify-psbt-derivations", raw], capture_output=True, text=True, timeout=30)
+    result = run_cli(args.node, "verify-psbt-derivations", raw)
     assert result.returncode != 0 and reason in result.stderr, result.stderr
 
 
@@ -335,8 +350,7 @@ def check_key_derivation_proofs(args, port, raw, kind, expected_maps=3):
 
 def reject_spending_data(args, raw, reason):
     for command, extra in [("decode-psbt", []), ("convert-psbt", ["--version", "2"]), ("extract-psbt", []), ("finalize-psbt", [])]:
-        result = subprocess.run([str(args.node), "--json", command, raw, *extra],
-                                capture_output=True, text=True, timeout=30)
+        result = run_cli(args.node, command, raw, *extra)
         assert result.returncode != 0 and reason in result.stderr, (command, result.stderr)
 
 
@@ -384,8 +398,7 @@ def check_spending_data(args, port, raw, finalized, coin, expected_tx):
 
 
 def reject_verification(args, raw, reason, partial=False):
-    result = subprocess.run([str(args.node), "--json", "verify-psbt", raw, *(["--partial"] if partial else [])],
-                            capture_output=True, text=True, timeout=30)
+    result = run_cli(args.node, "verify-psbt", raw, *(["--partial"] if partial else []))
     assert result.returncode != 0 and reason in result.stderr, result.stderr
 
 
@@ -469,8 +482,7 @@ def check_partial_verification(args, port, raw):
 
 
 def reject_finalization(args, raw, reason):
-    result = subprocess.run([str(args.node), "--json", "finalize-psbt", raw],
-                            capture_output=True, text=True, timeout=30)
+    result = run_cli(args.node, "finalize-psbt", raw)
     assert result.returncode != 0, (reason, result.stdout)
     assert reason in result.stderr, (reason, result.stderr)
     assert not result.stdout.strip(), result.stdout
@@ -898,6 +910,66 @@ def check_threshold_satisfactions(args, port, unsigned, raw, kind):
     print(f"PASSED: Core {kind} threshold subsets, invalid witness slots, mixed signature lengths and exact final bytes", flush=True)
 
 
+def check_large_threshold_wallet(args, port, kind, pair):
+    threshold, n = map(int, kind.rsplit("-", 1)[1].split("of"))
+    address, destination = pair
+    core_rpc(port, "generatetoaddress", [101, address], timeout=30)
+    coin = next(c for c in core_rpc(port, "listunspent", [100]) if c["address"] == address)
+    unsigned = core_rpc(port, "createpsbt", [[{"txid": coin["txid"], "vout": coin["vout"], "sequence": 0xfffffffd}],
+                                             {destination: round(coin["amount"] - 0.0005, 8)}, 23])
+    started = time.monotonic()
+    print(f"RUNNING: Core {kind} large wallet signer", flush=True)
+    signed = core_rpc(port, "walletprocesspsbt", [unsigned, True, "ALL", True, False], timeout=180)["psbt"]
+    print(f"SIGNED: Core {kind} in {time.monotonic() - started:.1f}s", flush=True)
+    raw = base64.b64decode(signed).hex()
+    assert len(raw) > 60_000  # force actual compiled binary-file input
+    check_funded_descriptor(args, port, address, raw, kind)
+    check_key_derivation_proofs(args, port, raw, kind)
+    maps = psbt_maps(raw)
+    keys = [key for key in maps[1] if key[0] == 0x14]
+    assert len(keys) == n
+    independent = core_rpc(port, "finalizepsbt", [signed], timeout=180)
+    assert independent["complete"]
+    for version in [0, 2]:
+        encoded = raw if version == 0 else cli(args.node, "convert-psbt", raw, "--version", "2")["psbt_hex"]
+        partial = cli(args.node, "verify-psbt", encoded, "--partial")
+        assert partial["signatures_checked"] == n and partial["spending_conditions_verified"] is False
+        result = cli(args.node, "finalize-psbt", encoded)
+        assert result["tx_hex"] == independent["hex"]
+        assert result["partial_signatures_checked"] == n and result["signatures_checked"] == threshold
+        final = cli(args.node, "verify-psbt", result["psbt_hex"])
+        assert final["tx_hex"] == independent["hex"] and final["fee_sat"] == 50_000
+        assert final["active_chain_verified"] is False
+        witness = witness_items(psbt_maps(result["psbt_hex"])[1][b"\x08"])
+        assert len(witness) == n + 2 and sum(bool(item) for item in witness[:n]) == threshold
+        assert len(witness[-2]) == n * 34 + (2 if threshold <= 16 else 4)
+        assert core_rpc(port, "testmempoolaccept", [[final["tx_hex"]]])[0]["allowed"] is True
+    # Real signatures at the beginning/middle/end all need to verify, including
+    # hundreds of unselected records in the sorted 2-of-999 spend.
+    for i in [0, n // 2, n - 1]:
+        bad = psbt_maps(raw); sig = bytearray(bad[1][keys[i]]); sig[63] ^= 1; bad[1][keys[i]] = bytes(sig)
+        reject_verification(args, encode_maps(bad), "partial signature equation failed", partial=True)
+        reject_finalization(args, encode_maps(bad), "partial signature equation failed")
+    insufficient = psbt_maps(raw)
+    for key in keys[threshold - 1:]:
+        insufficient[1].pop(key)
+    partial = cli(args.node, "verify-psbt", encode_maps(insufficient), "--partial")
+    assert partial["signatures_checked"] == threshold - 1
+    assert core_rpc(port, "finalizepsbt", [encode64(encode_maps(insufficient))], timeout=180)["complete"] is False
+    reject_finalization(args, encode_maps(insufficient), "missing supported Taproot script satisfaction")
+    # A populated witness is never allowed to omit one of its key slots.
+    final_maps = psbt_maps(result["psbt_hex"])
+    witness = witness_items(final_maps[1][b"\x08"]); witness.pop(0)
+    final_maps[1][b"\x08"] = encoded_witness(witness)
+    damaged = encode_maps(final_maps)
+    reject_verification(args, damaged, "invalid tapscript witness slots")
+    tx = cli(args.node, "extract-psbt", damaged)["tx_hex"]
+    assert core_rpc(port, "testmempoolaccept", [[tx]])[0]["allowed"] is False
+    core_rpc(port, "sendrawtransaction", [independent["hex"]])
+    core_rpc(port, "generatetoaddress", [1, address])
+    print(f"PASSED: Core {kind} {n} real keys/signatures, binary file tools, exact v0/v2 final bytes, insufficient/corrupt rejection and mined spend", flush=True)
+
+
 def check_wallet(args, port, kind, script_pair=None):
     if kind.startswith("taproot-") or kind in ["wsh", "sh-wsh", "wsh-multisig", "sh-wsh-multisig", "wsh-multisig-2of3"]:
         assert script_pair is not None
@@ -1095,6 +1167,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bitcoind", type=Path, required=True)
     parser.add_argument("--node", type=Path, default=Path("target/release/btc-node"))
+    parser.add_argument("--large-only", action="store_true", help="Run only the large threshold acceptance surfaces")
     args = parser.parse_args()
     args.bitcoind = args.bitcoind.resolve()
     args.node = args.node.resolve()
@@ -1106,7 +1179,7 @@ def main():
                                      "-listen=0", "-dnsseed=0", "-discover=0", "-connect=0",
                                      "-listenonion=0", "-par=1", f"-rpcport={port}",
                                      "-rpcbind=127.0.0.1", "-rpcallowip=127.0.0.1",
-                                     "-rpcuser=interop", "-rpcpassword=regtest-only", "-fallbackfee=0.00002"],
+                                     "-rpcuser=interop", "-rpcpassword=regtest-only", "-fallbackfee=0.00002", "-keypool=2"],
                                     stdout=log, stderr=log)
             try:
                 wait_until(lambda: core_rpc(port, "getblockchaininfo", []))
@@ -1117,20 +1190,26 @@ def main():
                 # descriptor: its deliberately unknown internal secret cannot
                 # be exported by listdescriptors(private=true).
                 descriptors = core_rpc(port, "listdescriptors", [True])["descriptors"]
-                script_pairs = {kind: script_addresses(port, kind, descriptors)
-                                for kind in ["wsh", "sh-wsh", "taproot-script", "taproot-unbalanced", "wsh-multisig", "sh-wsh-multisig", "sh-multisig", "wsh-multisig-2of3",
-                                             "taproot-multisig-2of3", "taproot-sortedmultisig-2of3", "taproot-multisig-17of20", "taproot-threshold-unbalanced"]}
-                check_public_descriptor_vectors(args, port)
-                check_published_taproot_vectors(args, port)
-                check_published_spending_vectors(args, port)
-                check_published_key_vectors(args, port)
-                check_published_signature_vectors(args, port)
-                check_published_commitment_vectors(args, port)
-                for kind in ["legacy", "p2sh-segwit", "bech32", "wsh", "sh-wsh", "bech32m", "taproot-script", "taproot-unbalanced", "wsh-multisig", "sh-wsh-multisig", "wsh-multisig-2of3",
-                             "taproot-multisig-2of3", "taproot-sortedmultisig-2of3", "taproot-multisig-17of20", "taproot-threshold-unbalanced"]:
-                    check_wallet(args, port, kind, script_pairs.get(kind))
-                check_two_input_taproot_verification(args, port)
-                check_legacy_multisig_partials(args, port, script_pairs["sh-multisig"])
+                script_kinds = ["wsh", "sh-wsh", "taproot-script", "taproot-unbalanced", "wsh-multisig", "sh-wsh-multisig", "sh-multisig", "wsh-multisig-2of3",
+                                             "taproot-multisig-2of3", "taproot-sortedmultisig-2of3", "taproot-multisig-17of20", "taproot-threshold-unbalanced",
+                                             "taproot-large-2of999", "taproot-large-128of128", "taproot-large-999of999"]
+                if args.large_only:
+                    script_kinds = [kind for kind in script_kinds if kind.startswith("taproot-large-")]
+                script_pairs = {kind: script_addresses(port, kind, descriptors) for kind in script_kinds}
+                if not args.large_only:
+                    check_public_descriptor_vectors(args, port)
+                    check_published_taproot_vectors(args, port)
+                    check_published_spending_vectors(args, port)
+                    check_published_key_vectors(args, port)
+                    check_published_signature_vectors(args, port)
+                    check_published_commitment_vectors(args, port)
+                    for kind in ["legacy", "p2sh-segwit", "bech32", "wsh", "sh-wsh", "bech32m", "taproot-script", "taproot-unbalanced", "wsh-multisig", "sh-wsh-multisig", "wsh-multisig-2of3",
+                                 "taproot-multisig-2of3", "taproot-sortedmultisig-2of3", "taproot-multisig-17of20", "taproot-threshold-unbalanced"]:
+                        check_wallet(args, port, kind, script_pairs.get(kind))
+                    check_two_input_taproot_verification(args, port)
+                    check_legacy_multisig_partials(args, port, script_pairs["sh-multisig"])
+                for kind in ["taproot-large-2of999", "taproot-large-128of128", "taproot-large-999of999"]:
+                    check_large_threshold_wallet(args, port, kind, script_pairs[kind])
                 core_rpc(port, "stop", [])
                 core.wait(timeout=15)
                 assert core.returncode == 0

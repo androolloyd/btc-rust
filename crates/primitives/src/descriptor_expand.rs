@@ -277,10 +277,11 @@ impl Expansion {
             Descriptor::MultiA(threshold, keys) | Descriptor::SortedMultiA(threshold, keys)
                 if context == Context::Tap =>
             {
-                // This is a bounded wallet template, not a consensus key limit.
-                if *threshold == 0 || *threshold as usize > keys.len() || keys.len() > 20 {
+                // BIP387's cap leaves room for the first key push under
+                // BIP342's 1000-element stack limit.
+                if *threshold == 0 || *threshold as usize > keys.len() || keys.len() > 999 {
                     return Err(error(
-                        "invalid Taproot threshold/key count (maximum 20 keys)",
+                        "invalid Taproot threshold/key count (maximum 999 keys)",
                     ));
                 }
                 let mut keys = keys
@@ -400,11 +401,21 @@ impl Expansion {
 }
 
 fn push_number(script: &mut ScriptBuf, value: u32) {
-    // Multisig integers are 1..20 and must use minimally encoded script numbers.
+    // Positive thresholds use minimal signed-magnitude script numbers,
+    // including the sign-padding byte at 128 and 32768.
     if value <= 16 {
         script.push_opcode(Opcode::from_u8(0x50 + value as u8));
     } else {
-        script.push_slice(&[value as u8]);
+        let mut value = value;
+        let mut bytes = Vec::new();
+        while value != 0 {
+            bytes.push(value as u8);
+            value >>= 8;
+        }
+        if bytes.last().is_some_and(|byte| byte & 0x80 != 0) {
+            bytes.push(0);
+        }
+        script.push_slice(&bytes);
     }
 }
 
@@ -511,11 +522,20 @@ mod tests {
                 assert!(Descriptor::parse(&text).unwrap().script_pubkey().is_err());
             }
         }
-        let keys = vec![KEY; 21].join(",");
-        assert!(Descriptor::parse(&format!("tr({KEY},multi_a(20,{keys}))"))
-            .unwrap()
-            .script_pubkey()
-            .is_err());
+        let excessive = Descriptor::MultiA(999, vec![KEY.to_owned(); 1000]);
+        let mut work = Expansion {
+            index: None,
+            network: Network::Mainnet,
+            ranged: false,
+            steps: 0,
+            keys: 0,
+            redeem: None,
+            witness: None,
+            internal: None,
+            root: None,
+            leaves: Vec::new(),
+        };
+        assert!(work.script(&excessive, Context::Tap).is_err());
         assert!(Descriptor::Tr(
             KEY.to_owned(),
             Some(Box::new(TapTree::Leaf(format!("multi_a(0,{KEY})"))))
@@ -629,7 +649,7 @@ mod tests {
         assert!(
             Descriptor::parse(&format!("{}pk(key){}", "sh(".repeat(133), ")".repeat(133))).is_err()
         );
-        assert!(Descriptor::parse(&format!("raw({})", "00".repeat(32769))).is_err());
+        assert!(Descriptor::parse(&format!("raw({})", "00".repeat(131073))).is_err());
         let leaf = format!("pk({KEY})");
         let mut tree = leaf.clone();
         for _ in 0..128 {

@@ -159,6 +159,32 @@ pub fn derive_descriptor(
 }
 
 fn parse_psbt_hex(hex_str: &str) -> eyre::Result<btc_primitives::psbt::Psbt> {
+    if let Some(path) = hex_str.strip_prefix('@') {
+        use eyre::WrapErr;
+        use std::io::Read;
+        eyre::ensure!(!path.is_empty(), "missing binary PSBT file path");
+        let file = std::fs::File::open(path).wrap_err("could not open binary PSBT file")?;
+        let metadata = file
+            .metadata()
+            .wrap_err("could not inspect binary PSBT file")?;
+        eyre::ensure!(
+            metadata.is_file(),
+            "binary PSBT input must be a regular file"
+        );
+        eyre::ensure!(
+            metadata.len() <= btc_primitives::psbt::MAX_PSBT_SIZE as u64,
+            "PSBT exceeds parser size limit"
+        );
+        let mut bytes = Vec::new();
+        file.take((btc_primitives::psbt::MAX_PSBT_SIZE + 1) as u64)
+            .read_to_end(&mut bytes)
+            .wrap_err("could not read binary PSBT file")?;
+        eyre::ensure!(
+            bytes.len() <= btc_primitives::psbt::MAX_PSBT_SIZE,
+            "PSBT exceeds parser size limit"
+        );
+        return Ok(btc_primitives::psbt::Psbt::deserialize(&bytes)?);
+    }
     if hex_str.len() > btc_primitives::psbt::MAX_PSBT_SIZE * 2 {
         eyre::bail!("PSBT exceeds parser size limit");
     }
@@ -922,6 +948,58 @@ mod tests {
     // -----------------------------------------------------------------------
     // parse_network
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn binary_psbt_files_support_large_wallet_inputs_with_read_bounds() {
+        use std::io::{Seek, Write};
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../primitives/tests/data/taproot-thresholds.json"
+        ))
+        .unwrap();
+        let vector = fixture["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == "two-of-999")
+            .unwrap();
+        let raw = vector["partial_psbt"].as_str().unwrap();
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&hex::decode(raw).unwrap()).unwrap();
+        let argument = format!("@{}", file.path().display());
+        assert_eq!(decode_psbt(&argument).unwrap(), decode_psbt(raw).unwrap());
+        assert_eq!(
+            verify_psbt_partials(&argument).unwrap()["signatures_checked"],
+            3
+        );
+        assert_eq!(
+            convert_psbt(&argument, 2).unwrap(),
+            convert_psbt(raw, 2).unwrap()
+        );
+        let finalized = finalize_psbt(&argument).unwrap();
+        assert_eq!(finalized["signatures_checked"], 2);
+        let bytes = hex::decode(finalized["psbt_hex"].as_str().unwrap()).unwrap();
+        file.as_file_mut().set_len(0).unwrap();
+        file.as_file_mut().rewind().unwrap();
+        file.write_all(&bytes).unwrap();
+        assert_eq!(
+            extract_psbt(&argument).unwrap()["tx_hex"],
+            finalized["tx_hex"]
+        );
+        assert_eq!(
+            verify_psbt(&argument).unwrap()["tx_hex"],
+            finalized["tx_hex"]
+        );
+        file.as_file_mut()
+            .set_len(btc_primitives::psbt::MAX_PSBT_SIZE as u64 + 1)
+            .unwrap();
+        assert!(decode_psbt(&argument)
+            .unwrap_err()
+            .to_string()
+            .contains("size limit"));
+        assert!(decode_psbt("@").is_err());
+        #[cfg(unix)]
+        assert!(decode_psbt("@/dev/null").is_err());
+    }
 
     #[test]
     fn psbt_cli_inspects_and_converts_published_vector() {

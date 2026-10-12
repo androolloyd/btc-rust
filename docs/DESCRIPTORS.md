@@ -42,15 +42,16 @@ still advance when its point equals the parent's point.
 
 Taproot accepts x-only or compressed keys and key-path-only outputs or binary
 trees of `pk`, `multi_a` and `sortedmulti_a` leaves. Threshold leaves use the
-BIP387 CHECKSIG/CHECKSIGADD/NUMEQUAL script and support 1..20 keys with a
+BIP387 CHECKSIG/CHECKSIGADD/NUMEQUAL script and support 1..999 keys with a
 threshold from one through the key count. `sortedmulti_a` sorts the derived
-x-only children. The twenty-key bound is an implementation limit; BIP387 allows
-999 keys. It applies the actual BIP341 tweak, leaf/branch hashes and
+x-only children. Thresholds use minimal signed-magnitude numbers, including
+the sign-padding byte at 128. BIP387's 999-key maximum leaves room for the first
+key push within BIP342's 1000-element stack limit. It applies the actual BIP341 tweak, leaf/branch hashes and
 output parity. Results include the internal key, merkle root when present, leaf
 scripts/hashes and complete control blocks, with a maximum tree depth of 128.
 Uncompressed Taproot keys and unsupported leaf templates fail.
 
-Untrusted input is bounded to 65,536 ASCII bytes and 132 delimiter nesting
+Untrusted input is bounded to 262,144 ASCII bytes and 132 delimiter nesting
 levels before recursive parsing. Expansion bounds key expressions to 4,096 bytes,
 1,024 total keys, 1,024 leaves and 10,000 CKDpub operations; raw scripts are at
 most 10,000 bytes. These are explicit implementation limits, not new consensus
@@ -60,7 +61,7 @@ uses the selected network. Errors return no partial expansion.
 The CLI scope is `public_descriptor_scripts`. `key_origins_verified`,
 `wallet_ownership_verified`, `signatures_verified` and `active_chain_verified`
 remain false. No signer, wallet import/rescan, spending-key coverage or chain
-admission is implied. General Miniscript, larger BIP387 thresholds, multipath, `combo`, `rawtr` and
+admission is implied. General Miniscript, multipath, `combo`, `rawtr` and
 private descriptor operations remain unfinished.
 
 The independent fixture retains twenty public descriptors and twenty-four exact
@@ -74,10 +75,12 @@ to tpub; curve keys, chain codes, origin/header metadata and expected scripts st
 unchanged. Wrong-network extended keys fail explicitly.
 
 Threshold regressions retain four unchanged published BIP387 public outputs,
-forty Core reference-generated script/control commitments spanning one through
-twenty keys, and independently signed offline PSBTs. Synthetic outpoints establish
+fifty-two Core reference-generated script/control commitments spanning one through
+999 keys, and independently signed offline PSBTs. Synthetic outpoints establish
 equations only. Live Core wallet acceptance separately funds and mines unsorted
-and sorted 2-of-3, 17-of-20 and mixed-depth threshold/key-leaf spends.
+and sorted 2-of-3, 17-of-20 and mixed-depth threshold/key-leaf spends, plus real
+2-of-999, 128-of-128 and 999-of-999 spends. Text/key/derivation budgets still apply
+to large descriptors; private and hardened-suffix expressions remain unsupported.
 
 Primary definitions: [BIP380 key expressions/checksums](https://github.com/bitcoin/bips/blob/master/bip-0380.mediawiki),
 [BIP381 legacy contexts](https://github.com/bitcoin/bips/blob/master/bip-0381.mediawiki),

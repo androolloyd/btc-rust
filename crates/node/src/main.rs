@@ -155,10 +155,14 @@ enum Commands {
     },
 
     /// Inspect PSBT v0/v2 hex (format checks; no signing or signature verification)
-    DecodePsbt { hex: String },
+    DecodePsbt {
+        /// PSBT hex or @path to a binary PSBT file
+        hex: String,
+    },
 
     /// Convert PSBT hex between v0/v2, preserving the transaction and wallet metadata
     ConvertPsbt {
+        /// PSBT hex or @path to a binary PSBT file
         hex: String,
         /// Target PSBT version: 0 or 2
         #[arg(long, value_parser = ["0", "2"])]
@@ -166,13 +170,22 @@ enum Commands {
     },
 
     /// Extract externally finalized PSBT fields (does not verify signatures)
-    ExtractPsbt { hex: String },
+    ExtractPsbt {
+        /// PSBT hex or @path to a binary PSBT file
+        hex: String,
+    },
 
     /// Assemble and verify supported PSBT spends from supplied signatures (offline)
-    FinalizePsbt { hex: String },
+    FinalizePsbt {
+        /// PSBT hex or @path to a binary PSBT file
+        hex: String,
+    },
 
     /// Verify public key derivations from supplied PSBT global xpubs (offline)
-    VerifyPsbtDerivations { hex: String },
+    VerifyPsbtDerivations {
+        /// PSBT hex or @path to a binary PSBT file
+        hex: String,
+    },
 
     /// Expand a public descriptor into scripts, an address and control proofs
     DeriveDescriptor {
@@ -209,6 +222,7 @@ enum Commands {
 
     /// Verify supported PSBT signatures against supplied prevouts (offline)
     VerifyPsbt {
+        /// PSBT hex or @path to a binary PSBT file
         hex: String,
         /// Check partial signatures on unfinalized inputs instead of final spends
         #[arg(long)]

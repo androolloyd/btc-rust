@@ -834,7 +834,15 @@ mod tests {
                     assert_eq!(result.partial_signatures_checked, count);
                     assert_eq!(result.verified.signatures_checked, threshold);
                     // Even unused excess records must pass the real equation.
-                    for i in 0..partial.inputs[0].tap_script_sigs.len() {
+                    let records = partial.inputs[0].tap_script_sigs.len();
+                    // Keep exhaustive small-set coverage; sample the start,
+                    // middle and end of maximum-size valid sets.
+                    let indices: Vec<_> = if records <= 20 {
+                        (0..records).collect()
+                    } else {
+                        vec![0, records / 2, records - 1]
+                    };
+                    for i in indices {
                         let mut bad = partial.clone();
                         bad.inputs[0].tap_script_sigs[i].1[63] ^= 1;
                         assert!(finalize_psbt(&bad).is_err(), "{name} {i}");
@@ -901,6 +909,9 @@ mod tests {
             vec![0x50, 0x9c],
             vec![0x52, 0x9c],
             vec![1, 1, 0x9c],
+            vec![2, 1, 0, 0x9c],
+            vec![2, 0, 0x80, 0x9c],
+            vec![3, 0xe7, 3, 0, 0x9c],
             vec![0x51, 0x9d],
             vec![0xab, 0x51, 0x9c],
             vec![0x51, 0x9c, 0x51],
@@ -908,11 +919,11 @@ mod tests {
             assert!(tapscript_template(&[prefix.clone(), tail].concat()).is_err());
         }
         let mut excessive = prefix;
-        for _ in 0..20 {
+        for _ in 0..999 {
             excessive.extend_from_within(0..33);
             excessive.push(0xba);
         }
-        excessive.extend_from_slice(&[1, 20, 0x9c]);
+        excessive.extend_from_slice(&[2, 0xe7, 3, 0x9c]);
         assert!(tapscript_template(&excessive).is_err());
         assert!(tapscript_template(&[0x51, 0x9c]).is_err());
     }
@@ -1161,7 +1172,7 @@ struct TapScriptTemplate<'a> {
 }
 
 fn tapscript_template(code: &[u8]) -> eyre::Result<TapScriptTemplate<'_>> {
-    ensure!(code.len() <= 20 * 34 + 3, "unsupported tapscript template");
+    ensure!(code.len() <= 999 * 34 + 4, "unsupported tapscript template");
     let mut keys = Vec::new();
     let mut offset = 0;
     while code.get(offset) == Some(&32) && offset + 34 <= code.len() {
@@ -1173,16 +1184,22 @@ fn tapscript_template(code: &[u8]) -> eyre::Result<TapScriptTemplate<'_>> {
         let key = &code[offset + 1..offset + 33];
         secp256k1::XOnlyPublicKey::from_slice(key)?;
         keys.push(key);
-        ensure!(keys.len() <= 20, "unsupported tapscript template");
+        ensure!(keys.len() <= 999, "unsupported tapscript template");
         offset += 34;
     }
     let threshold = match &code[offset..] {
         [] if keys.len() == 1 => 1,
         [number @ 0x51..=0x60, 0x9c] => usize::from(*number - 0x50),
-        [1, number @ 17..=20, 0x9c] => usize::from(*number),
+        [1, number @ 17..=127, 0x9c] => usize::from(*number),
+        [2, low, high, 0x9c] if *high <= 3 && (*high != 0 || low & 0x80 != 0) => {
+            usize::from(*low) + (usize::from(*high) << 8)
+        }
         _ => bail!("unsupported tapscript template"),
     };
-    ensure!(threshold <= keys.len(), "unsupported tapscript template");
+    ensure!(
+        threshold > 0 && threshold <= keys.len(),
+        "unsupported tapscript template"
+    );
     Ok(TapScriptTemplate { threshold, keys })
 }
 
@@ -1438,23 +1455,39 @@ fn verify_partial_input(
                 )
             })
             .collect();
+        // Cache only referenced templates: unsupported unselected leaves
+        // remain opaque. This avoids curve-parsing the same keys per record.
+        let mut templates = HashMap::new();
+        let mut digests = HashMap::new();
         for (record, sig) in &input.tap_script_sigs {
             let leaf_hash: [u8; 32] = record[32..].try_into()?;
             let leaf = leaves
                 .get(&leaf_hash)
                 .ok_or_else(|| eyre::eyre!("missing committed Taproot leaf for signature"))?;
-            let code = leaf.script.as_bytes();
             ensure!(
                 leaf.leaf_version == 0xc0,
                 "unsupported tapscript leaf version"
             );
-            let template = tapscript_template(code)?;
+            if let std::collections::hash_map::Entry::Vacant(entry) = templates.entry(leaf_hash) {
+                entry.insert(
+                    tapscript_template(leaf.script.as_bytes())?
+                        .keys
+                        .into_iter()
+                        .collect::<HashSet<_>>(),
+                );
+            }
             ensure!(
-                template.keys.contains(&&record[..32]),
+                templates[&leaf_hash].contains(&record[..32]),
                 "partial signature key does not belong to Taproot leaf"
             );
             let hash_type = check_sighash(sig, true, input.sighash_type)?;
-            let hash = sighash_taproot(tx, index, prevouts, hash_type, None, Some(&leaf_hash))?;
+            let hash =
+                match digests.entry((leaf_hash, hash_type.0)) {
+                    std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                    std::collections::hash_map::Entry::Vacant(entry) => *entry.insert(
+                        sighash_taproot(tx, index, prevouts, hash_type, None, Some(&leaf_hash))?,
+                    ),
+                };
             ensure!(
                 verifier.verify_schnorr(&hash, &sig[..64], &record[..32])?,
                 "partial signature equation failed"

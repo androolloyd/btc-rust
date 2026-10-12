@@ -20,7 +20,10 @@ BIP387_SHA256 = "92a1a95be774be27f3f373e15dcd8bf291f542cd62535dd1ccbd95bd1022464
 
 
 def compact(n):
-    return bytes([n]) if n < 253 else b"\xfd" + n.to_bytes(2, "little")
+    if n < 253:
+        return bytes([n])
+    size, prefix = (2, 0xfd) if n <= 0xffff else (4, 0xfe)
+    return bytes([prefix]) + n.to_bytes(size, "little")
 
 
 def psbt(tx, records):
@@ -44,7 +47,7 @@ def generate(path):
     published = [v for v in published if not re.search(r"xprv|tr\([LK5][^,)]{50,51}[,)]", v["descriptor"])]
     assert len(published) == 2 and sum(len(v["scripts"]) for v in published) == 4
     key, s, m = reference()
-    secrets = [i.to_bytes(32, "big") for i in range(1, 21)]
+    secrets = [i.to_bytes(32, "big") for i in range(1, 1000)]
     public = [key.compute_xonly_pubkey(secret)[0] for secret in secrets]
 
     def code(keys, threshold):
@@ -54,7 +57,7 @@ def generate(path):
         return bytes(s.CScript(items + [threshold, s.OP_NUMEQUAL]))
 
     descriptors = []
-    for n in range(1, 21):
+    for n in list(range(1, 21)) + [21, 127, 128, 255, 256, 999]:
         for sorted_keys in [False, True]:
             keys = list(reversed(public[:n]))
             name = "sortedmulti_a" if sorted_keys else "multi_a"
@@ -70,10 +73,13 @@ def generate(path):
     cases = [("one-of-one", 1, 1, False, False), ("two-of-three", 3, 2, False, False),
              ("sixteen-of-twenty", 20, 16, True, False), ("seventeen-of-twenty", 20, 17, True, False),
              ("twenty-of-twenty", 20, 20, False, False), ("repeated-key", 3, 2, False, False),
-             ("annex-two-of-three", 3, 2, False, True)]
+             ("annex-two-of-three", 3, 2, False, True),
+             ("128-of-128", 128, 128, False, False), ("256-of-256", 256, 256, False, False),
+             ("two-of-999", 999, 2, False, False), ("999-of-999-repeated-key", 999, 999, False, False)]
     for name, n, threshold, mixed, annex_present in cases:
-        keys = [public[0]] * n if name == "repeated-key" else public[:n]
-        priv = [secrets[0]] * n if name == "repeated-key" else secrets[:n]
+        repeated = "repeated-key" in name
+        keys = [public[0]] * n if repeated else public[:n]
+        priv = [secrets[0]] * n if repeated else secrets[:n]
         script = code(keys, threshold)
         info = s.taproot_construct(NUMS, [("leaf", script)])
         leaf = info.leaves["leaf"]
@@ -87,16 +93,22 @@ def generate(path):
         annex = b"\x50" + bytes(252) if annex_present else None
         records = {b"\x01": prevout.serialize(), b"\x15" + control: script + b"\xc0"}
         signatures = []
+        cache = {}
         for i, (pub, secret) in enumerate(zip(keys, priv, strict=True)):
+            if name == "two-of-999" and i < n - 3:
+                signatures.append(b"")
+                continue
             hash_type = 1 if mixed and i < 4 else 0
-            digest = s.TaprootSignatureHash(tx, [prevout], hash_type, scriptpath=True, leaf_script=script, annex=annex)
-            sig = key.sign_schnorr(secret, digest, aux=bytes(32)) + (bytes([hash_type]) if hash_type else b"")
+            if (pub, hash_type) not in cache:
+                digest = s.TaprootSignatureHash(tx, [prevout], hash_type, scriptpath=True, leaf_script=script, annex=annex)
+                cache[(pub, hash_type)] = key.sign_schnorr(secret, digest, aux=bytes(32)) + (bytes([hash_type]) if hash_type else b"")
+            sig = cache[(pub, hash_type)]
             signatures.append(sig)
             records[b"\x14" + pub + leaf.leaf_hash] = sig
         partial = psbt(tx, records)
         # Minimal weight, retaining later script keys on equal sizes, per
         # Core v29 miniscript's reverse-order dynamic programming satisfaction.
-        selected = set(sorted(range(n), key=lambda i: (len(signatures[i]), -i))[:threshold])
+        selected = set(sorted((i for i in range(n) if signatures[i]), key=lambda i: (len(signatures[i]), -i))[:threshold])
         slots = [signatures[i] if i in selected else b"" for i in reversed(range(n))]
         stack = slots + [script, control] + ([annex] if annex is not None else [])
         tx.wit.vtxinwit = [m.CTxInWitness()]
