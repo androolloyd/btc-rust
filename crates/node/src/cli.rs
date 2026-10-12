@@ -204,6 +204,28 @@ pub fn decode_psbt(hex_str: &str) -> eyre::Result<serde_json::Value> {
     }))
 }
 
+/// Verify public derivations relative to supplied, unauthenticated xpub anchors.
+pub fn verify_psbt_derivations(hex_str: &str) -> eyre::Result<serde_json::Value> {
+    let verified = crate::wallet::verify_key_derivations(&parse_psbt_hex(hex_str)?)?;
+    Ok(serde_json::json!({
+        "verification_scope": "public_derivations_from_supplied_xpubs",
+        "derivation_equations_verified": true,
+        "origin_records_checked": verified.records.len(),
+        "derivation_steps_checked": verified.derivation_steps_checked,
+        "key_origins_verified": false,
+        "wallet_ownership_verified": false,
+        "signatures_verified": false,
+        "taproot_leaf_membership_verified": false,
+        "active_chain_verified": false,
+        "records": verified.records.iter().map(|record| serde_json::json!({
+            "scope": record.scope, "index": record.index, "pubkey": hex::encode(&record.pubkey),
+            "key_type": if record.taproot { "taproot_xonly" } else { "legacy_public_key" },
+            "master_fingerprint": hex::encode(record.source.0), "path": record.source.1,
+            "global_xpub_index": record.global_xpub_index, "relative_path": record.relative_path,
+        })).collect::<Vec<_>>(),
+    }))
+}
+
 /// Convert version encoding without changing the transaction being signed.
 pub fn convert_psbt(hex_str: &str, version: u32) -> eyre::Result<serde_json::Value> {
     let original = parse_psbt_hex(hex_str)?;

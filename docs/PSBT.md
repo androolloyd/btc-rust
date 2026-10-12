@@ -12,6 +12,7 @@ btc-node --json extract-psbt "$FINALIZED_PSBT_HEX"
 btc-node --json verify-psbt "$FINALIZED_PSBT_HEX"
 btc-node --json verify-psbt "$PARTIALLY_SIGNED_PSBT_HEX" --partial
 btc-node --json finalize-psbt "$PARTIALLY_SIGNED_PSBT_HEX"
+btc-node --json verify-psbt-derivations "$PSBT_WITH_XPUB_ANCHORS_HEX"
 ```
 
 Inspection reports the actual unsigned transaction, PSBT version, resolved
@@ -180,6 +181,34 @@ fingerprint at depth zero or the parent fingerprint at depth one. At greater
 depths it remains a claim without the missing master ancestor. These consistency
 checks neither establish the full derivation nor link every input/output origin
 to a global xpub. Compressed/uncompressed keys retain their original encoding.
+
+`verify-psbt-derivations` separately checks every supplied legacy and Taproot
+input/output key-origin record against at least one supplied global xpub. The
+fingerprint and path prefix select candidate anchors; actual CKDpub HMAC/curve
+operations must produce the recorded point. Legacy compressed/uncompressed
+encodings compare the complete point, and Taproot records compare its x-only
+coordinate. Fingerprint collisions try alternative anchors. Matching the anchor
+itself is an identity proof with zero child steps. Shared prefixes are cached.
+The immutable wallet API is `wallet::verify_key_derivations`.
+
+Success reports `derivation_equations_verified: true`, the matching global xpub
+index and relative path for each record, plus record and unique child-step counts.
+Its scope is `public_derivations_from_supplied_xpubs`. The supplied anchor and its
+claimed master path are not authenticated: `key_origins_verified`,
+`wallet_ownership_verified`, `signatures_verified`, `taproot_leaf_membership_verified`
+and `active_chain_verified` remain false. The command does not establish coverage
+of every spending key or verify leaf-hash associations. Parsing, conversion,
+signature verification and finalization retain their existing separate scopes.
+
+Missing anchors/records, mismatched points/paths and paths above BIP32 depth 255
+fail explicitly. Hardened suffixes require a deeper supplied xpub; no private key
+or invented ancestor is substituted. Any unprovable supplied record fails the
+whole command without changing the PSBT. Work is bounded to 256 anchors, 4,096
+records and 10,000 child operations, including unsuccessful candidates.
+Core's literal NUMS origin annotations have no xpub anchor in the acceptance
+fixture and correctly fail complete derivation verification. Separate HD-subset
+checks explicitly omit only those optional annotations and make no complete
+origin or ownership claim.
 
 All BIP371 fields are typed, including input leaf scripts and input/output Taproot
 BIP32 origins and output trees. X-only keys must be actual secp256k1 points. Control

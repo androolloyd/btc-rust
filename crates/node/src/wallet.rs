@@ -1,5 +1,9 @@
 //! Offline PSBT verification and finalization against supplied prevouts.
 
+pub use crate::wallet_derivations::{
+    verify_key_derivations, VerifiedKeyDerivation, VerifiedKeyDerivations,
+};
+
 use btc_consensus::script_engine::ScriptFlags;
 use btc_consensus::sig_verify::{Secp256k1Verifier, SigError, SignatureVerifier};
 use btc_consensus::sighash::{

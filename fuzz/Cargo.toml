@@ -18,6 +18,8 @@ btc-consensus = { path = "../crates/consensus" }
 btc-network = { path = "../crates/network" }
 arbitrary = { version = "1", features = ["derive"] }
 bytes = "1"
+eyre = "0.6"
+secp256k1 = "0.29"
 tokio-util = { version = "0.7", features = ["codec"] }
 
 [[bin]]

@@ -171,6 +171,9 @@ enum Commands {
     /// Assemble and verify supported PSBT spends from supplied signatures (offline)
     FinalizePsbt { hex: String },
 
+    /// Verify public key derivations from supplied PSBT global xpubs (offline)
+    VerifyPsbtDerivations { hex: String },
+
     /// Verify supported PSBT signatures against supplied prevouts (offline)
     VerifyPsbt {
         hex: String,
@@ -323,6 +326,10 @@ async fn main() -> eyre::Result<()> {
         }
         Some(Commands::FinalizePsbt { hex }) => {
             output::emit(format, &cli::finalize_psbt(&hex)?);
+            Ok(())
+        }
+        Some(Commands::VerifyPsbtDerivations { hex }) => {
+            output::emit(format, &cli::verify_psbt_derivations(&hex)?);
             Ok(())
         }
         Some(Commands::VerifyPsbt { hex, partial }) => {

@@ -31,6 +31,9 @@ jobs:
               key = "psbt_vectors" if name in ["bip341-commitments", "bip32-keys", "psbt-signatures"] else "vectors"
               for i, vector in enumerate(json.loads(source.read_text())[key]):
                   (corpus / f"{name}-{i}").write_bytes(bytes.fromhex(vector["hex"]))
+      - name: Seed public derivation proofs
+        if: matrix.target == 'fuzz_psbt_decode'
+        run: python3 scripts/seed_psbt_derivations.py --corpus fuzz/corpus/fuzz_psbt_decode
       - run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=30 -rss_limit_mb=2048
       - uses: actions/upload-artifact@v4
         if: failure()

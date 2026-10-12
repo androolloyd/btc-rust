@@ -10,6 +10,8 @@ import argparse
 import base64
 import io
 import json
+import hashlib
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -19,7 +21,8 @@ from check_core_p2p import core_rpc, free_port, wait_until
 
 def cli(node, command, psbt, *extra):
     result = subprocess.run([str(node), "--json", command, psbt, *extra],
-                            capture_output=True, text=True, timeout=30, check=True)
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, (command, result.stderr)
     return json.loads(result.stdout)
 
 
@@ -129,6 +132,82 @@ def encode_maps(maps):
             wire.extend(compact_size(len(key)) + key + compact_size(len(value)) + value)
         wire.append(0)
     return wire.hex()
+
+
+def public_xpub_records(port):
+    alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    records = {}
+    # Public descriptors export the xpub after the hardened account prefix.
+    # No seed/private key is needed for the suffix proofs below.
+    for entry in core_rpc(port, "listdescriptors", [False])["descriptors"]:
+        for fingerprint, path, text in re.findall(r"\[([0-9a-fA-F]{8})([^\]]*)\]((?:xpub|tpub)[1-9A-HJ-NP-Za-km-z]+)", entry["desc"]):
+            value = 0
+            for character in text:
+                value = value * 58 + alphabet.index(character)
+            raw = value.to_bytes((value.bit_length() + 7) // 8, "big")
+            raw = b"\x00" * (len(text) - len(text.lstrip("1"))) + raw
+            assert len(raw) == 82 and hashlib.sha256(hashlib.sha256(raw[:-4]).digest()).digest()[:4] == raw[-4:]
+            indices = [int(part.rstrip("h'")) | (0x80000000 if part.endswith(("h", "'")) else 0)
+                       for part in path.split("/") if part]
+            records[b"\x01" + raw[:-4]] = bytes.fromhex(fingerprint) + b"".join(index.to_bytes(4, "little") for index in indices)
+    assert records, "Core public descriptors contain no xpub anchors"
+    return records
+
+
+def reject_derivations(args, raw, reason):
+    result = subprocess.run([str(args.node), "--json", "verify-psbt-derivations", raw], capture_output=True, text=True, timeout=30)
+    assert result.returncode != 0 and reason in result.stderr, result.stderr
+
+
+def check_key_derivation_proofs(args, port, raw, kind, expected_maps=3):
+    maps = psbt_maps(raw, expected_maps)
+    maps[0].update(public_xpub_records(port))
+    anchored = encode_maps(maps)
+    literal = bytes.fromhex("50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0")
+    opaque = []
+    for position, records in enumerate(maps[1:], 1):
+        for key in records:
+            if key in [b"\x16" + literal, b"\x07" + literal]:
+                opaque.append((position, key))
+    if opaque:
+        # Core annotates a literal NUMS key too. No xpub can prove its source
+        # here; the complete original must fail. Explicitly test only the HD
+        # subset after removing those optional opaque origin records.
+        reject_derivations(args, anchored, "no supplied global xpub")
+        for position, key in opaque:
+            maps[position].pop(key)
+        anchored = encode_maps(maps)
+    decoded = core_rpc(port, "decodepsbt", [encode64(anchored)])
+    count = sum(len(fields.get("bip32_derivs", [])) + len(fields.get("taproot_bip32_derivs", []))
+                for fields in decoded["inputs"] + decoded["outputs"])
+    assert count > 0
+    checked = cli(args.node, "verify-psbt-derivations", anchored)
+    assert checked["origin_records_checked"] == count
+    assert checked["derivation_equations_verified"] is True
+    assert checked["derivation_steps_checked"] > 0
+    assert checked["verification_scope"] == "public_derivations_from_supplied_xpubs"
+    assert all(checked[field] is False for field in ["key_origins_verified", "wallet_ownership_verified", "signatures_verified", "taproot_leaf_membership_verified", "active_chain_verified"])
+    converted = cli(args.node, "convert-psbt", anchored, "--version", "2")["psbt_hex"]
+    assert cli(args.node, "verify-psbt-derivations", converted) == checked
+    # Parsing preserves claims; the separate command proves relative equations.
+    # Core decodepsbt accepts changed paths as metadata, not proof of derivation.
+    for position, records in enumerate(maps[1:], 1):
+        wanted = [6, 0x16] if position <= len(decoded["inputs"]) else [2, 7]
+        for key in records:
+            if key[0] not in wanted:
+                continue
+            bad = psbt_maps(anchored, expected_maps)
+            data = bad[position][key]
+            assert len(data) >= 8
+            bad[position][key] = data[:-4] + (int.from_bytes(data[-4:], "little") ^ 1).to_bytes(4, "little")
+            corrupted = encode_maps(bad)
+            core_rpc(port, "decodepsbt", [encode64(corrupted)])
+            reject_derivations(args, corrupted, "no supplied global xpub")
+            break
+    missing = psbt_maps(anchored, expected_maps)
+    missing[0] = {key: value for key, value in missing[0].items() if key[0] != 1}
+    reject_derivations(args, encode_maps(missing), "missing global xpub")
+    print(f"PASSED: Core {kind} {count} real public derivation proofs, v0/v2 and altered-path rejection; {len(opaque)} unanchored literal records rejected", flush=True)
 
 
 def reject_spending_data(args, raw, reason):
@@ -649,6 +728,7 @@ def check_wallet(args, port, kind, script_pair=None):
     original_hex = base64.b64decode(signed, validate=True).hex()
     reject_verification(args, original_hex, "not finalized")
     decoded = cli(args.node, "decode-psbt", original_hex)
+    check_key_derivation_proofs(args, port, original_hex, kind)
     check_partial_verification(args, port, original_hex)
     independent = core_rpc(port, "decodepsbt", [signed])
     assert decoded["unsigned_txid"] == independent["tx"]["txid"]
@@ -734,6 +814,7 @@ def check_two_input_taproot_verification(args, port):
                                             {destination: round(sum(coin["amount"] for coin in coins) - 0.00002, 8)}, 23])
     signed = core_rpc(port, "walletprocesspsbt", [original, True, "DEFAULT", True, False])["psbt"]
     partial_hex = base64.b64decode(signed).hex()
+    check_key_derivation_proofs(args, port, partial_hex, "two-input Taproot", expected_maps=4)
     for encoded in [partial_hex, cli(args.node, "convert-psbt", partial_hex, "--version", "2")["psbt_hex"]]:
         checked = cli(args.node, "verify-psbt", encoded, "--partial")
         assert checked["signatures_per_input"] == [1, 1] and checked["signatures_checked"] == 2
@@ -785,6 +866,7 @@ def check_legacy_multisig_partials(args, port, addresses):
                                            {destination: round(coin["amount"] - 0.00002, 8)}, 23])
     signed = core_rpc(port, "walletprocesspsbt", [original, True, "ALL", True, False])["psbt"]
     raw = base64.b64decode(signed).hex()
+    check_key_derivation_proofs(args, port, raw, "legacy P2SH multisig")
     check_partial_verification(args, port, raw)
     finalized = core_rpc(port, "finalizepsbt", [signed])
     assert finalized["complete"] is True
