@@ -11,6 +11,7 @@ btc-node --json convert-psbt "$PSBT_V2_HEX" --version 0
 btc-node --json extract-psbt "$FINALIZED_PSBT_HEX"
 btc-node --json verify-psbt "$FINALIZED_PSBT_HEX"
 btc-node --json verify-psbt "$PARTIALLY_SIGNED_PSBT_HEX" --partial
+btc-node --json finalize-psbt "$PARTIALLY_SIGNED_PSBT_HEX"
 ```
 
 Inspection reports the actual unsigned transaction, PSBT version, resolved
@@ -31,8 +32,7 @@ BIP370's `psbt_id` uses zero sequences as required by its unique-identification
 rule. Decode, convert and extract set `signatures_verified` to false: parsing and copying external
 final fields do not prove that a transaction can spend its inputs. Submit extracted
 transactions through the validated mempool or an independent validating node.
-The tools do not sign, derive wallet keys, choose coins, or automatically finalize
-partial signatures.
+The tools do not create signatures, derive wallet keys or choose coins.
 Inspection exposes the declared `sighash_type`, per-key partial-signature types,
 the Taproot key-signature type and script-signature key/leaf/type records.
 An implicit 64-byte Taproot signature reports type zero (DEFAULT).
@@ -95,6 +95,40 @@ false. One valid signature in a 2-of-2 multisig verifies successfully while the
 transaction remains incomplete. This operation is read-only: it neither signs
 nor finalizes inputs. Full key-origin proofs, arbitrary script satisfaction,
 wallet signing and chain admission remain separate work.
+
+`finalize-psbt` assembles complete spends from supplied signatures for the same
+known templates. It verifies every supplied partial record, including excess
+multisig signatures and signatures for unselected Taproot leaves. Multisig uses
+the script's key order and requires the full threshold; a valid incomplete set
+returns an error. Taproot prefers a complete key path, otherwise the smallest
+serialized witness for a supported signed leaf, with deterministic Core-compatible
+ties. Wrapped witness uses an exact redeem-program push; legacy/witness multisig
+includes its empty CHECKMULTISIG dummy. No annex or separator context is invented
+for partial records. Existing final inputs are preserved and verified, enabling
+mixed partial/final transactions and idempotent finalization.
+
+The final transaction passes the actual shared spend verifier before the result
+is returned. Present sighash declarations are checked before cleanup. BIP174/371
+cleanup removes known signing metadata, keeping UTXOs, final fields and opaque
+unknown/proprietary input records. BIP370 construction/locktime fields and global
+modification flags survive; output/global metadata remains unchanged. Failure
+does not mutate the input PSBT or return partially finalized bytes.
+
+Success returns `complete: true`, cleaned `psbt_hex`, verified `tx_hex`, fee and
+scope/linkage fields. `signatures_checked` counts final-spend equations;
+`partial_signatures_checked` and `partial_signatures_per_input` count all supplied
+partial equations, including unused records. Both partial and final verification
+flags are true, including the vacuous check of zero partial records on already
+finalized inputs. Key-origin and active-chain verification remain false. These
+are offline supplied-prevout checks; broadcast still requires chain/policy
+admission. This command creates no signatures or wallet secrets. General script
+satisfaction, HD origin proofs, signing and active-chain wallet integration remain
+unfinished.
+
+Finalizer references: [BIP174 Input Finalizer](https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki#input-finalizer),
+[BIP370 retained construction fields](https://github.com/bitcoin/bips/blob/master/bip-0370.mediawiki#input-finalizer),
+[BIP371 Taproot cleanup](https://github.com/bitcoin/bips/blob/master/bip-0371.mediawiki),
+and [Core v29 signature assembly and path selection](https://github.com/bitcoin/bitcoin/blob/v29.0/src/script/sign.cpp).
 
 V2 serialization excludes the global unsigned transaction and includes transaction
 version, counts, per-input prevouts, and per-output amounts/scripts. Optional
@@ -189,7 +223,7 @@ These checks validate encoding and metadata consistency. Parsing does not
 validate signature equations, complete sighash context, full claimed key
 derivations or script satisfactions. Remaining
 BIP174/371 general-script/annex context and full key-origin verification, witness-only legacy signing restrictions,
-active-chain/unspentness checks, wallet signing/finalization,
+active-chain/unspentness checks, wallet signing and generalized finalization,
 descriptor operations and MuSig2 remain unfinished. Empty v2 creator maps can be
 represented; converting an empty-input creator to v0 is rejected by the legacy
 transaction decoder.
@@ -206,7 +240,15 @@ provenance and hex/base64 agreement. `scripts/check_core_psbt.py` creates and si
 real P2PKH, P2SH-P2WPKH, P2WPKH, P2WSH, P2SH-P2WSH and Taproot key/script-path
 regtest spends with Core v29, converts signed and finalized PSBTs
 through the compiled CLI, compares the extracted bytes and asks Core to validate
-them. The script-path wallet uses a NUMS internal key and two real signing keys,
+them. The finalizer additionally matches Core's exact final bytes in v0/v2 across
+twelve funded spend types and 26 hash-mode variants, preserves cleanup/unknown
+records, and submits Rust-assembled transactions for actual Core admission/mining.
+2-of-3 multisig has three valid partial records in reversed wire order; corrupting
+even the unselected one fails our explicit all-record verification. Unequal-depth
+Taproot leaves test the smallest serialized witness independently; equal-size
+leaves test deterministic selection. Mixed final/partial two-input Taproot spends
+remain valid, while corrupted existing final signatures fail. The script-path
+wallet uses a NUMS internal key and two real signing keys,
 requiring a script-path witness; input controls/origins and output trees are checked
 through the CLI. Core also decodes every published BIP371 case independently,
 compares the CLI's controls, trees, leaf hashes, fingerprints and paths against

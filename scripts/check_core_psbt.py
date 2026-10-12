@@ -2,8 +2,9 @@
 """Check compiled CLI v0/v2 PSBT conversion with independently signed Core v29.
 
 Uses a checksum-verified bitcoind, disposable regtest wallet, no peer discovery,
-and real mature SegWit/Taproot coins. Core finalizes and checks the converted
-transactions; the Rust converter does not claim to verify or create signatures.
+and real mature legacy/SegWit/Taproot coins. Core signs independently; the Rust
+finalizer assembles and verifies supplied signatures, and Core validates/mines
+the result. Conversion/extraction alone do not verify or create signatures.
 """
 import argparse
 import base64
@@ -62,19 +63,24 @@ def check_taproot_metadata(decoded, independent):
 def script_addresses(port, kind, descriptors):
     # The BIP341 NUMS point has no known secret; the wallet must spend a leaf.
     nums = "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0"
-    prefix = "tr(" if kind == "taproot-script" else "wpkh("
+    prefix = "tr(" if kind.startswith("taproot-") else "wpkh("
     original = next(d["desc"] for d in descriptors
                     if d["active"] and not d["internal"] and d["desc"].startswith(prefix))
     key = original.split("#")[0][len(prefix):-1]
     assert key.endswith("/0/*")
-    if kind == "taproot-script":
+    if kind.startswith("taproot-"):
         second = key[:-4] + "/1/*"
-        private = f"tr({nums},{{pk({key}),pk({second})}})"
+        if kind == "taproot-unbalanced":
+            third = key[:-4] + "/2/*"
+            private = f"tr({nums},{{pk({key}),{{pk({second}),pk({third})}}}})"
+        else:
+            private = f"tr({nums},{{pk({key}),pk({second})}})"
     else:
-        if kind.endswith("multisig"):
+        if kind.endswith(("multisig", "multisig-2of3")):
             second = key[:-4] + "/1/*"
-            multi = f"multi(2,{key},{second})"
-            private = f"sh({multi})" if kind == "sh-multisig" else f"wsh({multi})"
+            third = "," + key[:-4] + "/2/*" if kind.endswith("2of3") else ""
+            multi = f"multi(2,{key},{second}{third})"
+            private = f"sh({multi})" if kind.startswith("sh-multisig") else f"wsh({multi})"
         else:
             private = f"wsh(pk({key}))"
         if kind.startswith("sh-wsh"):
@@ -126,7 +132,7 @@ def encode_maps(maps):
 
 
 def reject_spending_data(args, raw, reason):
-    for command, extra in [("decode-psbt", []), ("convert-psbt", ["--version", "2"]), ("extract-psbt", [])]:
+    for command, extra in [("decode-psbt", []), ("convert-psbt", ["--version", "2"]), ("extract-psbt", []), ("finalize-psbt", [])]:
         result = subprocess.run([str(args.node), "--json", command, raw, *extra],
                                 capture_output=True, text=True, timeout=30)
         assert result.returncode != 0 and reason in result.stderr, (command, result.stderr)
@@ -206,8 +212,16 @@ def check_partial_verification(args, port, raw):
         cli(args.node, "decode-psbt", mutated)
         core_rpc(port, "decodepsbt", [encode64(mutated)])
         reject_verification(args, mutated, "signature equation failed", partial=True)
-        # Taproot finalizers may choose another leaf. Isolate this corrupted
-        # signature to independently exercise its own final transaction.
+        reject_finalization(args, mutated, "signature equation failed")
+        # Core may choose another leaf or ignore an excess multisig signature.
+        # Isolate the corrupted leaf, or keep exactly two records for the 2-of-3
+        # case, so its bad signature is required by the satisfaction.
+        ecdsa_records = [record for record in records if record[0] == 2]
+        if key[0] == 2 and len(ecdsa_records) == 3:
+            keep = next(record for record in ecdsa_records if record != key)
+            for other in ecdsa_records:
+                if other not in (key, keep):
+                    bad[1].pop(other)
         for other in records:
             if key[0] == 0x14 and other[0] == 0x14 and other != key:
                 bad[1].pop(other)
@@ -249,6 +263,62 @@ def check_partial_verification(args, port, raw):
         checked = cli(args.node, "verify-psbt", incomplete, "--partial")
         assert checked["signatures_checked"] == 1 and checked["spending_conditions_verified"] is False
         assert core_rpc(port, "finalizepsbt", [encode64(incomplete)])["complete"] is False
+        reject_finalization(args, incomplete, "insufficient multisig signatures")
+
+
+def reject_finalization(args, raw, reason):
+    result = subprocess.run([str(args.node), "--json", "finalize-psbt", raw],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode != 0, (reason, result.stdout)
+    assert reason in result.stderr, (reason, result.stderr)
+    assert not result.stdout.strip(), result.stdout
+
+
+def check_automatic_finalization(args, port, raw, expected_tx, expected_maps=3):
+    maps = psbt_maps(raw, expected_maps)
+    # Reverse wire order and add opaque updater data. Finalization must order
+    # signatures by script keys and retain unknown fields without interpreting them.
+    for index, records in enumerate(maps):
+        maps[index] = dict(reversed(list(records.items())))
+        maps[index][b"\x50"] = bytes([index, 42])
+    raw = encode_maps(maps)
+    for encoded in [raw, cli(args.node, "convert-psbt", raw, "--version", "2")["psbt_hex"]]:
+        before = psbt_maps(encoded, expected_maps)
+        result = cli(args.node, "finalize-psbt", encoded)
+        assert result["complete"] and result["spending_conditions_verified"] and result["signatures_verified"]
+        assert result["partial_signatures_verified"]
+        assert result["active_chain_verified"] is False and result["key_origins_verified"] is False
+        assert result["tx_hex"] == expected_tx, (result["tx_hex"], expected_tx)
+        after = psbt_maps(result["psbt_hex"], expected_maps)
+        assert before[0] == after[0] and before[-1] == after[-1]
+        counts = []
+        for original, cleaned in zip(before[1:-1], after[1:-1], strict=True):
+            counts.append(sum(key[0] in (2, 0x13, 0x14) for key in original))
+            retained = {0, 1, 7, 8, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x50}
+            assert all(key[0] in retained for key in cleaned), cleaned
+            assert cleaned[b"\x50"] == original[b"\x50"]
+            for key in [b"\x00", b"\x01", b"\x11", b"\x12"]:
+                assert original.get(key) == cleaned.get(key)
+        assert result["partial_signatures_per_input"] == counts
+        assert result["partial_signatures_checked"] == sum(counts)
+        verified = cli(args.node, "verify-psbt", result["psbt_hex"])
+        assert verified["tx_hex"] == expected_tx
+        assert verified["signatures_checked"] == result["signatures_checked"]
+        repeated = cli(args.node, "finalize-psbt", result["psbt_hex"])
+        assert repeated["psbt_hex"] == result["psbt_hex"] and repeated["partial_signatures_checked"] == 0
+        restored = cli(args.node, "convert-psbt", result["psbt_hex"], "--version", "0")["psbt_hex"]
+        assert core_rpc(port, "finalizepsbt", [encode64(restored)])["hex"] == expected_tx
+        assert core_rpc(port, "testmempoolaccept", [[result["tx_hex"]]])[0]["allowed"] is True
+    # A scalar-encoding-valid bad equation must fail before final fields or
+    # cleaned metadata are returned, even if another leaf/signature can satisfy it.
+    for key, signature in maps[1].items():
+        if key[0] in (2, 0x13, 0x14):
+            bad = psbt_maps(raw, expected_maps)
+            changed = bytearray(signature)
+            changed[10 if key[0] == 2 else 63] ^= 1
+            bad[1][key] = bytes(changed)
+            reject_finalization(args, encode_maps(bad), "partial signature equation failed")
+    return result["tx_hex"]
 
 
 def witness_items(data):
@@ -472,6 +542,7 @@ def check_signed_sighash_variants(args, port, unsigned, kind):
         finalized = core_rpc(port, "finalizepsbt", [encode64(raw)])
         assert finalized["complete"] is True, (kind, name)
         assert core_rpc(port, "testmempoolaccept", [[finalized["hex"]]])[0]["allowed"] is True
+        check_automatic_finalization(args, port, raw, finalized["hex"])
         final_psbt = core_rpc(port, "finalizepsbt", [encode64(raw), False])["psbt"]
         check_final_verification(args, port, base64.b64decode(final_psbt).hex(), finalized["hex"])
         decoded = cli(args.node, "decode-psbt", raw)
@@ -558,7 +629,7 @@ def check_published_commitment_vectors(args, port):
 
 
 def check_wallet(args, port, kind, script_pair=None):
-    if kind in ["taproot-script", "wsh", "sh-wsh", "wsh-multisig", "sh-wsh-multisig"]:
+    if kind.startswith("taproot-") or kind in ["wsh", "sh-wsh", "wsh-multisig", "sh-wsh-multisig", "wsh-multisig-2of3"]:
         assert script_pair is not None
         address, destination = script_pair
     else:
@@ -585,6 +656,15 @@ def check_wallet(args, port, kind, script_pair=None):
     assert decoded["signatures_verified"] is False
     check_taproot_metadata(decoded, independent)
     check_key_substitutions(args, port, original_hex)
+    if kind == "wsh-multisig-2of3":
+        assert decoded["inputs"][0]["partial_signatures"] == 3
+        incomplete = psbt_maps(original_hex)
+        keys = [key for key in incomplete[1] if key[0] == 2]
+        for key in keys[1:]:
+            incomplete[1].pop(key)
+        encoded = encode_maps(incomplete)
+        assert core_rpc(port, "finalizepsbt", [encode64(encoded)])["complete"] is False
+        reject_finalization(args, encoded, "insufficient multisig signatures")
     if kind == "taproot-script":
         fields = decoded["inputs"][0]
         assert len(fields["tap_leaf_scripts"]) == 2
@@ -612,13 +692,19 @@ def check_wallet(args, port, kind, script_pair=None):
     if kind == "taproot-script":
         witness = core_rpc(port, "decoderawtransaction", [finalized["hex"]])["vin"][0]["txinwitness"]
         assert len(witness) == 3 and len(bytes.fromhex(witness[-1])) == 65
+    if kind == "taproot-unbalanced":
+        assert decoded["inputs"][0]["tap_script_signatures"] == 3
+        assert sorted(len(bytes.fromhex(leaf["control_block"])) for leaf in decoded["inputs"][0]["tap_leaf_scripts"]) == [65, 97, 97]
+        witness = core_rpc(port, "decoderawtransaction", [expected["hex"]])["vin"][0]["txinwitness"]
+        assert len(bytes.fromhex(witness[-1])) == 65
     accepted = core_rpc(port, "testmempoolaccept", [[finalized["hex"]]])[0]
     assert accepted["allowed"] is True, accepted
     # Already-finalized witnesses must survive the same conversion as well.
     final_psbt = core_rpc(port, "finalizepsbt", [signed, False])["psbt"]
     final_hex = base64.b64decode(final_psbt, validate=True).hex()
     check_spending_data(args, port, original_hex, final_hex, coin, expected["hex"])
-    check_final_verification(args, port, final_hex, expected["hex"], 2 if kind.endswith("multisig") else 1)
+    rust_final_tx = check_automatic_finalization(args, port, original_hex, expected["hex"])
+    check_final_verification(args, port, final_hex, expected["hex"], 2 if "multisig" in kind else 1)
     v2_final = cli(args.node, "convert-psbt", final_hex, "--version", "2")
     final_restored = cli(args.node, "convert-psbt", v2_final["psbt_hex"], "--version", "0")
     assert core_rpc(port, "finalizepsbt", [encode64(final_restored["psbt_hex"])])["hex"] == expected["hex"]
@@ -629,7 +715,7 @@ def check_wallet(args, port, kind, script_pair=None):
         verified = cli(args.node, "verify-psbt", encoded)
         assert verified["tx_hex"] == expected["hex"] and verified["signatures_verified"] is True
         assert core_rpc(port, "testmempoolaccept", [[extracted["tx_hex"]]])[0]["allowed"] is True
-    core_rpc(port, "sendrawtransaction", [finalized["hex"]])
+    core_rpc(port, "sendrawtransaction", [rust_final_tx])
     core_rpc(port, "generatetoaddress", [1, address])
     # Trailing bytes are rejected at the actual binary boundary.
     malformed = subprocess.run([str(args.node), "--json", "decode-psbt", original_hex + "00"],
@@ -660,7 +746,18 @@ def check_two_input_taproot_verification(args, port):
     reject_verification(args, encode_maps(bad), "input 1: missing UTXO", partial=True)
     expected = core_rpc(port, "finalizepsbt", [signed])
     assert expected["complete"] is True
+    rust_final_tx = check_automatic_finalization(args, port, partial_hex, expected["hex"], expected_maps=4)
     raw = base64.b64decode(core_rpc(port, "finalizepsbt", [signed, False])["psbt"]).hex()
+    final_maps = psbt_maps(cli(args.node, "finalize-psbt", partial_hex)["psbt_hex"], expected_maps=4)
+    mixed = psbt_maps(partial_hex, expected_maps=4)
+    mixed[1] = final_maps[1]
+    mixed_result = cli(args.node, "finalize-psbt", encode_maps(mixed))
+    assert mixed_result["tx_hex"] == expected["hex"] and mixed_result["partial_signatures_per_input"] == [0, 1]
+    damaged = psbt_maps(encode_maps(mixed), expected_maps=4)
+    witness = witness_items(damaged[1][b"\x08"])
+    sig = bytearray(witness[0]); sig[63] ^= 1; witness[0] = bytes(sig)
+    damaged[1][b"\x08"] = encoded_witness(witness)
+    reject_finalization(args, encode_maps(damaged), "spending verification failed")
     v2 = cli(args.node, "convert-psbt", raw, "--version", "2")["psbt_hex"]
     for encoded in [raw, v2]:
         verified = cli(args.node, "verify-psbt", encoded)
@@ -675,7 +772,7 @@ def check_two_input_taproot_verification(args, port):
     reject_verification(args, encode_maps(bad), "input 0: spending verification failed")
     bad = psbt_maps(raw, expected_maps=4); bad[2].pop(b"\x01")
     reject_verification(args, encode_maps(bad), "input 1: missing UTXO")
-    core_rpc(port, "sendrawtransaction", [expected["hex"]])
+    core_rpc(port, "sendrawtransaction", [rust_final_tx])
     core_rpc(port, "generatetoaddress", [1, address])
     print("PASSED: Core two-input Taproot final verification and cross-input prevout substitution rejection", flush=True)
 
@@ -691,6 +788,7 @@ def check_legacy_multisig_partials(args, port, addresses):
     check_partial_verification(args, port, raw)
     finalized = core_rpc(port, "finalizepsbt", [signed])
     assert finalized["complete"] is True
+    rust_final_tx = check_automatic_finalization(args, port, raw, finalized["hex"])
     assert core_rpc(port, "testmempoolaccept", [[finalized["hex"]]])[0]["allowed"] is True
     final_psbt = core_rpc(port, "finalizepsbt", [signed, False])["psbt"]
     final_raw = base64.b64decode(final_psbt).hex()
@@ -703,7 +801,7 @@ def check_legacy_multisig_partials(args, port, addresses):
     bad = psbt_maps(raw); bad[1].pop(b"\x00")
     bad[1][b"\x01"] = fields["value_sat"].to_bytes(8,"little") + compact_size(len(script)) + script
     reject_verification(args, encode_maps(bad), "legacy verification requires non-witness UTXO", partial=True)
-    core_rpc(port, "sendrawtransaction", [finalized["hex"]])
+    core_rpc(port, "sendrawtransaction", [rust_final_tx])
     core_rpc(port, "generatetoaddress", [1, address])
     print("PASSED: Core legacy P2SH multisig partial equations, incomplete threshold and unsafe amount rejection", flush=True)
 
@@ -735,13 +833,13 @@ def main():
                 # be exported by listdescriptors(private=true).
                 descriptors = core_rpc(port, "listdescriptors", [True])["descriptors"]
                 script_pairs = {kind: script_addresses(port, kind, descriptors)
-                                for kind in ["wsh", "sh-wsh", "taproot-script", "wsh-multisig", "sh-wsh-multisig", "sh-multisig"]}
+                                for kind in ["wsh", "sh-wsh", "taproot-script", "taproot-unbalanced", "wsh-multisig", "sh-wsh-multisig", "sh-multisig", "wsh-multisig-2of3"]}
                 check_published_taproot_vectors(args, port)
                 check_published_spending_vectors(args, port)
                 check_published_key_vectors(args, port)
                 check_published_signature_vectors(args, port)
                 check_published_commitment_vectors(args, port)
-                for kind in ["legacy", "p2sh-segwit", "bech32", "wsh", "sh-wsh", "bech32m", "taproot-script", "wsh-multisig", "sh-wsh-multisig"]:
+                for kind in ["legacy", "p2sh-segwit", "bech32", "wsh", "sh-wsh", "bech32m", "taproot-script", "taproot-unbalanced", "wsh-multisig", "sh-wsh-multisig", "wsh-multisig-2of3"]:
                     check_wallet(args, port, kind, script_pairs.get(kind))
                 check_two_input_taproot_verification(args, port)
                 check_legacy_multisig_partials(args, port, script_pairs["sh-multisig"])
