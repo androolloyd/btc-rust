@@ -493,10 +493,14 @@ pub fn sign_psbt(
         .input_signature_schemes
         .iter()
         .any(|scheme| scheme.starts_with("taproot"));
+    let has_scriptpath = signed
+        .input_signature_schemes
+        .iter()
+        .any(|scheme| scheme.starts_with("taproot_scriptpath"));
     Ok(serde_json::json!({
         "psbt_hex": hex::encode(signed.psbt.try_serialize()?),
         "psbt_version": signed.psbt.version,
-        "signing_scope": if has_taproot {"known_ecdsa_and_taproot_keypath_partial_signing"} else {"ecdsa_sighash_all_partial_signing"},
+        "signing_scope": if has_scriptpath {"known_ecdsa_and_taproot_partial_signing"} else if has_taproot {"known_ecdsa_and_taproot_keypath_partial_signing"} else {"ecdsa_sighash_all_partial_signing"},
         "input_signature_schemes": signed.input_signature_schemes,
         "schnorr_aux_randomness": if has_taproot {Some("os_random_for_new_signatures")} else {None},
         "unsigned_txid": signed.verified.unsigned_transaction.txid().to_hex(),

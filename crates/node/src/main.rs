@@ -205,7 +205,7 @@ enum Commands {
         index: Option<u32>,
     },
 
-    /// Sign known ECDSA/Taproot key-path PSBT inputs with WIF keys (offline)
+    /// Sign known ECDSA/Taproot PSBT inputs with WIF keys (offline)
     SignPsbt {
         /// PSBT hex or @path to a binary PSBT file
         hex: String,

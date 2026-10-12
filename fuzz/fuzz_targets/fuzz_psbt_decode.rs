@@ -52,6 +52,13 @@ fuzz_target!(|data: &[u8]| {
                         .lines()
                         .map(str::to_owned),
                 );
+                // Keep a bounded sanitizer key set; large distinct-key
+                // thresholds have separate exact-vector/funded acceptance.
+                material.extend(
+                    include_str!("../../crates/primitives/tests/data/taproot-script-signer.keys")
+                        .lines()
+                        .map(str::to_owned),
+                );
                 material.sort();
                 material.dedup();
                 material

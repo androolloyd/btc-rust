@@ -31,7 +31,7 @@ def sign(args, raw, keys, cap=2000, reject=False, require_parents=True):
         return None
     assert result.returncode == 0,result.stderr
     output=json.loads(result.stdout)
-    assert output["signing_scope"] in ["ecdsa_sighash_all_partial_signing","known_ecdsa_and_taproot_keypath_partial_signing"]
+    assert output["signing_scope"] in ["ecdsa_sighash_all_partial_signing","known_ecdsa_and_taproot_keypath_partial_signing","known_ecdsa_and_taproot_partial_signing"]
     assert output["signatures_verified"] and output["partial_signatures_verified"]
     assert all(output[name] is False for name in ["spending_conditions_verified","final_fields_verified","key_origins_verified","change_outputs_verified","active_chain_verified"])
     if require_parents: assert all(output["txid_linked_prevouts"])
@@ -153,6 +153,7 @@ def main():
     parser.add_argument("--bitcoind",type=Path,required=True)
     parser.add_argument("--node",type=Path,default=Path("target/release/btc-node"))
     parser.add_argument("--taproot-only",action="store_true",help="Run the independently funded Taproot key-path signer cases")
+    parser.add_argument("--taproot-script-only",action="store_true",help="Run independently funded known Taproot leaf signer cases")
     args=parser.parse_args(); args.node=args.node.resolve(); args.bitcoind=args.bitcoind.resolve()
     port=free_port()
     with tempfile.TemporaryDirectory(prefix="btc-core-signer-") as directory:
@@ -164,7 +165,10 @@ def main():
                 core_rpc(port,"createwallet",["signer-interop"])
                 # The shared strict WIF decoder also drives private descriptors.
                 check_private_descriptor_vectors(args,port)
-                if args.taproot_only:
+                if args.taproot_script_only:
+                    from check_core_taproot_script_signer import run_cases as run_scripts
+                    run_scripts(args,port)
+                elif args.taproot_only:
                     from check_core_taproot_signer import run_cases as run_taproot
                     run_taproot(args,port)
                 else:

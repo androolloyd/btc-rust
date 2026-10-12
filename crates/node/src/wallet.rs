@@ -147,6 +147,267 @@ mod tests {
         .unwrap()
     }
 
+    fn leaf_signer_vectors() -> serde_json::Value {
+        serde_json::from_str(include_str!(
+            "../../primitives/tests/data/taproot-script-signer.json"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn core_leaf_signer_exact_untweaked_equations_thresholds_and_psbt_versions() {
+        let fixture = leaf_signer_vectors();
+        assert_eq!(fixture["vectors"].as_array().unwrap().len(), 17);
+        for vector in fixture["vectors"].as_array().unwrap() {
+            let base =
+                Psbt::deserialize(&hex::decode(vector["psbt"].as_str().unwrap()).unwrap()).unwrap();
+            let keys = signer_keys(vector);
+            for version in [0, 2] {
+                let mut psbt = base.convert_version(version).unwrap();
+                if version == 2 {
+                    psbt.tx_modifiable = Some(if vector["existing"] == true { 4 } else { 7 });
+                }
+                psbt.unknown.push((vec![0x9e], vec![6, 7]));
+                let original = psbt.try_serialize().unwrap();
+                let signed = sign_psbt_inner(&psbt, &keys, 1000, true, |secp, message, keypair| {
+                    Ok(secp.sign_schnorr_with_aux_rand(message, keypair, &[0; 32]))
+                })
+                .unwrap();
+                assert_eq!(psbt.try_serialize().unwrap(), original);
+                assert_eq!(signed.psbt.unknown, psbt.unknown);
+                assert_eq!(signed.psbt.tx_modifiable, (version == 2).then_some(4));
+                let input = signed.psbt.inputs.last().unwrap();
+                assert!(input.tap_key_sig.is_none());
+                let expected = vector["expected"].as_array().unwrap();
+                assert_eq!(input.tap_script_sigs.len(), expected.len());
+                for row in expected {
+                    let record = hex::decode(row["record"].as_str().unwrap()).unwrap();
+                    let actual = &input
+                        .tap_script_sigs
+                        .iter()
+                        .find(|(key, _)| *key == record)
+                        .unwrap()
+                        .1;
+                    assert_eq!(hex::encode(actual), row["signature"]);
+                }
+                assert_eq!(
+                    signed.input_signature_schemes.last(),
+                    Some(&if vector["hash_type"] == 0 {
+                        "taproot_scriptpath_default"
+                    } else {
+                        "taproot_scriptpath_all"
+                    })
+                );
+                assert_eq!(
+                    signed.signatures_added,
+                    expected.len() + usize::from(vector["mixed"] == true)
+                        - usize::from(vector["existing"] == true)
+                );
+                let random = sign_psbt(&psbt, &keys, 1000).unwrap();
+                let again = sign_psbt(&random.psbt, &keys, 1000).unwrap();
+                assert_eq!(again.signatures_added, 0);
+                assert_eq!(again.psbt, random.psbt);
+                if vector["name"] == "partial-2of3" {
+                    assert!(finalize_psbt(&random.psbt).is_err());
+                    let remaining = vector["remaining_wifs"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|key| {
+                            btc_primitives::wif::WifPrivateKey::from_wif(
+                                key.as_str().unwrap(),
+                                btc_primitives::Network::Mainnet,
+                            )
+                            .unwrap()
+                        })
+                        .collect::<Vec<_>>();
+                    let complete = sign_psbt(&random.psbt, &remaining, 1000).unwrap();
+                    assert_eq!(complete.signatures_added, 1);
+                    finalize_psbt(&complete.psbt).unwrap();
+                } else {
+                    finalize_psbt(&random.psbt).unwrap();
+                }
+                assert!(sign_psbt(&psbt, &keys, 999).is_err());
+            }
+            if vector["mixed"] != true {
+                let opposite = vector["opposite_wifs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|key| {
+                        btc_primitives::wif::WifPrivateKey::from_wif(
+                            key.as_str().unwrap(),
+                            btc_primitives::Network::Mainnet,
+                        )
+                        .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                let signed =
+                    sign_psbt_inner(&base, &opposite, 1000, true, |secp, message, keypair| {
+                        Ok(secp.sign_schnorr_with_aux_rand(message, keypair, &[0; 32]))
+                    })
+                    .unwrap();
+                for row in vector["expected"].as_array().unwrap() {
+                    let record = hex::decode(row["record"].as_str().unwrap()).unwrap();
+                    let actual = &signed
+                        .psbt
+                        .inputs
+                        .last()
+                        .unwrap()
+                        .tap_script_sigs
+                        .iter()
+                        .find(|(key, _)| *key == record)
+                        .unwrap()
+                        .1;
+                    assert_eq!(hex::encode(actual), row["signature"]);
+                }
+                assert!(sign_psbt(&base, &[keys[0].clone(), opposite[0].clone()], 1000).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn leaf_signer_requires_committed_known_context_and_is_atomic_on_entropy_failure() {
+        let fixture = leaf_signer_vectors();
+        for vector in fixture["unsupported"].as_array().unwrap() {
+            let psbt =
+                Psbt::deserialize(&hex::decode(vector["psbt"].as_str().unwrap()).unwrap()).unwrap();
+            assert!(sign_psbt(&psbt, &signer_keys(vector), 1000).is_err());
+        }
+        let vector = fixture["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == "multi-a-2of3-hash0")
+            .unwrap();
+        let base =
+            Psbt::deserialize(&hex::decode(vector["psbt"].as_str().unwrap()).unwrap()).unwrap();
+        let keys = signer_keys(vector);
+        let original = base.try_serialize().unwrap();
+        let mut calls = 0;
+        let error = sign_psbt_inner(&base, &keys, 1000, true, |secp, message, keypair| {
+            calls += 1;
+            if calls == 2 {
+                bail!("injected leaf entropy failure");
+            }
+            Ok(secp.sign_schnorr_with_aux_rand(message, keypair, &[0; 32]))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("entropy failure"));
+        assert_eq!(calls, 2);
+        assert_eq!(base.try_serialize().unwrap(), original);
+        let mut missing = base.clone();
+        missing.inputs[0].tap_leaf_scripts.clear();
+        assert!(sign_psbt(&missing, &keys, 1000).is_err());
+        let mut wrong = base.clone();
+        wrong.inputs[0].tap_leaf_scripts[0].0[0] ^= 1;
+        assert!(sign_psbt(&wrong, &keys, 1000).is_err());
+        let uncompressed = vector["uncompressed_wifs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|key| {
+                btc_primitives::wif::WifPrivateKey::from_wif(
+                    key.as_str().unwrap(),
+                    btc_primitives::Network::Mainnet,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(sign_psbt(&base, &uncompressed, 1000).is_err());
+        for mode in [2, 3, 0x81, 0x82, 0x83] {
+            let mut wrong = base.clone();
+            wrong.inputs[0].sighash_type = Some(mode);
+            assert!(sign_psbt(&wrong, &keys, 1000).is_err());
+        }
+        let signed = sign_psbt(&base, &keys, 1000).unwrap();
+        let mut bad = signed.psbt.clone();
+        bad.inputs[0].tap_script_sigs.last_mut().unwrap().1[20] ^= 1;
+        assert!(sign_psbt(&bad, &keys, 1000).is_err());
+        let mut bad = signed.psbt;
+        bad.inputs[0].tap_script_sigs[0].0[63] ^= 1;
+        assert!(sign_psbt(&bad, &keys, 1000).is_err());
+        let mut excessive = base.clone();
+        let proof = excessive.inputs[0].tap_leaf_scripts[0].clone();
+        excessive.inputs[0].tap_leaf_scripts = vec![proof; 1025];
+        assert!(sign_psbt(&excessive, &keys, 1000)
+            .unwrap_err()
+            .to_string()
+            .contains("control-proof limit"));
+        let mut excessive = base.clone();
+        excessive.inputs[0].tap_leaf_scripts[0].1.script =
+            ScriptBuf::from_bytes(vec![0x51; 1_048_577]);
+        assert!(sign_psbt(&excessive, &keys, 1000)
+            .unwrap_err()
+            .to_string()
+            .contains("leaf-script byte limit"));
+        // Supplying a real internal key still prefers the key path, even when
+        // an owned leaf is also available. The existing leaf is never erased.
+        let key_fixture = taproot_signer_vectors();
+        let key_vector = key_fixture["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == "existing-known-leaf")
+            .unwrap();
+        let psbt =
+            Psbt::deserialize(&hex::decode(key_vector["psbt"].as_str().unwrap()).unwrap()).unwrap();
+        let large = fixture["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == "999of999")
+            .unwrap();
+        let mut keys = signer_keys(key_vector);
+        keys.extend(
+            signer_keys(large)
+                .into_iter()
+                .filter(|key| key.public_key()[1..] == psbt.inputs[0].tap_script_sigs[0].0[..32]),
+        );
+        let signed = sign_psbt(&psbt, &keys, 1000).unwrap();
+        assert_eq!(
+            signed.input_signature_schemes,
+            vec!["taproot_keypath_default"]
+        );
+        assert_eq!(
+            signed.psbt.inputs[0].tap_script_sigs,
+            psbt.inputs[0].tap_script_sigs
+        );
+    }
+
+    #[test]
+    fn leaf_signer_mixed_full_parents_and_all_prevout_amount_commitments() {
+        let fixture = leaf_signer_vectors();
+        let vector = fixture["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == "mixed-ecdsa-scriptpath")
+            .unwrap();
+        let mut psbt =
+            Psbt::deserialize(&hex::decode(vector["psbt"].as_str().unwrap()).unwrap()).unwrap();
+        psbt.inputs[1].non_witness_utxo = None;
+        assert!(sign_psbt(&psbt, &signer_keys(vector), 1000)
+            .unwrap_err()
+            .to_string()
+            .contains("full parent"));
+        let vector = &fixture["vectors"][0];
+        let mut psbt =
+            Psbt::deserialize(&hex::decode(vector["psbt"].as_str().unwrap()).unwrap()).unwrap();
+        let mut second = psbt.unsigned_tx.inputs[0].clone();
+        second.previous_output.vout = 1;
+        psbt.unsigned_tx.inputs.push(second);
+        psbt.inputs.push(psbt.inputs[0].clone());
+        psbt.unsigned_tx.outputs[0].value = Amount::from_sat(199000);
+        let signed = sign_psbt(&psbt, &signer_keys(vector), 1000).unwrap();
+        let mut changed = signed.psbt;
+        changed.inputs[1].witness_utxo.as_mut().unwrap().value = Amount::from_sat(99999);
+        assert!(verify_partial_signatures(&changed)
+            .unwrap_err()
+            .to_string()
+            .contains("input 0"));
+    }
+
     #[test]
     fn published_bip341_private_tweaks_hashes_and_zero_aux_signatures() {
         let fixture = taproot_signer_vectors();
@@ -2062,7 +2323,9 @@ pub fn sign_ecdsa_psbt(
     })
 }
 
-/// Known ECDSA templates and BIP341 Taproot key paths. New Schnorr signatures
+/// Known ECDSA and BIP342 pk/multi_a templates, plus BIP341 Taproot key paths.
+/// A matching internal key prefers the key path; otherwise committed known
+/// leaves are signed with untweaked keys. New Schnorr signatures
 /// use fresh OS auxiliary randomness; failure to obtain it aborts signing.
 pub fn sign_psbt(
     psbt: &Psbt,
@@ -2106,6 +2369,52 @@ fn taproot_signing_keypair(
     Ok(tweaked)
 }
 
+/// Only keys in actual, validated leaf/control records can authorize signing.
+/// Duplicate proofs/keys share one BIP371 (x-only key, leaf hash) record.
+type TapLeafSigningKey<'a> = (Vec<u8>, &'a btc_primitives::wif::WifPrivateKey);
+
+fn taproot_leaf_signing_keys<'a>(
+    input: &PsbtInput,
+    public_keys: &HashMap<Vec<u8>, &'a btc_primitives::wif::WifPrivateKey>,
+) -> eyre::Result<Vec<TapLeafSigningKey<'a>>> {
+    let mut xonly = HashMap::<Vec<u8>, Vec<_>>::new();
+    for (public, key) in public_keys {
+        if public.len() == 33 {
+            xonly.entry(public[1..].to_vec()).or_default().push(*key);
+        }
+    }
+    let mut candidates = HashMap::new();
+    for (_, leaf) in &input.tap_leaf_scripts {
+        if leaf.leaf_version != 0xc0 {
+            continue;
+        }
+        let Ok(template) = tapscript_template(leaf.script.as_bytes()) else {
+            continue;
+        };
+        let hash =
+            btc_primitives::taproot::tap_leaf_hash(leaf.leaf_version, leaf.script.as_bytes());
+        for public in template.keys {
+            let Some(matching) = xonly.get(public) else {
+                continue;
+            };
+            ensure!(
+                matching.len() == 1,
+                "ambiguous compressed Taproot leaf signing key"
+            );
+            let mut record = public.to_vec();
+            record.extend(hash);
+            candidates.insert(record, matching[0]);
+        }
+    }
+    ensure!(
+        !candidates.is_empty(),
+        "no supplied key matches a known committed Taproot leaf or internal key"
+    );
+    let mut candidates = candidates.into_iter().collect::<Vec<_>>();
+    candidates.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(candidates)
+}
+
 fn sign_psbt_inner(
     psbt: &Psbt,
     keys: &[btc_primitives::wif::WifPrivateKey],
@@ -2123,6 +2432,23 @@ fn sign_psbt_inner(
         "signer requires 1..1024 keys"
     );
     ensure!(psbt.inputs.len() <= 128, "signer input limit (128)");
+    ensure!(
+        psbt.inputs
+            .iter()
+            .map(|input| input.tap_leaf_scripts.len())
+            .sum::<usize>()
+            <= 1024,
+        "signer control-proof limit (1024)"
+    );
+    let leaf_bytes = psbt
+        .inputs
+        .iter()
+        .flat_map(|input| &input.tap_leaf_scripts)
+        .try_fold(0usize, |sum, (_, leaf)| sum.checked_add(leaf.script.len()));
+    ensure!(
+        leaf_bytes.is_some_and(|bytes| bytes <= 1_048_576),
+        "signer leaf-script byte limit (1048576)"
+    );
     ensure!(
         max_fee_sat <= Amount::MAX_MONEY.as_sat() as u64,
         "fee cap exceeds money range"
@@ -2169,12 +2495,6 @@ fn sign_psbt_inner(
         );
         if output.script_pubkey.is_p2tr() {
             ensure!(taproot, "input {index}: Taproot signing is unsupported");
-            let internal: [u8; 32] = input
-                .tap_internal_key
-                .as_ref()
-                .ok_or_else(|| eyre::eyre!("input {index}: missing Taproot internal key"))?
-                .as_slice()
-                .try_into()?;
             let hash_type = input.sighash_type.unwrap_or_else(|| {
                 if input
                     .tap_key_sig
@@ -2200,6 +2520,86 @@ fn sign_psbt_inner(
                     "input {index}: Taproot signer supports DEFAULT/ALL only"
                 );
             }
+            if input.tap_key_sig.is_some() || !input.tap_script_sigs.is_empty() {
+                verify_partial_input(psbt, index, &prevouts, &verifier).wrap_err_with(|| {
+                    format!("input {index}: existing signature verification failed")
+                })?;
+            }
+            let internal = input
+                .tap_internal_key
+                .as_ref()
+                .map(|key| key.as_slice().try_into())
+                .transpose()?;
+            let matching = public_keys
+                .iter()
+                .filter(|(public, _)| {
+                    public.len() == 33 && internal.is_some_and(|key: [u8; 32]| public[1..] == key)
+                })
+                .collect::<Vec<_>>();
+            ensure!(
+                matching.len() <= 1,
+                "input {index}: ambiguous compressed Taproot internal signing key"
+            );
+            if matching.is_empty() {
+                let candidates =
+                    taproot_leaf_signing_keys(input, &public_keys).wrap_err_with(|| {
+                        format!("input {index}: unsupported Taproot signing context")
+                    })?;
+                let existing: HashSet<_> = input
+                    .tap_script_sigs
+                    .iter()
+                    .map(|(record, _)| record)
+                    .collect();
+                let new_records = candidates
+                    .iter()
+                    .filter(|(record, _)| !existing.contains(record))
+                    .count();
+                records += new_records;
+                ensure!(records <= 4096, "signer signature-record limit (4096)");
+                let mut digests = HashMap::new();
+                let mut keypairs = HashMap::new();
+                for (record, key) in candidates {
+                    if existing.contains(&record) {
+                        continue;
+                    }
+                    let leaf_hash: [u8; 32] = record[32..].try_into()?;
+                    let hash = match digests.entry(leaf_hash) {
+                        std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            *entry.insert(sighash_taproot(
+                                &psbt.unsigned_tx,
+                                index,
+                                &prevouts,
+                                SighashType(hash_type),
+                                None,
+                                Some(&leaf_hash),
+                            )?)
+                        }
+                    };
+                    let keypair = keypairs.entry(record[..32].to_vec()).or_insert_with(|| {
+                        secp256k1::Keypair::from_secret_key(&secp, key.secret_key())
+                    });
+                    // Script keys are NOT TapTweak-adjusted. Schnorr signing
+                    // itself normalizes the private key to the even lift.
+                    let mut signature = schnorr(&secp, &Message::from_digest(hash), keypair)?
+                        .as_ref()
+                        .to_vec();
+                    if hash_type != 0 {
+                        signature.push(hash_type as u8);
+                    }
+                    result.inputs[index]
+                        .tap_script_sigs
+                        .push((record, signature));
+                }
+                signatures_added_per_input.push(new_records);
+                input_signature_schemes.push(if hash_type == 0 {
+                    "taproot_scriptpath_default"
+                } else {
+                    "taproot_scriptpath_all"
+                });
+                continue;
+            }
+            let internal = internal.ok_or_else(|| eyre::eyre!("missing Taproot internal key"))?;
             let mut root = input.tap_merkle_root;
             if root.is_none() {
                 // try_serialize already verified every proof against Q and
@@ -2218,14 +2618,6 @@ fn sign_psbt_inner(
                     root = Some(inferred);
                 }
             }
-            let matching = public_keys
-                .iter()
-                .filter(|(public, _)| public.len() == 33 && public[1..] == internal)
-                .collect::<Vec<_>>();
-            ensure!(
-                matching.len() == 1,
-                "input {index}: missing or ambiguous compressed Taproot internal signing key"
-            );
             let tweaked = taproot_signing_keypair(
                 &secp,
                 matching[0].1.secret_key(),
@@ -2234,11 +2626,6 @@ fn sign_psbt_inner(
                 &output.script_pubkey.as_bytes()[2..],
             )
             .wrap_err_with(|| format!("input {index}: invalid Taproot signing commitment"))?;
-            if input.tap_key_sig.is_some() || !input.tap_script_sigs.is_empty() {
-                verify_partial_input(psbt, index, &prevouts, &verifier).wrap_err_with(|| {
-                    format!("input {index}: existing signature verification failed")
-                })?;
-            }
             let added = usize::from(input.tap_key_sig.is_none());
             records += added;
             ensure!(records <= 4096, "signer signature-record limit (4096)");

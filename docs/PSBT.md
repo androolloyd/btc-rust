@@ -272,7 +272,7 @@ These checks validate encoding and metadata consistency. Parsing does not
 validate signature equations, complete sighash context, full claimed key
 derivations or script satisfactions. Remaining
 BIP174/371 general-script/annex context and full key-origin verification,
-active-chain/unspentness checks, Taproot script-path/HD/general signing and generalized finalization,
+active-chain/unspentness checks, HD/general signing and generalized finalization,
 descriptor operations and MuSig2 remain unfinished. Empty v2 creator maps can be
 represented; converting an empty-input creator to v0 is rejected by the legacy
 transaction decoder.
@@ -384,7 +384,7 @@ uncompressed WIF encodings have strict checksum/version/scalar/marker checks.
 Witness-v0 signing requires compressed keys. Private file data and keys are
 not interpolated into diagnostics; the WIF wrapper's Debug omits its scalar.
 The source and transient key data use ordinary process memory, not a protected
-keystore. HD/Taproot script-path/general-script signing remains unsupported.
+keystore. HD/general-script signing remains unsupported.
 
 All inputs require txid-linked full parent transactions, including witness-v0,
 with dual UTXO agreement and redeem/witness commitments checked by the shared
@@ -437,7 +437,7 @@ compatibility entry point. Taproot creates SIGHASH_DEFAULT (64 bytes) or an
 explicit SIGHASH_ALL (65 bytes ending in 01); NONE/SINGLE/ANYONECANPAY remain
 unsupported by the signer. Existing supported signature records are verified
 and retained, including supplied known leaf signatures not used for the new key
-path. Script-path signature creation remains unsupported.
+path. Known script-path signature creation is described below.
 
 The updater must supply the 32-byte internal key, matching exactly one supplied
 compressed WIF key. The signer normalizes odd internal parity before the actual
@@ -491,5 +491,65 @@ The earlier twenty-five funded ECDSA cases also pass through the general CLI.
 The final local gate passes 3,382 tests in 43 suites, formatting, Clippy, minimal
 and isolated features and release build (two preexisting ignored tests). Twenty
 fresh sanitizer seeds completed 752,974 executions in 31 seconds without failure.
-Script-path signature creation, HD/general signing, protected key storage and
+HD/general signing, protected key storage and
 authenticated origin/change/chain checks remain unfinished.
+
+## Known Taproot script-path signing
+
+`wallet::sign_psbt` and the compiled `sign-psbt` command now create DEFAULT/ALL
+Schnorr records for exact c0 `pk`, `multi_a` and `sortedmulti_a` templates, up to
+999 keys. A matching supplied internal key keeps the key-path preference.
+Otherwise, the signer finds supplied compressed WIF keys in the actual committed
+leaf/control records, signs all matching known leaves and preserves partial
+thresholds for sequential cosigning. Repeated script keys and duplicate proofs
+share a single BIP371 `(x-only key, leaf hash)` record.
+
+Leaf signatures use the **untweaked** key and the BIP342 leaf extension, including
+the actual leaf hash and the no-separator position. Odd-key normalization belongs
+to Schnorr signing. Each new signature requires fresh OS auxiliary randomness;
+an error after earlier additions still returns no partially mutated PSBT.
+Existing signature equations, including unused cosigners/leaves/key paths, are
+verified before returning any result. Unknown unsigned leaves stay opaque;
+future-version, OP_SUCCESS, separator and arbitrary-script leaves cannot
+authorize new signatures. An optional internal-key field can be absent when
+actual control proofs establish the script path.
+
+Pure Taproot inputs keep DEFAULT/ALL's all-prevout amount/script commitment and
+witness-only support; mixed ECDSA transactions keep full parents for every input.
+The explicit fee cap and BIP370 modification rules remain enforced. In addition
+to 128 inputs, 1,024 keys and 4,096 supplied/created signature records, signing
+limits supplied control proofs to 1,024 and their total leaf-script bytes to
+1 MiB, before commitment verification. These are wallet work bounds, not new
+consensus restrictions.
+
+Script-path receipts use `known_ecdsa_and_taproot_partial_signing` with per-input
+`taproot_scriptpath_default` / `taproot_scriptpath_all` schemes; the scheme names
+the chosen creation type, while existing valid DEFAULT/ALL records can coexist
+when no type is declared. Signing does not promise threshold completion, origin,
+change or active-chain verification. Key-path-only and ECDSA-only receipts retain
+their prior scope names.
+
+Seventeen checksum-pinned Core-generated cases provide independent exact
+fixed-aux signatures and digests, including both parities/types, partial
+cosigning, duplicate proofs, multiple/opaque leaves, omitted optional internal
+keys, existing records, mixed inputs and distinct-key 128/999 thresholds. Three
+unsupported-only leaves carry actual commitments. Live acceptance independently
+funds those scripts, verifies each random Rust equation with unchanged Core
+math/preimages, compares final bytes and requires admission/mining. Both Rust
+PSBT versions use actual v2-to-v0 conversion for Core, without a native-Core-v2
+claim. Acceptance passed for all seventeen exact cases and all seventeen actual
+funded/admitted/mined Rust leaf-signed spends, including distinct-key 999-of-999.
+The earlier twenty funded/mined key-path cases also pass after the fallback change.
+Leaf script tables store each signature context once; normalized comparison
+proves all PSBTs, keys, digests and signatures survived fixture compaction.
+The local gate passes 3,385 tests across 43 suites, formatting, Clippy, minimal
+and isolated feature checks and release build (two preexisting ignored tests).
+Twenty fresh sanitizer seeds completed 635,959 executions in 31 seconds without
+failure.
+
+Primary definitions: [BIP342 signature extension](https://github.com/bitcoin/bips/blob/master/bip-0342.mediawiki),
+[BIP371 leaf signature records](https://github.com/bitcoin/bips/blob/master/bip-0371.mediawiki),
+[BIP387 thresholds](https://github.com/bitcoin/bips/blob/master/bip-0387.mediawiki) and
+[unchanged Core v29 preimages/math](https://github.com/bitcoin/bitcoin/blob/v29.0/test/functional/test_framework/script.py).
+HD/general signing, authenticated origin/change/chain checks, protected keystores
+and annex/general-script creation remain unfinished.
