@@ -34,6 +34,15 @@ jobs:
       - name: Seed public derivation proofs
         if: matrix.target == 'fuzz_psbt_decode'
         run: python3 scripts/seed_psbt_derivations.py --corpus fuzz/corpus/fuzz_psbt_decode
+      - name: Seed independently signed threshold wallets
+        if: matrix.target == 'fuzz_psbt_decode'
+        shell: python
+        run: |
+          import json, pathlib
+          corpus = pathlib.Path("fuzz/corpus/fuzz_psbt_decode")
+          for i, vector in enumerate(json.loads(pathlib.Path("crates/primitives/tests/data/taproot-thresholds.json").read_text())["vectors"]):
+              for field in ["partial_psbt", "final_psbt"]:
+                  (corpus / f"threshold-{i}-{field}").write_bytes(bytes.fromhex(vector[field]))
       - name: Seed published descriptors
         if: matrix.target == 'fuzz_descriptor'
         shell: python
@@ -44,6 +53,8 @@ jobs:
           corpus = pathlib.Path("fuzz/corpus/fuzz_descriptor")
           corpus.mkdir(parents=True, exist_ok=True)
           vectors = json.loads(pathlib.Path("crates/primitives/tests/data/descriptors.json").read_text())["vectors"]
+          thresholds = json.loads(pathlib.Path("crates/primitives/tests/data/taproot-thresholds.json").read_text())
+          vectors += thresholds["published"] + thresholds["descriptors"]
           for i, vector in enumerate(vectors):
               (corpus / f"published-{i}").write_text(vector["descriptor"])
               translated = regtest_descriptor(vector["descriptor"])

@@ -791,6 +791,133 @@ mod tests {
     }
 
     #[test]
+    fn core_threshold_equations_final_slots_and_annex_scope() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../primitives/tests/data/taproot-thresholds.json"
+        ))
+        .unwrap();
+        for vector in fixture["vectors"].as_array().unwrap() {
+            let name = vector["name"].as_str().unwrap();
+            let psbt =
+                Psbt::deserialize(&hex::decode(vector["partial_psbt"].as_str().unwrap()).unwrap())
+                    .unwrap();
+            let final_psbt =
+                Psbt::deserialize(&hex::decode(vector["final_psbt"].as_str().unwrap()).unwrap())
+                    .unwrap();
+            let expected = hex::decode(vector["transaction"].as_str().unwrap()).unwrap();
+            let threshold = vector["threshold"].as_u64().unwrap() as usize;
+            for version in [0, 2] {
+                let finalized = final_psbt.convert_version(version).unwrap();
+                let result = verify_finalized_psbt(&finalized).unwrap();
+                assert_eq!(
+                    btc_primitives::encode::encode(&result.transaction),
+                    expected,
+                    "{name}"
+                );
+                assert_eq!(result.signatures_checked, threshold, "{name}");
+                let partial = psbt.convert_version(version).unwrap();
+                let before = partial.try_serialize().unwrap();
+                if vector["partial_valid"] == true {
+                    let count = vector["partial_records"].as_u64().unwrap() as usize;
+                    assert_eq!(
+                        verify_partial_signatures(&partial)
+                            .unwrap()
+                            .signatures_checked,
+                        count
+                    );
+                    let result = finalize_psbt(&partial).unwrap();
+                    assert_eq!(
+                        btc_primitives::encode::encode(&result.verified.transaction),
+                        expected,
+                        "{name}"
+                    );
+                    assert_eq!(result.partial_signatures_checked, count);
+                    assert_eq!(result.verified.signatures_checked, threshold);
+                    // Even unused excess records must pass the real equation.
+                    for i in 0..partial.inputs[0].tap_script_sigs.len() {
+                        let mut bad = partial.clone();
+                        bad.inputs[0].tap_script_sigs[i].1[63] ^= 1;
+                        assert!(finalize_psbt(&bad).is_err(), "{name} {i}");
+                        assert_eq!(bad.inputs[0].final_script_witness, None);
+                    }
+                } else {
+                    // BIP371 partial records cannot declare an annex. A real
+                    // annex-bound signature verifies only with its final witness.
+                    assert!(verify_partial_signatures(&partial).is_err());
+                    assert!(finalize_psbt(&partial).is_err());
+                }
+                assert_eq!(partial.try_serialize().unwrap(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn core_two_of_three_subsets_and_invalid_final_slots() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../primitives/tests/data/taproot-thresholds.json"
+        ))
+        .unwrap();
+        let vector = &fixture["vectors"][1];
+        let original =
+            Psbt::deserialize(&hex::decode(vector["partial_psbt"].as_str().unwrap()).unwrap())
+                .unwrap();
+        for bits in 0u8..8 {
+            let mut psbt = original.clone();
+            psbt.inputs[0].tap_script_sigs = original.inputs[0]
+                .tap_script_sigs
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| bits & (1 << i) != 0)
+                .map(|(_, record)| record.clone())
+                .collect();
+            assert_eq!(verify_partial_signatures(&psbt).is_ok(), bits != 0);
+            assert_eq!(finalize_psbt(&psbt).is_ok(), bits.count_ones() >= 2);
+        }
+        let valid = finalize_psbt(&original).unwrap().psbt;
+        for mode in 0..5 {
+            let mut bad = valid.clone();
+            let witness = bad.inputs[0].final_script_witness.as_mut().unwrap();
+            match mode {
+                0 => {
+                    witness.remove(2);
+                } // missing empty signature slot
+                1 => witness.swap(0, 1), // two valid signatures under wrong keys
+                2 => witness[2] = witness[0].clone(), // three signatures != threshold
+                3 => witness[0].clear(), // one signature < threshold
+                _ => {
+                    witness[0][63] ^= 1;
+                }
+            }
+            assert!(verify_finalized_psbt(&bad).is_err(), "{mode}");
+        }
+    }
+
+    #[test]
+    fn threshold_templates_require_exact_bounded_minimal_scripts() {
+        let key = hex::decode("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+            .unwrap();
+        let prefix = [vec![32], key, vec![0xac]].concat();
+        for tail in [
+            vec![0x50, 0x9c],
+            vec![0x52, 0x9c],
+            vec![1, 1, 0x9c],
+            vec![0x51, 0x9d],
+            vec![0xab, 0x51, 0x9c],
+            vec![0x51, 0x9c, 0x51],
+        ] {
+            assert!(tapscript_template(&[prefix.clone(), tail].concat()).is_err());
+        }
+        let mut excessive = prefix;
+        for _ in 0..20 {
+            excessive.extend_from_within(0..33);
+            excessive.push(0xba);
+        }
+        excessive.extend_from_slice(&[1, 20, 0x9c]);
+        assert!(tapscript_template(&excessive).is_err());
+        assert!(tapscript_template(&[0x51, 0x9c]).is_err());
+    }
+
+    #[test]
     fn finalizer_prefers_shortest_taproot_path_then_a_complete_key_path() {
         use btc_primitives::psbt::TapLeafScript;
         use btc_primitives::taproot::{output_key, tap_branch_hash, tap_leaf_hash, tap_tweak_hash};
@@ -1026,6 +1153,39 @@ fn witness_signatures(witness: &Witness, program: &Script) -> eyre::Result<Vec<V
     }
 }
 
+/// Exact bounded BIP342 pk/multi_a templates; no separator or annex context is
+/// inferred from partial records. This wallet limit is not a consensus rule.
+struct TapScriptTemplate<'a> {
+    threshold: usize,
+    keys: Vec<&'a [u8]>,
+}
+
+fn tapscript_template(code: &[u8]) -> eyre::Result<TapScriptTemplate<'_>> {
+    ensure!(code.len() <= 20 * 34 + 3, "unsupported tapscript template");
+    let mut keys = Vec::new();
+    let mut offset = 0;
+    while code.get(offset) == Some(&32) && offset + 34 <= code.len() {
+        let opcode = if keys.is_empty() { 0xac } else { 0xba };
+        ensure!(
+            code[offset + 33] == opcode,
+            "unsupported tapscript template"
+        );
+        let key = &code[offset + 1..offset + 33];
+        secp256k1::XOnlyPublicKey::from_slice(key)?;
+        keys.push(key);
+        ensure!(keys.len() <= 20, "unsupported tapscript template");
+        offset += 34;
+    }
+    let threshold = match &code[offset..] {
+        [] if keys.len() == 1 => 1,
+        [number @ 0x51..=0x60, 0x9c] => usize::from(*number - 0x50),
+        [1, number @ 17..=20, 0x9c] => usize::from(*number),
+        _ => bail!("unsupported tapscript template"),
+    };
+    ensure!(threshold <= keys.len(), "unsupported tapscript template");
+    Ok(TapScriptTemplate { threshold, keys })
+}
+
 fn input_signatures(
     tx: &Transaction,
     index: usize,
@@ -1043,11 +1203,21 @@ fn input_signatures(
                 control.first().is_some_and(|v| v & 0xfe == 0xc0),
                 "unsupported Taproot leaf version"
             );
+            let template = tapscript_template(script)?;
             ensure!(
-                len == 3 && script.len() == 34 && script[0] == 32 && script[33] == 0xac,
-                "unsupported tapscript template"
+                len == template.keys.len() + 2,
+                "invalid tapscript witness slots"
             );
-            secp256k1::XOnlyPublicKey::from_slice(&script[1..33])?;
+            let signatures: Vec<_> = (0..len - 2)
+                .map(|i| witness.get(i).unwrap())
+                .filter(|signature| !signature.is_empty())
+                .map(<[u8]>::to_vec)
+                .collect();
+            ensure!(
+                signatures.len() == template.threshold,
+                "invalid tapscript signature threshold"
+            );
+            return Ok((signatures, true, true));
         }
         return Ok((vec![witness.get(0).unwrap().to_vec()], true, true));
     }
@@ -1275,11 +1445,12 @@ fn verify_partial_input(
                 .ok_or_else(|| eyre::eyre!("missing committed Taproot leaf for signature"))?;
             let code = leaf.script.as_bytes();
             ensure!(
-                leaf.leaf_version == 0xc0 && code.len() == 34 && code[0] == 32 && code[33] == 0xac,
-                "unsupported tapscript template"
+                leaf.leaf_version == 0xc0,
+                "unsupported tapscript leaf version"
             );
+            let template = tapscript_template(code)?;
             ensure!(
-                code[1..33] == record[..32],
+                template.keys.contains(&&record[..32]),
                 "partial signature key does not belong to Taproot leaf"
             );
             let hash_type = check_sighash(sig, true, input.sighash_type)?;
@@ -1425,32 +1596,50 @@ fn final_taproot_witness(input: &PsbtInput) -> eyre::Result<Vec<Vec<u8>>> {
     let mut best = None;
     for (control, leaf) in &input.tap_leaf_scripts {
         let script = leaf.script.as_bytes();
-        if leaf.leaf_version != 0xc0 || script.len() != 34 || script[0] != 32 || script[33] != 0xac
-        {
+        if leaf.leaf_version != 0xc0 {
             continue;
         }
+        let Ok(template) = tapscript_template(script) else {
+            continue;
+        };
         let mut record = [0; 64];
-        record[..32].copy_from_slice(&script[1..33]);
         record[32..].copy_from_slice(&btc_primitives::taproot::tap_leaf_hash(0xc0, script));
-        if let Some(sig) = signatures.get(record.as_slice()) {
-            let size = 1
-                + sig.len()
-                + 1
-                + script.len()
-                + 1
-                + control.len()
-                + btc_primitives::VarInt(control.len() as u64).encoded_size();
-            // Core's script map is lexicographic; its control set orders by
-            // length, then bytes. Match ties without depending on map order.
-            let order = (size, script, control.len(), control.as_slice());
-            if best.as_ref().is_none_or(|(previous, _)| order < *previous) {
-                best = Some((order, *sig));
+        let mut available = Vec::new();
+        for (index, key) in template.keys.iter().enumerate() {
+            record[..32].copy_from_slice(key);
+            if let Some(sig) = signatures.get(record.as_slice()) {
+                available.push((index, *sig));
             }
         }
+        if available.len() < template.threshold {
+            continue;
+        }
+        // Core builds multi_a stacks from the last key backwards and retains
+        // an existing satisfaction on equal size. Prefer shorter signatures,
+        // then later script positions. Repeated keys still occupy separate
+        // slots: the threshold counts equations, not independent owners.
+        available.sort_by_key(|(index, sig)| (sig.len(), std::cmp::Reverse(*index)));
+        let mut stack = vec![Vec::new(); template.keys.len()];
+        for (index, sig) in available.into_iter().take(template.threshold) {
+            stack[template.keys.len() - 1 - index] = sig.to_vec();
+        }
+        stack.push(script.to_vec());
+        stack.push(control.clone());
+        let size = btc_primitives::VarInt(stack.len() as u64).encoded_size()
+            + stack
+                .iter()
+                .map(|item| btc_primitives::VarInt(item.len() as u64).encoded_size() + item.len())
+                .sum::<usize>();
+        // Core's script map is lexicographic; its control set orders by
+        // length, then bytes. Match ties without depending on map order.
+        let order = (size, script, control.len(), control.as_slice());
+        if best.as_ref().is_none_or(|(previous, _)| order < *previous) {
+            best = Some((order, stack));
+        }
     }
-    let ((_, script, _, control), sig) =
+    let (_, stack) =
         best.ok_or_else(|| eyre::eyre!("missing supported Taproot script satisfaction"))?;
-    Ok(vec![sig.to_vec(), script.to_vec(), control.to_vec()])
+    Ok(stack)
 }
 
 fn assemble_final_input(output: &Script, input: &mut PsbtInput) -> eyre::Result<()> {

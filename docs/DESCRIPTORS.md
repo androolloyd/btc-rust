@@ -7,6 +7,7 @@ public scripts and addresses from supported descriptors:
 btc-node --json --network regtest derive-descriptor "wpkh($ACCOUNT_TPUB/0/*)" --index 7
 btc-node --json derive-descriptor "sh(wpkh($PUBLIC_KEY))"
 btc-node --json derive-descriptor "tr($INTERNAL_XONLY,pk($LEAF_XONLY))"
+btc-node --json derive-descriptor "tr($INTERNAL_XONLY,multi_a(2,$KEY_A,$KEY_B,$KEY_C))"
 ```
 
 Checksums are optional on input and verified when supplied. Output includes a
@@ -17,7 +18,7 @@ same implementation for fixed descriptors with mainnet address interpretation.
 `Descriptor::parse()` builds a bounded structural representation; expansion
 performs the key and script-context checks before returning a result.
 
-Supported public expressions are `pk`, `pkh`, `wpkh`, `multi`, `sortedmulti`,
+Supported public expressions are `pk`, `pkh`, `wpkh`, `multi`, `sortedmulti`, `multi_a`, `sortedmulti_a`,
 `sh`, `wsh`, `tr`, `addr` and `raw`. `sh` is top level; `wsh` and `wpkh` can be
 top level or inside `sh`. Their inner script contexts are checked. Witness-v0
 keys must be compressed. Bare multisig has at most three keys; P2SH uses the
@@ -40,7 +41,11 @@ of out-of-range tweaks and infinite child points; the child chain code and heade
 still advance when its point equals the parent's point.
 
 Taproot accepts x-only or compressed keys and key-path-only outputs or binary
-trees of `pk` leaves. It applies the actual BIP341 tweak, leaf/branch hashes and
+trees of `pk`, `multi_a` and `sortedmulti_a` leaves. Threshold leaves use the
+BIP387 CHECKSIG/CHECKSIGADD/NUMEQUAL script and support 1..20 keys with a
+threshold from one through the key count. `sortedmulti_a` sorts the derived
+x-only children. The twenty-key bound is an implementation limit; BIP387 allows
+999 keys. It applies the actual BIP341 tweak, leaf/branch hashes and
 output parity. Results include the internal key, merkle root when present, leaf
 scripts/hashes and complete control blocks, with a maximum tree depth of 128.
 Uncompressed Taproot keys and unsupported leaf templates fail.
@@ -55,7 +60,7 @@ uses the selected network. Errors return no partial expansion.
 The CLI scope is `public_descriptor_scripts`. `key_origins_verified`,
 `wallet_ownership_verified`, `signatures_verified` and `active_chain_verified`
 remain false. No signer, wallet import/rescan, spending-key coverage or chain
-admission is implied. General Miniscript, BIP387, multipath, `combo`, `rawtr` and
+admission is implied. General Miniscript, larger BIP387 thresholds, multipath, `combo`, `rawtr` and
 private descriptor operations remain unfinished.
 
 The independent fixture retains twenty public descriptors and twenty-four exact
@@ -68,9 +73,16 @@ regtest parser, only their extended-key version and Base58 checksum are converte
 to tpub; curve keys, chain codes, origin/header metadata and expected scripts stay
 unchanged. Wrong-network extended keys fail explicitly.
 
+Threshold regressions retain four unchanged published BIP387 public outputs,
+forty Core reference-generated script/control commitments spanning one through
+twenty keys, and independently signed offline PSBTs. Synthetic outpoints establish
+equations only. Live Core wallet acceptance separately funds and mines unsorted
+and sorted 2-of-3, 17-of-20 and mixed-depth threshold/key-leaf spends.
+
 Primary definitions: [BIP380 key expressions/checksums](https://github.com/bitcoin/bips/blob/master/bip-0380.mediawiki),
 [BIP381 legacy contexts](https://github.com/bitcoin/bips/blob/master/bip-0381.mediawiki),
 [BIP382 witness contexts](https://github.com/bitcoin/bips/blob/master/bip-0382.mediawiki),
 [BIP383 multisig](https://github.com/bitcoin/bips/blob/master/bip-0383.mediawiki),
 [BIP386 Taproot](https://github.com/bitcoin/bips/blob/master/bip-0386.mediawiki) and
+[BIP387 threshold leaves](https://github.com/bitcoin/bips/blob/master/bip-0387.mediawiki),
 [Core v29 descriptor parsing/expansion](https://github.com/bitcoin/bitcoin/blob/v29.0/src/script/descriptor.cpp).

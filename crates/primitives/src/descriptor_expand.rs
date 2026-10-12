@@ -274,6 +274,35 @@ impl Expansion {
                 script.push_opcode(Opcode::OP_CHECKMULTISIG);
                 Ok(script)
             }
+            Descriptor::MultiA(threshold, keys) | Descriptor::SortedMultiA(threshold, keys)
+                if context == Context::Tap =>
+            {
+                // This is a bounded wallet template, not a consensus key limit.
+                if *threshold == 0 || *threshold as usize > keys.len() || keys.len() > 20 {
+                    return Err(error(
+                        "invalid Taproot threshold/key count (maximum 20 keys)",
+                    ));
+                }
+                let mut keys = keys
+                    .iter()
+                    .map(|key| self.key(key, Context::Tap))
+                    .collect::<Result<Vec<_>, _>>()?;
+                if matches!(descriptor, Descriptor::SortedMultiA(..)) {
+                    keys.sort();
+                }
+                let mut script = ScriptBuf::new();
+                for (index, key) in keys.iter().enumerate() {
+                    script.push_slice(key);
+                    script.push_opcode(if index == 0 {
+                        Opcode::OP_CHECKSIG
+                    } else {
+                        Opcode::OP_CHECKSIGADD
+                    });
+                }
+                push_number(&mut script, *threshold);
+                script.push_opcode(Opcode::OP_NUMEQUAL);
+                Ok(script)
+            }
             Descriptor::Tr(key, tree) if context == Context::Top => {
                 let internal: [u8; 32] =
                     self.key(key, Context::Tap)?.try_into().expect("x-only key");
@@ -334,8 +363,11 @@ impl Expansion {
                     return Err(error("checksum is only permitted at descriptor top level"));
                 }
                 let descriptor = Descriptor::parse(expression)?;
-                // General Miniscript and BIP387 templates remain unsupported.
-                if !matches!(descriptor, Descriptor::Pk(_)) {
+                // General Miniscript remains unsupported.
+                if !matches!(
+                    descriptor,
+                    Descriptor::Pk(_) | Descriptor::MultiA(..) | Descriptor::SortedMultiA(..)
+                ) {
                     return Err(DescriptorError::UnsupportedScriptPubkey);
                 }
                 let script = self.script(&descriptor, Context::Tap)?;
@@ -438,6 +470,58 @@ mod tests {
             }
         }
         assert_eq!(count, 24);
+    }
+
+    #[test]
+    fn core_threshold_descriptor_commitments_and_context_bounds() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/data/taproot-thresholds.json")).unwrap();
+        for vector in fixture["published"].as_array().unwrap() {
+            let text = vector["descriptor"].as_str().unwrap();
+            for (i, expected) in vector["scripts"].as_array().unwrap().iter().enumerate() {
+                let expanded = Descriptor::parse(text)
+                    .unwrap()
+                    .expand(text.contains('*').then_some(i as u32), Network::Mainnet)
+                    .unwrap();
+                assert_eq!(
+                    hex::encode(expanded.script_pubkey.as_bytes()),
+                    expected.as_str().unwrap()
+                );
+            }
+        }
+        for vector in fixture["descriptors"].as_array().unwrap() {
+            let text = vector["descriptor"].as_str().unwrap();
+            let parsed = Descriptor::parse(text).unwrap();
+            assert_eq!(parsed.to_string(), text);
+            let expanded = parsed.expand(None, Network::Mainnet).unwrap();
+            assert_eq!(
+                hex::encode(expanded.script_pubkey.as_bytes()),
+                vector["script_pubkey"]
+            );
+            let leaf = &expanded.tap_leaves[0];
+            assert_eq!(hex::encode(leaf.script.as_bytes()), vector["script"]);
+            assert_eq!(hex::encode(&leaf.control_block), vector["control"]);
+            assert_eq!(hex::encode(leaf.leaf_hash), vector["leaf_hash"]);
+        }
+        for leaf in [
+            format!("multi_a(1,{KEY})"),
+            format!("sortedmulti_a(1,{KEY})"),
+        ] {
+            for text in [leaf.clone(), format!("wsh({leaf})"), format!("sh({leaf})")] {
+                assert!(Descriptor::parse(&text).unwrap().script_pubkey().is_err());
+            }
+        }
+        let keys = vec![KEY; 21].join(",");
+        assert!(Descriptor::parse(&format!("tr({KEY},multi_a(20,{keys}))"))
+            .unwrap()
+            .script_pubkey()
+            .is_err());
+        assert!(Descriptor::Tr(
+            KEY.to_owned(),
+            Some(Box::new(TapTree::Leaf(format!("multi_a(0,{KEY})"))))
+        )
+        .script_pubkey()
+        .is_err());
     }
 
     #[test]

@@ -97,6 +97,10 @@ pub enum Descriptor {
     Multi(u32, Vec<String>),
     /// `sortedmulti(k, KEY, KEY, ...)` -- k-of-n multisig with sorted keys.
     SortedMulti(u32, Vec<String>),
+    /// `multi_a(k, KEY, ...)` -- CHECKSIGADD threshold, only in Taproot leaves.
+    MultiA(u32, Vec<String>),
+    /// `sortedmulti_a(k, KEY, ...)` -- threshold with sorted x-only child keys.
+    SortedMultiA(u32, Vec<String>),
     /// `addr(ADDRESS)` -- A raw address.
     Addr(String),
     /// `raw(HEX)` -- A raw hex scriptPubKey.
@@ -275,6 +279,14 @@ impl Descriptor {
                 let (k, keys) = parse_multi_args(args)?;
                 Ok(Descriptor::SortedMulti(k, keys))
             }
+            "multi_a" => {
+                let (k, keys) = parse_multi_args(args)?;
+                Ok(Descriptor::MultiA(k, keys))
+            }
+            "sortedmulti_a" => {
+                let (k, keys) = parse_multi_args(args)?;
+                Ok(Descriptor::SortedMultiA(k, keys))
+            }
             "addr" => Ok(Descriptor::Addr(args.to_string())),
             "raw" => Ok(Descriptor::Raw(args.to_string())),
             other => Err(DescriptorError::UnknownType(other.to_string())),
@@ -313,6 +325,18 @@ impl fmt::Display for Descriptor {
             }
             Descriptor::SortedMulti(k, keys) => {
                 write!(f, "sortedmulti({k}")?;
+                for key in keys {
+                    write!(f, ",{key}")?;
+                }
+                write!(f, ")")
+            }
+            Descriptor::MultiA(k, keys) | Descriptor::SortedMultiA(k, keys) => {
+                let name = if matches!(self, Descriptor::SortedMultiA(..)) {
+                    "sortedmulti_a"
+                } else {
+                    "multi_a"
+                };
+                write!(f, "{name}({k}")?;
                 for key in keys {
                     write!(f, ",{key}")?;
                 }

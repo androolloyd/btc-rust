@@ -43,7 +43,10 @@ real ECDSA/Schnorr verifier and all supplied prevouts. It supports P2PKH/P2PK an
 bare canonical multisig, legacy P2SH with those known redeem templates,
 native/wrapped P2WPKH, native/wrapped P2WSH with P2PK,
 P2PKH or canonical multisig scripts, Taproot key paths, and version-c0 single-key
-`<32-byte key> CHECKSIG` Taproot leaves. An annex is included in the Taproot digest.
+`<32-byte key> CHECKSIG` Taproot leaves and canonical BIP387 CHECKSIGADD threshold
+leaves with up to twenty curve-valid x-only keys. Threshold witnesses contain
+one reversed-order slot per script key, empty slots for unused keys, and exactly
+the specified number of nonempty signatures. An annex is included in the Taproot digest.
 Arbitrary witness/tapscript programs, future witness/leaf/key versions,
 OP_SUCCESS and signature-free scripts return explicit errors. This bounded wallet
 scope prevents consensus forward-compatibility success from becoming a signature
@@ -79,8 +82,9 @@ P2SH with known key/multisig redeem scripts are supported. Legacy inputs still
 require full parent transactions; the witness-only amount attack is rejected.
 Missing redeem/witness scripts, unrelated keys and unsupported templates fail.
 Taproot key signatures verify against the actual output key Q. Each script
-signature must name a supplied, committed version-c0 single-key CHECKSIG leaf
-and its actual key; unknown leaf hashes or missing controls/scripts fail.
+signature must name a supplied, committed version-c0 CHECKSIG or bounded
+CHECKSIGADD threshold leaf and a key in that actual script; unknown leaf hashes
+or missing controls/scripts fail.
 All prevouts enter the BIP341 digest where required. This mode uses no annex and
 no OP_CODESEPARATOR, because its supported partial-record context has neither.
 Finalized inputs are rejected; annex-bearing final witnesses belong to the
@@ -104,7 +108,11 @@ the script's key order and requires the full threshold; a valid incomplete set
 returns an error. Taproot prefers a complete key path, otherwise the smallest
 serialized witness for a supported signed leaf, with deterministic Core-compatible
 ties. Wrapped witness uses an exact redeem-program push; legacy/witness multisig
-includes its empty CHECKMULTISIG dummy. No annex or separator context is invented
+includes its empty CHECKMULTISIG dummy. Taproot thresholds choose the required
+number of shortest signatures, prefer later script keys on equal size, and
+retain all empty slots. Witness selection includes actual CompactSize lengths
+for scripts and control blocks. Repeated keys count separate equations, without
+claiming independent signers or authenticated origins. No annex or separator context is invented
 for partial records. Existing final inputs are preserved and verified, enabling
 mixed partial/final transactions and idempotent finalization.
 
