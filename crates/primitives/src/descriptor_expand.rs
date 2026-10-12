@@ -1,10 +1,10 @@
-//! Bounded public descriptor expansion. Origin annotations are unauthenticated.
+//! Bounded descriptor expansion. Origin annotations are unauthenticated.
 use super::{Descriptor, DescriptorError, TapTree};
 use crate::{
-    bip32::{ChildNumber, ExtendedPubKey},
+    bip32::{base58check_decode, ChildNumber, ExtendedPrivKey, ExtendedPubKey},
     hash160, sha256, taproot, Address, Network, Opcode, ScriptBuf,
 };
-use secp256k1::{PublicKey, XOnlyPublicKey};
+use secp256k1::{PublicKey, Secp256k1, SecretKey, XOnlyPublicKey};
 
 #[derive(Debug, Clone)]
 pub struct ExpandedTapLeaf {
@@ -26,6 +26,14 @@ pub struct DescriptorExpansion {
     pub derivation_steps: usize,
 }
 
+/// A single resolved output, with a fixed public descriptor. This is not a
+/// ranged descriptor export or an authenticated key-origin/ownership proof.
+#[derive(Debug, Clone)]
+pub struct PrivateDescriptorExpansion {
+    pub expansion: DescriptorExpansion,
+    pub public_descriptor: Descriptor,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Context {
     Top,
@@ -35,6 +43,8 @@ enum Context {
 }
 
 struct Expansion {
+    private: bool,
+    public_keys: Vec<String>,
     index: Option<u32>,
     network: Network,
     ranged: bool,
@@ -80,10 +90,42 @@ impl Descriptor {
         index: Option<u32>,
         network: Network,
     ) -> Result<DescriptorExpansion, DescriptorError> {
+        self.expand_inner(index, network, false)
+            .map(|result| result.0)
+    }
+
+    /// Resolve WIF/xprv/tprv and public keys at one index, including hardened
+    /// private derivations. Returned data contains only public keys/scripts;
+    /// origin annotations are omitted from the fixed resolved descriptor.
+    pub fn expand_private(
+        &self,
+        index: Option<u32>,
+        network: Network,
+    ) -> Result<PrivateDescriptorExpansion, DescriptorError> {
+        let (expansion, keys) = self.expand_inner(index, network, true)?;
+        let mut keys = keys.into_iter();
+        let public_descriptor = resolved_descriptor(self, &mut keys)?;
+        if keys.next().is_some() {
+            return Err(error("inconsistent resolved public keys"));
+        }
+        Ok(PrivateDescriptorExpansion {
+            expansion,
+            public_descriptor,
+        })
+    }
+
+    fn expand_inner(
+        &self,
+        index: Option<u32>,
+        network: Network,
+        private: bool,
+    ) -> Result<(DescriptorExpansion, Vec<String>), DescriptorError> {
         if index.is_some_and(|index| index >= 0x80000000) {
             return Err(error("wildcard index exceeds BIP32 range"));
         }
         let mut work = Expansion {
+            private,
+            public_keys: Vec::new(),
             index,
             network,
             ranged: false,
@@ -100,21 +142,50 @@ impl Descriptor {
             return Err(error("index supplied for a fixed descriptor"));
         }
         let address = address_for_script(&script_pubkey, network);
-        Ok(DescriptorExpansion {
-            script_pubkey,
-            address,
-            redeem_script: work.redeem,
-            witness_script: work.witness,
-            internal_key: work.internal,
-            merkle_root: work.root,
-            tap_leaves: work.leaves,
-            is_ranged: work.ranged,
-            derivation_steps: work.steps,
-        })
+        Ok((
+            DescriptorExpansion {
+                script_pubkey,
+                address,
+                redeem_script: work.redeem,
+                witness_script: work.witness,
+                internal_key: work.internal,
+                merkle_root: work.root,
+                tap_leaves: work.leaves,
+                is_ranged: work.ranged,
+                derivation_steps: work.steps,
+            },
+            work.public_keys,
+        ))
     }
 }
 
 impl Expansion {
+    fn suffix(&mut self, parts: &[&str], depth: u8) -> Result<Vec<ChildNumber>, DescriptorError> {
+        if depth as usize + parts.len() > 255 {
+            return Err(key_error("derived depth exceeds BIP32 range"));
+        }
+        if self.steps + parts.len() > 10_000 {
+            return Err(error("descriptor derivation work limit"));
+        }
+        let mut result = Vec::with_capacity(parts.len());
+        for (position, component) in parts.iter().enumerate() {
+            let number = if ["*", "*h", "*'"].contains(component) {
+                if position + 1 != parts.len() {
+                    return Err(key_error("wildcard must be final"));
+                }
+                self.ranged = true;
+                self.index
+                    .ok_or_else(|| error("ranged descriptor requires an index"))?
+                    | if *component == "*" { 0 } else { 0x80000000 }
+            } else {
+                child(component)?
+            };
+            result.push(ChildNumber(number));
+        }
+        self.steps += parts.len();
+        Ok(result)
+    }
+
     fn key(&mut self, expression: &str, context: Context) -> Result<Vec<u8>, DescriptorError> {
         self.keys += 1;
         if self.keys > 1024 || expression.len() > 4096 {
@@ -149,35 +220,59 @@ impl Expansion {
                     "extended public key version does not match selected network",
                 ));
             }
-            let suffix = parts.collect::<Vec<_>>();
-            if key.depth as usize + suffix.len() > 255 {
-                return Err(key_error("derived depth exceeds BIP32 range"));
-            }
-            for (position, component) in suffix.iter().enumerate() {
-                let number = if *component == "*" {
-                    if position + 1 != suffix.len() {
-                        return Err(key_error("wildcard must be final"));
-                    }
-                    self.ranged = true;
-                    self.index
-                        .ok_or_else(|| error("ranged descriptor requires an index"))?
-                } else {
-                    child(component)?
-                };
-                if number >= 0x80000000 {
+            for number in self.suffix(&parts.collect::<Vec<_>>(), key.depth)? {
+                if number.is_hardened() {
                     return Err(error(
                         "hardened derivation requires private keys and is unsupported",
                     ));
                 }
-                if self.steps >= 10_000 {
-                    return Err(error("descriptor derivation work limit"));
-                }
-                self.steps += 1;
                 key = key
-                    .derive_child(ChildNumber(number))
+                    .derive_child(number)
                     .map_err(|_| key_error("invalid public child derivation"))?;
             }
             key.public_key.serialize().to_vec()
+        } else if self.private && (base.starts_with("xprv") || base.starts_with("tprv")) {
+            if base.len() > 112 {
+                return Err(key_error("invalid extended private key length"));
+            }
+            let mut key = ExtendedPrivKey::from_base58(base)
+                .map_err(|_| key_error("invalid extended private key"))?;
+            if (key.network == Network::Mainnet) != (self.network == Network::Mainnet) {
+                return Err(key_error(
+                    "extended private key version does not match selected network",
+                ));
+            }
+            for number in self.suffix(&parts.collect::<Vec<_>>(), key.depth)? {
+                key = key
+                    .derive_child(number)
+                    .map_err(|_| key_error("invalid private child derivation"))?;
+            }
+            key.public_key().serialize().to_vec()
+        } else if self.private && [51, 52].contains(&base.len()) {
+            if parts.next().is_some() {
+                return Err(key_error("suffix requires an extended key"));
+            }
+            let payload =
+                base58check_decode(base).map_err(|_| key_error("invalid WIF private key"))?;
+            if ![33, 34].contains(&payload.len()) || (payload.len() == 34 && payload[33] != 1) {
+                return Err(key_error("invalid WIF private key encoding"));
+            }
+            let version = if self.network == Network::Mainnet {
+                0x80
+            } else {
+                0xef
+            };
+            if payload[0] != version {
+                return Err(key_error("WIF version does not match selected network"));
+            }
+            let secret = SecretKey::from_slice(&payload[1..33])
+                .map_err(|_| key_error("invalid WIF private scalar"))?;
+            let key = PublicKey::from_secret_key(&Secp256k1::new(), &secret);
+            if payload.len() == 34 {
+                key.serialize().to_vec()
+            } else {
+                key.serialize_uncompressed().to_vec()
+            }
         } else {
             if parts.next().is_some() {
                 return Err(key_error("suffix requires an extended public key"));
@@ -203,7 +298,11 @@ impl Expansion {
                 }
                 _ => return Err(key_error("uncompressed keys are forbidden in Taproot")),
             };
-            return Ok(xonly.serialize().to_vec());
+            let bytes = xonly.serialize().to_vec();
+            if self.private {
+                self.public_keys.push(hex::encode(&bytes));
+            }
+            return Ok(bytes);
         }
         if bytes.len() != 33 && bytes.len() != 65 {
             return Err(key_error("invalid public key encoding"));
@@ -211,6 +310,9 @@ impl Expansion {
         PublicKey::from_slice(&bytes).map_err(|_| key_error("invalid curve public key"))?;
         if context == Context::Wsh && bytes.len() != 33 {
             return Err(key_error("witness keys must be compressed"));
+        }
+        if self.private {
+            self.public_keys.push(hex::encode(&bytes));
         }
         Ok(bytes)
     }
@@ -363,7 +465,8 @@ impl Expansion {
                 if expression.contains('#') {
                     return Err(error("checksum is only permitted at descriptor top level"));
                 }
-                let descriptor = Descriptor::parse(expression)?;
+                let descriptor = Descriptor::parse(expression)
+                    .map_err(|_| error("invalid Taproot leaf descriptor"))?;
                 // General Miniscript remains unsupported.
                 if !matches!(
                     descriptor,
@@ -398,6 +501,65 @@ impl Expansion {
         };
         Ok((hash, start..self.leaves.len()))
     }
+}
+
+// Walk in precisely the compiler's key order: internal key before Taproot
+// leaves and left subtree before right. No private expression is copied into
+// the returned descriptor, including its leaf-expression strings.
+fn resolved_descriptor(
+    descriptor: &Descriptor,
+    keys: &mut impl Iterator<Item = String>,
+) -> Result<Descriptor, DescriptorError> {
+    let mut next = || {
+        keys.next()
+            .ok_or_else(|| error("missing resolved public key"))
+    };
+    Ok(match descriptor {
+        Descriptor::Pk(_) => Descriptor::Pk(next()?),
+        Descriptor::Pkh(_) => Descriptor::Pkh(next()?),
+        Descriptor::Wpkh(_) => Descriptor::Wpkh(next()?),
+        Descriptor::Sh(inner) => Descriptor::Sh(Box::new(resolved_descriptor(inner, keys)?)),
+        Descriptor::Wsh(inner) => Descriptor::Wsh(Box::new(resolved_descriptor(inner, keys)?)),
+        Descriptor::Tr(_, tree) => Descriptor::Tr(
+            next()?,
+            tree.as_ref()
+                .map(|tree| resolved_tree(tree, keys).map(Box::new))
+                .transpose()?,
+        ),
+        Descriptor::Multi(k, old) => {
+            Descriptor::Multi(*k, old.iter().map(|_| next()).collect::<Result<_, _>>()?)
+        }
+        Descriptor::SortedMulti(k, old) => {
+            Descriptor::SortedMulti(*k, old.iter().map(|_| next()).collect::<Result<_, _>>()?)
+        }
+        Descriptor::MultiA(k, old) => {
+            Descriptor::MultiA(*k, old.iter().map(|_| next()).collect::<Result<_, _>>()?)
+        }
+        Descriptor::SortedMultiA(k, old) => {
+            Descriptor::SortedMultiA(*k, old.iter().map(|_| next()).collect::<Result<_, _>>()?)
+        }
+        Descriptor::Addr(text) => Descriptor::Addr(text.clone()),
+        Descriptor::Raw(text) => Descriptor::Raw(text.clone()),
+    })
+}
+
+fn resolved_tree(
+    tree: &TapTree,
+    keys: &mut impl Iterator<Item = String>,
+) -> Result<TapTree, DescriptorError> {
+    Ok(match tree {
+        TapTree::Leaf(text) => TapTree::Leaf(
+            resolved_descriptor(
+                &Descriptor::parse(text).map_err(|_| error("invalid Taproot leaf descriptor"))?,
+                keys,
+            )?
+            .to_string(),
+        ),
+        TapTree::Branch(left, right) => TapTree::Branch(
+            Box::new(resolved_tree(left, keys)?),
+            Box::new(resolved_tree(right, keys)?),
+        ),
+    })
 }
 
 fn push_number(script: &mut ScriptBuf, value: u32) {
@@ -455,6 +617,132 @@ fn address_for_script(script: &ScriptBuf, network: Network) -> Option<Address> {
 mod tests {
     use super::*;
     const KEY: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+
+    #[test]
+    fn published_private_descriptor_scripts_and_public_only_resolution() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/data/private-descriptors.json")).unwrap();
+        assert_eq!(fixture["vectors"].as_array().unwrap().len(), 28);
+        let mut count = 0;
+        for vector in fixture["vectors"].as_array().unwrap() {
+            let text = vector["descriptor"].as_str().unwrap();
+            let descriptor = Descriptor::parse(text).unwrap();
+            // The old public resolver must continue rejecting private material.
+            assert!(descriptor
+                .expand(text.contains('*').then_some(0), Network::Mainnet)
+                .is_err());
+            for (i, expected) in vector["scripts"].as_array().unwrap().iter().enumerate() {
+                let resolved = descriptor
+                    .expand_private(text.contains('*').then_some(i as u32), Network::Mainnet)
+                    .unwrap();
+                let expansion = &resolved.expansion;
+                assert_eq!(
+                    hex::encode(expansion.script_pubkey.as_bytes()),
+                    expected.as_str().unwrap()
+                );
+                assert_eq!(expansion.is_ranged, text.contains('*'));
+                let public = resolved.public_descriptor.to_string();
+                assert!(!public.contains("prv") && !public.contains('[') && !public.contains('*'));
+                let reparsed = Descriptor::parse(&public)
+                    .unwrap()
+                    .expand(None, Network::Mainnet)
+                    .unwrap();
+                assert_eq!(reparsed.script_pubkey, expansion.script_pubkey);
+                assert_eq!(reparsed.redeem_script, expansion.redeem_script);
+                assert_eq!(reparsed.witness_script, expansion.witness_script);
+                assert_eq!(reparsed.tap_leaves.len(), expansion.tap_leaves.len());
+                for (a, b) in reparsed.tap_leaves.iter().zip(&expansion.tap_leaves) {
+                    assert_eq!(a.script, b.script);
+                    assert_eq!(a.control_block, b.control_block);
+                }
+                count += 1;
+            }
+        }
+        assert_eq!(count, 37);
+    }
+
+    #[test]
+    fn private_derivation_network_depth_work_and_wif_context_bounds() {
+        let compressed = "L4rK1yDtCWekvXuE6oXD9jCYfFNV2cWRpVuPLBcCU2z8TrisoyY1";
+        let uncompressed = "5KYZdUEo39z3FPrtuX2QbbwGnNP5zTd7yyr2SC1j299sBCnWjss";
+        let mut root = ExtendedPrivKey::from_seed(&[1; 32], Network::Mainnet).unwrap();
+        let xprv = root.to_base58();
+        let public = root.to_extended_pub_key().to_base58();
+        for text in [
+            format!("wpkh({uncompressed})"),
+            format!("tr({uncompressed})"),
+            format!("wsh(pk({uncompressed}))"),
+            format!("pk({compressed}/0)"),
+            format!("pk({xprv}/*h/0)"),
+            format!("pk({public}/*h)"),
+            format!("pk({xprv}/2147483648)"),
+            format!("pk({xprv}/0hh)"),
+            format!("pk({xprv}/<0;1>)"),
+        ] {
+            assert!(Descriptor::parse(&text)
+                .unwrap()
+                .expand_private(Some(0), Network::Mainnet)
+                .is_err());
+        }
+        for key in [compressed, uncompressed, &xprv] {
+            assert!(Descriptor::Pk(key.to_owned())
+                .expand_private(None, Network::Regtest)
+                .is_err());
+        }
+        for suffix in ["/0h/1/*h", "/0'/1/*'"] {
+            let desc = Descriptor::Wpkh(format!("{xprv}{suffix}"));
+            let result = desc
+                .expand_private(Some(0x7fffffff), Network::Mainnet)
+                .unwrap();
+            assert_eq!(result.expansion.derivation_steps, 3);
+            let child = root
+                .derive_child(ChildNumber(0x80000000))
+                .unwrap()
+                .derive_child(ChildNumber(1))
+                .unwrap()
+                .derive_child(ChildNumber(0xffffffff))
+                .unwrap();
+            assert_eq!(
+                result.public_descriptor,
+                Descriptor::Wpkh(hex::encode(child.public_key().serialize()))
+            );
+            assert!(desc.expand_private(None, Network::Mainnet).is_err());
+            assert!(desc
+                .expand_private(Some(0x80000000), Network::Mainnet)
+                .is_err());
+        }
+        root.depth = 254;
+        let desc = Descriptor::Wpkh(format!("{}/0h/*", root.to_base58()));
+        assert!(desc.expand_private(Some(0), Network::Mainnet).is_err());
+        root.depth = 255;
+        assert!(Descriptor::Wpkh(root.to_base58())
+            .expand_private(None, Network::Mainnet)
+            .is_ok());
+        root.network = Network::Testnet;
+        let desc = Descriptor::Wpkh(root.to_base58());
+        assert!(desc.expand_private(None, Network::Mainnet).is_err());
+        for network in [
+            Network::Regtest,
+            Network::Testnet,
+            Network::Signet,
+            Network::Testnet4,
+        ] {
+            assert!(desc.expand_private(None, network).is_ok());
+        }
+        let steps = "/0".repeat(200);
+        let keys = vec![format!("{xprv}{steps}"); 51];
+        let desc = Descriptor::Tr(
+            KEY.to_owned(),
+            Some(Box::new(TapTree::Leaf(
+                Descriptor::MultiA(1, keys).to_string(),
+            ))),
+        );
+        assert!(desc
+            .expand_private(None, Network::Mainnet)
+            .unwrap_err()
+            .to_string()
+            .contains("work limit"));
+    }
 
     #[test]
     fn published_public_descriptor_scripts_match_exactly() {
@@ -524,6 +812,8 @@ mod tests {
         }
         let excessive = Descriptor::MultiA(999, vec![KEY.to_owned(); 1000]);
         let mut work = Expansion {
+            private: false,
+            public_keys: Vec::new(),
             index: None,
             network: Network::Mainnet,
             ranged: false,

@@ -1,4 +1,4 @@
-# Public output descriptor expansion
+# Output descriptor expansion
 
 The library `Descriptor::expand(index, network)` and compiled CLI produce actual
 public scripts and addresses from supported descriptors:
@@ -32,7 +32,8 @@ components and an optional final `/*`. All wildcards in one descriptor use the s
 requires `--index`; a fixed descriptor rejects it. Child indices are below
 2^31, and resulting BIP32 depth cannot exceed 255. Optional `[fingerprint/path]`
 annotations are parsed as metadata and do not authenticate the key's origin.
-Hardened suffixes, private extended keys and WIF keys fail explicitly; diagnostics
+In the public-only API, hardened suffixes, private extended keys and WIF keys
+fail explicitly; diagnostics
 from the public-key resolver do not echo potential private material.
 Extended-key text and legacy addresses accept only the actual ASCII Base58
 alphabet. Unicode characters are never truncated into ASCII aliases. The shared
@@ -53,7 +54,7 @@ Uncompressed Taproot keys and unsupported leaf templates fail.
 
 Untrusted input is bounded to 262,144 ASCII bytes and 132 delimiter nesting
 levels before recursive parsing. Expansion bounds key expressions to 4,096 bytes,
-1,024 total keys, 1,024 leaves and 10,000 CKDpub operations; raw scripts are at
+1,024 total keys, 1,024 leaves and 10,000 CKD operations; raw scripts are at
 most 10,000 bytes. These are explicit implementation limits, not new consensus
 rules. Unsupported witness address versions fail explicitly; address parsing
 uses the selected network. Errors return no partial expansion.
@@ -62,7 +63,7 @@ The CLI scope is `public_descriptor_scripts`. `key_origins_verified`,
 `wallet_ownership_verified`, `signatures_verified` and `active_chain_verified`
 remain false. No signer, wallet import/rescan, spending-key coverage or chain
 admission is implied. General Miniscript, multipath, `combo`, `rawtr` and
-private descriptor operations remain unfinished.
+ranged private-to-public export and private descriptor signing remain unfinished.
 
 The independent fixture retains twenty public descriptors and twenty-four exact
 scripts from the canonical BIP381/382/383/386 vectors, with source SHA256s and
@@ -80,7 +81,7 @@ fifty-two Core reference-generated script/control commitments spanning one throu
 equations only. Live Core wallet acceptance separately funds and mines unsorted
 and sorted 2-of-3, 17-of-20 and mixed-depth threshold/key-leaf spends, plus real
 2-of-999, 128-of-128 and 999-of-999 spends. Text/key/derivation budgets still apply
-to large descriptors; private and hardened-suffix expressions remain unsupported.
+to large descriptors; private expressions use the separate API below.
 
 Primary definitions: [BIP380 key expressions/checksums](https://github.com/bitcoin/bips/blob/master/bip-0380.mediawiki),
 [BIP381 legacy contexts](https://github.com/bitcoin/bips/blob/master/bip-0381.mediawiki),
@@ -89,3 +90,48 @@ Primary definitions: [BIP380 key expressions/checksums](https://github.com/bitco
 [BIP386 Taproot](https://github.com/bitcoin/bips/blob/master/bip-0386.mediawiki) and
 [BIP387 threshold leaves](https://github.com/bitcoin/bips/blob/master/bip-0387.mediawiki),
 [Core v29 descriptor parsing/expansion](https://github.com/bitcoin/bitcoin/blob/v29.0/src/script/descriptor.cpp).
+
+## Private descriptor files
+
+`Descriptor::expand_private(index, network)` resolves supported WIF/xprv/tprv
+expressions using the actual curve and BIP32 private derivation. It accepts
+normal/hardened suffixes and final `/*`, `/*h` or `/*'` wildcards, with the same
+network, depth, key, tree and work bounds as public expansion. WIF compression
+and network bytes are enforced; uncompressed private keys remain forbidden in
+witness-v0 and Taproot contexts. Public xpub/tpub expressions still cannot derive
+hardened children. Public-only `expand` continues rejecting private keys.
+
+The compiled command accepts a UTF-8 regular file of at most 262,144 bytes:
+
+```sh
+btc-node --json --network regtest derive-private-descriptor --file /path/to/wallet-descriptor.txt --index 7
+```
+
+Private material never enters this command's descriptor argv or output. Syntax
+and checksum errors are redacted because ordinary parser diagnostics can contain
+source text. Output includes the actual scripts/address/control proofs and a
+checksummed **fixed public descriptor for the selected output**. Its key origin
+annotations and wildcard paths are omitted; `is_ranged` describes the original
+input. This is not BIP380's ranged export normalization. The scope is
+`private_descriptor_scripts`, with `descriptor_is_fixed: true` and
+`key_origins_preserved: false`; origin, ownership, signature and chain claims stay
+false. The source descriptor and transient derivation data are held in ordinary
+process memory; this tool is not a protected keystore or a signer.
+
+The additional fixture retains twenty-eight unchanged published private
+descriptors and thirty-seven exact scripts from BIP381/382/383/386/387, with
+source hashes and BSD-2-Clause licensing. Core acceptance compares both unchanged
+mainnet vectors and version-only test-network conversions, including hardened
+wildcards and mixed private/public Taproot trees. Actual Core wallet private HD
+expansions are compared before funding/mining the existing witness/threshold
+surfaces; a new final-hardened-child witness surface checks that public-origin
+proofs remain explicitly unprovable without a deeper xpub anchor.
+
+Acceptance passed: all thirty-seven published scripts, eight shared malformed-key
+rejections, sixteen private HD wallet pairs (thirty-two addresses), and the
+complete twenty-one-surface funded/signed/mined Core harness, including large
+2-of-999/128-of-128/999-of-999 spends. The final gate passes 3,376 tests across 43
+suites, formatting, Clippy, isolated features and release build (two preexisting
+ignored tests). The fresh descriptor sanitizer corpus completed 981,770
+executions in 31 seconds without failure. These are disposable regtest wallet
+checks; signing and public-chain qualification remain separate work.

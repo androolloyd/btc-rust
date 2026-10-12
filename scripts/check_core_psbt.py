@@ -73,7 +73,7 @@ def check_taproot_metadata(decoded, independent):
         assert tree == core_tree
 
 
-def script_addresses(port, kind, descriptors):
+def script_addresses(args, port, kind, descriptors):
     # The BIP341 NUMS point has no known secret; the wallet must spend a leaf.
     nums = "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0"
     prefix = "tr(" if kind.startswith("taproot-") else "wpkh("
@@ -81,6 +81,8 @@ def script_addresses(port, kind, descriptors):
                     if d["active"] and not d["internal"] and d["desc"].startswith(prefix))
     key = original.split("#")[0][len(prefix):-1]
     assert key.endswith("/0/*")
+    if kind == "wsh-hardened":
+        key += "h"
     if kind.startswith("taproot-"):
         second = key[:-4] + "/1/*"
         if kind.startswith("taproot-large-"):
@@ -123,7 +125,17 @@ def script_addresses(port, kind, descriptors):
     assert all(item["success"] for item in imported), imported
     # These wallet root keys include hardened paths; their public serialization
     # cannot derive those paths. Core derives the test addresses with its private keys.
-    return core_rpc(port, "deriveaddresses", [checked_private, [0, 1]])
+    addresses = core_rpc(port, "deriveaddresses", [checked_private, [0, 1]])
+    for index, address in enumerate(addresses):
+        resolved = derive_private_descriptor(args, checked_private, index)
+        args.private_outputs[address] = resolved
+        assert resolved["address"] == address
+        assert resolved["script_pubkey"] == core_rpc(port, "getaddressinfo", [address])["scriptPubKey"]
+        public = core_rpc(port, "getdescriptorinfo", [resolved["descriptor"]])
+        assert not public["hasprivatekeys"] and not public["isrange"]
+        assert core_rpc(port, "deriveaddresses", [resolved["descriptor"]]) == [address]
+    print(f"PASSED: {kind} private HD expansion matches two Core wallet addresses", flush=True)
+    return addresses
 
 
 def compact_size(n):
@@ -171,8 +183,30 @@ def derive_descriptor(args, text, index=None, network="regtest"):
     return result
 
 
+def derive_private_descriptor(args, text, index=None, network="regtest", reject=False):
+    # Ephemeral wallet private keys never enter the process command line.
+    with tempfile.NamedTemporaryFile(mode="w", prefix="btc-private-descriptor-", suffix=".txt") as file:
+        file.write(text); file.flush()
+        command = [str(args.node), "--json", "--network", network, "derive-private-descriptor", "--file", file.name]
+        if index is not None:
+            command += ["--index", str(index)]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+    secrets = re.findall(r"(?:[xt]prv[1-9A-HJ-NP-Za-km-z]+|(?<![a-zA-Z0-9])[KL5c9][1-9A-HJ-NP-Za-km-z]{50,51})", text)
+    assert all(secret not in result.stdout + result.stderr for secret in secrets)
+    if reject:
+        assert result.returncode != 0 and not result.stdout.strip()
+        return None
+    assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)
+    assert output["expansion_scope"] == "private_descriptor_scripts"
+    assert output["descriptor_is_fixed"] and not output["key_origins_preserved"]
+    assert all(output[field] is False for field in ["key_origins_verified", "wallet_ownership_verified", "signatures_verified", "active_chain_verified"])
+    assert not re.search(r"prv|\[|\*", output["descriptor"])
+    return output
+
+
 def regtest_descriptor(text):
-    # Core's regtest descriptor parser requires tpub versions. Keep every
+    # Core's regtest parser requires test-network xkey/WIF versions. Keep every
     # published cryptographic/header byte after the version unchanged; do not
     # derive replacement keys or regenerate expected scripts.
     alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -181,18 +215,75 @@ def regtest_descriptor(text):
         for char in match[0]:
             value = value * 58 + alphabet.index(char)
         raw = value.to_bytes((value.bit_length() + 7) // 8, "big")
-        assert len(raw) == 82 and raw[:4] == bytes.fromhex("0488b21e")
         assert hashlib.sha256(hashlib.sha256(raw[:-4]).digest()).digest()[:4] == raw[-4:]
-        payload = bytes.fromhex("043587cf") + raw[4:-4]
+        if match[0].startswith(("xpub", "xprv")):
+            assert len(raw) == 82
+            version = {bytes.fromhex("0488b21e"): bytes.fromhex("043587cf"),
+                       bytes.fromhex("0488ade4"): bytes.fromhex("04358394")}[raw[:4]]
+            payload = version + raw[4:-4]
+        else:
+            assert len(raw) in (37, 38) and raw[0] == 0x80
+            payload = b"\xef" + raw[1:-4]
         converted = payload + hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
         value = int.from_bytes(converted, "big")
         result = ""
         while value:
             value, digit = divmod(value, 58)
             result = alphabet[digit] + result
-        assert result.startswith("tpub")
         return result
-    return re.sub(r"xpub[1-9A-HJ-NP-Za-km-z]+", replace, text)
+    return re.sub(r"(?:xpub|xprv)[1-9A-HJ-NP-Za-km-z]+|(?<![a-zA-Z0-9])[KL5][1-9A-HJ-NP-Za-km-z]{50,51}(?![a-zA-Z0-9])", replace, text)
+
+
+def check_private_descriptor_vectors(args, port):
+    fixture = Path(__file__).resolve().parents[1] / "crates/primitives/tests/data/private-descriptors.json"
+    count = 0
+    for vector in json.loads(fixture.read_text())["vectors"]:
+        original = vector["descriptor"]
+        text = regtest_descriptor(original)
+        info = core_rpc(port, "getdescriptorinfo", [text])
+        assert info["hasprivatekeys"]
+        for index, script in enumerate(vector["scripts"]):
+            index = index if info["isrange"] else None
+            original_output = derive_private_descriptor(args, original, index, "mainnet")
+            output = derive_private_descriptor(args, text, index)
+            assert output["script_pubkey"] == original_output["script_pubkey"] == script
+            assert output["is_ranged"] == info["isrange"]
+            checked_private = text + "#" + info["checksum"]
+            derive_private_descriptor(args, checked_private, index)
+            public_info = core_rpc(port, "getdescriptorinfo", [output["descriptor"]])
+            assert not public_info["hasprivatekeys"] and not public_info["isrange"]
+            assert derive_descriptor(args, output["descriptor"])["script_pubkey"] == script
+            if output["address"] is not None:
+                params = [checked_private] + ([[index, index]] if index is not None else [])
+                assert core_rpc(port, "deriveaddresses", params) == [output["address"]]
+                assert core_rpc(port, "deriveaddresses", [output["descriptor"]]) == [output["address"]]
+                assert core_rpc(port, "getaddressinfo", [output["address"]])["scriptPubKey"] == script
+            count += 1
+        derive_private_descriptor(args, original, 0 if info["isrange"] else None, reject=True)
+        derive_private_descriptor(args, text, None if info["isrange"] else 0, reject=True)
+    # Independently encoded invalid scalars, compression markers and checksums.
+    alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    def wif(secret, marker=b"\x01"):
+        payload = b"\xef" + secret + marker
+        raw = payload + hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
+        value, output = int.from_bytes(raw, "big"), ""
+        while value:
+            value, digit = divmod(value, 58); output = alphabet[digit] + output
+        return output
+    order = bytes.fromhex("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141")
+    keys = [wif(bytes(32)), wif(order), wif(bytes.fromhex("01" * 32), b"\x02")]
+    key = wif(bytes.fromhex("01" * 32))
+    keys += [key[:-1] + ("1" if key[-1] != "1" else "2"), "Ł" + key[1:]]
+    invalid = [f"pk({key})" for key in keys]
+    invalid += [f"pk({key}/0)", f"wpkh({wif(bytes.fromhex('01' * 32), b'')})", f"tr({wif(bytes.fromhex('01' * 32), b'')})"]
+    for text in invalid:
+        derive_private_descriptor(args, text, reject=True)
+        try:
+            core_rpc(port, "getdescriptorinfo", [text])
+            raise AssertionError("Core accepted invalid private descriptor")
+        except RuntimeError:
+            pass
+    print(f"PASSED: {count} unchanged private-vector scripts on mainnet/test versions, Core addresses/checksums and {len(invalid)} shared malformed-key rejections", flush=True)
 
 
 def check_public_descriptor_vectors(args, port):
@@ -263,6 +354,11 @@ def check_funded_descriptor(args, port, address, raw, kind, expected_maps=3, inp
         if key in records:
             assert checked[field] == records[key].hex(), (kind, field)
     leaves = {(leaf["control_block"], leaf["script"]) for leaf in checked["tap_leaves"]}
+    if address in args.private_outputs:
+        private = args.private_outputs[address]
+        for field in ["script_pubkey", "address", "redeem_script", "witness_script", "internal_key", "merkle_root"]:
+            assert private[field] == checked[field], (kind, field)
+        assert {(leaf["control_block"], leaf["script"]) for leaf in private["tap_leaves"]} == leaves
     expected = {(key[1:].hex(), value[:-1].hex()) for key, value in records.items() if key[0] == 0x15}
     assert expected <= leaves, (kind, expected, leaves)
     if b"\x17" in records:
@@ -301,6 +397,14 @@ def check_key_derivation_proofs(args, port, raw, kind, expected_maps=3):
     maps = psbt_maps(raw, expected_maps)
     maps[0].update(public_xpub_records(port))
     anchored = encode_maps(maps)
+    if kind == "wsh-hardened":
+        # A final hardened wildcard cannot be proved from its public parent.
+        # Private expansion is not permission to label those origin claims true.
+        reject_derivations(args, anchored, "hardened derivation")
+        converted = cli(args.node, "convert-psbt", anchored, "--version", "2")["psbt_hex"]
+        reject_derivations(args, converted, "hardened derivation")
+        print("PASSED: final hardened child origin remains unprovable from supplied public parents", flush=True)
+        return
     literal = bytes.fromhex("50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0")
     opaque = []
     for position, records in enumerate(maps[1:], 1):
@@ -974,7 +1078,7 @@ def check_large_threshold_wallet(args, port, kind, pair):
 
 
 def check_wallet(args, port, kind, script_pair=None):
-    if kind.startswith("taproot-") or kind in ["wsh", "sh-wsh", "wsh-multisig", "sh-wsh-multisig", "wsh-multisig-2of3"]:
+    if kind.startswith("taproot-") or kind in ["wsh", "wsh-hardened", "sh-wsh", "wsh-multisig", "sh-wsh-multisig", "wsh-multisig-2of3"]:
         assert script_pair is not None
         address, destination = script_pair
     else:
@@ -1174,6 +1278,7 @@ def main():
     args = parser.parse_args()
     args.bitcoind = args.bitcoind.resolve()
     args.node = args.node.resolve()
+    args.private_outputs = {}
     port = free_port()
     with tempfile.TemporaryDirectory(prefix="btc-core-psbt-") as directory:
         root = Path(directory)
@@ -1193,20 +1298,21 @@ def main():
                 # descriptor: its deliberately unknown internal secret cannot
                 # be exported by listdescriptors(private=true).
                 descriptors = core_rpc(port, "listdescriptors", [True])["descriptors"]
-                script_kinds = ["wsh", "sh-wsh", "taproot-script", "taproot-unbalanced", "wsh-multisig", "sh-wsh-multisig", "sh-multisig", "wsh-multisig-2of3",
+                script_kinds = ["wsh", "wsh-hardened", "sh-wsh", "taproot-script", "taproot-unbalanced", "wsh-multisig", "sh-wsh-multisig", "sh-multisig", "wsh-multisig-2of3",
                                              "taproot-multisig-2of3", "taproot-sortedmultisig-2of3", "taproot-multisig-17of20", "taproot-threshold-unbalanced",
                                              "taproot-large-2of999", "taproot-large-128of128", "taproot-large-999of999"]
                 if args.large_only:
                     script_kinds = [kind for kind in script_kinds if kind.startswith("taproot-large-")]
-                script_pairs = {kind: script_addresses(port, kind, descriptors) for kind in script_kinds}
+                script_pairs = {kind: script_addresses(args, port, kind, descriptors) for kind in script_kinds}
                 if not args.large_only:
+                    check_private_descriptor_vectors(args, port)
                     check_public_descriptor_vectors(args, port)
                     check_published_taproot_vectors(args, port)
                     check_published_spending_vectors(args, port)
                     check_published_key_vectors(args, port)
                     check_published_signature_vectors(args, port)
                     check_published_commitment_vectors(args, port)
-                    for kind in ["legacy", "p2sh-segwit", "bech32", "wsh", "sh-wsh", "bech32m", "taproot-script", "taproot-unbalanced", "wsh-multisig", "sh-wsh-multisig", "wsh-multisig-2of3",
+                    for kind in ["legacy", "p2sh-segwit", "bech32", "wsh", "wsh-hardened", "sh-wsh", "bech32m", "taproot-script", "taproot-unbalanced", "wsh-multisig", "sh-wsh-multisig", "wsh-multisig-2of3",
                                  "taproot-multisig-2of3", "taproot-sortedmultisig-2of3", "taproot-multisig-17of20", "taproot-threshold-unbalanced"]:
                         check_wallet(args, port, kind, script_pairs.get(kind))
                     check_two_input_taproot_verification(args, port)

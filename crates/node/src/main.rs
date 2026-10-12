@@ -195,6 +195,16 @@ enum Commands {
         index: Option<u32>,
     },
 
+    /// Expand a private descriptor file into public scripts and control proofs
+    DerivePrivateDescriptor {
+        /// UTF-8 regular file containing the descriptor (never inline secrets)
+        #[arg(long)]
+        file: std::path::PathBuf,
+        /// Required for /*, /*h or /*'; forbidden for fixed descriptors
+        #[arg(long)]
+        index: Option<u32>,
+    },
+
     /// Build an experimental BIP330 sketch of supplied witness transaction IDs
     ErlaySketch {
         #[arg(long)]
@@ -414,6 +424,20 @@ async fn main() -> eyre::Result<()> {
             output::emit(
                 format,
                 &cli::derive_descriptor(&descriptor, index, network)?,
+            );
+            Ok(())
+        }
+        Some(Commands::DerivePrivateDescriptor { file, index }) => {
+            eyre::ensure!(
+                matches!(
+                    cli.network.as_str(),
+                    "mainnet" | "testnet" | "testnet4" | "signet" | "regtest"
+                ),
+                "unsupported descriptor network"
+            );
+            output::emit(
+                format,
+                &cli::derive_private_descriptor(&file, index, network)?,
             );
             Ok(())
         }

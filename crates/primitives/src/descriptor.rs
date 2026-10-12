@@ -1,4 +1,4 @@
-//! Public output descriptors (BIP380-386 subset).
+//! Output descriptors (BIP380-387 subset).
 //!
 //! Output descriptors are a human-readable language for describing how to
 //! derive `scriptPubKey`s for wallet operations. Supported expansion covers
@@ -9,7 +9,7 @@
 //! - `Descriptor` enum covering all standard descriptor types
 //! - Parsing from descriptor strings (`Descriptor::parse`)
 //! - Serialization back to descriptor strings (`Descriptor::to_string`)
-//! - Public key/HD expansion into scripts, addresses and Taproot control proofs
+//! - Public/private key expansion into scripts, addresses and Taproot control proofs
 //! - BIP380 descriptor checksum computation (`descriptor_checksum`)
 
 use crate::script::ScriptBuf;
@@ -18,7 +18,9 @@ use thiserror::Error;
 
 #[path = "descriptor_expand.rs"]
 mod expand;
-pub use expand::{DescriptorExpansion, ExpandedTapLeaf};
+pub use expand::{DescriptorExpansion, ExpandedTapLeaf, PrivateDescriptorExpansion};
+
+pub const MAX_DESCRIPTOR_SIZE: usize = 262_144;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -356,7 +358,7 @@ impl fmt::Display for Descriptor {
 fn check_structure(s: &str) -> Result<(), DescriptorError> {
     // Fixed budget before checksum/recursion; accommodates 999 annotated
     // compressed or ordinary extended-key expressions.
-    if s.len() > 262_144 || !s.is_ascii() {
+    if s.len() > MAX_DESCRIPTOR_SIZE || !s.is_ascii() {
         return Err(DescriptorError::Expansion(
             "descriptor size/character limit",
         ));

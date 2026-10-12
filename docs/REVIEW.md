@@ -1,5 +1,7 @@
 # Repository review — 2026-10-12 (UTC)
 
+- **P2 — unsupported private descriptor derivation:** a separate bounded `expand_private` API and file-based `derive-private-descriptor` command now resolve WIF/xprv/tprv, hardened suffixes and hardened final wildcards through real BIP32/curve operations. The existing public resolver keeps its public-only behavior. Results contain fixed public descriptors/scripts/control proofs with origins omitted, and syntax/checksum errors are redacted. This does not implement signing, authenticated origins, a protected keystore or BIP380 ranged export normalization. All 28 published private descriptors / 37 exact scripts, eight malformed-key/context cases and the complete 21-surface funded Core wallet harness pass; the gate passes 3,376 tests and the descriptor sanitizer completed 981,770 executions.
+
 This is an experimental implementation. A green unit suite does not establish Bitcoin Core consensus parity or make every advertised node feature operational. Remaining implementation work is tracked in [BUILD_PLAN.md](BUILD_PLAN.md).
 
 ## Fixed findings

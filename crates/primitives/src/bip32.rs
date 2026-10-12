@@ -113,7 +113,7 @@ fn base58_encode(data: &[u8]) -> String {
 }
 
 fn base58_decode(s: &str) -> Result<Vec<u8>, Bip32Error> {
-    // Only standard extended keys are decoded here. Bound work before the
+    // Standard extended keys and WIF share this decoder. Bound work before the
     // quadratic radix conversion, including malformed untrusted inputs.
     if s.len() > 112 {
         return Err(Bip32Error::InvalidBase58);
@@ -160,7 +160,7 @@ fn base58check_encode(data: &[u8]) -> String {
     base58_encode(&buf)
 }
 
-fn base58check_decode(s: &str) -> Result<Vec<u8>, Bip32Error> {
+pub(crate) fn base58check_decode(s: &str) -> Result<Vec<u8>, Bip32Error> {
     let data = base58_decode(s)?;
     if data.len() < 5 {
         return Err(Bip32Error::InvalidBase58);

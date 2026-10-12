@@ -131,12 +131,68 @@ pub fn derive_descriptor(
     index: Option<u32>,
     network: Network,
 ) -> eyre::Result<serde_json::Value> {
-    use btc_primitives::descriptor::{descriptor_checksum, Descriptor};
+    use btc_primitives::descriptor::Descriptor;
     let descriptor = Descriptor::parse(text)?;
     let expanded = descriptor.expand(index, network)?;
+    descriptor_json(descriptor, expanded, index, "public_descriptor_scripts")
+}
+
+/// Private material is read from a bounded regular file, never an argv value.
+/// Parse failures are redacted: parser diagnostics may include source text.
+pub fn derive_private_descriptor(
+    path: &std::path::Path,
+    index: Option<u32>,
+    network: Network,
+) -> eyre::Result<serde_json::Value> {
+    use btc_primitives::descriptor::{Descriptor, MAX_DESCRIPTOR_SIZE};
+    use eyre::{ensure, WrapErr};
+    use std::io::Read;
+    let file = std::fs::File::open(path).wrap_err("could not open private descriptor file")?;
+    let metadata = file
+        .metadata()
+        .wrap_err("could not inspect private descriptor file")?;
+    ensure!(
+        metadata.is_file(),
+        "private descriptor input must be a regular file"
+    );
+    ensure!(
+        metadata.len() <= MAX_DESCRIPTOR_SIZE as u64,
+        "private descriptor exceeds size limit"
+    );
+    let mut bytes = Vec::new();
+    file.take((MAX_DESCRIPTOR_SIZE + 1) as u64)
+        .read_to_end(&mut bytes)
+        .wrap_err("could not read private descriptor file")?;
+    ensure!(
+        bytes.len() <= MAX_DESCRIPTOR_SIZE,
+        "private descriptor exceeds size limit"
+    );
+    let text =
+        std::str::from_utf8(&bytes).map_err(|_| eyre::eyre!("invalid private descriptor text"))?;
+    let descriptor = Descriptor::parse(text)
+        .map_err(|_| eyre::eyre!("invalid private descriptor syntax or checksum"))?;
+    let resolved = descriptor.expand_private(index, network)?;
+    let mut output = descriptor_json(
+        resolved.public_descriptor,
+        resolved.expansion,
+        index,
+        "private_descriptor_scripts",
+    )?;
+    output["descriptor_is_fixed"] = serde_json::json!(true);
+    output["key_origins_preserved"] = serde_json::json!(false);
+    Ok(output)
+}
+
+fn descriptor_json(
+    descriptor: btc_primitives::descriptor::Descriptor,
+    expanded: btc_primitives::descriptor::DescriptorExpansion,
+    index: Option<u32>,
+    scope: &str,
+) -> eyre::Result<serde_json::Value> {
+    use btc_primitives::descriptor::descriptor_checksum;
     let text = descriptor.to_string();
     Ok(serde_json::json!({
-        "expansion_scope": "public_descriptor_scripts",
+        "expansion_scope": scope,
         "descriptor": format!("{}#{}", text, descriptor_checksum(&text)?),
         "is_ranged": expanded.is_ranged,
         "index": index,
@@ -948,6 +1004,68 @@ mod tests {
     // -----------------------------------------------------------------------
     // parse_network
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn private_descriptor_file_returns_public_data_and_redacts_parser_errors() {
+        use btc_primitives::descriptor::MAX_DESCRIPTOR_SIZE;
+        use std::io::{Seek, Write};
+        let secret = "L4rK1yDtCWekvXuE6oXD9jCYfFNV2cWRpVuPLBcCU2z8TrisoyY1";
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "tr({secret},{{pk({secret}),multi_a(1,{secret})}})").unwrap();
+        let output = derive_private_descriptor(file.path(), None, Network::Mainnet).unwrap();
+        let text = output.to_string();
+        assert!(!text.contains(secret));
+        assert_eq!(output["expansion_scope"], "private_descriptor_scripts");
+        assert_eq!(output["descriptor_is_fixed"], true);
+        assert_eq!(output["key_origins_preserved"], false);
+        for field in [
+            "key_origins_verified",
+            "wallet_ownership_verified",
+            "signatures_verified",
+            "active_chain_verified",
+        ] {
+            assert_eq!(output[field], false);
+        }
+        assert_eq!(
+            derive_descriptor(
+                output["descriptor"].as_str().unwrap(),
+                None,
+                Network::Mainnet
+            )
+            .unwrap()["script_pubkey"],
+            output["script_pubkey"]
+        );
+        for bad in [
+            format!("{secret}(a)"),
+            format!("multi({secret},{secret})"),
+            format!("pk({secret})#{secret}"),
+            format!("pk({secret}){secret}"),
+            format!("tr({secret},{secret}(a))"),
+            format!("pk([123]{secret})"),
+        ] {
+            file.as_file().set_len(0).unwrap();
+            file.rewind().unwrap();
+            write!(file, "{bad}").unwrap();
+            let error = derive_private_descriptor(file.path(), None, Network::Mainnet).unwrap_err();
+            assert!(!format!("{error:?}").contains(secret));
+        }
+        file.as_file()
+            .set_len((MAX_DESCRIPTOR_SIZE + 1) as u64)
+            .unwrap();
+        assert!(
+            derive_private_descriptor(file.path(), None, Network::Mainnet)
+                .unwrap_err()
+                .to_string()
+                .contains("size limit")
+        );
+        #[cfg(unix)]
+        assert!(derive_private_descriptor(
+            std::path::Path::new("/dev/null"),
+            None,
+            Network::Mainnet
+        )
+        .is_err());
+    }
 
     #[test]
     fn binary_psbt_files_support_large_wallet_inputs_with_read_bounds() {

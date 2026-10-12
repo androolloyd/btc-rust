@@ -15,7 +15,7 @@ bip32 = []              # HD key derivation (BIP32)
 bip39 = ["dep:unicode-normalization"]              # Mnemonic seed phrases (BIP39)
 bip21 = []              # Bitcoin URI parsing (BIP21)
 psbt = ["bip32"]        # Partially Signed Bitcoin Transactions with BIP32 key validation
-descriptor = ["bip32"]  # Public output descriptor expansion (BIP380-386 subset)
+descriptor = ["bip32"]  # Bounded output descriptor expansion (BIP380-387 subset)
 silent-payments = []    # Silent payments (BIP352)
 serde = ["dep:serde"]   # Optional serde support
 
