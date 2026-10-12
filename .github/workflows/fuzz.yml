@@ -56,6 +56,8 @@ jobs:
           leaves = json.loads(pathlib.Path("crates/primitives/tests/data/taproot-script-signer.json").read_text())
           for i, vector in enumerate(leaves["vectors"] + leaves["unsupported"]):
               (corpus / f"taproot-script-signer-{i}").write_bytes(bytes.fromhex(vector["psbt"]))
+          for i, vector in enumerate(json.loads(pathlib.Path("crates/primitives/tests/data/hd-signer.json").read_text())["vectors"]):
+              (corpus / f"hd-signer-{i}").write_bytes(bytes.fromhex(vector["psbt"]))
       - name: Seed published descriptors
         if: matrix.target == 'fuzz_descriptor'
         shell: python

@@ -21,6 +21,11 @@ impl std::fmt::Debug for WifPrivateKey {
 }
 
 impl WifPrivateKey {
+    /// Use an already validated curve secret without encoding it as text.
+    pub fn from_secret_key(secret: SecretKey, compressed: bool) -> Self {
+        Self { secret, compressed }
+    }
+
     pub fn from_wif(text: &str, network: Network) -> Result<Self, WifError> {
         if ![51, 52].contains(&text.len()) {
             return Err(WifError("length"));

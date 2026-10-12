@@ -553,3 +553,80 @@ Primary definitions: [BIP342 signature extension](https://github.com/bitcoin/bip
 [unchanged Core v29 preimages/math](https://github.com/bitcoin/bitcoin/blob/v29.0/test/functional/test_framework/script.py).
 HD/general signing, authenticated origin/change/chain checks, protected keystores
 and annex/general-script creation remain unfinished.
+
+## HD private signing
+
+`wallet_hd::sign_hd_psbt` and compiled `sign-hd-psbt` now derive actual normal and
+hardened BIP32 children before using the existing ECDSA/Taproot signature engine.
+The CLI accepts PSBT hex or bounded binary `@file`, an explicit `--max-fee-sat`,
+and a regular UTF-8 `--key-file` containing one private anchor per line. A bare
+master xprv/tprv uses its actual fingerprint; a deep anchor requires
+`[fingerprint/path]xprv` or `[fingerprint/path]tprv`. `'` and `h` mark hardened
+indices. Anchor versions must match the selected mainnet/test serialization
+family. Private input and diagnostics are redacted; no inline secret option is
+provided. This is ordinary transient process memory, not protected key storage.
+
+Origin depth, terminal index and directly known parent/master fingerprints are
+checked. When a matching supplied master exists, every deep anchor must match
+actual derivation of its full public extended-key payload, including its chain
+code and headers. Without that master, a deep anchor's prefix is an explicitly
+unverified user annotation: the tool proves only its relative child equations.
+Fingerprints select candidates, with collision handling; actual public points
+prove input derivations. Relevant supplied global xpubs require exact derived
+78-byte payload matches. Missing global xpubs do not prevent direct private
+proofs. Foreign/global records outside supplied private subtrees remain metadata.
+
+Each input needs its own proven key records. Keys proved on another input cannot
+silently authorize an input with missing origins. Legacy origins preserve the
+record's compressed/uncompressed representation; witness-v0 still requires
+compressed keys. Owned Taproot origins bind the internal key or every declared
+leaf hash to actual committed c0 known scripts. HD leaf signatures are restricted
+to those declared, proved `(key, leaf hash)` records. Unlisted unsigned leaves
+stay opaque, even when the same child key appears in them. Raw output-key
+origins, annex/separator/arbitrary contexts and future leaf signing remain
+unsupported. Existing signatures from any cosigner/path still require equations.
+Partial thresholds support a later HD cosigner. No invalid exact child index is
+silently advanced to the next index.
+
+Limits are 64 anchors, 4,096 input origin records, 256 global xpubs, 16,384 declared
+leaf memberships, 10,000 unique private child operations and BIP32 depth 255.
+Shared derivation prefixes are cached per anchor. The existing limits on 128
+inputs, 1,024 distinct signing keys, control/script work and signature records,
+fee caps, mixed full-parent requirements, OS Schnorr auxiliary randomness and
+BIP370 modification flags still apply. Failure returns no partially modified
+PSBT. Signing never finalizes or broadcasts automatically.
+
+The receipt uses `hd_known_templates_partial_signing`. It lists public input
+proofs and relative paths, step/record counts, checked global xpub counts and
+`anchor_master_paths_verified`. `owned_input_derivations_verified` means actual
+relative equations and declared input roles passed. Overall `key_origins_verified`,
+`master_identity_authenticated`, output/change proofs, final-spend and active
+chain flags remain false: supplied masters are not externally authenticated
+wallet identities, and foreign/output origin coverage is not claimed.
+
+Twenty-eight real-HMAC reference cases use standard-library HMAC and unchanged
+checksum-pinned Core curve/preimage/signature code. All seventeen published
+BIP32 real-seed paths are cross-checked before generation. Cases cover legacy,
+SegWit, Taproot key/leaf DEFAULT/ALL, mixed inputs, partial cosigning, uncompressed
+legacy records, account anchors/hardened suffixes, master affiliation, declared
+leaf restrictions and 128/999 distinct HD keys. Synthetic parents prove offline
+equations only. The live Core harness independently funds the scripts and must
+admit/mine Rust HD-signed spends; an additional actual Core HD provider updates
+unsigned PSBTs with signing disabled before Rust signs its four standard address
+families and three hardened script cases. Core receives v0 after actual Rust v2
+conversion. Acceptance passed for all twenty-eight reference cases, twenty-eight actual
+funded/mined HD-signed spends and seven actual Core HD-provider spends. The
+final local gate passes 3,389 tests in 43 suites, formatting, Clippy, minimal and
+isolated feature checks and release build (two preexisting ignored tests).
+Twenty-eight fresh sanitizer seeds completed 12,566 executions in 31 seconds
+without failure. Regtest comparisons change only fixture private/global-public
+version bytes; public points, paths, scripts and unsigned transactions remain
+unchanged.
+
+Primary definitions: [BIP32 private derivation](https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki),
+[BIP174 signer and origin records](https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki),
+[BIP371 internal/leaf origins](https://github.com/bitcoin/bips/blob/master/bip-0371.mediawiki)
+and [unchanged Core reference math](https://github.com/bitcoin/bitcoin/blob/v29.0/test/functional/test_framework/key.py).
+General script creation, protected storage, authenticated master identities,
+complete foreign/output/change origin policy and active-chain integration remain
+unfinished.

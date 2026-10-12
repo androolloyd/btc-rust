@@ -489,6 +489,76 @@ pub fn sign_psbt(
         );
     }
     let signed = crate::wallet::sign_psbt(&psbt, &keys, max_fee_sat)?;
+    signing_receipt(&signed, max_fee_sat)
+}
+
+/// Private extended keys enter only through a bounded regular UTF-8 file.
+pub fn sign_hd_psbt(
+    hex_str: &str,
+    key_file: &std::path::Path,
+    max_fee_sat: u64,
+    network: Network,
+) -> eyre::Result<serde_json::Value> {
+    use eyre::{ensure, WrapErr};
+    use std::io::Read;
+    const MAX_FILE: usize = 262_144;
+    let psbt = parse_psbt_hex(hex_str)?;
+    let file = std::fs::File::open(key_file).wrap_err("could not open HD anchor file")?;
+    let metadata = file
+        .metadata()
+        .wrap_err("could not inspect HD anchor file")?;
+    ensure!(metadata.is_file(), "HD anchor input must be a regular file");
+    ensure!(
+        metadata.len() <= MAX_FILE as u64,
+        "HD anchor file exceeds size limit"
+    );
+    let mut bytes = Vec::new();
+    file.take((MAX_FILE + 1) as u64)
+        .read_to_end(&mut bytes)
+        .wrap_err("could not read HD anchor file")?;
+    ensure!(bytes.len() <= MAX_FILE, "HD anchor file exceeds size limit");
+    let text =
+        std::str::from_utf8(&bytes).map_err(|_| eyre::eyre!("invalid HD anchor file text"))?;
+    let mut anchors = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        ensure!(anchors.len() < 64, "HD anchor count exceeds 64");
+        anchors.push(
+            crate::wallet_hd::HdSigningAnchor::parse(line, network)
+                .wrap_err_with(|| format!("invalid HD anchor at line {}", index + 1))?,
+        );
+    }
+    let signed = crate::wallet_hd::sign_hd_psbt(&psbt, &anchors, max_fee_sat)?;
+    let mut receipt = signing_receipt(&signed.signed, max_fee_sat)?;
+    receipt["signing_scope"] = serde_json::json!("hd_known_templates_partial_signing");
+    receipt["hd_derivation_scope"] =
+        serde_json::json!("owned_input_keys_relative_to_supplied_private_anchors");
+    receipt["owned_input_derivations_verified"] = serde_json::json!(true);
+    receipt["input_derivations_checked"] = serde_json::json!(signed.input_derivations.len());
+    receipt["derivation_steps_checked"] = serde_json::json!(signed.derivation_steps_checked);
+    receipt["anchor_master_paths_verified"] =
+        serde_json::json!(signed.anchor_master_paths_verified);
+    receipt["global_xpubs_checked"] = serde_json::json!(signed.global_xpubs_checked);
+    receipt["foreign_input_derivations_preserved"] =
+        serde_json::json!(signed.input_foreign_records);
+    receipt["output_derivations_verified"] = serde_json::json!(false);
+    receipt["master_identity_authenticated"] = serde_json::json!(false);
+    receipt["input_derivation_proofs"] =
+        serde_json::json!(signed.input_derivations.iter().map(|proof| serde_json::json!({
+        "input": proof.input, "pubkey": hex::encode(&proof.pubkey), "taproot": proof.taproot,
+        "master_fingerprint": hex::encode(proof.source.0), "path": proof.source.1,
+        "anchor_index": proof.anchor_index, "relative_path": proof.relative_path,
+    })).collect::<Vec<_>>());
+    Ok(receipt)
+}
+
+fn signing_receipt(
+    signed: &crate::wallet::SignedPsbt,
+    max_fee_sat: u64,
+) -> eyre::Result<serde_json::Value> {
     let has_taproot = signed
         .input_signature_schemes
         .iter()

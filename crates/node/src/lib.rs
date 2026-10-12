@@ -10,6 +10,7 @@ pub mod state;
 pub mod sync;
 pub mod wallet;
 mod wallet_derivations;
+pub mod wallet_hd;
 pub mod zmq;
 
 mod mempool;

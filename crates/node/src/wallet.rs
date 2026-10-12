@@ -2332,14 +2332,113 @@ pub fn sign_psbt(
     keys: &[btc_primitives::wif::WifPrivateKey],
     max_fee_sat: u64,
 ) -> eyre::Result<SignedPsbt> {
-    sign_psbt_inner(psbt, keys, max_fee_sat, true, |secp, message, keypair| {
-        use secp256k1::rand::RngCore;
-        let mut auxiliary = [0; 32];
-        secp256k1::rand::rngs::OsRng
-            .try_fill_bytes(&mut auxiliary)
-            .map_err(|_| eyre::eyre!("Schnorr auxiliary randomness unavailable"))?;
-        Ok(secp.sign_schnorr_with_aux_rand(message, keypair, &auxiliary))
-    })
+    sign_psbt_inner(psbt, keys, max_fee_sat, true, schnorr_with_os_rand)
+}
+
+fn schnorr_with_os_rand(
+    secp: &secp256k1::Secp256k1<secp256k1::All>,
+    message: &secp256k1::Message,
+    keypair: &secp256k1::Keypair,
+) -> eyre::Result<secp256k1::schnorr::Signature> {
+    use secp256k1::rand::RngCore;
+    let mut auxiliary = [0; 32];
+    secp256k1::rand::rngs::OsRng
+        .try_fill_bytes(&mut auxiliary)
+        .map_err(|_| eyre::eyre!("Schnorr auxiliary randomness unavailable"))?;
+    Ok(secp.sign_schnorr_with_aux_rand(message, keypair, &auxiliary))
+}
+
+/// HD keys are authorized per input; a child proven on another input cannot
+/// silently authorize an input whose derivation metadata is missing.
+#[derive(Default)]
+pub(crate) struct InputSigningKeys {
+    pub keys: Vec<btc_primitives::wif::WifPrivateKey>,
+    pub taproot_internal: HashSet<Vec<u8>>,
+    pub taproot_leaves: HashSet<Vec<u8>>,
+}
+
+struct InputKeyPermissions {
+    public_keys: HashSet<Vec<u8>>,
+    taproot_internal: HashSet<Vec<u8>>,
+    taproot_leaves: HashSet<Vec<u8>>,
+}
+
+pub(crate) fn sign_psbt_with_input_keys(
+    psbt: &Psbt,
+    input_keys: &[InputSigningKeys],
+    max_fee_sat: u64,
+) -> eyre::Result<SignedPsbt> {
+    ensure!(
+        input_keys.len() == psbt.inputs.len(),
+        "HD input-key count differs"
+    );
+    let mut material = HashMap::new();
+    let mut allowed = Vec::with_capacity(input_keys.len());
+    for keys in input_keys {
+        let mut public = HashSet::new();
+        for key in &keys.keys {
+            let bytes = key.public_key();
+            public.insert(bytes.clone());
+            material.entry(bytes).or_insert_with(|| key.clone());
+        }
+        ensure!(!public.is_empty(), "input has no proven HD signing key");
+        allowed.push(InputKeyPermissions {
+            public_keys: public,
+            taproot_internal: keys.taproot_internal.clone(),
+            taproot_leaves: keys.taproot_leaves.clone(),
+        });
+    }
+    let keys = material.into_values().collect::<Vec<_>>();
+    sign_psbt_inner_impl(
+        psbt,
+        &keys,
+        max_fee_sat,
+        true,
+        Some(&allowed),
+        schnorr_with_os_rand,
+    )
+}
+
+/// Wallet resource bounds, checked before expensive untrusted commitments.
+pub(crate) fn signing_work_bounds(psbt: &Psbt) -> eyre::Result<()> {
+    ensure!(psbt.inputs.len() <= 128, "signer input limit (128)");
+    ensure!(
+        psbt.inputs
+            .iter()
+            .map(|input| input.tap_leaf_scripts.len())
+            .sum::<usize>()
+            <= 1024,
+        "signer control-proof limit (1024)"
+    );
+    let leaf_bytes = psbt
+        .inputs
+        .iter()
+        .flat_map(|input| &input.tap_leaf_scripts)
+        .try_fold(0usize, |sum, (_, leaf)| sum.checked_add(leaf.script.len()));
+    ensure!(
+        leaf_bytes.is_some_and(|bytes| bytes <= 1_048_576),
+        "signer leaf-script byte limit (1048576)"
+    );
+    let records = psbt
+        .inputs
+        .iter()
+        .map(|input| {
+            input.partial_sigs.len()
+                + input.tap_script_sigs.len()
+                + usize::from(input.tap_key_sig.is_some())
+        })
+        .sum::<usize>();
+    ensure!(records <= 4096, "signer signature-record limit (4096)");
+    Ok(())
+}
+
+/// Keys from owned BIP371 origins must occur in each actual committed leaf.
+pub(crate) fn known_tapleaf_keys(script: &[u8]) -> eyre::Result<Vec<Vec<u8>>> {
+    Ok(tapscript_template(script)?
+        .keys
+        .into_iter()
+        .map(<[u8]>::to_vec)
+        .collect())
 }
 
 fn taproot_signing_keypair(
@@ -2420,6 +2519,21 @@ fn sign_psbt_inner(
     keys: &[btc_primitives::wif::WifPrivateKey],
     max_fee_sat: u64,
     taproot: bool,
+    schnorr: impl FnMut(
+        &secp256k1::Secp256k1<secp256k1::All>,
+        &secp256k1::Message,
+        &secp256k1::Keypair,
+    ) -> eyre::Result<secp256k1::schnorr::Signature>,
+) -> eyre::Result<SignedPsbt> {
+    sign_psbt_inner_impl(psbt, keys, max_fee_sat, taproot, None, schnorr)
+}
+
+fn sign_psbt_inner_impl(
+    psbt: &Psbt,
+    keys: &[btc_primitives::wif::WifPrivateKey],
+    max_fee_sat: u64,
+    taproot: bool,
+    allowed: Option<&[InputKeyPermissions]>,
     mut schnorr: impl FnMut(
         &secp256k1::Secp256k1<secp256k1::All>,
         &secp256k1::Message,
@@ -2431,24 +2545,7 @@ fn sign_psbt_inner(
         !keys.is_empty() && keys.len() <= 1024,
         "signer requires 1..1024 keys"
     );
-    ensure!(psbt.inputs.len() <= 128, "signer input limit (128)");
-    ensure!(
-        psbt.inputs
-            .iter()
-            .map(|input| input.tap_leaf_scripts.len())
-            .sum::<usize>()
-            <= 1024,
-        "signer control-proof limit (1024)"
-    );
-    let leaf_bytes = psbt
-        .inputs
-        .iter()
-        .flat_map(|input| &input.tap_leaf_scripts)
-        .try_fold(0usize, |sum, (_, leaf)| sum.checked_add(leaf.script.len()));
-    ensure!(
-        leaf_bytes.is_some_and(|bytes| bytes <= 1_048_576),
-        "signer leaf-script byte limit (1048576)"
-    );
+    signing_work_bounds(psbt)?;
     ensure!(
         max_fee_sat <= Amount::MAX_MONEY.as_sat() as u64,
         "fee cap exceeds money range"
@@ -2472,10 +2569,10 @@ fn sign_psbt_inner(
         fee_sat as u64 <= max_fee_sat,
         "transaction fee exceeds explicit fee cap"
     );
-    let mut public_keys = HashMap::new();
+    let mut all_public_keys = HashMap::new();
     for key in keys {
         ensure!(
-            public_keys.insert(key.public_key(), key).is_none(),
+            all_public_keys.insert(key.public_key(), key).is_none(),
             "duplicate signing public key"
         );
     }
@@ -2485,6 +2582,17 @@ fn sign_psbt_inner(
     let mut signatures_added_per_input = Vec::with_capacity(psbt.inputs.len());
     let mut input_signature_schemes = Vec::with_capacity(psbt.inputs.len());
     for (index, (input, output)) in psbt.inputs.iter().zip(&prevouts).enumerate() {
+        let restricted;
+        let public_keys = if let Some(sets) = allowed {
+            restricted = all_public_keys
+                .iter()
+                .filter(|(public, _)| sets[index].public_keys.contains(*public))
+                .map(|(public, key)| (public.clone(), *key))
+                .collect::<HashMap<_, _>>();
+            &restricted
+        } else {
+            &all_public_keys
+        };
         ensure!(
             input.final_script_sig.is_none() && input.final_script_witness.is_none(),
             "input {index}: signing requires unfinalized inputs"
@@ -2533,7 +2641,10 @@ fn sign_psbt_inner(
             let matching = public_keys
                 .iter()
                 .filter(|(public, _)| {
-                    public.len() == 33 && internal.is_some_and(|key: [u8; 32]| public[1..] == key)
+                    public.len() == 33
+                        && internal.is_some_and(|key: [u8; 32]| public[1..] == key)
+                        && allowed
+                            .is_none_or(|sets| sets[index].taproot_internal.contains(&public[1..]))
                 })
                 .collect::<Vec<_>>();
             ensure!(
@@ -2541,10 +2652,17 @@ fn sign_psbt_inner(
                 "input {index}: ambiguous compressed Taproot internal signing key"
             );
             if matching.is_empty() {
-                let candidates =
-                    taproot_leaf_signing_keys(input, &public_keys).wrap_err_with(|| {
+                let mut candidates =
+                    taproot_leaf_signing_keys(input, public_keys).wrap_err_with(|| {
                         format!("input {index}: unsupported Taproot signing context")
                     })?;
+                if let Some(sets) = allowed {
+                    candidates.retain(|(record, _)| sets[index].taproot_leaves.contains(record));
+                }
+                ensure!(
+                    !candidates.is_empty(),
+                    "input {index}: no authorized Taproot leaf signing key"
+                );
                 let existing: HashSet<_> = input
                     .tap_script_sigs
                     .iter()

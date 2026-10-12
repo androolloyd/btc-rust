@@ -8,6 +8,8 @@ use libfuzzer_sys::fuzz_target;
 mod wallet;
 #[path = "../../crates/node/src/wallet_derivations.rs"]
 mod wallet_derivations;
+#[path = "../../crates/node/src/wallet_hd.rs"]
+mod wallet_hd;
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(psbt) = Psbt::deserialize(data) {
@@ -31,6 +33,26 @@ fuzz_target!(|data: &[u8]| {
             // Exercise the exact wallet equations/finalizer with a bounded
             // sanitizer work budget, including unselected threshold records.
             let _ = wallet::verify_partial_signatures(&psbt);
+            static HD_ANCHORS: std::sync::OnceLock<Vec<wallet_hd::HdSigningAnchor>> =
+                std::sync::OnceLock::new();
+            let hd_anchors = HD_ANCHORS.get_or_init(|| {
+                include_str!("../../crates/primitives/tests/data/hd-signer.keys")
+                    .lines()
+                    .map(|text| {
+                        wallet_hd::HdSigningAnchor::parse(text, btc_primitives::Network::Mainnet)
+                            .unwrap()
+                    })
+                    .collect()
+            });
+            if let Ok(signed) = wallet_hd::sign_hd_psbt(&psbt, hd_anchors, 1_000_000) {
+                assert_eq!(signed.signed.psbt.unsigned_tx, psbt.unsigned_tx);
+                wallet::verify_partial_signatures(&signed.signed.psbt)
+                    .expect("HD signer verified all returned equations");
+                assert!(signed
+                    .input_derivations
+                    .iter()
+                    .all(|proof| proof.input < psbt.inputs.len()));
+            }
             // Public test keys from the independent signer fixture; every
             // successful result still has its real equations checked.
             static KEYS: std::sync::OnceLock<Vec<btc_primitives::wif::WifPrivateKey>> =

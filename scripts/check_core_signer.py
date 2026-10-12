@@ -154,6 +154,8 @@ def main():
     parser.add_argument("--node",type=Path,default=Path("target/release/btc-node"))
     parser.add_argument("--taproot-only",action="store_true",help="Run the independently funded Taproot key-path signer cases")
     parser.add_argument("--taproot-script-only",action="store_true",help="Run independently funded known Taproot leaf signer cases")
+    parser.add_argument("--hd-only",action="store_true",help="Run real HD private-derivation signing acceptance")
+    parser.add_argument("--hd-native-only",action="store_true",help="Focused acceptance for Core native HD provider metadata")
     args=parser.parse_args(); args.node=args.node.resolve(); args.bitcoind=args.bitcoind.resolve()
     port=free_port()
     with tempfile.TemporaryDirectory(prefix="btc-core-signer-") as directory:
@@ -165,7 +167,13 @@ def main():
                 core_rpc(port,"createwallet",["signer-interop"])
                 # The shared strict WIF decoder also drives private descriptors.
                 check_private_descriptor_vectors(args,port)
-                if args.taproot_script_only:
+                if args.hd_native_only:
+                    from check_core_hd_signer import run_native_cases
+                    run_native_cases(args,port)
+                elif args.hd_only:
+                    from check_core_hd_signer import run_cases as run_hd
+                    run_hd(args,port)
+                elif args.taproot_script_only:
                     from check_core_taproot_script_signer import run_cases as run_scripts
                     run_scripts(args,port)
                 elif args.taproot_only:

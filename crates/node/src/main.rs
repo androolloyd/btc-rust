@@ -217,6 +217,18 @@ enum Commands {
         max_fee_sat: u64,
     },
 
+    /// Sign known PSBT templates by actual normal/hardened HD private derivation
+    SignHdPsbt {
+        /// PSBT hex or @path to a binary PSBT file
+        hex: String,
+        /// Regular UTF-8 file: master xprv/tprv or [fingerprint/path]private anchor per line
+        #[arg(long)]
+        key_file: std::path::PathBuf,
+        /// Maximum absolute transaction fee in satoshis (required)
+        #[arg(long)]
+        max_fee_sat: u64,
+    },
+
     /// Build an experimental BIP330 sketch of supplied witness transaction IDs
     ErlaySketch {
         #[arg(long)]
@@ -468,6 +480,24 @@ async fn main() -> eyre::Result<()> {
             output::emit(
                 format,
                 &cli::sign_psbt(&hex, &key_file, max_fee_sat, network)?,
+            );
+            Ok(())
+        }
+        Some(Commands::SignHdPsbt {
+            hex,
+            key_file,
+            max_fee_sat,
+        }) => {
+            eyre::ensure!(
+                matches!(
+                    cli.network.as_str(),
+                    "mainnet" | "testnet" | "testnet4" | "signet" | "regtest"
+                ),
+                "unsupported HD signer network"
+            );
+            output::emit(
+                format,
+                &cli::sign_hd_psbt(&hex, &key_file, max_fee_sat, network)?,
             );
             Ok(())
         }
