@@ -190,6 +190,10 @@ encodings compare the complete point, and Taproot records compare its x-only
 coordinate. Fingerprint collisions try alternative anchors. Matching the anchor
 itself is an identity proof with zero child steps. Shared prefixes are cached.
 The immutable wallet API is `wallet::verify_key_derivations`.
+Its shared CKDpub primitive accepts a zero child tweak as BIP32 specifies; the
+point can equal the parent's while the child chain code and header advance.
+Out-of-range tweaks and infinite child points still fail. Deterministic boundary
+tests inject post-HMAC values privately; production proofs always compute HMAC.
 
 Success reports `derivation_equations_verified: true`, the matching global xpub
 index and relative path for each record, plus record and unique child-step counts.

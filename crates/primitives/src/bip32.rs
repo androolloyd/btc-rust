@@ -113,6 +113,11 @@ fn base58_encode(data: &[u8]) -> String {
 }
 
 fn base58_decode(s: &str) -> Result<Vec<u8>, Bip32Error> {
+    // Only standard extended keys are decoded here. Bound work before the
+    // quadratic radix conversion, including malformed untrusted inputs.
+    if s.len() > 112 {
+        return Err(Bip32Error::InvalidBase58);
+    }
     if s.is_empty() {
         return Ok(Vec::new());
     }
@@ -123,7 +128,7 @@ fn base58_decode(s: &str) -> Result<Vec<u8>, Bip32Error> {
     for ch in s.chars() {
         let val = BASE58_ALPHABET
             .iter()
-            .position(|&c| c == ch as u8)
+            .position(|&c| c as char == ch)
             .ok_or(Bip32Error::InvalidBase58)? as u32;
 
         let mut carry = val;
@@ -383,10 +388,16 @@ impl ExtendedPrivKey {
         }
         mac.update(&child.0.to_be_bytes());
 
-        let result = mac.finalize().into_bytes();
-        let (il, ir) = result.split_at(32);
+        let result: [u8; 64] = mac.finalize().into_bytes().into();
+        self.child_from_hmac(child, &result)
+    }
 
-        // child_key = parse256(IL) + kpar (mod n)
+    // Kept private: boundary tests can supply otherwise unreachable HMAC
+    // outputs, while production derivation always computes the real HMAC.
+    fn child_from_hmac(&self, child: ChildNumber, result: &[u8; 64]) -> Result<Self, Bip32Error> {
+        let (il, ir) = result.split_at(32);
+        // child_key = parse256(IL) + kpar (mod n). Zero IL is a valid tweak;
+        // a zero resulting private key remains invalid.
         let tweak = Scalar::from_be_bytes(il.try_into().expect("IL is 32 bytes"))
             .map_err(|_| Bip32Error::InvalidKey)?;
         let child_key = self
@@ -556,22 +567,28 @@ impl ExtendedPubKey {
             return Err(Bip32Error::HardenedFromPublic);
         }
 
-        let secp = Secp256k1::new();
-
         let mut mac =
             HmacSha512::new_from_slice(&self.chain_code).expect("HMAC accepts any key size");
         mac.update(&self.public_key.serialize());
         mac.update(&child.0.to_be_bytes());
 
-        let result = mac.finalize().into_bytes();
-        let (il, ir) = result.split_at(32);
+        let result: [u8; 64] = mac.finalize().into_bytes().into();
+        self.child_from_hmac(child, &result)
+    }
 
-        // Parse IL as a secret key, then compute IL*G + parent_pubkey
-        let il_key = SecretKey::from_slice(il).map_err(|_| Bip32Error::InvalidKey)?;
+    fn child_from_hmac(&self, child: ChildNumber, result: &[u8; 64]) -> Result<Self, Bip32Error> {
+        if child.is_hardened() {
+            return Err(Bip32Error::HardenedFromPublic);
+        }
+        let (il, ir) = result.split_at(32);
+        // CKDpub uses a scalar tweak, not a secret key: IL = 0 is permitted.
+        // IL >= n and a resulting point at infinity are still invalid.
+        let tweak = Scalar::from_be_bytes(il.try_into().expect("IL is 32 bytes"))
+            .map_err(|_| Bip32Error::InvalidKey)?;
 
         let mut child_pubkey = self.public_key;
         child_pubkey = child_pubkey
-            .add_exp_tweak(&secp, &il_key.into())
+            .add_exp_tweak(&Secp256k1::verification_only(), &tweak)
             .map_err(|_| Bip32Error::InvalidKey)?;
 
         let mut chain_code = [0u8; 32];
@@ -728,6 +745,154 @@ pub fn bip86_path(coin: u32, account: u32, change: u32, index: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extended_key_base58_rejects_unicode_aliases_and_excessive_work() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/data/bip32-keys.json")).unwrap();
+        for kind in ["xpub", "xprv"] {
+            let key = fixture["valid_keys"][0][kind].as_str().unwrap();
+            for (position, byte) in key.bytes().enumerate() {
+                let alias = char::from_u32(0x100 + byte as u32).unwrap();
+                let bad = format!("{}{alias}{}", &key[..position], &key[position + 1..]);
+                assert!(ExtendedPubKey::from_base58(&bad).is_err());
+                assert!(ExtendedPrivKey::from_base58(&bad).is_err());
+            }
+            let prefix = format!("Ա{key}");
+            assert!(ExtendedPubKey::from_base58(&prefix).is_err());
+            assert!(ExtendedPrivKey::from_base58(&prefix).is_err());
+        }
+        for byte in BASE58_ALPHABET {
+            let bad = char::from_u32(0x500 + *byte as u32).unwrap().to_string();
+            assert!(matches!(
+                base58_decode(&bad),
+                Err(Bip32Error::InvalidBase58)
+            ));
+        }
+        assert!(matches!(
+            base58_decode(&"3".repeat(100_000)),
+            Err(Bip32Error::InvalidBase58)
+        ));
+    }
+
+    #[test]
+    fn core_post_hmac_child_tweak_boundaries() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/data/bip32-child-tweaks.json")).unwrap();
+        let cases = fixture["cases"].as_array().unwrap();
+        assert_eq!(cases.len(), 45);
+        let mut zero_cases = 0;
+        for case in cases {
+            let public = ExtendedPubKey::deserialize(
+                &hex::decode(case["parent_public"].as_str().unwrap()).unwrap(),
+            )
+            .unwrap();
+            let private = ExtendedPrivKey::deserialize(
+                &hex::decode(case["parent_private"].as_str().unwrap()).unwrap(),
+            )
+            .unwrap();
+            let before_public = public.serialize();
+            let before_private = private.serialize();
+            let result: [u8; 64] = hex::decode(case["injected_hmac_result"].as_str().unwrap())
+                .unwrap()
+                .try_into()
+                .unwrap();
+            let child = ChildNumber(case["child_index"].as_u64().unwrap() as u32);
+            let derived_public = public.child_from_hmac(child, &result);
+            let derived_private = private.child_from_hmac(child, &result);
+            if case["allowed"].as_bool().unwrap() {
+                let derived_public = derived_public.unwrap();
+                let derived_private = derived_private.unwrap();
+                assert_eq!(
+                    hex::encode(derived_public.serialize()),
+                    case["expected_public"].as_str().unwrap(),
+                    "{}",
+                    case["case"]
+                );
+                assert_eq!(
+                    hex::encode(derived_private.serialize()),
+                    case["expected_private"].as_str().unwrap(),
+                    "{}",
+                    case["case"]
+                );
+                assert_eq!(
+                    derived_private.to_extended_pub_key().serialize(),
+                    derived_public.serialize()
+                );
+                if result[..32] == [0; 32] {
+                    zero_cases += 1;
+                    assert_eq!(derived_public.public_key, public.public_key);
+                    assert_eq!(derived_private.secret_key, private.secret_key);
+                    assert_eq!(derived_public.depth, public.depth + 1);
+                    assert_ne!(derived_public.chain_code, public.chain_code);
+                    assert_eq!(derived_public.child_number, child);
+                }
+            } else {
+                assert!(
+                    matches!(derived_public, Err(Bip32Error::InvalidKey)),
+                    "{}",
+                    case["case"]
+                );
+                assert!(
+                    matches!(derived_private, Err(Bip32Error::InvalidKey)),
+                    "{}",
+                    case["case"]
+                );
+            }
+            assert_eq!(before_public, public.serialize());
+            assert_eq!(before_private, private.serialize());
+        }
+        assert_eq!(zero_cases, 5);
+    }
+
+    #[test]
+    fn child_tweak_fix_preserves_master_hardening_and_depth_rules() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/data/bip32-child-tweaks.json")).unwrap();
+        let case = &fixture["cases"][0];
+        let mut public = ExtendedPubKey::deserialize(
+            &hex::decode(case["parent_public"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        let mut private = ExtendedPrivKey::deserialize(
+            &hex::decode(case["parent_private"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        let result: [u8; 64] = hex::decode(case["injected_hmac_result"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let hardened = ChildNumber(0x80000000);
+        assert!(matches!(
+            public.child_from_hmac(hardened, &result),
+            Err(Bip32Error::HardenedFromPublic)
+        ));
+        assert!(matches!(
+            public.derive_child(hardened),
+            Err(Bip32Error::HardenedFromPublic)
+        ));
+        let hardened_private = private.child_from_hmac(hardened, &result).unwrap();
+        assert_eq!(hardened_private.secret_key, private.secret_key);
+        assert_eq!(hardened_private.child_number, hardened);
+        let mut invalid_master = private.serialize();
+        invalid_master[46..].fill(0);
+        assert!(matches!(
+            ExtendedPrivKey::deserialize(&invalid_master),
+            Err(Bip32Error::InvalidKey)
+        ));
+        public.depth = 255;
+        private.depth = 255;
+        assert!(matches!(
+            public.child_from_hmac(ChildNumber(0), &result),
+            Err(Bip32Error::InvalidPath(_))
+        ));
+        assert!(matches!(
+            private.child_from_hmac(ChildNumber(0), &result),
+            Err(Bip32Error::InvalidPath(_))
+        ));
+        assert!(public.derive_child(ChildNumber(0)).is_err());
+        assert!(private.derive_child(ChildNumber(0)).is_err());
+    }
 
     #[test]
     fn all_published_extended_key_vectors() {

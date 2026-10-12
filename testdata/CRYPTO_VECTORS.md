@@ -7,6 +7,24 @@ Downloaded on 2026-10-11 from the canonical bitcoin/bips repository:
 
 These fixtures must remain independent expected values. Update them deliberately from the upstream source and rerun every case; do not regenerate expected cryptographic values from our implementation.
 
+`crates/primitives/tests/data/bip32-child-tweaks.json` contains 45 independent
+post-HMAC child arithmetic cases from `scripts/core29_bip32.py`. It uses unchanged,
+checksum-pinned Core v29 curve code and public test secrets, with 23 valid and
+22 invalid outcomes and exact public/private extended-child serialization.
+Zero IL, small/high valid tweaks, order boundaries, cancellation, leading zeros,
+different key parities/networks and depths through 254 are covered. Injected
+IL/IR values exercise rare boundaries; they are explicitly not claimed HMAC
+outputs from a real seed. Production always computes HMAC; the injection helpers
+are private. The unchanged 17 published key pairs still independently test actual
+seed/path/HMAC derivation, and the 16 published invalid records still fail.
+The BIP32 fuzzer seeds both Base58 text and checksum-valid raw records, retaining
+the invalid-checksum example as text rather than erasing its negative condition.
+It also exercises three known legacy addresses and the preserved Unicode-alias
+crash input. Base58 character policy follows [Core v29 base58.cpp](https://github.com/bitcoin/bitcoin/blob/v29.0/src/base58.cpp);
+child arithmetic follows [BIP32](https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki),
+[Core public derivation](https://github.com/bitcoin/bitcoin/blob/v29.0/src/pubkey.cpp)
+and [Core private derivation](https://github.com/bitcoin/bitcoin/blob/v29.0/src/key.cpp).
+
 `crates/primitives/tests/data/descriptors.json` retains twenty public-only
 descriptor examples and twenty-four unchanged expected scripts from BIP381,
 BIP382, BIP383 and BIP386. Source URLs, SHA256s and BSD-2-Clause licenses are

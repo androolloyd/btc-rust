@@ -14,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [fuzz_transaction_decode, fuzz_block_decode, fuzz_script_execute, fuzz_p2p_message, fuzz_bech32_decode, fuzz_varint_decode, fuzz_witness_verify, fuzz_block_template, fuzz_psbt_decode, fuzz_descriptor]
+        target: [fuzz_transaction_decode, fuzz_block_decode, fuzz_script_execute, fuzz_p2p_message, fuzz_bech32_decode, fuzz_varint_decode, fuzz_witness_verify, fuzz_block_template, fuzz_psbt_decode, fuzz_descriptor, fuzz_bip32]
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install nightly --profile minimal
@@ -49,6 +49,9 @@ jobs:
               translated = regtest_descriptor(vector["descriptor"])
               if translated != vector["descriptor"]:
                   (corpus / f"regtest-{i}").write_text(translated)
+      - name: Seed published BIP32 keys
+        if: matrix.target == 'fuzz_bip32'
+        run: python3 scripts/seed_bip32.py --corpus fuzz/corpus/fuzz_bip32
       - run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=30 -rss_limit_mb=2048
       - uses: actions/upload-artifact@v4
         if: failure()

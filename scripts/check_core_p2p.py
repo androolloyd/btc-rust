@@ -110,6 +110,22 @@ def rust_rpc(port, method, params):
     return result["result"]
 
 
+def check_base58_address_rejections(core_port, rust_port, address):
+    assert core_rpc(core_port, "validateaddress", [address])["isvalid"]
+    aliases = ["Ա" + address, address[0] + chr(0x100 + ord(address[1])) + address[2:], "3" * 1000]
+    before = rust_rpc(rust_port, "getbestblockhash", [])
+    for alias in aliases:
+        assert core_rpc(core_port, "validateaddress", [alias])["isvalid"] is False
+        for port, rpc in [(core_port, core_rpc), (rust_port, rust_rpc)]:
+            try:
+                rpc(port, "generatetoaddress", [1, alias])
+                raise AssertionError("invalid Base58 address was mined")
+            except RuntimeError as error:
+                assert "-5" in str(error), str(error)
+        assert rust_rpc(rust_port, "getbestblockhash", []) == before
+    print("PASSED: Core/Rust reject Unicode Base58 aliases and oversized mining addresses without tip changes", flush=True)
+
+
 class CoreClock:
     """Drive Core's actual regtest relay scheduler without relaxing validation.
 
@@ -723,6 +739,7 @@ def scenario(args, encrypted, outbound):
                 if encrypted:
                     assert core_peers[0]["session_id"] == rust_peers[0]["session_id"]
                     assert int(core_peers[0]["services"], 16) & (1 << 11)
+                check_base58_address_rejections(core_port, rust_port, address)
                 rust_hashes = rust_rpc(rust_port, "generatetoaddress", [3, address])
                 wait_until(lambda: core_rpc(core_port, "getbestblockhash", []) == rust_hashes[-1])
                 # Core independently checks our coinbase construction and proof of work.

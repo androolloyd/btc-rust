@@ -83,6 +83,11 @@ impl Address {
 
     /// Decode from base58check
     pub fn from_base58(s: &str, network: Network) -> Result<Self, AddressError> {
+        // Legacy addresses encode a version, 20-byte hash and checksum.
+        // Reject oversized strings before radix conversion/allocation.
+        if s.len() > 35 {
+            return Err(AddressError::InvalidLength);
+        }
         let (version, data) = base58check_decode(s)?;
         if data.len() != 20 {
             return Err(AddressError::InvalidLength);
@@ -215,7 +220,7 @@ fn base58_decode(s: &str) -> Result<Vec<u8>, AddressError> {
     for ch in s.chars() {
         let val = BASE58_ALPHABET
             .iter()
-            .position(|&c| c == ch as u8)
+            .position(|&c| c as char == ch)
             .ok_or(AddressError::InvalidBase58Char(ch))? as u32;
 
         let mut carry = val;
@@ -278,6 +283,34 @@ mod tests {
         let encoded = base58_encode(&data);
         let decoded = base58_decode(&encoded).unwrap();
         assert_eq!(data, decoded);
+    }
+
+    #[test]
+    fn legacy_addresses_reject_unicode_aliases_and_excessive_work() {
+        for (text, network) in [
+            ("1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa", Network::Mainnet),
+            ("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy", Network::Mainnet),
+            ("mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn", Network::Regtest),
+        ] {
+            assert!(Address::from_base58(text, network).is_ok());
+            for (position, byte) in text.bytes().enumerate() {
+                let alias = char::from_u32(0x100 + byte as u32).unwrap();
+                let bad = format!("{}{alias}{}", &text[..position], &text[position + 1..]);
+                assert!(Address::from_base58(&bad, network).is_err());
+            }
+            assert!(Address::from_base58(&format!("Ա{text}"), network).is_err());
+        }
+        for byte in BASE58_ALPHABET {
+            let bad = char::from_u32(0x500 + *byte as u32).unwrap().to_string();
+            assert!(matches!(
+                base58_decode(&bad),
+                Err(AddressError::InvalidBase58Char(_))
+            ));
+        }
+        assert!(matches!(
+            Address::from_base58(&"3".repeat(100_000), Network::Mainnet),
+            Err(AddressError::InvalidLength)
+        ));
     }
 
     #[test]

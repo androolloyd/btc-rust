@@ -81,3 +81,9 @@ name = "fuzz_descriptor"
 path = "fuzz_targets/fuzz_descriptor.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_bip32"
+path = "fuzz_targets/fuzz_bip32.rs"
+test = false
+doc = false

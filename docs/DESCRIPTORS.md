@@ -33,6 +33,11 @@ requires `--index`; a fixed descriptor rejects it. Child indices are below
 annotations are parsed as metadata and do not authenticate the key's origin.
 Hardened suffixes, private extended keys and WIF keys fail explicitly; diagnostics
 from the public-key resolver do not echo potential private material.
+Extended-key text and legacy addresses accept only the actual ASCII Base58
+alphabet. Unicode characters are never truncated into ASCII aliases. The shared
+HD primitive permits a zero child tweak while retaining the required rejection
+of out-of-range tweaks and infinite child points; the child chain code and header
+still advance when its point equals the parent's point.
 
 Taproot accepts x-only or compressed keys and key-path-only outputs or binary
 trees of `pk` leaves. It applies the actual BIP341 tweak, leaf/branch hashes and

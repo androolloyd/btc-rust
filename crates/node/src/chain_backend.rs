@@ -1635,6 +1635,17 @@ mod tests {
             ("getblockheader", json!(["aa".repeat(32)]), -5),
             ("getblockhash", json!([1]), -8),
             ("generatetoaddress", json!([1, "invalid address"]), -5),
+            (
+                "generatetoaddress",
+                json!([1, "ԱmipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn"]),
+                -5,
+            ),
+            (
+                "generatetoaddress",
+                json!([1, "m\u{169}pcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn"]),
+                -5,
+            ),
+            ("generatetoaddress", json!([1, "3".repeat(100_000)]), -5),
             ("getblockhash", json!([-1]), INVALID_PARAMS),
             ("submitblock", json!(["ff"]), -22),
         ] {
@@ -1647,6 +1658,7 @@ mod tests {
             assert_eq!(response.error.unwrap().code, code);
             assert!(response.result.is_none());
         }
+        assert_eq!(rpc(&rpc_handler, "getblockcount", json!([])), 0);
         let mut block = backend
             .candidate(ScriptBuf::from_bytes(vec![0x51]))
             .unwrap();
