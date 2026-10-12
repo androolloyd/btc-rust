@@ -14,6 +14,10 @@ use crate::tables::{
 };
 use crate::traits::{AddressIndexValue, Database, DbTx, DbTxMut, StorageError, TxBlockLocation};
 
+#[path = "legacy_checkpoint.rs"]
+mod legacy_checkpoint;
+pub use legacy_checkpoint::LegacyCheckpointArchive;
+
 /// Table definitions for redb.
 /// All tables use `&[u8]` keys and `&[u8]` values — serialization is handled
 /// in the trait implementations using btc_primitives::encode.

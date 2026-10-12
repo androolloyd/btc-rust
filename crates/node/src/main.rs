@@ -94,6 +94,10 @@ enum Commands {
         #[arg(long)]
         assumeutxo: Option<String>,
 
+        /// Archive an unverified tip-only database and validate again from genesis.
+        #[arg(long, conflicts_with = "assumeutxo")]
+        resync_legacy_checkpoint: bool,
+
         /// Disable full RBF (revert to BIP125 opt-in RBF behavior).
         /// By default, full RBF is enabled (Bitcoin Core v29+ behavior).
         #[arg(long)]
@@ -341,6 +345,7 @@ async fn main() -> eyre::Result<()> {
             dust_limit,
             datacarrier_size,
             assumeutxo,
+            resync_legacy_checkpoint,
             no_full_rbf,
             op_return_limit,
             zmq_pub_hashblock,
@@ -357,6 +362,7 @@ async fn main() -> eyre::Result<()> {
                 dust_limit,
                 datacarrier_size,
                 assumeutxo,
+                resync_legacy_checkpoint,
                 no_full_rbf,
                 op_return_limit,
                 zmq_pub_hashblock,
@@ -376,6 +382,7 @@ async fn main() -> eyre::Result<()> {
                 None,
                 None,
                 None,
+                false,
                 false,
                 None,
                 None,
@@ -529,6 +536,7 @@ async fn cmd_run(
     dust_limit: Option<u64>,
     datacarrier_size: Option<usize>,
     assumeutxo: Option<String>,
+    resync_legacy_checkpoint: bool,
     no_full_rbf: bool,
     op_return_limit: Option<usize>,
     zmq_pub_hashblock: Option<String>,
@@ -549,6 +557,7 @@ async fn cmd_run(
     }
 
     let full_rbf = !no_full_rbf;
+    config.resync_legacy_checkpoint = resync_legacy_checkpoint;
     let effective_op_return_limit =
         op_return_limit.unwrap_or(btc_mempool::policy::MAX_OP_RETURN_SIZE);
 

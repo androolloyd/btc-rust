@@ -44,6 +44,7 @@ pub struct NodeChainBackend {
     state: NodeState,
     block_events: tokio::sync::broadcast::Sender<BlockHash>,
     tx_events: tokio::sync::broadcast::Sender<TxHash>,
+    legacy_checkpoint: Option<btc_storage::redb_backend::LegacyCheckpointArchive>,
 }
 
 #[derive(Debug)]
@@ -93,22 +94,49 @@ impl CoinOverlay<'_> {
 
 impl NodeChainBackend {
     pub fn open(path: &Path, state: NodeState) -> eyre::Result<Self> {
+        Self::open_with_legacy_resync(path, state, false)
+    }
+
+    pub fn open_with_legacy_resync(
+        path: &Path,
+        state: NodeState,
+        resync: bool,
+    ) -> eyre::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let db = Arc::new(RedbDatabase::new(path)?);
         db.init_tables()?;
-        let utxos = PersistentUtxoSet::new(Arc::clone(&db));
         let mut params = ChainParams::from_network(state.network);
         // RPC submissions always run scripts; an assume-valid shortcut cannot
         // be inferred merely from a matching incoming block hash.
         params.assume_valid = None;
         let mut headers = ChainState::new(params);
+        let genesis = headers.best_header().header;
+        if resync {
+            if let Some(archive) = db.resync_legacy_checkpoint(&genesis)? {
+                tracing::warn!(height = archive.height, hash = %archive.hash,
+                    "preserved unverified legacy checkpoint tables; validation resuming from genesis");
+            }
+        }
+        let legacy_checkpoint = db.legacy_checkpoint_archive()?;
+        if legacy_checkpoint
+            .as_ref()
+            .is_some_and(|archive| archive.genesis != genesis.block_hash())
+        {
+            return Err(eyre::eyre!(
+                "legacy checkpoint archive belongs to another network"
+            ));
+        }
+        let utxos = PersistentUtxoSet::new(Arc::clone(&db));
         if let Some((height, expected)) = utxos.validated_tip()? {
+            if height == 0 && db.coin_count()? != 0 {
+                return Err(eyre::eyre!("genesis checkpoint contains unvalidated coins"));
+            }
             let tx = db.tx()?;
             for h in 1..=height {
                 let hash = tx.get_block_hash_by_height(h)?.ok_or_else(|| eyre::eyre!(
-                    "committed chain lacks header history at height {h}; legacy checkpoint migration requires a resync in a separate data directory"
+                    "committed chain lacks header history at height {h}; legacy checkpoint migration requires run --resync-legacy-checkpoint (archives tip-only tables), or a separate data directory for partial histories"
                 ))?;
                 let header = tx
                     .get_block_header(&hash)?
@@ -124,6 +152,14 @@ impl NodeChainBackend {
                 ));
             }
         } else {
+            if db.tx()?.get_best_block_height()? != 0
+                || db.coin_count()? != 0
+                || !db.stored_headers()?.is_empty()
+            {
+                return Err(eyre::eyre!(
+                    "database has coins/history or a height without a committed tip"
+                ));
+            }
             let genesis = headers.best_header().header.clone();
             let hash = genesis.block_hash();
             let tx = db.tx_mut()?;
@@ -196,6 +232,7 @@ impl NodeChainBackend {
             state,
             block_events: tokio::sync::broadcast::channel(256).0,
             tx_events: tokio::sync::broadcast::channel(1024).0,
+            legacy_checkpoint,
         })
     }
 
@@ -1154,6 +1191,9 @@ impl ChainBackend for NodeChainBackend {
                         json!({ "chain": self.state.rpc_network_name(), "blocks": tip.height, "headers": tip.height,
                         "bestblockhash": tip.header.block_hash().to_string(), "difficulty": compact_bits_to_difficulty(tip.header.bits.to_u32()),
                         "mediantime": headers.median_time_past(tip), "chainwork": hex::encode(tip.cumulative_work),
+                        "legacy_checkpoint_archive": self.legacy_checkpoint.as_ref().map(|archive| json!({
+                            "height": archive.height, "hash": archive.hash.to_string(), "genesis": archive.genesis.to_string(),
+                            "used_for_validation": false })),
                         "initialblockdownload": self.state.syncing.load(std::sync::atomic::Ordering::SeqCst), "pruned": false, "warnings": "experimental node: full Core consensus parity remains unverified" }),
                     ),
                     _ => Err(RpcError::new(-32601, "method not found")),
@@ -1695,6 +1735,121 @@ mod tests {
         assert!(error.to_string().contains("legacy checkpoint migration"));
         let db = RedbDatabase::new(&path).unwrap();
         assert_eq!(db.tx().unwrap().get_best_block_height().unwrap(), 42);
+    }
+
+    #[test]
+    fn legacy_resync_revalidates_history_and_cannot_reuse_archived_coins() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("original.redb");
+        let path = dir.path().join("legacy.redb");
+        let backend = NodeChainBackend::open(&original, NodeState::new(Network::Regtest)).unwrap();
+        let key = TestKeyPair::from_secret(secp256k1::SecretKey::from_slice(&[1; 32]).unwrap());
+        let mut blocks = Vec::new();
+        for _ in 0..101 {
+            let mut block = backend.candidate(key.p2pkh_script()).unwrap();
+            mine(&mut block);
+            backend.submit_block(&block).unwrap();
+            blocks.push(block);
+        }
+        let op = OutPoint::new(blocks[0].transactions[0].txid(), 0);
+        let prev = blocks[0].transactions[0].outputs[0].clone();
+        let spend = signed_spend(&key, op, &prev, 10_000);
+        backend.submit_transaction(spend.clone()).unwrap();
+        let mut spent_block = backend.candidate(key.p2pkh_script()).unwrap();
+        mine(&mut spent_block);
+        backend.submit_block(&spent_block).unwrap();
+        blocks.push(spent_block);
+        let tip = backend.tip().unwrap();
+        drop(backend);
+        let db = Arc::new(RedbDatabase::new(&path).unwrap());
+        db.init_tables().unwrap();
+        let mut coins = PersistentUtxoSet::new(db.clone());
+        // A stale legacy checkpoint falsely retains a now-spent, mature coin.
+        coins
+            .apply_update(&UtxoSetUpdate {
+                created: vec![(
+                    op,
+                    UtxoEntry {
+                        txout: prev,
+                        height: 1,
+                        is_coinbase: true,
+                    },
+                )],
+                spent: vec![],
+            })
+            .unwrap();
+        coins.flush_cache_with_tip(tip.0, tip.1).unwrap();
+        drop(coins);
+        drop(db);
+        assert!(NodeChainBackend::open(&path, NodeState::new(Network::Regtest)).is_err());
+        let backend = NodeChainBackend::open_with_legacy_resync(
+            &path,
+            NodeState::new(Network::Regtest),
+            true,
+        )
+        .unwrap();
+        assert_eq!(backend.tip().unwrap().0, 0);
+        assert!(backend.lock().unwrap().utxos.get_utxo(&op).is_none());
+        assert!(backend.submit_transaction(spend.clone()).is_err());
+        for block in &blocks[..50] {
+            backend.submit_block(block).unwrap();
+        }
+        drop(backend);
+        let backend = NodeChainBackend::open(&path, NodeState::new(Network::Regtest)).unwrap();
+        assert_eq!(backend.tip().unwrap().0, 50);
+        for block in &blocks[50..] {
+            backend.submit_block(block).unwrap();
+        }
+        assert_eq!(backend.tip().unwrap(), tip);
+        assert!(backend.lock().unwrap().utxos.get_utxo(&op).is_none());
+        assert!(backend.submit_transaction(spend).is_err());
+        drop(backend);
+        let backend = NodeChainBackend::open_with_legacy_resync(
+            &path,
+            NodeState::new(Network::Regtest),
+            true,
+        )
+        .unwrap();
+        assert_eq!(backend.tip().unwrap(), tip);
+        assert!(backend.lock().unwrap().utxos.get_utxo(&op).is_none());
+        assert_eq!(backend.legacy_checkpoint.unwrap().height, tip.0);
+    }
+
+    #[test]
+    fn coins_without_a_validated_tip_cannot_become_genesis_state() {
+        for committed_genesis in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("orphan.redb");
+            let db = RedbDatabase::new(&path).unwrap();
+            db.init_tables().unwrap();
+            let write = db.tx_mut().unwrap();
+            write
+                .put_utxo(
+                    &OutPoint::new(TxHash::from_bytes([1; 32]), 0),
+                    &TxOut {
+                        value: Amount::from_sat(10_000),
+                        script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                    },
+                )
+                .unwrap();
+            if committed_genesis {
+                let genesis = ChainState::new(ChainParams::from_network(Network::Regtest))
+                    .best_header()
+                    .header;
+                write.set_best_block(0, &genesis.block_hash()).unwrap();
+            }
+            write.commit().unwrap();
+            drop(db);
+            assert!(NodeChainBackend::open_with_legacy_resync(
+                &path,
+                NodeState::new(Network::Regtest),
+                true
+            )
+            .is_err());
+            let db = RedbDatabase::new(&path).unwrap();
+            assert_eq!(db.coin_count().unwrap(), 1);
+            assert!(db.legacy_checkpoint_archive().unwrap().is_none());
+        }
     }
     fn signed_spend(key: &TestKeyPair, op: OutPoint, prev: &TxOut, fee: i64) -> Transaction {
         let mut tx = Transaction {

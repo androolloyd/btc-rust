@@ -42,6 +42,7 @@ pub struct NodeConfig {
     pub rpc_port: u16,
     pub p2p_port: u16,
     pub connect_peers: Vec<std::net::SocketAddr>,
+    pub resync_legacy_checkpoint: bool,
     pub full_rbf: bool,
     pub mempool_policy: btc_mempool::policy::TxValidationPolicy,
     pub mempool_flags: btc_consensus::script_engine::ScriptFlags,
@@ -58,6 +59,7 @@ impl NodeConfig {
             rpc_port,
             p2p_port,
             connect_peers: Vec::new(),
+            resync_legacy_checkpoint: false,
             full_rbf: true,
             mempool_policy: btc_mempool::policy::TxValidationPolicy::default(),
             mempool_flags: btc_consensus::script_engine::ScriptFlags::all(),
@@ -241,10 +243,13 @@ impl Node {
             .syncing
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
-        let chain_backend = Arc::new(crate::chain_backend::NodeChainBackend::open(
-            &self.config.datadir.join("utxo.redb"),
-            node_state.clone(),
-        )?);
+        let chain_backend = Arc::new(
+            crate::chain_backend::NodeChainBackend::open_with_legacy_resync(
+                &self.config.datadir.join("utxo.redb"),
+                node_state.clone(),
+                self.config.resync_legacy_checkpoint,
+            )?,
+        );
 
         chain_backend
             .configure_mempool(

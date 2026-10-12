@@ -25,6 +25,10 @@ cargo build --release
 ./target/release/btc-node run --interactive
 ```
 
+Old tip-only databases can preserve their data and rebuild from genesis using
+`run --resync-legacy-checkpoint`. See [checkpoint recovery](docs/CHECKPOINT_RECOVERY.md)
+for the supported layout and verified recovery behavior.
+
 ## Script Development Quickstart
 
 btc-rust includes `btc-forge`, a Foundry-equivalent toolkit for Bitcoin Script development. No external tools needed — write, test, debug, and analyze scripts entirely in Rust.
