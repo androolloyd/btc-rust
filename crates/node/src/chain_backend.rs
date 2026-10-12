@@ -44,6 +44,7 @@ pub struct NodeChainBackend {
     state: NodeState,
     block_events: tokio::sync::broadcast::Sender<BlockHash>,
     tx_events: tokio::sync::broadcast::Sender<TxHash>,
+    wallet_events: tokio::sync::watch::Sender<u64>,
     legacy_checkpoint: Option<btc_storage::redb_backend::LegacyCheckpointArchive>,
 }
 
@@ -233,6 +234,7 @@ impl NodeChainBackend {
             state,
             block_events: tokio::sync::broadcast::channel(256).0,
             tx_events: tokio::sync::broadcast::channel(1024).0,
+            wallet_events: tokio::sync::watch::channel(0).0,
             legacy_checkpoint,
         })
     }
@@ -575,6 +577,8 @@ impl NodeChainBackend {
                     });
                 }
             }
+            self.wallet_events
+                .send_modify(|revision| *revision = revision.wrapping_add(1));
             let _ = self.block_events.send(hash);
             // Reaccepted disconnected transactions must be announced again.
             for txid in &data.mempool.order {
@@ -616,6 +620,8 @@ impl NodeChainBackend {
         data.mempool = pool;
         self.state
             .update_mempool(data.mempool.entries.len() as u64, data.mempool.bytes as u64);
+        self.wallet_events
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
         Ok(())
     }
     pub fn set_exex_sender(
@@ -661,6 +667,8 @@ impl NodeChainBackend {
         data.mempool = pool;
         self.state
             .update_mempool(data.mempool.entries.len() as u64, data.mempool.bytes as u64);
+        self.wallet_events
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
         let _ = self.tx_events.send(id);
         Ok(id)
     }
@@ -1104,6 +1112,21 @@ impl NodeChainBackend {
 }
 
 impl btc_electrum::ElectrumBackend for NodeChainBackend {
+    fn subscribe_scripts(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        Some(self.wallet_events.subscribe())
+    }
+    fn script_statuses(
+        &self,
+        scripts: &[String],
+    ) -> Result<Vec<Value>, btc_electrum::ElectrumRpcError> {
+        let fail = |error: RpcError| btc_electrum::ElectrumRpcError {
+            code: error.code,
+            message: error.message,
+        };
+        let data = self.lock().map_err(fail)?;
+        self.electrum_statuses(&data, scripts).map_err(fail)
+    }
+
     fn subscribe_headers(&self) -> tokio::sync::broadcast::Receiver<BlockHash> {
         self.subscribe_blocks()
     }
@@ -1709,6 +1732,48 @@ mod tests {
         while !block.header.check_proof_of_work() {
             block.header.nonce += 1;
         }
+    }
+
+    #[test]
+    fn script_revisions_follow_successful_publication_and_not_rejected_writes() {
+        use btc_electrum::ElectrumBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let backend = NodeChainBackend::open(
+            &dir.path().join("chain.redb"),
+            NodeState::new(Network::Regtest),
+        )
+        .unwrap();
+        let mut events = backend.subscribe_scripts().unwrap();
+        let key = TestKeyPair::from_secret(secp256k1::SecretKey::from_slice(&[12; 32]).unwrap());
+        let address = Address::p2pkh_from_pubkey(&key.pubkey_bytes(), Network::Regtest).to_string();
+        let block = ChainBackend::call(&backend, "generatetoaddress", json!([1, address])).unwrap();
+        assert!(events.has_changed().unwrap());
+        let first = *events.borrow_and_update();
+        assert_eq!(first, 1);
+        let hash = block_hash_param(&json!([block[0]])).unwrap();
+        let body = backend.block(&hash).unwrap().unwrap();
+        assert!(backend.submit_block(&body).is_err());
+        assert!(!events.has_changed().unwrap());
+        let mut invalid = body.transactions[0].clone();
+        invalid.inputs[0].previous_output = OutPoint::new(TxHash::ZERO, 0);
+        assert!(backend.submit_transaction(invalid).is_err());
+        assert!(!events.has_changed().unwrap());
+        backend
+            .configure_mempool(
+                true,
+                btc_mempool::policy::TxValidationPolicy::default(),
+                btc_consensus::script_engine::ScriptFlags::core_compliant(),
+            )
+            .unwrap();
+        assert!(events.has_changed().unwrap());
+        assert_eq!(*events.borrow_and_update(), first + 1);
+        // Snapshot failures are errors; subscribing cannot invent a status.
+        assert!(backend
+            .script_statuses(&vec![
+                "00".repeat(32);
+                btc_electrum::handler::MAX_SCRIPT_SUBSCRIPTIONS + 1
+            ])
+            .is_err());
     }
 
     #[test]

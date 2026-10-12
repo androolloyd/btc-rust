@@ -16,6 +16,7 @@ pub const METHOD_SCRIPTHASH_GET_HISTORY: &str = "blockchain.scripthash.get_histo
 pub const METHOD_SCRIPTHASH_GET_BALANCE: &str = "blockchain.scripthash.get_balance";
 pub const METHOD_SCRIPTHASH_LISTUNSPENT: &str = "blockchain.scripthash.listunspent";
 pub const METHOD_SCRIPTHASH_SUBSCRIBE: &str = "blockchain.scripthash.subscribe";
+pub const METHOD_SCRIPTHASH_UNSUBSCRIBE: &str = "blockchain.scripthash.unsubscribe";
 
 // Transaction methods
 pub const METHOD_TRANSACTION_GET: &str = "blockchain.transaction.get";

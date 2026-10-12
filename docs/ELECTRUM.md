@@ -11,8 +11,8 @@ This is an implemented subset, not a complete wallet server. `server.version`
 and `server.features` return explicit unsupported errors; failed version
 negotiation closes that connection. The service advertises no completed Electrum
 protocol version. The protocol requires every nonoptional method of an advertised
-version to work. Status subscriptions, header checkpoint proofs, fee estimation
-and other required methods remain unfinished and return explicit errors.
+version to work. Header checkpoint proofs, fee estimation and other required
+methods remain unfinished and return explicit errors.
 Script history, balances, mempool and unspent queries now use an independently
 maintained validated index and the actual pool. Unknown scripts return real
 empty state only when that index is complete for the active tip.
@@ -29,6 +29,8 @@ empty state only when that index is complete for the active tip.
 | `blockchain.scripthash.get_mempool(scripthash)` | Actual transactions receiving or spending the script, including unconfirmed parents |
 | `blockchain.scripthash.get_balance(scripthash)` | Durable coin balance including immature coinbases; signed net mempool delta |
 | `blockchain.scripthash.listunspent(scripthash)` | Confirmed outputs in block order followed by unspent pool outputs; pool-spent outputs excluded |
+| `blockchain.scripthash.subscribe(scripthash)` | Actual history status plus connection-owned notifications after durable chain/pool changes |
+| `blockchain.scripthash.unsubscribe(scripthash)` | Removes only this connection's script subscription; returns whether it existed |
 | `server.ping()` / `server.banner()` | Connection keepalive / explicit subset description |
 
 Queries use the same mutex-protected validated backend as HTTP RPC, mining and
@@ -75,6 +77,41 @@ returns an explicit error rather than truncating balances or history. Balances
 ignore pool spends in the confirmed total, while the unconfirmed signed delta
 includes every actual pool receipt and spend. Unspent pool outputs always have
 height zero; pool history uses -1 whenever any parent remains unconfirmed.
+
+Script status is SHA256 of the ordered `tx_hash:height:` history, or null for
+empty history, as specified in the primary protocol. Confirmed rows retain block
+order; pool rows now use stable ascending display-txid order for both history
+and status, preserving hashes across pool rebuild/restart. Status ignores fees.
+A coalesced revision is published only after successful durable block/admission/
+pool-configuration commits. It covers removed RBF descendants, disconnected and
+restored transactions, and policy revalidation rather than only new broadcasts.
+Rejected writes publish no revision.
+
+Subscriptions belong to their TCP connection. Subscribe returns the actual
+initial status; repeats and hex-case variants reuse the same entry. Unsubscribe
+returns true only when that connection owned the entry, and prevents subsequent
+notifications for it. Disconnect/restart clears ownership and requires a fresh
+subscribe. State is never stored in a global fake wallet map.
+
+Each connection captures the revision stream before querying its initial status,
+so a commit between the query and response cannot disappear. Refresh obtains one
+chain lock and database snapshot for all subscribed scripts; subsequent changes
+remain pending. Only changed statuses generate notifications, with canonical
+script hashes and `[scripthash, status]` parameters. Revisions coalesce under load;
+clients may observe the latest state without every intermediate transition.
+The owned reader retains fragmented inbound requests during both header and
+script notifications. Connection selection is fair between requests and events.
+Closed event sources or failed refreshes disconnect subscribed clients instead
+of leaving a silently stale subscription.
+
+There are at most 64 scripts per connection. Initial subscribe checks the entire
+connection against a shared budget of 10,000 history references, 1,000,000 examined
+inputs/outputs, 64 MiB of loaded block weight and 64 MiB of examined script bytes.
+Refresh uses the same budget. A new subscription that exceeds it errors before
+changing ownership; failure during a later refresh closes the connection.
+Ordinary wallet queries also bound examined script bytes. Larger indexed wallets,
+public hosting and broad-load performance remain unqualified. Stateless library
+dispatch cannot acknowledge a live script subscription; it errors explicitly.
 
 The transport handles positional/named implemented arguments, sequential batches
 up to 128 members, v2 notifications and legacy/v2 response envelopes. Empty or
@@ -130,6 +167,23 @@ maturity check is relaxed. All five actual Core-wallet-signed transactions are
 admitted and mined. The local gate passes 3,337 tests; verified old-body upgrade,
 transaction/unwind aborts, corrupt receipt/row/manifest and query bounds pass.
 Legacy archival preserves both index tables and tests all 26 rollback stages.
-Status subscriptions and complete protocol negotiation remain unfinished.
+Status subscriptions are accepted below; complete protocol negotiation remains
+unfinished.
 Existing HTTP acceptance, all 350 verbose RPC comparisons and both v1/v2 legacy
 checkpoint crash/resync/restart scenarios also pass with the index enabled.
+
+The status-subscription milestone passes 260 exact Core-derived wallet-query
+comparisons across thirteen real snapshots plus independently calculated status
+hashes and actual streamed updates on separate connections. A real subscribe +
+signed broadcast batch proves a change after the initial query but before its
+response still arrives. Notifications arrive during a partial inbound JSON frame.
+Real RBF removes an existing parent and child; snapshots and notifications agree
+with Core before new dependent admission and same-block mining. Unsubscribe on
+one connection leaves the other receiving updates, repeats return true/false,
+case variants reuse capacity, the 65th subscription fails and freed capacity is
+reusable. Batch and notification unsubscribe work. Stable hashes survive restart
+with four actual pool transactions and a confirmed-chain restart at 105; new
+connections inherit no subscriptions. Unknown-script null status is deduplicated.
+The gate passes 3,339 tests across 43 suites (two existing ignores), formatting,
+Clippy, feature checks and release build. Closed-stream and successful-versus-
+rejected-publication regressions pass. No package or consensus rules changed.

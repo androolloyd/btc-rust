@@ -1,5 +1,5 @@
 //! Opt-in loopback Electrum chain/transaction transport with bounded clients.
-use crate::handler::ElectrumHandler;
+use crate::handler::{ElectrumHandler, ScriptSession};
 use crate::methods::METHOD_HEADERS_SUBSCRIBE;
 use std::sync::Arc;
 use std::time::Duration;
@@ -145,6 +145,10 @@ async fn connection(
     let (reader, mut writer) = stream.into_split();
     let mut events = handler.subscribe_headers();
     let mut last_header = None;
+    // Capture revisions before any initial snapshot; a commit between the
+    // query and first response remains pending and is refreshed afterwards.
+    let mut script_events = handler.subscribe_scripts();
+    let mut scripts = ScriptSession::default();
     let (sender, mut requests) = mpsc::channel(1);
     // A separate bounded reader retains partially consumed bytes when a
     // header notification arrives. Cancelling a read future would lose them.
@@ -167,7 +171,6 @@ async fn connection(
     }));
     loop {
         tokio::select! {
-            biased;
             _ = stopped(&mut shutdown) => return Ok(()),
             event = async { events.as_mut().unwrap().recv().await }, if events.is_some() && last_header.is_some() => {
                 if matches!(event, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
@@ -182,13 +185,21 @@ async fn connection(
                     last_header = Some(header);
                 }
             }
+            event = async { script_events.as_mut().unwrap().changed().await }, if script_events.is_some() && !scripts.scripts.is_empty() => {
+                if event.is_err() { return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof,"validated script event stream closed")); }
+                let provider = handler.clone();
+                let (result,session) = tokio::task::spawn_blocking(move || { let result = provider.refresh_scripts(&mut scripts); (result,scripts) }).await.map_err(std::io::Error::other)?;
+                scripts = session;
+                for notification in result.map_err(|error| std::io::Error::other(error.message))? { write(&mut writer,&notification.to_string(),&mut shutdown).await?; }
+            }
             request = requests.recv() => {
                 let Some(request) = request else { return Ok(()); };
                 let request = request?;
                 let text = std::str::from_utf8(&request).map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData,error))?.trim();
                 if text.is_empty() { continue; }
                 let text = text.to_owned(); let worker = handler.clone();
-                let result = tokio::task::spawn_blocking(move || worker.dispatch(&text)).await.map_err(std::io::Error::other)?;
+                let (result,session) = tokio::task::spawn_blocking(move || { let result = worker.dispatch_session(&text,Some(&mut scripts)); (result,scripts) }).await.map_err(std::io::Error::other)?;
+                scripts = session;
                 if let Some(header) = result.header { last_header = Some(header); }
                 if !result.output.is_empty() { write(&mut writer, &result.output, &mut shutdown).await?; }
                 if result.close { return Ok(()); }
@@ -308,6 +319,64 @@ mod tests {
         );
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut String::new()))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        sender.send(true).unwrap();
+        task.await.unwrap().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod script_fault_tests {
+    use super::*;
+    use crate::{ElectrumBackend, ElectrumRpcError};
+    use serde_json::{json, Value};
+    /// Only event delivery is deliberately faulty. Empty history at genesis
+    /// has a real null status; this is not a chain/cryptographic oracle.
+    struct ClosedScriptEvents;
+    impl ElectrumBackend for ClosedScriptEvents {
+        fn call(&self, _: &str, _: Value) -> Result<Value, ElectrumRpcError> {
+            Err(ElectrumRpcError {
+                code: -32601,
+                message: "unsupported".into(),
+            })
+        }
+        fn subscribe_headers(&self) -> tokio::sync::broadcast::Receiver<btc_primitives::BlockHash> {
+            tokio::sync::broadcast::channel(1).1
+        }
+        fn subscribe_scripts(&self) -> Option<watch::Receiver<u64>> {
+            Some(watch::channel(0).1)
+        }
+        fn script_statuses(&self, scripts: &[String]) -> Result<Vec<Value>, ElectrumRpcError> {
+            Ok(vec![Value::Null; scripts.len()])
+        }
+    }
+    #[tokio::test]
+    async fn closed_script_source_disconnects_instead_of_silencing_subscriptions() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (sender, receiver) = watch::channel(false);
+        let handler = Arc::new(ElectrumHandler::new().with_backend(Arc::new(ClosedScriptEvents)));
+        let task = tokio::spawn(
+            ElectrumServer::new(addr.port()).run_listener(listener, handler, receiver),
+        );
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(format!("{}\n",json!({"jsonrpc":"2.0","id":1,"method":"blockchain.scripthash.subscribe","params":["00".repeat(32)]})).as_bytes()).await.unwrap();
+        let mut client = BufReader::new(client);
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(2), client.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&line).unwrap(),
+            json!({"jsonrpc":"2.0","id":1,"result":null})
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), client.read_line(&mut String::new()))
                 .await
                 .unwrap()
                 .unwrap(),
