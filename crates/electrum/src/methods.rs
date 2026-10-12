@@ -20,6 +20,7 @@ pub const METHOD_SCRIPTHASH_SUBSCRIBE: &str = "blockchain.scripthash.subscribe";
 // Transaction methods
 pub const METHOD_TRANSACTION_GET: &str = "blockchain.transaction.get";
 pub const METHOD_TRANSACTION_BROADCAST: &str = "blockchain.transaction.broadcast";
+pub const METHOD_TRANSACTION_GET_MERKLE: &str = "blockchain.transaction.get_merkle";
 
 // Fee estimation
 pub const METHOD_ESTIMATEFEE: &str = "blockchain.estimatefee";

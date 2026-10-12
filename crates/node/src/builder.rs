@@ -41,6 +41,8 @@ pub struct NodeConfig {
     pub datadir: PathBuf,
     pub rpc_port: u16,
     pub p2p_port: u16,
+    /// Explicitly enable the experimental loopback chain/transaction service.
+    pub electrum_port: Option<u16>,
     pub connect_peers: Vec<std::net::SocketAddr>,
     pub resync_legacy_checkpoint: bool,
     pub full_rbf: bool,
@@ -58,6 +60,7 @@ impl NodeConfig {
             datadir: PathBuf::from("~/.btc-rust"),
             rpc_port,
             p2p_port,
+            electrum_port: None,
             connect_peers: Vec::new(),
             resync_legacy_checkpoint: false,
             full_rbf: true,
@@ -262,6 +265,12 @@ impl Node {
         // Fail credential setup before binding or spawning any network service.
         let rpc_cookie = crate::rpc_cookie::RpcCookie::create(&self.config.datadir)?;
 
+        // Requested services fail before any network tasks are spawned.
+        let electrum_listener = match self.config.electrum_port {
+            Some(port) => Some(tokio::net::TcpListener::bind(("127.0.0.1", port)).await?),
+            None => None,
+        };
+
         let p2p_listener = tokio::net::TcpListener::bind(("0.0.0.0", self.network.port)).await?;
         let peer_table = Arc::new(crate::p2p::PeerTable::new(node_state.peer_count.clone()));
 
@@ -329,6 +338,19 @@ impl Node {
 
         // Spawn RPC server
         let mut rpc_handle = tokio::spawn(async move { rpc.run(rpc_handler_clone).await });
+        let (electrum_shutdown, electrum_receiver) = tokio::sync::watch::channel(false);
+        let mut electrum_handle = if let Some(listener) = electrum_listener {
+            let port = listener.local_addr()?.port();
+            let handler =
+                Arc::new(btc_electrum::ElectrumHandler::new().with_backend(chain_backend.clone()));
+            Some(tokio::spawn(async move {
+                btc_electrum::ElectrumServer::new(port)
+                    .run_listener(listener, handler, electrum_receiver)
+                    .await
+            }))
+        } else {
+            None
+        };
 
         let p2p_backend = chain_backend.clone();
         let p2p_peers = peer_table.clone();
@@ -389,9 +411,22 @@ impl Node {
                 Ok(result) => result,
                 Err(error) => Err(error.into()),
             },
+            result = async { electrum_handle.as_mut().unwrap().await }, if electrum_handle.is_some() => match result {
+                Ok(result) => result.map_err(Into::into), Err(error) => Err(error.into()),
+            },
         };
         info!("shutting down");
         rpc_handler.request_shutdown();
+        let _ = electrum_shutdown.send(true);
+        if let Some(handle) = electrum_handle.as_mut() {
+            if !handle.is_finished()
+                && tokio::time::timeout(std::time::Duration::from_secs(2), &mut *handle)
+                    .await
+                    .is_err()
+            {
+                handle.abort();
+            }
+        }
         if tokio::time::timeout(std::time::Duration::from_secs(2), &mut sync_handle)
             .await
             .is_err()

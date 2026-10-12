@@ -1,1363 +1,321 @@
-//! Electrum protocol request handler and method dispatch.
-
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
-
-use serde_json::Value;
-use tracing::info;
-
+//! Experimental chain/transaction Electrum dispatch. No fabricated wallet state.
 use crate::methods::*;
-use crate::protocol::{ElectrumRequest, ElectrumResponse, METHOD_NOT_FOUND, PARSE_ERROR};
+use crate::protocol::{
+    ElectrumError, ElectrumRequest, ElectrumResponse, INTERNAL_ERROR, INVALID_PARAMS,
+    INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR,
+};
+use btc_primitives::BlockHash;
+use serde_json::{json, Value};
+use std::sync::Arc;
+use tokio::sync::broadcast;
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
+pub const MAX_BATCH: usize = 128;
+pub const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
-/// Server identification string.
-const SERVER_VERSION: &str = "btc-rust-electrum 0.1.0";
+/// Implementations must query the actual validated chain and admit broadcasts
+/// through its verifier. No provider is equivalent to explicit unavailability.
+pub trait ElectrumBackend: Send + Sync {
+    fn call(&self, method: &str, params: Value) -> Result<Value, ElectrumError>;
+    fn subscribe_headers(&self) -> broadcast::Receiver<BlockHash>;
+}
 
-/// Electrum protocol version we support.
-const PROTOCOL_VERSION: &str = "1.4";
-
-/// Bitcoin mainnet genesis block hash.
-const GENESIS_HASH: &str = "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f";
-
-/// Default server banner.
-const DEFAULT_BANNER: &str =
-    "Welcome to btc-rust embedded Electrum server. https://github.com/example/btc-rust";
-
-// ---------------------------------------------------------------------------
-// Method handler function type
-// ---------------------------------------------------------------------------
-
-type MethodFn = Box<dyn Fn(Value) -> Value + Send + Sync>;
-
-// ---------------------------------------------------------------------------
-// ElectrumHandler
-// ---------------------------------------------------------------------------
-
-/// Central dispatcher for Electrum protocol methods.
-///
-/// Holds shared chain state and a map of method name -> handler closures.
+#[derive(Default)]
 pub struct ElectrumHandler {
-    methods: HashMap<String, MethodFn>,
-    // Shared chain state
-    chain_height: Arc<AtomicU64>,
-    best_hash: Arc<RwLock<String>>,
-    /// Per-scripthash subscription status hashes (scripthash -> status).
-    scripthash_statuses: Arc<RwLock<HashMap<String, String>>>,
-    /// Mock balances for testing: scripthash -> (confirmed, unconfirmed).
-    mock_balances: Arc<RwLock<HashMap<String, (u64, u64)>>>,
-    /// Mock history for testing: scripthash -> vec of (tx_hash, height).
-    mock_history: Arc<RwLock<HashMap<String, Vec<(String, i64)>>>>,
-    /// Mock unspent outputs: scripthash -> vec of (tx_hash, tx_pos, value, height).
-    mock_unspent: Arc<RwLock<HashMap<String, Vec<(String, u32, u64, u64)>>>>,
-    /// Mock raw transactions: txid -> raw_hex.
-    mock_transactions: Arc<RwLock<HashMap<String, String>>>,
-    /// Mock block headers: height -> 80-byte hex.
-    mock_headers: Arc<RwLock<HashMap<u64, String>>>,
+    backend: Option<Arc<dyn ElectrumBackend>>,
+}
+
+pub(crate) struct Dispatch {
+    pub output: String,
+    pub header: Option<Value>,
+    pub close: bool,
+}
+
+fn error(code: i32, message: &str) -> ElectrumError {
+    ElectrumError {
+        code,
+        message: message.into(),
+    }
 }
 
 impl ElectrumHandler {
-    /// Create a handler with default genesis state.
     pub fn new() -> Self {
-        Self::new_with_state(
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(RwLock::new(GENESIS_HASH.to_string())),
-        )
+        Self::default()
+    }
+    pub fn with_backend(mut self, backend: Arc<dyn ElectrumBackend>) -> Self {
+        self.backend = Some(backend);
+        self
+    }
+    pub(crate) fn subscribe_headers(&self) -> Option<broadcast::Receiver<BlockHash>> {
+        self.backend
+            .as_ref()
+            .map(|backend| backend.subscribe_headers())
+    }
+    pub(crate) fn tip(&self) -> Result<Value, ElectrumError> {
+        self.call(METHOD_HEADERS_SUBSCRIBE, json!([]))
     }
 
-    /// Create a handler with shared state references.
-    pub fn new_with_state(chain_height: Arc<AtomicU64>, best_hash: Arc<RwLock<String>>) -> Self {
-        let scripthash_statuses = Arc::new(RwLock::new(HashMap::new()));
-        let mock_balances = Arc::new(RwLock::new(HashMap::new()));
-        let mock_history = Arc::new(RwLock::new(HashMap::new()));
-        let mock_unspent = Arc::new(RwLock::new(HashMap::new()));
-        let mock_transactions = Arc::new(RwLock::new(HashMap::new()));
-        let mock_headers = Arc::new(RwLock::new(HashMap::new()));
-
-        let mut handler = ElectrumHandler {
-            methods: HashMap::new(),
-            chain_height,
-            best_hash,
-            scripthash_statuses,
-            mock_balances,
-            mock_history,
-            mock_unspent,
-            mock_transactions,
-            mock_headers,
+    fn call(&self, method: &str, params: Value) -> Result<Value, ElectrumError> {
+        let (names, required): (&[&str], usize) = match method {
+            METHOD_SERVER_PING | METHOD_SERVER_BANNER | METHOD_HEADERS_SUBSCRIBE => (&[], 0),
+            METHOD_BLOCK_HEADER => (&["height", "cp_height"], 1),
+            METHOD_BLOCK_HEADERS => (&["start_height", "count", "cp_height"], 2),
+            METHOD_TRANSACTION_GET => (&["tx_hash", "verbose"], 1),
+            METHOD_TRANSACTION_BROADCAST => (&["raw_tx"], 1),
+            METHOD_TRANSACTION_GET_MERKLE => (&["tx_hash", "height"], 2),
+            // An advertised Electrum version requires *all* its nonoptional
+            // methods. Do not claim wallet compatibility while the index is absent.
+            METHOD_SERVER_VERSION | METHOD_SERVER_FEATURES => return Err(error(METHOD_NOT_FOUND, "complete Electrum protocol negotiation is unavailable; this is an experimental chain/transaction subset")),
+            METHOD_ESTIMATEFEE | METHOD_SCRIPTHASH_GET_HISTORY | METHOD_SCRIPTHASH_GET_BALANCE |
+            METHOD_SCRIPTHASH_LISTUNSPENT | METHOD_SCRIPTHASH_SUBSCRIBE => return Err(error(METHOD_NOT_FOUND, "wallet index or fee estimator is not implemented")),
+            _ => return Err(error(METHOD_NOT_FOUND, "unknown or unsupported Electrum method")),
         };
-
-        handler.register_all_methods();
-        handler
-    }
-
-    // -----------------------------------------------------------------
-    // State mutation helpers (for testing / integration)
-    // -----------------------------------------------------------------
-
-    /// Update the chain tip.
-    pub fn update_chain_state(&self, height: u64, hash: &str) {
-        self.chain_height.store(height, Ordering::SeqCst);
-        let mut guard = self.best_hash.write().unwrap();
-        *guard = hash.to_string();
-    }
-
-    /// Set mock balance for a scripthash.
-    pub fn set_mock_balance(&self, scripthash: &str, confirmed: u64, unconfirmed: u64) {
-        let mut balances = self.mock_balances.write().unwrap();
-        balances.insert(scripthash.to_string(), (confirmed, unconfirmed));
-    }
-
-    /// Set mock transaction history for a scripthash.
-    pub fn set_mock_history(&self, scripthash: &str, history: Vec<(String, i64)>) {
-        let mut h = self.mock_history.write().unwrap();
-        h.insert(scripthash.to_string(), history);
-    }
-
-    /// Set mock unspent outputs for a scripthash.
-    pub fn set_mock_unspent(&self, scripthash: &str, utxos: Vec<(String, u32, u64, u64)>) {
-        let mut u = self.mock_unspent.write().unwrap();
-        u.insert(scripthash.to_string(), utxos);
-    }
-
-    /// Set mock raw transaction data.
-    pub fn set_mock_transaction(&self, txid: &str, raw_hex: &str) {
-        let mut txns = self.mock_transactions.write().unwrap();
-        txns.insert(txid.to_string(), raw_hex.to_string());
-    }
-
-    /// Set mock block header hex for a given height.
-    pub fn set_mock_header(&self, height: u64, header_hex: &str) {
-        let mut headers = self.mock_headers.write().unwrap();
-        headers.insert(height, header_hex.to_string());
-    }
-
-    // -----------------------------------------------------------------
-    // Method registration
-    // -----------------------------------------------------------------
-
-    fn register_all_methods(&mut self) {
-        // --- server.version ---
-        self.register(METHOD_SERVER_VERSION, |_params| {
-            serde_json::json!([SERVER_VERSION, PROTOCOL_VERSION])
-        });
-
-        // --- server.banner ---
-        self.register(METHOD_SERVER_BANNER, |_params| {
-            serde_json::json!(DEFAULT_BANNER)
-        });
-
-        // --- server.features ---
-        {
-            let height = self.chain_height.clone();
-            let hash = self.best_hash.clone();
-            self.register(METHOD_SERVER_FEATURES, move |_params| {
-                let h = height.load(Ordering::SeqCst);
-                let bh = hash.read().unwrap().clone();
-                serde_json::json!({
-                    "genesis_hash": GENESIS_HASH,
-                    "hosts": {
-                        "": {
-                            "tcp_port": 50001
-                        }
-                    },
-                    "protocol_max": PROTOCOL_VERSION,
-                    "protocol_min": "1.4",
-                    "pruning": null,
-                    "server_version": SERVER_VERSION,
-                    "hash_function": "sha256",
-                    "block_height": h,
-                    "best_block_hash": bh,
-                })
-            });
-        }
-
-        // --- server.ping ---
-        self.register(METHOD_SERVER_PING, |_params| Value::Null);
-
-        // --- blockchain.headers.subscribe ---
-        {
-            let height = self.chain_height.clone();
-            let headers = self.mock_headers.clone();
-            self.register(METHOD_HEADERS_SUBSCRIBE, move |_params| {
-                let h = height.load(Ordering::SeqCst);
-                let header_hex = {
-                    let guard = headers.read().unwrap();
-                    guard.get(&h).cloned().unwrap_or_else(|| "00".repeat(80))
-                };
-                serde_json::json!({
-                    "height": h,
-                    "hex": header_hex,
-                })
-            });
-        }
-
-        // --- blockchain.scripthash.get_history ---
-        {
-            let history = self.mock_history.clone();
-            self.register(METHOD_SCRIPTHASH_GET_HISTORY, move |params| {
-                let scripthash = match params_get_str(&params, 0) {
-                    Some(s) => s,
-                    None => return serde_json::json!([]),
-                };
-                let guard = history.read().unwrap();
-                match guard.get(&scripthash) {
-                    Some(entries) => {
-                        let arr: Vec<Value> = entries
-                            .iter()
-                            .map(|(txid, height)| {
-                                serde_json::json!({
-                                    "tx_hash": txid,
-                                    "height": height,
-                                })
-                            })
-                            .collect();
-                        Value::Array(arr)
-                    }
-                    None => serde_json::json!([]),
+        let params = match params {
+            Value::Array(values) if values.len() >= required && values.len() <= names.len() => {
+                Value::Array(values)
+            }
+            Value::Object(values) => {
+                if values.keys().any(|key| !names.contains(&key.as_str())) {
+                    return Err(error(INVALID_PARAMS, "unknown named parameter"));
                 }
-            });
-        }
-
-        // --- blockchain.scripthash.get_balance ---
-        {
-            let balances = self.mock_balances.clone();
-            self.register(METHOD_SCRIPTHASH_GET_BALANCE, move |params| {
-                let scripthash = match params_get_str(&params, 0) {
-                    Some(s) => s,
-                    None => {
-                        return serde_json::json!({
-                            "confirmed": 0,
-                            "unconfirmed": 0,
-                        });
-                    }
-                };
-                let guard = balances.read().unwrap();
-                let (confirmed, unconfirmed) = guard.get(&scripthash).copied().unwrap_or((0, 0));
-                serde_json::json!({
-                    "confirmed": confirmed,
-                    "unconfirmed": unconfirmed,
-                })
-            });
-        }
-
-        // --- blockchain.scripthash.listunspent ---
-        {
-            let unspent = self.mock_unspent.clone();
-            self.register(METHOD_SCRIPTHASH_LISTUNSPENT, move |params| {
-                let scripthash = match params_get_str(&params, 0) {
-                    Some(s) => s,
-                    None => return serde_json::json!([]),
-                };
-                let guard = unspent.read().unwrap();
-                match guard.get(&scripthash) {
-                    Some(utxos) => {
-                        let arr: Vec<Value> = utxos
-                            .iter()
-                            .map(|(txid, pos, value, height)| {
-                                serde_json::json!({
-                                    "tx_hash": txid,
-                                    "tx_pos": pos,
-                                    "value": value,
-                                    "height": height,
-                                })
-                            })
-                            .collect();
-                        Value::Array(arr)
-                    }
-                    None => serde_json::json!([]),
+                let mut ordered: Vec<_> = names
+                    .iter()
+                    .map(|name| values.get(*name).cloned().unwrap_or(Value::Null))
+                    .collect();
+                while ordered.len() > required && ordered.last() == Some(&Value::Null) {
+                    ordered.pop();
                 }
-            });
-        }
-
-        // --- blockchain.scripthash.subscribe ---
-        {
-            let statuses = self.scripthash_statuses.clone();
-            let history = self.mock_history.clone();
-            self.register(METHOD_SCRIPTHASH_SUBSCRIBE, move |params| {
-                let scripthash = match params_get_str(&params, 0) {
-                    Some(s) => s,
-                    None => return Value::Null,
-                };
-
-                // Compute a status hash from the history if available.
-                // The Electrum protocol defines status as the SHA-256 of the
-                // concatenated "txid:height:" strings for all history entries.
-                let status = {
-                    let guard = history.read().unwrap();
-                    match guard.get(&scripthash) {
-                        Some(entries) if !entries.is_empty() => {
-                            use sha2::{Digest, Sha256};
-                            let mut hasher = Sha256::new();
-                            for (txid, height) in entries {
-                                hasher.update(format!("{txid}:{height}:"));
-                            }
-                            let hash = hasher.finalize();
-                            hex::encode(hash)
-                        }
-                        _ => return Value::Null,
-                    }
-                };
-
-                // Store the subscription status.
-                let mut guard = statuses.write().unwrap();
-                guard.insert(scripthash, status.clone());
-
-                serde_json::json!(status)
-            });
-        }
-
-        // --- blockchain.transaction.get ---
-        {
-            let transactions = self.mock_transactions.clone();
-            self.register(METHOD_TRANSACTION_GET, move |params| {
-                let txid = match params_get_str(&params, 0) {
-                    Some(s) => s,
-                    None => return Value::Null,
-                };
-                let guard = transactions.read().unwrap();
-                match guard.get(&txid) {
-                    Some(raw) => serde_json::json!(raw),
-                    None => Value::Null,
-                }
-            });
-        }
-
-        // --- blockchain.transaction.broadcast ---
-        self.register(METHOD_TRANSACTION_BROADCAST, |params| {
-            // In a real implementation, this would decode, validate, and
-            // relay the transaction to the mempool. For now, echo back a
-            // mock txid (double-SHA-256 of the raw hex bytes).
-            let raw_hex = match params_get_str(&params, 0) {
-                Some(s) => s,
-                None => return Value::Null,
-            };
-            // Compute a deterministic "txid" from the raw hex for testing.
-            use sha2::{Digest, Sha256};
-            let bytes = hex::decode(&raw_hex).unwrap_or_default();
-            let hash1 = Sha256::digest(&bytes);
-            let hash2 = Sha256::digest(hash1);
-            let mut txid_bytes: [u8; 32] = hash2.into();
-            txid_bytes.reverse(); // Bitcoin display order
-            serde_json::json!(hex::encode(txid_bytes))
-        });
-
-        // --- blockchain.estimatefee ---
-        self.register(METHOD_ESTIMATEFEE, |params| {
-            let _nblocks = params.get(0).and_then(|v| v.as_u64()).unwrap_or(6);
-            // Default fee estimate: 0.0001 BTC/kB (~10 sat/vbyte)
-            serde_json::json!(0.0001)
-        });
-
-        // --- blockchain.block.header ---
-        {
-            let headers = self.mock_headers.clone();
-            self.register(METHOD_BLOCK_HEADER, move |params| {
-                let height = match params.get(0).and_then(|v| v.as_u64()) {
-                    Some(h) => h,
-                    None => return Value::Null,
-                };
-                let guard = headers.read().unwrap();
-                match guard.get(&height) {
-                    Some(hex) => serde_json::json!(hex),
-                    None => {
-                        // Return a zeroed 80-byte header as placeholder
-                        serde_json::json!("00".repeat(80))
-                    }
-                }
-            });
-        }
-
-        // --- blockchain.block.headers ---
-        {
-            let headers = self.mock_headers.clone();
-            self.register(METHOD_BLOCK_HEADERS, move |params| {
-                let start_height = match params.get(0).and_then(|v| v.as_u64()) {
-                    Some(h) => h,
-                    None => return Value::Null,
-                };
-                let count = params
-                    .get(1)
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(1)
-                    .min(2016); // Cap at 2016 (one difficulty period)
-
-                let guard = headers.read().unwrap();
-                let mut hex_concat = String::new();
-                let mut actual_count = 0u64;
-                for h in start_height..start_height + count {
-                    let header_hex = guard.get(&h).cloned().unwrap_or_else(|| "00".repeat(80));
-                    hex_concat.push_str(&header_hex);
-                    actual_count += 1;
-                }
-
-                serde_json::json!({
-                    "count": actual_count,
-                    "hex": hex_concat,
-                    "max": 2016,
-                })
-            });
+                Value::Array(ordered)
+            }
+            _ => {
+                return Err(error(
+                    INVALID_PARAMS,
+                    "expected supported positional or named parameters",
+                ))
+            }
+        };
+        match method {
+            METHOD_SERVER_PING => Ok(Value::Null),
+            METHOD_SERVER_BANNER => Ok(json!("btc-rust experimental validated chain/transaction service; wallet indexing and full protocol negotiation are unavailable")),
+            _ => self.backend.as_ref().ok_or_else(|| error(INTERNAL_ERROR, "validated chain provider unavailable"))?.call(method, params),
         }
     }
 
-    /// Register a method handler. The closure receives `params` and must
-    /// return the `result` value.
-    fn register<F>(&mut self, method: &str, f: F)
-    where
-        F: Fn(Value) -> Value + Send + Sync + 'static,
-    {
-        self.methods.insert(method.to_string(), Box::new(f));
-    }
-
-    // -----------------------------------------------------------------
-    // Dispatch
-    // -----------------------------------------------------------------
-
-    /// Dispatch a parsed request and return a response.
     pub fn handle(&self, request: &ElectrumRequest) -> ElectrumResponse {
-        info!(method = %request.method, "electrum call");
-
-        match self.methods.get(&request.method) {
-            Some(handler) => {
-                let result = handler(request.params.clone());
-                ElectrumResponse::success(request.id.clone(), result)
-            }
-            None => ElectrumResponse::error(
+        if request.method.len() > 128
+            || request
+                .jsonrpc
+                .as_deref()
+                .is_some_and(|v| v != "2.0" && v != "1.0")
+        {
+            return ElectrumResponse::error(
                 request.id.clone(),
-                METHOD_NOT_FOUND,
-                format!("unknown method: {}", request.method),
-            ),
+                INVALID_REQUEST,
+                "invalid RPC version or method",
+            );
+        }
+        match self.call(&request.method, request.params.clone()) {
+            Ok(result) => ElectrumResponse::success(request.id.clone(), result),
+            Err(error) => ElectrumResponse::error(request.id.clone(), error.code, error.message),
         }
     }
 
-    /// Handle a raw JSON line -- parse, dispatch, serialize.
-    pub fn handle_raw(&self, raw: &str) -> String {
-        let request: ElectrumRequest = match serde_json::from_str(raw) {
-            Ok(r) => r,
-            Err(e) => {
-                let resp = ElectrumResponse::error(Value::Null, PARSE_ERROR, e.to_string());
-                return resp.to_json();
+    fn member(&self, mut value: Value, dispatch: &mut Dispatch) -> Option<Value> {
+        let id = value.get("id").cloned().unwrap_or(Value::Null);
+        let valid_id = matches!(id, Value::Null | Value::Number(_) | Value::String(_));
+        let version2 = value.get("jsonrpc") == Some(&json!("2.0"));
+        let notification = value.is_object() && value.get("id").is_none();
+        if notification {
+            value["id"] = Value::Null;
+        }
+        let request: Result<ElectrumRequest, _> = serde_json::from_value(value);
+        let response = match request {
+            Ok(request) if valid_id => {
+                let response = self.handle(&request);
+                if request.method == METHOD_HEADERS_SUBSCRIBE && response.error.is_none() {
+                    dispatch.header = response.result.clone();
+                }
+                if request.method == METHOD_SERVER_VERSION {
+                    dispatch.close = true;
+                }
+                // Valid notifications execute but never carry response bytes.
+                if notification
+                    && response
+                        .error
+                        .as_ref()
+                        .is_none_or(|e| e.code != INVALID_REQUEST)
+                {
+                    return None;
+                }
+                response
+            }
+            _ => ElectrumResponse::error(
+                if valid_id { id } else { Value::Null },
+                INVALID_REQUEST,
+                "invalid Electrum request",
+            ),
+        };
+        // Malformed envelopes have no negotiated legacy context. Emit the
+        // standard v2 invalid-request shape with a fresh safe identifier.
+        let version2 = version2
+            || response
+                .error
+                .as_ref()
+                .is_some_and(|e| e.code == INVALID_REQUEST);
+        let mut out = serde_json::to_value(response).expect("RPC response serializes");
+        if !version2 {
+            out.as_object_mut().unwrap().remove("jsonrpc");
+            if out.get("result").is_none() {
+                out["result"] = Value::Null;
+            }
+            if out.get("error").is_none() {
+                out["error"] = Value::Null;
+            }
+        }
+        Some(out)
+    }
+
+    pub(crate) fn dispatch(&self, line: &str) -> Dispatch {
+        let mut dispatch = Dispatch {
+            output: String::new(),
+            header: None,
+            close: false,
+        };
+        let value: Value = match serde_json::from_str(line) {
+            Ok(value) => value,
+            Err(_) => {
+                dispatch.output =
+                    ElectrumResponse::error(Value::Null, PARSE_ERROR, "invalid JSON").to_json();
+                return dispatch;
             }
         };
-
-        let resp = self.handle(&request);
-        resp.to_json()
+        let batch = value.is_array();
+        let members = match value {
+            Value::Array(values) if !values.is_empty() && values.len() <= MAX_BATCH => values,
+            Value::Array(_) => {
+                dispatch.output = ElectrumResponse::error(
+                    Value::Null,
+                    INVALID_REQUEST,
+                    "empty or oversized batch",
+                )
+                .to_json();
+                return dispatch;
+            }
+            value => vec![value],
+        };
+        if batch {
+            dispatch.output.push('[');
+        }
+        let mut count = 0;
+        for member in members {
+            let Some(out) = self.member(member, &mut dispatch) else {
+                continue;
+            };
+            let encoded = serde_json::to_string(&out).expect("RPC response serializes");
+            if encoded.len() + dispatch.output.len() + 2 > MAX_RESPONSE_BYTES {
+                dispatch.output = ElectrumResponse::error(
+                    Value::Null,
+                    INTERNAL_ERROR,
+                    "response exceeds limit; batch operations are not rolled back",
+                )
+                .to_json();
+                dispatch.close = true;
+                return dispatch;
+            }
+            if batch && count > 0 {
+                dispatch.output.push(',');
+            }
+            dispatch.output.push_str(&encoded);
+            count += 1;
+        }
+        if count == 0 {
+            dispatch.output.clear();
+        } else if batch {
+            dispatch.output.push(']');
+        }
+        dispatch
     }
 
-    /// Returns a list of all registered method names.
-    pub fn method_names(&self) -> Vec<&str> {
-        self.methods.keys().map(|s| s.as_str()).collect()
+    pub fn handle_raw(&self, line: &str) -> String {
+        self.dispatch(line).output
     }
 }
-
-impl Default for ElectrumHandler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Extract a string from a params array at the given index.
-fn params_get_str(params: &Value, index: usize) -> Option<String> {
-    params
-        .get(index)
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn make_request(method: &str, params: Value) -> ElectrumRequest {
-        ElectrumRequest {
-            id: Value::Number(1.into()),
-            method: method.to_string(),
-            params,
-            jsonrpc: None,
+    #[test]
+    fn missing_provider_never_fabricates_chain_or_broadcast_success() {
+        let handler = ElectrumHandler::new();
+        for (method, params) in [
+            (METHOD_HEADERS_SUBSCRIBE, json!([])),
+            (METHOD_BLOCK_HEADER, json!([0])),
+            (METHOD_BLOCK_HEADERS, json!([0, 2])),
+            (METHOD_TRANSACTION_GET, json!(["00".repeat(32)])),
+            (METHOD_TRANSACTION_BROADCAST, json!(["ff"])),
+        ] {
+            let response = handler.handle(&ElectrumRequest {
+                id: json!(4),
+                method: method.into(),
+                params,
+                jsonrpc: None,
+            });
+            assert_eq!(response.error.unwrap().code, INTERNAL_ERROR);
+            assert!(response.result.is_none());
         }
-    }
-
-    // -- server.version --
-
-    #[test]
-    fn test_server_version() {
-        let handler = ElectrumHandler::new();
-        let req = make_request(
+        for method in [
             METHOD_SERVER_VERSION,
-            serde_json::json!(["Electrum", "1.4"]),
-        );
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let result = resp.result.unwrap();
-        let arr = result.as_array().unwrap();
-        assert_eq!(arr[0], SERVER_VERSION);
-        assert_eq!(arr[1], PROTOCOL_VERSION);
-    }
-
-    // -- server.banner --
-
-    #[test]
-    fn test_server_banner() {
-        let handler = ElectrumHandler::new();
-        let req = make_request(METHOD_SERVER_BANNER, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let banner = resp.result.unwrap();
-        assert!(banner.as_str().unwrap().contains("btc-rust"));
-    }
-
-    // -- server.features --
-
-    #[test]
-    fn test_server_features() {
-        let handler = ElectrumHandler::new();
-        let req = make_request(METHOD_SERVER_FEATURES, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let features = resp.result.unwrap();
-        assert_eq!(features["genesis_hash"], GENESIS_HASH);
-        assert_eq!(features["protocol_max"], PROTOCOL_VERSION);
-        assert_eq!(features["hash_function"], "sha256");
-        assert_eq!(features["server_version"], SERVER_VERSION);
-    }
-
-    // -- server.ping --
-
-    #[test]
-    fn test_server_ping() {
-        let handler = ElectrumHandler::new();
-        let req = make_request(METHOD_SERVER_PING, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        assert_eq!(resp.result, Some(Value::Null));
-    }
-
-    // -- blockchain.headers.subscribe --
-
-    #[test]
-    fn test_headers_subscribe() {
-        let handler = ElectrumHandler::new();
-        handler.update_chain_state(100, "00000000000000aabb");
-        let req = make_request(METHOD_HEADERS_SUBSCRIBE, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let result = resp.result.unwrap();
-        assert_eq!(result["height"], 100);
-        // hex should be present (placeholder)
-        assert!(!result["hex"].as_str().unwrap().is_empty());
-    }
-
-    // -- blockchain.scripthash.get_balance --
-
-    #[test]
-    fn test_scripthash_get_balance_empty() {
-        let handler = ElectrumHandler::new();
-        let req = make_request(
-            METHOD_SCRIPTHASH_GET_BALANCE,
-            serde_json::json!(["abcd1234"]),
-        );
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let result = resp.result.unwrap();
-        assert_eq!(result["confirmed"], 0);
-        assert_eq!(result["unconfirmed"], 0);
-    }
-
-    #[test]
-    fn test_scripthash_get_balance_with_mock_data() {
-        let handler = ElectrumHandler::new();
-        let scripthash = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
-        handler.set_mock_balance(scripthash, 150_000, 25_000);
-
-        let req = make_request(
-            METHOD_SCRIPTHASH_GET_BALANCE,
-            serde_json::json!([scripthash]),
-        );
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let result = resp.result.unwrap();
-        assert_eq!(result["confirmed"], 150_000);
-        assert_eq!(result["unconfirmed"], 25_000);
-    }
-
-    // -- blockchain.scripthash.get_history --
-
-    #[test]
-    fn test_scripthash_get_history_empty() {
-        let handler = ElectrumHandler::new();
-        let req = make_request(
-            METHOD_SCRIPTHASH_GET_HISTORY,
-            serde_json::json!(["deadbeef"]),
-        );
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        assert_eq!(resp.result.unwrap(), serde_json::json!([]));
-    }
-
-    #[test]
-    fn test_scripthash_get_history_with_data() {
-        let handler = ElectrumHandler::new();
-        let sh = "aabbccdd";
-        handler.set_mock_history(
-            sh,
-            vec![("tx1111".to_string(), 100), ("tx2222".to_string(), 200)],
-        );
-
-        let req = make_request(METHOD_SCRIPTHASH_GET_HISTORY, serde_json::json!([sh]));
-        let resp = handler.handle(&req);
-        let result = resp.result.unwrap();
-        let arr = result.as_array().unwrap();
-        assert_eq!(arr.len(), 2);
-        assert_eq!(arr[0]["tx_hash"], "tx1111");
-        assert_eq!(arr[0]["height"], 100);
-        assert_eq!(arr[1]["tx_hash"], "tx2222");
-        assert_eq!(arr[1]["height"], 200);
-    }
-
-    // -- blockchain.scripthash.listunspent --
-
-    #[test]
-    fn test_scripthash_listunspent() {
-        let handler = ElectrumHandler::new();
-        let sh = "aabbccdd";
-        handler.set_mock_unspent(sh, vec![("txid1".to_string(), 0, 50_000, 500)]);
-
-        let req = make_request(METHOD_SCRIPTHASH_LISTUNSPENT, serde_json::json!([sh]));
-        let resp = handler.handle(&req);
-        let result = resp.result.unwrap();
-        let arr = result.as_array().unwrap();
-        assert_eq!(arr.len(), 1);
-        assert_eq!(arr[0]["tx_hash"], "txid1");
-        assert_eq!(arr[0]["tx_pos"], 0);
-        assert_eq!(arr[0]["value"], 50_000);
-        assert_eq!(arr[0]["height"], 500);
-    }
-
-    // -- blockchain.scripthash.subscribe --
-
-    #[test]
-    fn test_scripthash_subscribe_no_history() {
-        let handler = ElectrumHandler::new();
-        let req = make_request(METHOD_SCRIPTHASH_SUBSCRIBE, serde_json::json!(["deadbeef"]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        // No history => null status
-        assert_eq!(resp.result, Some(Value::Null));
-    }
-
-    #[test]
-    fn test_scripthash_subscribe_with_history() {
-        let handler = ElectrumHandler::new();
-        let sh = "abcdef01";
-        handler.set_mock_history(sh, vec![("txhash_abc".to_string(), 42)]);
-
-        let req = make_request(METHOD_SCRIPTHASH_SUBSCRIBE, serde_json::json!([sh]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let status = resp.result.unwrap();
-        // Status should be a hex-encoded SHA-256 hash (64 chars)
-        let status_str = status.as_str().unwrap();
-        assert_eq!(status_str.len(), 64);
-    }
-
-    // -- blockchain.transaction.get --
-
-    #[test]
-    fn test_transaction_get() {
-        let handler = ElectrumHandler::new();
-        let txid = "aaaa";
-        let raw_hex = "0100000001abcdef";
-        handler.set_mock_transaction(txid, raw_hex);
-
-        let req = make_request(METHOD_TRANSACTION_GET, serde_json::json!([txid]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        assert_eq!(resp.result.unwrap(), serde_json::json!(raw_hex));
-    }
-
-    #[test]
-    fn test_transaction_get_unknown() {
-        let handler = ElectrumHandler::new();
-        let req = make_request(METHOD_TRANSACTION_GET, serde_json::json!(["nonexistent"]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        assert_eq!(resp.result, Some(Value::Null));
-    }
-
-    // -- blockchain.transaction.broadcast --
-
-    #[test]
-    fn test_transaction_broadcast() {
-        let handler = ElectrumHandler::new();
-        let raw_hex = "0100000001aaaa";
-        let req = make_request(METHOD_TRANSACTION_BROADCAST, serde_json::json!([raw_hex]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        // Should return a hex txid (64 chars for sha256d)
-        let txid = resp.result.unwrap();
-        assert_eq!(txid.as_str().unwrap().len(), 64);
-    }
-
-    // -- blockchain.estimatefee --
-
-    #[test]
-    fn test_estimatefee() {
-        let handler = ElectrumHandler::new();
-        let req = make_request(METHOD_ESTIMATEFEE, serde_json::json!([6]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let fee = resp.result.unwrap().as_f64().unwrap();
-        assert!(fee > 0.0);
-    }
-
-    // -- blockchain.block.header --
-
-    #[test]
-    fn test_block_header() {
-        let handler = ElectrumHandler::new();
-        let header_hex = "aa".repeat(80);
-        handler.set_mock_header(0, &header_hex);
-
-        let req = make_request(METHOD_BLOCK_HEADER, serde_json::json!([0]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        assert_eq!(resp.result.unwrap(), serde_json::json!(header_hex));
-    }
-
-    #[test]
-    fn test_block_header_placeholder() {
-        let handler = ElectrumHandler::new();
-        let req = make_request(METHOD_BLOCK_HEADER, serde_json::json!([999]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        // Placeholder should be 80 zero-bytes = 160 hex chars
-        let hex = resp.result.unwrap();
-        assert_eq!(hex.as_str().unwrap().len(), 160);
-    }
-
-    // -- blockchain.block.headers --
-
-    #[test]
-    fn test_block_headers_range() {
-        let handler = ElectrumHandler::new();
-        handler.set_mock_header(0, &"aa".repeat(80));
-        handler.set_mock_header(1, &"bb".repeat(80));
-
-        let req = make_request(METHOD_BLOCK_HEADERS, serde_json::json!([0, 2]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let result = resp.result.unwrap();
-        assert_eq!(result["count"], 2);
-        assert_eq!(result["max"], 2016);
-        // Two 80-byte headers concatenated = 320 hex chars
-        assert_eq!(result["hex"].as_str().unwrap().len(), 320);
-    }
-
-    // -- unknown method --
-
-    #[test]
-    fn test_unknown_method() {
-        let handler = ElectrumHandler::new();
-        let req = make_request("nonexistent.method", serde_json::json!([]));
-        let resp = handler.handle(&req);
-        assert!(resp.result.is_none());
-        assert_eq!(resp.error.as_ref().unwrap().code, METHOD_NOT_FOUND);
-    }
-
-    // -- handle_raw --
-
-    #[test]
-    fn test_handle_raw_valid() {
-        let handler = ElectrumHandler::new();
-        let raw = r#"{"id":1,"method":"server.version","params":["test","1.4"]}"#;
-        let resp_str = handler.handle_raw(raw);
-        let resp: ElectrumResponse = serde_json::from_str(&resp_str).unwrap();
-        assert!(resp.error.is_none());
-        let result = resp.result.unwrap();
-        assert_eq!(result[0], SERVER_VERSION);
-    }
-
-    #[test]
-    fn test_handle_raw_parse_error() {
-        let handler = ElectrumHandler::new();
-        let raw = "this is not json";
-        let resp_str = handler.handle_raw(raw);
-        let resp: ElectrumResponse = serde_json::from_str(&resp_str).unwrap();
-        assert!(resp.result.is_none());
-        assert_eq!(resp.error.as_ref().unwrap().code, PARSE_ERROR);
-    }
-
-    #[test]
-    fn test_response_id_echoed() {
-        let handler = ElectrumHandler::new();
-        let req = ElectrumRequest {
-            id: Value::String("my-unique-id".to_string()),
-            method: METHOD_SERVER_PING.to_string(),
-            params: serde_json::json!([]),
-            jsonrpc: None,
-        };
-        let resp = handler.handle(&req);
-        assert_eq!(resp.id, Value::String("my-unique-id".to_string()));
-    }
-
-    // -- method dispatch enumeration --
-
-    #[test]
-    fn test_all_methods_registered() {
-        let handler = ElectrumHandler::new();
-        let names = handler.method_names();
-        let expected = vec![
-            METHOD_SERVER_VERSION,
-            METHOD_SERVER_BANNER,
             METHOD_SERVER_FEATURES,
-            METHOD_SERVER_PING,
-            METHOD_HEADERS_SUBSCRIBE,
-            METHOD_SCRIPTHASH_GET_HISTORY,
+            METHOD_ESTIMATEFEE,
             METHOD_SCRIPTHASH_GET_BALANCE,
+            METHOD_SCRIPTHASH_GET_HISTORY,
             METHOD_SCRIPTHASH_LISTUNSPENT,
             METHOD_SCRIPTHASH_SUBSCRIBE,
-            METHOD_TRANSACTION_GET,
-            METHOD_TRANSACTION_BROADCAST,
-            METHOD_ESTIMATEFEE,
-            METHOD_BLOCK_HEADER,
-            METHOD_BLOCK_HEADERS,
-        ];
-        for name in &expected {
-            assert!(names.contains(name), "missing method: {name}");
+        ] {
+            let response: Value = serde_json::from_str(
+                &handler.handle_raw(&json!({"id":4,"method":method,"params":[]}).to_string()),
+            )
+            .unwrap();
+            assert_eq!(response["error"]["code"], METHOD_NOT_FOUND);
+            assert_eq!(response["result"], Value::Null);
         }
     }
-
-    // -----------------------------------------------------------------
-    // Additional coverage tests
-    // -----------------------------------------------------------------
-
     #[test]
-    fn test_default_trait() {
-        let handler = ElectrumHandler::default();
-        let req = make_request(METHOD_SERVER_PING, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-    }
-
-    #[test]
-    fn test_server_features_updated_state() {
+    fn wire_ids_named_params_notifications_and_batch_are_bounded() {
         let handler = ElectrumHandler::new();
-        handler.update_chain_state(12345, "aabbccdd");
-        let req = make_request(METHOD_SERVER_FEATURES, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        let features = resp.result.unwrap();
-        assert_eq!(features["block_height"], 12345);
-        assert_eq!(features["best_block_hash"], "aabbccdd");
-    }
-
-    #[test]
-    fn test_headers_subscribe_with_mock_header() {
-        let handler = ElectrumHandler::new();
-        let header_hex = "ff".repeat(80);
-        handler.set_mock_header(0, &header_hex);
-        let req = make_request(METHOD_HEADERS_SUBSCRIBE, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        let result = resp.result.unwrap();
-        assert_eq!(result["height"], 0);
-        assert_eq!(result["hex"], header_hex);
-    }
-
-    #[test]
-    fn test_headers_subscribe_default_placeholder() {
-        let handler = ElectrumHandler::new();
-        let req = make_request(METHOD_HEADERS_SUBSCRIBE, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        let result = resp.result.unwrap();
-        let hex = result["hex"].as_str().unwrap();
-        // Default placeholder is 80 zero-bytes = 160 hex chars
-        assert_eq!(hex.len(), 160);
-    }
-
-    #[test]
-    fn test_scripthash_get_balance_no_params() {
-        let handler = ElectrumHandler::new();
-        let req = make_request(METHOD_SCRIPTHASH_GET_BALANCE, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let result = resp.result.unwrap();
-        assert_eq!(result["confirmed"], 0);
-        assert_eq!(result["unconfirmed"], 0);
-    }
-
-    #[test]
-    fn test_scripthash_get_balance_null_param() {
-        let handler = ElectrumHandler::new();
-        let req = make_request(METHOD_SCRIPTHASH_GET_BALANCE, serde_json::json!([null]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let result = resp.result.unwrap();
-        assert_eq!(result["confirmed"], 0);
-        assert_eq!(result["unconfirmed"], 0);
-    }
-
-    #[test]
-    fn test_scripthash_get_history_no_params() {
-        let handler = ElectrumHandler::new();
-        let req = make_request(METHOD_SCRIPTHASH_GET_HISTORY, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        assert_eq!(resp.result.unwrap(), serde_json::json!([]));
-    }
-
-    #[test]
-    fn test_scripthash_get_history_null_param() {
-        let handler = ElectrumHandler::new();
-        let req = make_request(METHOD_SCRIPTHASH_GET_HISTORY, serde_json::json!([null]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        assert_eq!(resp.result.unwrap(), serde_json::json!([]));
-    }
-
-    #[test]
-    fn test_scripthash_listunspent_no_params() {
-        let handler = ElectrumHandler::new();
-        let req = make_request(METHOD_SCRIPTHASH_LISTUNSPENT, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        assert_eq!(resp.result.unwrap(), serde_json::json!([]));
-    }
-
-    #[test]
-    fn test_scripthash_listunspent_null_param() {
-        let handler = ElectrumHandler::new();
-        let req = make_request(METHOD_SCRIPTHASH_LISTUNSPENT, serde_json::json!([null]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        assert_eq!(resp.result.unwrap(), serde_json::json!([]));
-    }
-
-    #[test]
-    fn test_scripthash_listunspent_unknown_scripthash() {
-        let handler = ElectrumHandler::new();
-        let req = make_request(
-            METHOD_SCRIPTHASH_LISTUNSPENT,
-            serde_json::json!(["unknown_scripthash_hex"]),
+        let out: Value = serde_json::from_str(&handler.handle_raw(r#"[{"method":"server.ping","jsonrpc":"2.0"},{"id":"x","method":"server.ping","params":{},"jsonrpc":"2.0"},{"id":null,"method":"server.ping"},7]"#)).unwrap();
+        assert_eq!(out.as_array().unwrap().len(), 3);
+        assert_eq!(out[0], json!({"jsonrpc":"2.0","id":"x","result":null}));
+        assert_eq!(out[1], json!({"id":null,"result":null,"error":null}));
+        assert_eq!(out[2]["error"]["code"], INVALID_REQUEST);
+        assert_eq!(out[2]["jsonrpc"], "2.0");
+        assert!(out[2].get("result").is_none());
+        assert_eq!(
+            handler.handle_raw(r#"{"method":"server.ping","jsonrpc":"2.0"}"#),
+            ""
         );
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        assert_eq!(resp.result.unwrap(), serde_json::json!([]));
-    }
-
-    #[test]
-    fn test_scripthash_listunspent_multiple_utxos() {
-        let handler = ElectrumHandler::new();
-        let sh = "scripthash_multi";
-        handler.set_mock_unspent(
-            sh,
-            vec![
-                ("txid_a".to_string(), 0, 10_000, 100),
-                ("txid_b".to_string(), 1, 20_000, 200),
-                ("txid_c".to_string(), 2, 30_000, 300),
-            ],
-        );
-        let req = make_request(METHOD_SCRIPTHASH_LISTUNSPENT, serde_json::json!([sh]));
-        let resp = handler.handle(&req);
-        let result = resp.result.unwrap();
-        let arr = result.as_array().unwrap();
-        assert_eq!(arr.len(), 3);
-        assert_eq!(arr[0]["tx_hash"], "txid_a");
-        assert_eq!(arr[1]["tx_pos"], 1);
-        assert_eq!(arr[2]["value"], 30_000);
-    }
-
-    #[test]
-    fn test_scripthash_subscribe_no_params() {
-        let handler = ElectrumHandler::new();
-        let req = make_request(METHOD_SCRIPTHASH_SUBSCRIBE, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        assert_eq!(resp.result, Some(Value::Null));
-    }
-
-    #[test]
-    fn test_scripthash_subscribe_null_param() {
-        let handler = ElectrumHandler::new();
-        let req = make_request(METHOD_SCRIPTHASH_SUBSCRIBE, serde_json::json!([null]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        assert_eq!(resp.result, Some(Value::Null));
-    }
-
-    #[test]
-    fn test_scripthash_subscribe_with_empty_history() {
-        let handler = ElectrumHandler::new();
-        let sh = "empty_hist_sh";
-        handler.set_mock_history(sh, vec![]);
-        let req = make_request(METHOD_SCRIPTHASH_SUBSCRIBE, serde_json::json!([sh]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        // Empty history => null status
-        assert_eq!(resp.result, Some(Value::Null));
-    }
-
-    #[test]
-    fn test_scripthash_subscribe_multiple_history_entries() {
-        let handler = ElectrumHandler::new();
-        let sh = "multi_hist_sh";
-        handler.set_mock_history(
-            sh,
-            vec![
-                ("tx_one".to_string(), 10),
-                ("tx_two".to_string(), 20),
-                ("tx_three".to_string(), 30),
-            ],
-        );
-        let req = make_request(METHOD_SCRIPTHASH_SUBSCRIBE, serde_json::json!([sh]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let status = resp.result.unwrap();
-        let status_str = status.as_str().unwrap();
-        assert_eq!(status_str.len(), 64); // SHA-256 hex
-    }
-
-    #[test]
-    fn test_transaction_get_no_params() {
-        let handler = ElectrumHandler::new();
-        let req = make_request(METHOD_TRANSACTION_GET, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        assert_eq!(resp.result, Some(Value::Null));
-    }
-
-    #[test]
-    fn test_transaction_get_null_param() {
-        let handler = ElectrumHandler::new();
-        let req = make_request(METHOD_TRANSACTION_GET, serde_json::json!([null]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        assert_eq!(resp.result, Some(Value::Null));
-    }
-
-    #[test]
-    fn test_transaction_broadcast_no_params() {
-        let handler = ElectrumHandler::new();
-        let req = make_request(METHOD_TRANSACTION_BROADCAST, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        assert_eq!(resp.result, Some(Value::Null));
-    }
-
-    #[test]
-    fn test_transaction_broadcast_null_param() {
-        let handler = ElectrumHandler::new();
-        let req = make_request(METHOD_TRANSACTION_BROADCAST, serde_json::json!([null]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        assert_eq!(resp.result, Some(Value::Null));
-    }
-
-    #[test]
-    fn test_transaction_broadcast_deterministic_txid() {
-        let handler = ElectrumHandler::new();
-        let raw_hex = "01020304";
-        let req1 = make_request(METHOD_TRANSACTION_BROADCAST, serde_json::json!([raw_hex]));
-        let resp1 = handler.handle(&req1);
-        let txid1 = resp1.result.unwrap();
-
-        // Same input should produce same txid
-        let req2 = make_request(METHOD_TRANSACTION_BROADCAST, serde_json::json!([raw_hex]));
-        let resp2 = handler.handle(&req2);
-        let txid2 = resp2.result.unwrap();
-        assert_eq!(txid1, txid2);
-    }
-
-    #[test]
-    fn test_transaction_broadcast_invalid_hex_returns_txid() {
-        let handler = ElectrumHandler::new();
-        // Not valid hex, but hex::decode will return empty vec -> still produces a hash
-        let req = make_request(
-            METHOD_TRANSACTION_BROADCAST,
-            serde_json::json!(["not_hex_at_all"]),
-        );
-        let resp = handler.handle(&req);
-        // hex::decode("not_hex_at_all") returns error -> unwrap_or_default gives empty bytes
-        // Should still produce a valid (deterministic) txid hash of empty
-        let txid = resp.result.unwrap();
-        assert_eq!(txid.as_str().unwrap().len(), 64);
-    }
-
-    #[test]
-    fn test_estimatefee_no_params() {
-        let handler = ElectrumHandler::new();
-        let req = make_request(METHOD_ESTIMATEFEE, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let fee = resp.result.unwrap().as_f64().unwrap();
-        assert_eq!(fee, 0.0001);
-    }
-
-    #[test]
-    fn test_estimatefee_null_param() {
-        let handler = ElectrumHandler::new();
-        let req = make_request(METHOD_ESTIMATEFEE, serde_json::json!([null]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let fee = resp.result.unwrap().as_f64().unwrap();
-        assert_eq!(fee, 0.0001);
-    }
-
-    #[test]
-    fn test_estimatefee_custom_nblocks() {
-        let handler = ElectrumHandler::new();
-        let req = make_request(METHOD_ESTIMATEFEE, serde_json::json!([25]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let fee = resp.result.unwrap().as_f64().unwrap();
-        assert_eq!(fee, 0.0001);
-    }
-
-    #[test]
-    fn test_block_header_no_params() {
-        let handler = ElectrumHandler::new();
-        let req = make_request(METHOD_BLOCK_HEADER, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        assert_eq!(resp.result, Some(Value::Null));
-    }
-
-    #[test]
-    fn test_block_header_null_param() {
-        let handler = ElectrumHandler::new();
-        let req = make_request(METHOD_BLOCK_HEADER, serde_json::json!([null]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        assert_eq!(resp.result, Some(Value::Null));
-    }
-
-    #[test]
-    fn test_block_headers_no_params() {
-        let handler = ElectrumHandler::new();
-        let req = make_request(METHOD_BLOCK_HEADERS, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        assert_eq!(resp.result, Some(Value::Null));
-    }
-
-    #[test]
-    fn test_block_headers_null_param() {
-        let handler = ElectrumHandler::new();
-        let req = make_request(METHOD_BLOCK_HEADERS, serde_json::json!([null]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        assert_eq!(resp.result, Some(Value::Null));
-    }
-
-    #[test]
-    fn test_block_headers_default_count() {
-        let handler = ElectrumHandler::new();
-        // Only start_height provided, count defaults to 1
-        let req = make_request(METHOD_BLOCK_HEADERS, serde_json::json!([0]));
-        let resp = handler.handle(&req);
-        let result = resp.result.unwrap();
-        assert_eq!(result["count"], 1);
-        // One header = 160 hex chars
-        assert_eq!(result["hex"].as_str().unwrap().len(), 160);
-    }
-
-    #[test]
-    fn test_block_headers_capped_at_2016() {
-        let handler = ElectrumHandler::new();
-        // Request 5000 headers -- should be capped at 2016
-        let req = make_request(METHOD_BLOCK_HEADERS, serde_json::json!([0, 5000]));
-        let resp = handler.handle(&req);
-        let result = resp.result.unwrap();
-        assert_eq!(result["count"], 2016);
-        assert_eq!(result["max"], 2016);
-    }
-
-    #[test]
-    fn test_block_headers_with_mock_data() {
-        let handler = ElectrumHandler::new();
-        handler.set_mock_header(5, &"aa".repeat(80));
-        handler.set_mock_header(6, &"bb".repeat(80));
-        handler.set_mock_header(7, &"cc".repeat(80));
-        let req = make_request(METHOD_BLOCK_HEADERS, serde_json::json!([5, 3]));
-        let resp = handler.handle(&req);
-        let result = resp.result.unwrap();
-        assert_eq!(result["count"], 3);
-        let hex = result["hex"].as_str().unwrap();
-        assert_eq!(hex.len(), 480); // 3 * 160
-        assert!(hex.starts_with(&"aa".repeat(80)));
-    }
-
-    #[test]
-    fn test_handle_raw_malformed_json() {
-        let handler = ElectrumHandler::new();
-        let resp_str = handler.handle_raw("[1,2,3]");
-        let resp: ElectrumResponse = serde_json::from_str(&resp_str).unwrap();
-        assert!(resp.error.is_some());
-        assert_eq!(resp.error.as_ref().unwrap().code, PARSE_ERROR);
-    }
-
-    #[test]
-    fn test_handle_raw_empty_string() {
-        let handler = ElectrumHandler::new();
-        let resp_str = handler.handle_raw("");
-        let resp: ElectrumResponse = serde_json::from_str(&resp_str).unwrap();
-        assert!(resp.error.is_some());
-    }
-
-    #[test]
-    fn test_handle_raw_unknown_method() {
-        let handler = ElectrumHandler::new();
-        let raw = r#"{"id":1,"method":"unknown.method","params":[]}"#;
-        let resp_str = handler.handle_raw(raw);
-        let resp: ElectrumResponse = serde_json::from_str(&resp_str).unwrap();
-        assert!(resp.error.is_some());
-        assert_eq!(resp.error.as_ref().unwrap().code, METHOD_NOT_FOUND);
-    }
-
-    #[test]
-    fn test_new_with_state_custom() {
-        let height = Arc::new(AtomicU64::new(500));
-        let hash = Arc::new(RwLock::new("deadbeef".to_string()));
-        let handler = ElectrumHandler::new_with_state(height, hash);
-
-        let req = make_request(METHOD_HEADERS_SUBSCRIBE, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        let result = resp.result.unwrap();
-        assert_eq!(result["height"], 500);
-    }
-
-    #[test]
-    fn test_update_chain_state() {
-        let handler = ElectrumHandler::new();
-        handler.update_chain_state(999, "newblockhash");
-        let req = make_request(METHOD_HEADERS_SUBSCRIBE, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        let result = resp.result.unwrap();
-        assert_eq!(result["height"], 999);
-    }
-
-    #[test]
-    fn test_set_mock_balance() {
-        let handler = ElectrumHandler::new();
-        let sh = "test_sh_balance";
-        handler.set_mock_balance(sh, 100_000, 50_000);
-        let req = make_request(METHOD_SCRIPTHASH_GET_BALANCE, serde_json::json!([sh]));
-        let resp = handler.handle(&req);
-        let result = resp.result.unwrap();
-        assert_eq!(result["confirmed"], 100_000);
-        assert_eq!(result["unconfirmed"], 50_000);
-    }
-
-    #[test]
-    fn test_set_mock_history() {
-        let handler = ElectrumHandler::new();
-        let sh = "test_sh_hist";
-        handler.set_mock_history(
-            sh,
-            vec![
-                ("txA".to_string(), 100),
-                ("txB".to_string(), -1), // mempool (unconfirmed)
-            ],
-        );
-        let req = make_request(METHOD_SCRIPTHASH_GET_HISTORY, serde_json::json!([sh]));
-        let resp = handler.handle(&req);
-        let arr = resp.result.unwrap();
-        let entries = arr.as_array().unwrap();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[1]["height"], -1);
-    }
-
-    #[test]
-    fn test_set_mock_transaction() {
-        let handler = ElectrumHandler::new();
-        handler.set_mock_transaction("txid_xyz", "deadbeefcafe");
-        let req = make_request(METHOD_TRANSACTION_GET, serde_json::json!(["txid_xyz"]));
-        let resp = handler.handle(&req);
-        assert_eq!(resp.result.unwrap(), serde_json::json!("deadbeefcafe"));
-    }
-
-    #[test]
-    fn test_set_mock_header() {
-        let handler = ElectrumHandler::new();
-        let header_hex = "ab".repeat(80);
-        handler.set_mock_header(42, &header_hex);
-        let req = make_request(METHOD_BLOCK_HEADER, serde_json::json!([42]));
-        let resp = handler.handle(&req);
-        assert_eq!(resp.result.unwrap(), serde_json::json!(header_hex));
-    }
-
-    #[test]
-    fn test_server_features_genesis_hash() {
-        let handler = ElectrumHandler::new();
-        let req = make_request(METHOD_SERVER_FEATURES, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        let features = resp.result.unwrap();
-        assert_eq!(features["genesis_hash"], GENESIS_HASH,);
-        assert!(features["hosts"].is_object());
-        assert!(features["pruning"].is_null());
-    }
-
-    #[test]
-    fn test_server_version_returns_correct_pair() {
-        let handler = ElectrumHandler::new();
-        let req = make_request(
-            METHOD_SERVER_VERSION,
-            serde_json::json!(["TestClient", "1.4"]),
-        );
-        let resp = handler.handle(&req);
-        let result = resp.result.unwrap();
-        assert_eq!(result[0], SERVER_VERSION);
-        assert_eq!(result[1], PROTOCOL_VERSION);
-    }
-
-    #[test]
-    fn test_server_banner_content() {
-        let handler = ElectrumHandler::new();
-        let req = make_request(METHOD_SERVER_BANNER, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        let banner = resp.result.unwrap();
-        assert_eq!(banner, serde_json::json!(DEFAULT_BANNER));
-    }
-
-    #[test]
-    fn test_params_get_str_valid() {
-        let params = serde_json::json!(["hello", "world"]);
-        assert_eq!(params_get_str(&params, 0), Some("hello".to_string()));
-        assert_eq!(params_get_str(&params, 1), Some("world".to_string()));
-    }
-
-    #[test]
-    fn test_params_get_str_out_of_bounds() {
-        let params = serde_json::json!(["hello"]);
-        assert_eq!(params_get_str(&params, 1), None);
-    }
-
-    #[test]
-    fn test_params_get_str_non_string() {
-        let params = serde_json::json!([42, null, true]);
-        assert_eq!(params_get_str(&params, 0), None);
-        assert_eq!(params_get_str(&params, 1), None);
-        assert_eq!(params_get_str(&params, 2), None);
-    }
-
-    #[test]
-    fn test_params_get_str_empty_array() {
-        let params = serde_json::json!([]);
-        assert_eq!(params_get_str(&params, 0), None);
-    }
-
-    #[test]
-    fn test_method_names_count() {
-        let handler = ElectrumHandler::new();
-        let names = handler.method_names();
-        assert_eq!(names.len(), 14); // 14 methods registered
+        for raw in [
+            r#"{"id":1,"method":"server.ping","params":{"unused":1}}"#,
+            r#"{"id":1,"method":"server.ping","params":[1]}"#,
+        ] {
+            let value: Value = serde_json::from_str(&handler.handle_raw(raw)).unwrap();
+            assert_eq!(value["error"]["code"], INVALID_PARAMS);
+        }
+        let oversized = vec![json!({"id":1,"method":"server.ping"}); MAX_BATCH + 1];
+        let value: Value =
+            serde_json::from_str(&handler.handle_raw(&json!(oversized).to_string())).unwrap();
+        assert_eq!(value["error"]["code"], INVALID_REQUEST);
+        for (raw, code) in [
+            ("{", PARSE_ERROR),
+            ("[]", INVALID_REQUEST),
+            ("null", INVALID_REQUEST),
+            (r#"{"id":true,"method":"server.ping"}"#, INVALID_REQUEST),
+            (
+                r#"{"id":1,"method":"server.ping","jsonrpc":"9"}"#,
+                INVALID_REQUEST,
+            ),
+        ] {
+            let value: Value = serde_json::from_str(&handler.handle_raw(raw)).unwrap();
+            assert_eq!(value["error"]["code"], code);
+        }
     }
 }

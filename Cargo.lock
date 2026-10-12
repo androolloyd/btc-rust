@@ -262,6 +262,7 @@ name = "btc-node"
 version = "0.1.0"
 dependencies = [
  "btc-consensus",
+ "btc-electrum",
  "btc-exex",
  "btc-forge",
  "btc-mempool",

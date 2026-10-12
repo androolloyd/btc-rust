@@ -25,6 +25,7 @@ btc-network = { workspace = true }
 btc-stages = { workspace = true }
 btc-rpc = { workspace = true }
 btc-exex = { workspace = true }
+btc-electrum = { workspace = true }
 btc-forge = { workspace = true }
 sha2 = { workspace = true }
 serde = { workspace = true }

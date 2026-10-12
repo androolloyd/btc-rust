@@ -45,6 +45,10 @@ struct Cli {
     #[arg(long, global = true)]
     port: Option<u16>,
 
+    /// Enable the experimental loopback Electrum chain/transaction subset.
+    #[arg(long, global = true)]
+    electrum_port: Option<u16>,
+
     /// Connect only to these IP:port peers; repeat to supply alternatives.
     #[arg(long = "connect", global = true)]
     connect_peers: Vec<std::net::SocketAddr>,
@@ -337,6 +341,7 @@ async fn main() -> eyre::Result<()> {
     if let Some(p2p_port) = cli.port {
         config = config.with_p2p_port(p2p_port);
     }
+    config.electrum_port = cli.electrum_port;
 
     match cli.command {
         Some(Commands::Run {

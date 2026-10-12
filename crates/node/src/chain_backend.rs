@@ -1043,6 +1043,147 @@ impl NodeChainBackend {
     }
 }
 
+impl btc_electrum::ElectrumBackend for NodeChainBackend {
+    fn subscribe_headers(&self) -> tokio::sync::broadcast::Receiver<BlockHash> {
+        self.subscribe_blocks()
+    }
+
+    fn call(&self, method: &str, params: Value) -> Result<Value, btc_electrum::ElectrumRpcError> {
+        use btc_electrum::methods::*;
+        let fail = |code, message: &str| btc_electrum::ElectrumRpcError {
+            code,
+            message: message.into(),
+        };
+        let map_error = |error: RpcError| btc_electrum::ElectrumRpcError {
+            code: if error.code == INTERNAL_ERROR {
+                INTERNAL_ERROR
+            } else {
+                1
+            },
+            message: error.message,
+        };
+        let number = |index: usize| {
+            params
+                .get(index)
+                .and_then(Value::as_u64)
+                .ok_or_else(|| fail(INVALID_PARAMS, "expected nonnegative integer"))
+        };
+        let string = |index: usize| {
+            params
+                .get(index)
+                .and_then(Value::as_str)
+                .ok_or_else(|| fail(INVALID_PARAMS, "expected string"))
+        };
+        if method == METHOD_TRANSACTION_BROADCAST {
+            return ChainBackend::call(self, "sendrawtransaction", json!([string(0)?]))
+                .map_err(map_error);
+        }
+        if method == METHOD_TRANSACTION_GET {
+            let verbose = match params.get(1) {
+                None | Some(Value::Null) => false,
+                Some(value) => value
+                    .as_bool()
+                    .ok_or_else(|| fail(INVALID_PARAMS, "verbose must be boolean"))?,
+            };
+            return ChainBackend::call(self, "getrawtransaction", json!([string(0)?, verbose]))
+                .map_err(map_error);
+        }
+        let data = self.lock().map_err(map_error)?;
+        let header = |height| {
+            data.headers
+                .get_header_by_height(height)
+                .ok_or_else(|| fail(1, "header height unavailable"))
+        };
+        match method {
+            METHOD_HEADERS_SUBSCRIBE => Ok(
+                json!({"height":data.headers.best_height(), "hex":hex::encode(encode(&data.headers.best_header().header))}),
+            ),
+            METHOD_BLOCK_HEADER | METHOD_BLOCK_HEADERS => {
+                let cp_index = if method == METHOD_BLOCK_HEADER { 1 } else { 2 };
+                let checkpoint = match params.get(cp_index) {
+                    None | Some(Value::Null) => 0,
+                    Some(_) => number(cp_index)?,
+                };
+                if checkpoint != 0 {
+                    return Err(fail(
+                        btc_electrum::protocol::METHOD_NOT_FOUND,
+                        "header checkpoint proofs are not implemented",
+                    ));
+                }
+                let start = number(0)?;
+                if method == METHOD_BLOCK_HEADER {
+                    return Ok(json!(hex::encode(encode(&header(start)?.header))));
+                }
+                let count = number(1)?.min(2016);
+                let available = if start > data.headers.best_height() {
+                    0
+                } else {
+                    data.headers.best_height() - start + 1
+                };
+                let count = count.min(available);
+                let mut bytes = Vec::with_capacity(count as usize * 80);
+                for offset in 0..count {
+                    bytes.extend(encode(&header(start + offset)?.header));
+                }
+                Ok(json!({"count":count, "hex":hex::encode(bytes), "max":2016}))
+            }
+            METHOD_TRANSACTION_GET_MERKLE => {
+                let txid = TxHash::from_hex(string(0)?)
+                    .map_err(|_| fail(INVALID_PARAMS, "invalid transaction hash"))?;
+                let height = number(1)?;
+                let hash = header(height)?.header.block_hash();
+                let block = self
+                    .db
+                    .tx()
+                    .map_err(|e| fail(INTERNAL_ERROR, &e.to_string()))?
+                    .get_block(&hash)
+                    .map_err(|e| fail(INTERNAL_ERROR, &e.to_string()))?
+                    .ok_or_else(|| fail(1, "block body unavailable"))?;
+                if block.block_hash() != hash || !block.check_merkle_root() {
+                    return Err(fail(
+                        INTERNAL_ERROR,
+                        "stored block body disagrees with header",
+                    ));
+                }
+                let position = block
+                    .transactions
+                    .iter()
+                    .position(|tx| tx.txid() == txid)
+                    .ok_or_else(|| {
+                        fail(1, "transaction is not in the active block at that height")
+                    })?;
+                let mut index = position;
+                let mut hashes: Vec<_> = block
+                    .transactions
+                    .iter()
+                    .map(|tx| tx.txid().to_bytes())
+                    .collect();
+                let mut branch = Vec::new();
+                while hashes.len() > 1 {
+                    branch.push(
+                        TxHash::from_bytes(hashes[(index ^ 1).min(hashes.len() - 1)]).to_string(),
+                    );
+                    hashes = hashes
+                        .chunks(2)
+                        .map(|pair| {
+                            let mut bytes = [0; 64];
+                            bytes[..32].copy_from_slice(&pair[0]);
+                            bytes[32..].copy_from_slice(pair.get(1).unwrap_or(&pair[0]));
+                            btc_primitives::hash::sha256d(&bytes)
+                        })
+                        .collect();
+                    index >>= 1;
+                }
+                Ok(json!({"block_height":height, "pos":position, "merkle":branch}))
+            }
+            _ => Err(fail(
+                btc_electrum::protocol::METHOD_NOT_FOUND,
+                "unsupported Electrum provider method",
+            )),
+        }
+    }
+}
+
 impl ChainBackend for NodeChainBackend {
     fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
         match method {

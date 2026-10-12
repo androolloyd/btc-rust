@@ -1,8 +1,7 @@
 //! Embedded Electrum protocol server for btc-rust.
 //!
-//! Implements the Electrum protocol (newline-delimited JSON-RPC over TCP)
-//! so that wallets such as Electrum, Sparrow, or Blue Wallet can connect
-//! directly without requiring a separate Electrs process.
+//! Experimental newline RPC chain/transaction subset with an actual provider.
+//! Complete wallet protocol negotiation awaits the script-history index.
 
 pub mod error;
 pub mod handler;
@@ -11,6 +10,6 @@ pub mod protocol;
 pub mod server;
 
 pub use error::ElectrumError;
-pub use handler::ElectrumHandler;
+pub use handler::{ElectrumBackend, ElectrumHandler};
 pub use protocol::{ElectrumError as ElectrumRpcError, ElectrumRequest, ElectrumResponse};
 pub use server::ElectrumServer;
