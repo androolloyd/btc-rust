@@ -272,7 +272,7 @@ These checks validate encoding and metadata consistency. Parsing does not
 validate signature equations, complete sighash context, full claimed key
 derivations or script satisfactions. Remaining
 BIP174/371 general-script/annex context and full key-origin verification,
-active-chain/unspentness checks, Taproot/HD/general signing and generalized finalization,
+active-chain/unspentness checks, Taproot script-path/HD/general signing and generalized finalization,
 descriptor operations and MuSig2 remain unfinished. Empty v2 creator maps can be
 represented; converting an empty-input creator to v0 is rejected by the legacy
 transaction decoder.
@@ -384,7 +384,7 @@ uncompressed WIF encodings have strict checksum/version/scalar/marker checks.
 Witness-v0 signing requires compressed keys. Private file data and keys are
 not interpolated into diagnostics; the WIF wrapper's Debug omits its scalar.
 The source and transient key data use ordinary process memory, not a protected
-keystore. HD/Taproot/general-script signing remains unsupported.
+keystore. HD/Taproot script-path/general-script signing remains unsupported.
 
 All inputs require txid-linked full parent transactions, including witness-v0,
 with dual UTXO agreement and redeem/witness commitments checked by the shared
@@ -428,3 +428,68 @@ features and release build (two preexisting ignored tests). Twenty-five fresh
 independent sanitizer seeds completed 1,365,693 executions in 31 seconds without
 failure. Live acceptance uses disposable regtest coins; full-chain/keystore and
 remaining wallet signing qualification remain separate.
+
+## Taproot key-path signing
+
+The general `wallet::sign_psbt` entry point and the same compiled `sign-psbt`
+command now include BIP341 key-path signing. `sign_ecdsa_psbt` remains an ECDSA-only
+compatibility entry point. Taproot creates SIGHASH_DEFAULT (64 bytes) or an
+explicit SIGHASH_ALL (65 bytes ending in 01); NONE/SINGLE/ANYONECANPAY remain
+unsupported by the signer. Existing supported signature records are verified
+and retained, including supplied known leaf signatures not used for the new key
+path. Script-path signature creation remains unsupported.
+
+The updater must supply the 32-byte internal key, matching exactly one supplied
+compressed WIF key. The signer normalizes odd internal parity before the actual
+BIP341 scalar tweak, then checks the resulting output key against the prevout.
+A merkle root can be supplied explicitly or derived from an already verified
+control proof. An absent root is accepted only when the actual no-tree tweak
+matches that prevout; missing tree context fails. Arbitrary unsigned leaves stay
+opaque when spending the committed key path. Existing leaf signatures still
+require supported verification context; no annex or separator is invented.
+
+New Schnorr signatures receive fresh 32-byte auxiliary data from the OS. Entropy
+failure aborts; the CLI exposes no deterministic-entropy override. Private test
+callbacks alone use fixed auxiliary bytes for independent exact vectors and
+failure injection. Re-signing a verified existing key signature preserves it,
+so idempotence does not generate another nonce.
+
+Pure native Taproot transactions can use witness UTXOs without full parents:
+DEFAULT/ALL commit every input amount and script, as BIP371 specifies. Whenever
+any input uses an ECDSA template, full txid-linked parents remain mandatory for
+**every** input, including Taproot, preserving the earlier fee-attack defense.
+Fees still require an explicit cap. Signing is bounded to 128 inputs, 1,024 WIF
+keys and 4,096 supplied/created signature records. Final-spend, chain, change and
+origin claims remain false; this is not a protected keystore or an HD signer.
+
+Receipts keep the original ECDSA scope for ECDSA-only inputs. Taproot/mixed
+receipts use `known_ecdsa_and_taproot_keypath_partial_signing`, report each input's
+signature scheme, and identify OS randomness for newly created Schnorr records.
+The same finalizer independently checks complete spending conditions afterward.
+
+`taproot-key-signer.json` retains all seven unchanged published BIP341 private
+tweaks/signature objects and twenty independently generated Core cases. The
+published object includes hash modes outside the public signer's bounded scope;
+its private tweak, preimage and fixed-aux signature primitives are tested without
+claiming those modes are enabled. Generated cases span both internal/output
+parities, tree/no-tree commitments, DEFAULT/ALL, proof-derived roots, known unused
+leaf records, two witness-only Taproot inputs and mixed ECDSA/Taproot inputs.
+The separate `check_core_signer.py --taproot-only` harness checks actual random
+signatures with unchanged Core preimages/math, then independently funds outputs
+and validates/mines their Rust-signed spends. Core receives v0 after Rust v2
+conversion, with no native-Core-v2 claim.
+
+Primary definitions: [BIP340 signing and auxiliary randomness](https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki),
+[BIP341 private tweaks and key-path signatures](https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki),
+[BIP371 Taproot UTXOs](https://github.com/bitcoin/bips/blob/master/bip-0371.mediawiki) and
+[published wallet vectors](https://github.com/bitcoin/bips/blob/master/bip-0341/wallet-test-vectors.json).
+
+Acceptance passed for all twenty generated cases through both Rust PSBT versions,
+independent Core Schnorr equations, identical final transaction bytes, explicit
+fee/context/corrupt-record rejection and all twenty funded/admitted/mined spends.
+The earlier twenty-five funded ECDSA cases also pass through the general CLI.
+The final local gate passes 3,382 tests in 43 suites, formatting, Clippy, minimal
+and isolated features and release build (two preexisting ignored tests). Twenty
+fresh sanitizer seeds completed 752,974 executions in 31 seconds without failure.
+Script-path signature creation, HD/general signing, protected key storage and
+authenticated origin/change/chain checks remain unfinished.

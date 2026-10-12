@@ -51,6 +51,8 @@ jobs:
           corpus = pathlib.Path("fuzz/corpus/fuzz_psbt_decode")
           for i, vector in enumerate(json.loads(pathlib.Path("crates/primitives/tests/data/ecdsa-signer.json").read_text())["vectors"]):
               (corpus / f"signer-{i}").write_bytes(bytes.fromhex(vector["psbt"]))
+          for i, vector in enumerate(json.loads(pathlib.Path("crates/primitives/tests/data/taproot-key-signer.json").read_text())["vectors"]):
+              (corpus / f"taproot-key-signer-{i}").write_bytes(bytes.fromhex(vector["psbt"]))
       - name: Seed published descriptors
         if: matrix.target == 'fuzz_descriptor'
         shell: python

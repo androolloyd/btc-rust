@@ -488,11 +488,17 @@ pub fn sign_psbt(
                 .wrap_err_with(|| format!("invalid WIF at line {}", index + 1))?,
         );
     }
-    let signed = crate::wallet::sign_ecdsa_psbt(&psbt, &keys, max_fee_sat)?;
+    let signed = crate::wallet::sign_psbt(&psbt, &keys, max_fee_sat)?;
+    let has_taproot = signed
+        .input_signature_schemes
+        .iter()
+        .any(|scheme| scheme.starts_with("taproot"));
     Ok(serde_json::json!({
         "psbt_hex": hex::encode(signed.psbt.try_serialize()?),
         "psbt_version": signed.psbt.version,
-        "signing_scope": "ecdsa_sighash_all_partial_signing",
+        "signing_scope": if has_taproot {"known_ecdsa_and_taproot_keypath_partial_signing"} else {"ecdsa_sighash_all_partial_signing"},
+        "input_signature_schemes": signed.input_signature_schemes,
+        "schnorr_aux_randomness": if has_taproot {Some("os_random_for_new_signatures")} else {None},
         "unsigned_txid": signed.verified.unsigned_transaction.txid().to_hex(),
         "outputs": signed.verified.unsigned_transaction.outputs.iter().map(|out| serde_json::json!({
             "value_sat": out.value.as_sat(), "script_pubkey": hex::encode(out.script_pubkey.as_bytes()),

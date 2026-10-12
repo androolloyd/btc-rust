@@ -47,12 +47,15 @@ pub struct FinalizedPsbt {
 }
 
 #[derive(Debug)]
-pub struct SignedEcdsaPsbt {
+pub struct SignedPsbt {
     pub psbt: Psbt,
     pub verified: VerifiedPartialSignatures,
     pub signatures_added: usize,
     pub signatures_added_per_input: Vec<usize>,
+    pub input_signature_schemes: Vec<&'static str>,
 }
+
+pub type SignedEcdsaPsbt = SignedPsbt;
 
 #[cfg(test)]
 mod tests {
@@ -135,6 +138,260 @@ mod tests {
                 .unwrap()
             })
             .collect()
+    }
+
+    fn taproot_signer_vectors() -> serde_json::Value {
+        serde_json::from_str(include_str!(
+            "../../primitives/tests/data/taproot-key-signer.json"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn published_bip341_private_tweaks_hashes_and_zero_aux_signatures() {
+        let fixture = taproot_signer_vectors();
+        let secp = Secp256k1::new();
+        let mut checked = 0;
+        for entry in fixture["published"].as_array().unwrap() {
+            let tx: Transaction = btc_primitives::decode(
+                &hex::decode(entry["given"]["rawUnsignedTx"].as_str().unwrap()).unwrap(),
+            )
+            .unwrap();
+            let prevouts = entry["given"]["utxosSpent"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|out| TxOut {
+                    value: Amount::from_sat(out["amountSats"].as_i64().unwrap()),
+                    script_pubkey: ScriptBuf::from_bytes(
+                        hex::decode(out["scriptPubKey"].as_str().unwrap()).unwrap(),
+                    ),
+                })
+                .collect::<Vec<_>>();
+            for row in entry["inputSpending"].as_array().unwrap() {
+                let given = &row["given"];
+                let expected = &row["intermediary"];
+                let index = given["txinIndex"].as_u64().unwrap() as usize;
+                let secret = SecretKey::from_slice(
+                    &hex::decode(given["internalPrivkey"].as_str().unwrap()).unwrap(),
+                )
+                .unwrap();
+                let internal = hex::decode(expected["internalPubkey"].as_str().unwrap())
+                    .unwrap()
+                    .try_into()
+                    .unwrap();
+                let root = given["merkleRoot"]
+                    .as_str()
+                    .map(|text| hex::decode(text).unwrap().try_into().unwrap());
+                let tweaked = taproot_signing_keypair(
+                    &secp,
+                    &secret,
+                    &internal,
+                    root.as_ref(),
+                    &prevouts[index].script_pubkey.as_bytes()[2..],
+                )
+                .unwrap();
+                assert_eq!(
+                    hex::encode(tweaked.secret_bytes()),
+                    expected["tweakedPrivkey"]
+                );
+                let hash_type = given["hashType"].as_u64().unwrap() as u32;
+                let hash =
+                    sighash_taproot(&tx, index, &prevouts, SighashType(hash_type), None, None)
+                        .unwrap();
+                assert_eq!(hex::encode(hash), expected["sigHash"]);
+                let mut sig = secp
+                    .sign_schnorr_with_aux_rand(&Message::from_digest(hash), &tweaked, &[0; 32])
+                    .as_ref()
+                    .to_vec();
+                if hash_type != 0 {
+                    sig.push(hash_type as u8);
+                }
+                assert_eq!(hex::encode(sig), row["expected"]["witness"][0]);
+                assert!(taproot_signing_keypair(
+                    &secp,
+                    &secret,
+                    &internal,
+                    root.as_ref(),
+                    &[0; 32]
+                )
+                .is_err());
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 7);
+    }
+
+    #[test]
+    fn core_keypath_signer_parities_roots_hash_modes_and_mixed_inputs() {
+        let fixture = taproot_signer_vectors();
+        assert_eq!(fixture["vectors"].as_array().unwrap().len(), 20);
+        for vector in fixture["vectors"].as_array().unwrap() {
+            let base =
+                Psbt::deserialize(&hex::decode(vector["psbt"].as_str().unwrap()).unwrap()).unwrap();
+            let keys = signer_keys(vector);
+            for version in [0, 2] {
+                let mut psbt = base.convert_version(version).unwrap();
+                if version == 2 {
+                    psbt.tx_modifiable = Some(
+                        if psbt
+                            .inputs
+                            .iter()
+                            .any(|input| !input.tap_script_sigs.is_empty())
+                        {
+                            4
+                        } else {
+                            7
+                        },
+                    );
+                }
+                psbt.unknown.push((vec![0x9e], vec![6, 7]));
+                let before = psbt.try_serialize().unwrap();
+                let signed = sign_psbt_inner(&psbt, &keys, 1000, true, |secp, msg, keypair| {
+                    Ok(secp.sign_schnorr_with_aux_rand(msg, keypair, &[0; 32]))
+                })
+                .unwrap();
+                assert_eq!(psbt.try_serialize().unwrap(), before);
+                assert_eq!(signed.psbt.unknown, psbt.unknown);
+                assert_eq!(signed.psbt.tx_modifiable, (version == 2).then_some(4));
+                assert_eq!(signed.signatures_added, psbt.inputs.len());
+                for (i, expected) in vector["signatures"].as_array().unwrap().iter().enumerate() {
+                    let actual = if expected["scheme"] == "ecdsa_all" {
+                        &signed.psbt.inputs[i].partial_sigs[0].1
+                    } else {
+                        signed.psbt.inputs[i].tap_key_sig.as_ref().unwrap()
+                    };
+                    assert_eq!(hex::encode(actual), expected["signature"]);
+                    assert_eq!(
+                        signed.input_signature_schemes[i],
+                        expected["scheme"].as_str().unwrap()
+                    );
+                    assert_eq!(
+                        signed.psbt.inputs[i].tap_script_sigs,
+                        psbt.inputs[i].tap_script_sigs
+                    );
+                }
+                // Exercise the actual OS-random public entry point too. Its
+                // signatures need not equal fixed-aux reference bytes.
+                let random = sign_psbt(&psbt, &keys, 1000).unwrap();
+                let final_tx = finalize_psbt(&random.psbt).unwrap();
+                assert_eq!(final_tx.verified.fee_sat, 1000);
+                assert_eq!(final_tx.verified.signatures_checked, psbt.inputs.len());
+                let again = sign_psbt(&random.psbt, &keys, 1000).unwrap();
+                assert_eq!(again.signatures_added, 0);
+                assert_eq!(again.psbt, random.psbt);
+                assert!(sign_psbt(&psbt, &keys, 999).is_err());
+            }
+            if base.inputs.len() == 1 {
+                let opposite = vector["opposite_wifs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|key| {
+                        btc_primitives::wif::WifPrivateKey::from_wif(
+                            key.as_str().unwrap(),
+                            btc_primitives::Network::Mainnet,
+                        )
+                        .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                let signed = sign_psbt_inner(&base, &opposite, 1000, true, |secp, msg, keypair| {
+                    Ok(secp.sign_schnorr_with_aux_rand(msg, keypair, &[0; 32]))
+                })
+                .unwrap();
+                assert_eq!(
+                    hex::encode(signed.psbt.inputs[0].tap_key_sig.as_ref().unwrap()),
+                    vector["signatures"][0]["signature"]
+                );
+                assert!(sign_psbt(&base, &[keys[0].clone(), opposite[0].clone()], 1000).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn keypath_signer_missing_context_entropy_unused_records_and_other_prevouts() {
+        let fixture = taproot_signer_vectors();
+        let vectors = fixture["vectors"].as_array().unwrap();
+        let tree = vectors
+            .iter()
+            .find(|v| v["name"] == "tree1-P1-Q1-hash0")
+            .unwrap();
+        let base =
+            Psbt::deserialize(&hex::decode(tree["psbt"].as_str().unwrap()).unwrap()).unwrap();
+        let keys = signer_keys(tree);
+        let before = base.try_serialize().unwrap();
+        assert!(sign_psbt_inner(&base, &keys, 1000, true, |_, _, _| bail!(
+            "injected entropy failure"
+        ))
+        .unwrap_err()
+        .to_string()
+        .contains("entropy failure"));
+        assert_eq!(base.try_serialize().unwrap(), before);
+        let mut missing = base.clone();
+        missing.inputs[0].tap_internal_key = None;
+        assert!(sign_psbt(&missing, &keys, 1000).is_err());
+        let mut missing = base.clone();
+        missing.inputs[0].tap_merkle_root = None;
+        assert!(sign_psbt(&missing, &keys, 1000).is_err());
+        let uncompressed = btc_primitives::wif::WifPrivateKey::from_wif(
+            tree["uncompressed_wifs"][0].as_str().unwrap(),
+            btc_primitives::Network::Mainnet,
+        )
+        .unwrap();
+        assert!(sign_psbt(&base, &[uncompressed], 1000).is_err());
+        for hash_type in [2, 3, 0x81, 0x82, 0x83] {
+            let mut wrong = base.clone();
+            wrong.inputs[0].sighash_type = Some(hash_type);
+            assert!(sign_psbt(&wrong, &keys, 1000).is_err());
+        }
+        let vector = vectors
+            .iter()
+            .find(|v| v["name"] == "existing-known-leaf")
+            .unwrap();
+        let mut bad =
+            Psbt::deserialize(&hex::decode(vector["psbt"].as_str().unwrap()).unwrap()).unwrap();
+        bad.inputs[0].tap_script_sigs[0].1[20] ^= 1;
+        assert!(sign_psbt(&bad, &signer_keys(vector), 1000).is_err());
+        let mut excessive = base.clone();
+        for index in 0u32..4097 {
+            let mut record = base.inputs[0].tap_internal_key.clone().unwrap();
+            let mut label = [0; 32];
+            label[..4].copy_from_slice(&index.to_le_bytes());
+            record.extend(label);
+            excessive.inputs[0]
+                .tap_script_sigs
+                .push((record, vec![0; 64]));
+        }
+        excessive.try_serialize().unwrap();
+        assert!(sign_psbt(&excessive, &keys, 1000)
+            .unwrap_err()
+            .to_string()
+            .contains("record limit"));
+        let mixed = vectors
+            .iter()
+            .find(|v| v["name"] == "mixed-ecdsa-taproot-inputs")
+            .unwrap();
+        let mut bad =
+            Psbt::deserialize(&hex::decode(mixed["psbt"].as_str().unwrap()).unwrap()).unwrap();
+        bad.inputs[1].non_witness_utxo = None;
+        assert!(sign_psbt(&bad, &signer_keys(mixed), 1000)
+            .unwrap_err()
+            .to_string()
+            .contains("full parent"));
+        let two = vectors
+            .iter()
+            .find(|v| v["name"] == "two-witness-only-taproot-inputs")
+            .unwrap();
+        let unsigned =
+            Psbt::deserialize(&hex::decode(two["psbt"].as_str().unwrap()).unwrap()).unwrap();
+        let signed = sign_psbt(&unsigned, &signer_keys(two), 1000).unwrap();
+        assert_eq!(signed.verified.txid_linked_prevouts, vec![false, false]);
+        let mut changed = signed.psbt;
+        changed.inputs[1].witness_utxo.as_mut().unwrap().value = Amount::from_sat(99_999);
+        assert!(verify_partial_signatures(&changed)
+            .unwrap_err()
+            .to_string()
+            .contains("input 0"));
     }
 
     #[test]
@@ -1800,6 +2057,66 @@ pub fn sign_ecdsa_psbt(
     keys: &[btc_primitives::wif::WifPrivateKey],
     max_fee_sat: u64,
 ) -> eyre::Result<SignedEcdsaPsbt> {
+    sign_psbt_inner(psbt, keys, max_fee_sat, false, |_, _, _| {
+        bail!("Taproot signing is unsupported")
+    })
+}
+
+/// Known ECDSA templates and BIP341 Taproot key paths. New Schnorr signatures
+/// use fresh OS auxiliary randomness; failure to obtain it aborts signing.
+pub fn sign_psbt(
+    psbt: &Psbt,
+    keys: &[btc_primitives::wif::WifPrivateKey],
+    max_fee_sat: u64,
+) -> eyre::Result<SignedPsbt> {
+    sign_psbt_inner(psbt, keys, max_fee_sat, true, |secp, message, keypair| {
+        use secp256k1::rand::RngCore;
+        let mut auxiliary = [0; 32];
+        secp256k1::rand::rngs::OsRng
+            .try_fill_bytes(&mut auxiliary)
+            .map_err(|_| eyre::eyre!("Schnorr auxiliary randomness unavailable"))?;
+        Ok(secp.sign_schnorr_with_aux_rand(message, keypair, &auxiliary))
+    })
+}
+
+fn taproot_signing_keypair(
+    secp: &secp256k1::Secp256k1<secp256k1::All>,
+    key: &secp256k1::SecretKey,
+    internal: &[u8; 32],
+    root: Option<&[u8; 32]>,
+    output: &[u8],
+) -> eyre::Result<secp256k1::Keypair> {
+    let keypair = secp256k1::Keypair::from_secret_key(secp, key);
+    ensure!(
+        keypair.x_only_public_key().0.serialize() == *internal,
+        "Taproot private/internal keys differ"
+    );
+    let tweak =
+        secp256k1::Scalar::from_be_bytes(btc_primitives::taproot::tap_tweak_hash(internal, root))
+            .map_err(|_| eyre::eyre!("invalid Taproot tweak"))?;
+    // libsecp's x-only keypair operation performs the required odd-P
+    // normalization before the scalar addition and rejects infinity.
+    let tweaked = keypair
+        .add_xonly_tweak(secp, &tweak)
+        .map_err(|_| eyre::eyre!("invalid tweaked Taproot key"))?;
+    ensure!(
+        tweaked.x_only_public_key().0.serialize().as_slice() == output,
+        "Taproot signing context does not match prevout key (missing or incorrect root)"
+    );
+    Ok(tweaked)
+}
+
+fn sign_psbt_inner(
+    psbt: &Psbt,
+    keys: &[btc_primitives::wif::WifPrivateKey],
+    max_fee_sat: u64,
+    taproot: bool,
+    mut schnorr: impl FnMut(
+        &secp256k1::Secp256k1<secp256k1::All>,
+        &secp256k1::Message,
+        &secp256k1::Keypair,
+    ) -> eyre::Result<secp256k1::schnorr::Signature>,
+) -> eyre::Result<SignedPsbt> {
     use secp256k1::{Message, Secp256k1};
     ensure!(
         !keys.is_empty() && keys.len() <= 1024,
@@ -1812,6 +2129,19 @@ pub fn sign_ecdsa_psbt(
     );
     psbt.try_serialize()?;
     let (prevouts, fee_sat) = verification_context(psbt, &psbt.unsigned_tx)?;
+    let require_parents = prevouts
+        .iter()
+        .any(|output| !output.script_pubkey.is_p2tr());
+    let mut records = psbt
+        .inputs
+        .iter()
+        .map(|input| {
+            input.partial_sigs.len()
+                + input.tap_script_sigs.len()
+                + usize::from(input.tap_key_sig.is_some())
+        })
+        .sum::<usize>();
+    ensure!(records <= 4096, "signer signature-record limit (4096)");
     ensure!(
         fee_sat as u64 <= max_fee_sat,
         "transaction fee exceeds explicit fee cap"
@@ -1827,19 +2157,116 @@ pub fn sign_ecdsa_psbt(
     let verifier = WalletVerifier::default();
     let mut result = psbt.clone();
     let mut signatures_added_per_input = Vec::with_capacity(psbt.inputs.len());
+    let mut input_signature_schemes = Vec::with_capacity(psbt.inputs.len());
     for (index, (input, output)) in psbt.inputs.iter().zip(&prevouts).enumerate() {
         ensure!(
             input.final_script_sig.is_none() && input.final_script_witness.is_none(),
             "input {index}: signing requires unfinalized inputs"
         );
         ensure!(
-            input.non_witness_utxo.is_some(),
+            !require_parents || input.non_witness_utxo.is_some(),
             "input {index}: signing requires txid-linked full parent even for witness-v0"
         );
-        ensure!(
-            !output.script_pubkey.is_p2tr(),
-            "input {index}: Taproot signing is unsupported"
-        );
+        if output.script_pubkey.is_p2tr() {
+            ensure!(taproot, "input {index}: Taproot signing is unsupported");
+            let internal: [u8; 32] = input
+                .tap_internal_key
+                .as_ref()
+                .ok_or_else(|| eyre::eyre!("input {index}: missing Taproot internal key"))?
+                .as_slice()
+                .try_into()?;
+            let hash_type = input.sighash_type.unwrap_or_else(|| {
+                if input
+                    .tap_key_sig
+                    .as_ref()
+                    .is_some_and(|sig| sig.len() == 65)
+                {
+                    1
+                } else {
+                    0
+                }
+            });
+            ensure!(
+                hash_type <= 1,
+                "input {index}: Taproot signer supports DEFAULT/ALL only"
+            );
+            for signature in input
+                .tap_key_sig
+                .iter()
+                .chain(input.tap_script_sigs.iter().map(|(_, sig)| sig))
+            {
+                ensure!(
+                    check_sighash(signature, true, input.sighash_type)?.0 <= 1,
+                    "input {index}: Taproot signer supports DEFAULT/ALL only"
+                );
+            }
+            let mut root = input.tap_merkle_root;
+            if root.is_none() {
+                // try_serialize already verified every proof against Q and
+                // against the other proofs. Infer only from an actual control.
+                if let Some((control, leaf)) = input.tap_leaf_scripts.first() {
+                    let mut inferred = btc_primitives::taproot::tap_leaf_hash(
+                        leaf.leaf_version,
+                        leaf.script.as_bytes(),
+                    );
+                    for sibling in control[33..].chunks_exact(32) {
+                        inferred = btc_primitives::taproot::tap_branch_hash(
+                            &inferred,
+                            &sibling.try_into()?,
+                        );
+                    }
+                    root = Some(inferred);
+                }
+            }
+            let matching = public_keys
+                .iter()
+                .filter(|(public, _)| public.len() == 33 && public[1..] == internal)
+                .collect::<Vec<_>>();
+            ensure!(
+                matching.len() == 1,
+                "input {index}: missing or ambiguous compressed Taproot internal signing key"
+            );
+            let tweaked = taproot_signing_keypair(
+                &secp,
+                matching[0].1.secret_key(),
+                &internal,
+                root.as_ref(),
+                &output.script_pubkey.as_bytes()[2..],
+            )
+            .wrap_err_with(|| format!("input {index}: invalid Taproot signing commitment"))?;
+            if input.tap_key_sig.is_some() || !input.tap_script_sigs.is_empty() {
+                verify_partial_input(psbt, index, &prevouts, &verifier).wrap_err_with(|| {
+                    format!("input {index}: existing signature verification failed")
+                })?;
+            }
+            let added = usize::from(input.tap_key_sig.is_none());
+            records += added;
+            ensure!(records <= 4096, "signer signature-record limit (4096)");
+            if added != 0 {
+                let hash = sighash_taproot(
+                    &psbt.unsigned_tx,
+                    index,
+                    &prevouts,
+                    SighashType(hash_type),
+                    None,
+                    None,
+                )?;
+                let mut signature = schnorr(&secp, &Message::from_digest(hash), &tweaked)?
+                    .as_ref()
+                    .to_vec();
+                if hash_type != 0 {
+                    signature.push(hash_type as u8);
+                }
+                result.inputs[index].tap_key_sig = Some(signature);
+            }
+            signatures_added_per_input.push(added);
+            input_signature_schemes.push(if hash_type == 0 {
+                "taproot_keypath_default"
+            } else {
+                "taproot_keypath_all"
+            });
+            continue;
+        }
         ensure!(
             input.sighash_type.unwrap_or(1) == 1
                 && input
@@ -1877,6 +2304,16 @@ pub fn sign_ecdsa_psbt(
             "input {index}: no supplied key matches the committed spending script"
         );
         matched.sort_by(|a, b| a.0.cmp(b.0));
+        records += matched
+            .iter()
+            .filter(|(public, _)| {
+                !input
+                    .partial_sigs
+                    .iter()
+                    .any(|(old, _)| old.as_slice() == public.as_slice())
+            })
+            .count();
+        ensure!(records <= 4096, "signer signature-record limit (4096)");
         let hash = if witness {
             sighash_segwit_v0(
                 &psbt.unsigned_tx,
@@ -1904,6 +2341,7 @@ pub fn sign_ecdsa_psbt(
             added += 1;
         }
         signatures_added_per_input.push(added);
+        input_signature_schemes.push("ecdsa_all");
     }
     // Every created ALL signature forbids both input and output changes. Keep
     // an existing SINGLE-pairing flag for other construction metadata.
@@ -1915,11 +2353,12 @@ pub fn sign_ecdsa_psbt(
         verified.unsigned_transaction == psbt.unsigned_tx && verified.fee_sat == fee_sat,
         "signing changed the transaction or fee"
     );
-    Ok(SignedEcdsaPsbt {
+    Ok(SignedPsbt {
         psbt: result,
         verified,
         signatures_added: signatures_added_per_input.iter().sum(),
         signatures_added_per_input,
+        input_signature_schemes,
     })
 }
 
