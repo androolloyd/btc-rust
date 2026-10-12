@@ -11,3 +11,6 @@ tarpaulin-report.json
 
 # Python interoperability tools
 __pycache__/
+# Per-start local RPC authentication material.
+.cookie
+.cookie.tmp-*

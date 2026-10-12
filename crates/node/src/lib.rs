@@ -6,6 +6,7 @@ pub mod http;
 pub mod nostr;
 pub mod output;
 pub mod p2p;
+mod rpc_cookie;
 pub mod state;
 pub mod sync;
 pub mod wallet;

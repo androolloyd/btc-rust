@@ -1083,6 +1083,13 @@ impl ChainBackend for NodeChainBackend {
                     "getblockcount" => Ok(json!(tip.height)),
                     "getbestblockhash" => Ok(json!(tip.header.block_hash().to_string())),
                     "getblockhash" => {
+                        if params
+                            .get(0)
+                            .and_then(Value::as_i64)
+                            .is_some_and(|height| height < 0)
+                        {
+                            return Err(RpcError::new(-8, "height out of range"));
+                        }
                         let entry = headers
                             .get_header_by_height(unsigned_param(&params, 0)?)
                             .ok_or_else(|| RpcError::new(-8, "height out of range"))?;
@@ -1694,7 +1701,7 @@ mod tests {
                 -5,
             ),
             ("generatetoaddress", json!([1, "3".repeat(100_000)]), -5),
-            ("getblockhash", json!([-1]), INVALID_PARAMS),
+            ("getblockhash", json!([-1]), -8),
             ("submitblock", json!(["ff"]), -22),
         ] {
             let response = rpc_handler.handle(&RpcRequest {

@@ -30,6 +30,7 @@ jobs:
       - run: cargo check --locked --package btc-network --no-default-features --features erlay
       - run: cargo check --locked --package btc-network --no-default-features --features compact-blocks
       - run: cargo check --locked --package btc-storage --no-default-features
+      - run: cargo check --locked --package btc-rpc --no-default-features
   advisories:
     runs-on: ubuntu-latest
     steps:
@@ -71,6 +72,7 @@ jobs:
               source.extractall(directory, filter="data")
       - run: python3 scripts/check_core_p2p.py --bitcoind "$RUNNER_TEMP/btc-core29/bitcoin-29.0/bin/bitcoind"
       - run: python3 scripts/check_core_checkpoint.py --bitcoind "$RUNNER_TEMP/btc-core29/bitcoin-29.0/bin/bitcoind"
+      - run: python3 scripts/check_core_http.py --bitcoind "$RUNNER_TEMP/btc-core29/bitcoin-29.0/bin/bitcoind"
       - run: python3 scripts/check_core_psbt.py --bitcoind "$RUNNER_TEMP/btc-core29/bitcoin-29.0/bin/bitcoind"
       - run: python3 scripts/check_core_signer.py --bitcoind "$RUNNER_TEMP/btc-core29/bitcoin-29.0/bin/bitcoind"
       - run: python3 scripts/check_core_signer.py --taproot-only --bitcoind "$RUNNER_TEMP/btc-core29/bitcoin-29.0/bin/bitcoind"

@@ -7,7 +7,7 @@ license.workspace = true
 
 [features]
 default = ["json-rpc"]
-json-rpc = []        # Bitcoin Core-compatible JSON-RPC server
+json-rpc = ["dep:httparse", "dep:base64", "dep:subtle"]
 esplora = []         # Esplora-compatible REST API
 
 [dependencies]
@@ -20,3 +20,9 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 eyre = { workspace = true }
 hex = { workspace = true }
+httparse = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+subtle = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

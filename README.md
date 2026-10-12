@@ -29,6 +29,10 @@ Old tip-only databases can preserve their data and rebuild from genesis using
 `run --resync-legacy-checkpoint`. See [checkpoint recovery](docs/CHECKPOINT_RECOVERY.md)
 for the supported layout and verified recovery behavior.
 
+Core’s `bitcoin-cli` can use the node’s authenticated HTTP RPC with the data
+directory’s private `.cookie`. See [HTTP RPC](docs/RPC_HTTP.md) for client setup
+and supported protocol behavior.
+
 ## Script Development Quickstart
 
 btc-rust includes `btc-forge`, a Foundry-equivalent toolkit for Bitcoin Script development. No external tools needed — write, test, debug, and analyze scripts entirely in Rust.

@@ -259,6 +259,9 @@ impl Node {
             )
             .map_err(|error| eyre::eyre!(error.message))?;
 
+        // Fail credential setup before binding or spawning any network service.
+        let rpc_cookie = crate::rpc_cookie::RpcCookie::create(&self.config.datadir)?;
+
         let p2p_listener = tokio::net::TcpListener::bind(("0.0.0.0", self.network.port)).await?;
         let peer_table = Arc::new(crate::p2p::PeerTable::new(node_state.peer_count.clone()));
 
@@ -321,7 +324,7 @@ impl Node {
         let rpc_peers = peer_table.clone();
         rpc_handler.register_fallible("getnetworkinfo", move |_| rpc_peers.network_info());
         let rpc_handler = Arc::new(rpc_handler);
-        let rpc = RpcServer::new(self.config.rpc_port);
+        let rpc = RpcServer::new(self.config.rpc_port).with_http_auth(rpc_cookie.auth());
         let rpc_handler_clone = rpc_handler.clone();
 
         // Spawn RPC server

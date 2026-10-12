@@ -7,16 +7,26 @@ use tokio::task::JoinSet;
 use tracing::{error, info};
 
 use crate::handler::RpcHandler;
+pub use crate::http::HttpAuth;
 
-/// JSON-RPC server -- provides a Bitcoin Core-compatible RPC interface over
-/// newline-delimited JSON on a raw TCP socket.
+/// Loopback JSON-RPC with authenticated HTTP and legacy newline JSON transport.
 pub struct RpcServer {
     port: u16,
+    http_auth: Option<HttpAuth>,
 }
 
 impl RpcServer {
     pub fn new(port: u16) -> Self {
-        RpcServer { port }
+        RpcServer {
+            port,
+            http_auth: None,
+        }
+    }
+
+    /// HTTP is unavailable without credentials; legacy local TCP is retained.
+    pub fn with_http_auth(mut self, auth: HttpAuth) -> Self {
+        self.http_auth = Some(auth);
+        self
     }
 
     pub fn port(&self) -> u16 {
@@ -45,6 +55,7 @@ impl RpcServer {
     ) -> eyre::Result<()> {
         info!(addr = %listener.local_addr()?, "rpc server listening");
         let mut clients = JoinSet::new();
+        let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
         loop {
             tokio::select! {
                 biased;
@@ -54,9 +65,12 @@ impl RpcServer {
                 }
                 accepted = listener.accept() => {
                     let (stream, _) = accepted?;
+                    let Ok(permit) = permits.clone().try_acquire_owned() else { drop(stream); continue; };
                     let handler = Arc::clone(&handler);
+                    let auth = self.http_auth.clone();
                     clients.spawn(async move {
-                        if let Err(error) = serve_connection(stream, handler).await {
+                        let _permit = permit;
+                        if let Err(error) = serve_connection(stream, handler, auth).await {
                             error!(%error, "RPC connection failed");
                         }
                     });
@@ -79,8 +93,17 @@ impl RpcServer {
 
 /// A 4 MW block fits as hex, including its request envelope.
 pub const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024 + 4096;
+pub const MAX_CONNECTIONS: usize = 64;
+pub(crate) const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 async fn read_request<R: AsyncBufRead + Unpin>(reader: &mut R) -> std::io::Result<Option<Vec<u8>>> {
+    read_line_limited(reader, MAX_REQUEST_BYTES).await
+}
+
+pub(crate) async fn read_line_limited<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    limit: usize,
+) -> std::io::Result<Option<Vec<u8>>> {
     let mut line = Vec::new();
     loop {
         let available = reader.fill_buf().await?;
@@ -93,7 +116,7 @@ async fn read_request<R: AsyncBufRead + Unpin>(reader: &mut R) -> std::io::Resul
         }
         let newline = available.iter().position(|b| *b == b'\n');
         let consumed = newline.map(|n| n + 1).unwrap_or(available.len());
-        if consumed > MAX_REQUEST_BYTES.saturating_sub(line.len()) {
+        if consumed > limit.saturating_sub(line.len()) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "RPC request exceeds size limit",
@@ -110,9 +133,20 @@ async fn read_request<R: AsyncBufRead + Unpin>(reader: &mut R) -> std::io::Resul
 async fn serve_connection(
     stream: tokio::net::TcpStream,
     handler: Arc<RpcHandler>,
+    auth: Option<HttpAuth>,
 ) -> eyre::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
+    // The mode is selected once. A rejected HTTP body can never be reparsed as
+    // a legacy request, nor can an HTTP keepalive switch to raw TCP dispatch.
+    let first = tokio::select! {
+        biased;
+        _ = handler.wait_for_shutdown() => return Ok(()),
+        result = tokio::time::timeout(IO_TIMEOUT, reader.fill_buf()) => result??.first().copied(),
+    };
+    if first.is_some_and(|byte| byte.is_ascii_alphabetic()) {
+        return crate::http::serve(&mut reader, &mut writer, handler, auth).await;
+    }
     loop {
         let line = tokio::select! {
             biased;

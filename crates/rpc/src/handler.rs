@@ -92,6 +92,8 @@ pub const CHAIN_METHODS: &[&str] = &[
     METHOD_SUBMITBLOCK,
     METHOD_GETMININGINFO,
     METHOD_GETNETWORKHASHPS,
+    METHOD_ESTIMATEFEE,
+    METHOD_PRIORITISETRANSACTION,
     METHOD_GENERATETOADDRESS,
     "sendrawtransaction",
     "testmempoolaccept",
@@ -132,8 +134,6 @@ pub struct RpcHandler {
     peer_count: Arc<AtomicU64>,
     mempool_size: Arc<AtomicU64>,
     mempool_bytes: Arc<AtomicU64>,
-    /// Fee deltas for prioritised transactions (txid hex -> satoshi delta).
-    priority_deltas: Arc<RwLock<HashMap<String, i64>>>,
 }
 
 impl RpcHandler {
@@ -181,7 +181,6 @@ impl RpcHandler {
             peer_count,
             mempool_size,
             mempool_bytes,
-            priority_deltas: Arc::new(RwLock::new(HashMap::new())),
         };
 
         // --- getblockcount ---
@@ -225,13 +224,6 @@ impl RpcHandler {
                 serde_json::json!(bh)
             });
         }
-
-        // --- estimatefee ---
-        handler.register(METHOD_ESTIMATEFEE, |params| {
-            let _nblocks = params.get(0).and_then(|v| v.as_u64()).unwrap_or(6);
-            // Return a default fee estimate of 0.00001 BTC/kB (1 sat/vbyte)
-            serde_json::json!(0.00001)
-        });
 
         // --- getnetworkinfo ---
         {
@@ -277,34 +269,6 @@ impl RpcHandler {
         // ---------------------------------------------------------------
         // Mining RPCs
         // ---------------------------------------------------------------
-
-        // --- prioritisetransaction ---
-        {
-            let deltas = handler.priority_deltas.clone();
-            handler.register(METHOD_PRIORITISETRANSACTION, move |params| {
-                let txid = match params.get(0).and_then(|v| v.as_str()) {
-                    Some(t) => t.to_string(),
-                    None => {
-                        return serde_json::json!(false);
-                    }
-                };
-                // params[1] is the dummy value (ignored, for Bitcoin Core compat)
-                let fee_delta = match params
-                    .get(2)
-                    .and_then(|v| v.as_i64())
-                    .or_else(|| params.get(1).and_then(|v| v.as_i64()))
-                {
-                    Some(d) => d,
-                    None => {
-                        return serde_json::json!(false);
-                    }
-                };
-                let mut guard = deltas.write().unwrap();
-                let entry = guard.entry(txid).or_insert(0);
-                *entry += fee_delta;
-                serde_json::json!(true)
-            });
-        }
 
         // Chain operations require a backend; never fabricate successful data.
         for method in CHAIN_METHODS {
@@ -451,12 +415,6 @@ impl RpcHandler {
     /// Returns true if a `stop` call has been received.
     pub fn should_shutdown(&self) -> bool {
         self.shutdown_flag.load(Ordering::SeqCst)
-    }
-
-    /// Get the priority delta for a transaction (for testing/introspection).
-    pub fn get_priority_delta(&self, txid: &str) -> Option<i64> {
-        let guard = self.priority_deltas.read().unwrap();
-        guard.get(txid).copied()
     }
 }
 
@@ -737,9 +695,8 @@ mod tests {
         let handler = RpcHandler::new();
         let req = make_request(METHOD_ESTIMATEFEE, serde_json::json!([6]));
         let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let fee = resp.result.unwrap().as_f64().unwrap();
-        assert!(fee > 0.0);
+        assert!(resp.result.is_none());
+        assert_eq!(resp.error.unwrap().code, INTERNAL_ERROR);
     }
 
     #[test]
@@ -758,30 +715,17 @@ mod tests {
     // -- Mining RPC tests --
 
     #[test]
-    fn test_prioritisetransaction_stores_delta() {
+    fn test_prioritisetransaction_cannot_claim_success_without_a_backend() {
         let handler = RpcHandler::new();
         let txid = "aaaa000000000000000000000000000000000000000000000000000000000001";
-
-        // Should return true
-        let req = make_request(
-            METHOD_PRIORITISETRANSACTION,
-            serde_json::json!([txid, 0, 5000]),
-        );
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        assert_eq!(resp.result.unwrap(), serde_json::json!(true));
-
-        // Verify stored delta
-        assert_eq!(handler.get_priority_delta(txid), Some(5000));
-
-        // Apply another delta -- should accumulate
-        let req = make_request(
-            METHOD_PRIORITISETRANSACTION,
-            serde_json::json!([txid, 0, -2000]),
-        );
-        let resp = handler.handle(&req);
-        assert_eq!(resp.result.unwrap(), serde_json::json!(true));
-        assert_eq!(handler.get_priority_delta(txid), Some(3000));
+        for delta in [5000, -2000, i64::MAX] {
+            let response = handler.handle(&make_request(
+                METHOD_PRIORITISETRANSACTION,
+                serde_json::json!([txid, 0, delta]),
+            ));
+            assert!(response.result.is_none());
+            assert_eq!(response.error.unwrap().code, INTERNAL_ERROR);
+        }
     }
 
     // -----------------------------------------------------------------
@@ -802,9 +746,8 @@ mod tests {
         let handler = RpcHandler::new();
         let req = make_request(METHOD_ESTIMATEFEE, serde_json::json!([]));
         let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let fee = resp.result.unwrap().as_f64().unwrap();
-        assert!(fee > 0.0);
+        assert!(resp.result.is_none());
+        assert_eq!(resp.error.unwrap().code, INTERNAL_ERROR);
     }
 
     #[test]
@@ -812,9 +755,8 @@ mod tests {
         let handler = RpcHandler::new();
         let req = make_request(METHOD_ESTIMATEFEE, serde_json::json!([null]));
         let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let fee = resp.result.unwrap().as_f64().unwrap();
-        assert_eq!(fee, 0.00001);
+        assert!(resp.result.is_none());
+        assert_eq!(resp.error.unwrap().code, INTERNAL_ERROR);
     }
 
     #[test]
@@ -822,8 +764,8 @@ mod tests {
         let handler = RpcHandler::new();
         let req = make_request(METHOD_PRIORITISETRANSACTION, serde_json::json!([]));
         let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        assert_eq!(resp.result.unwrap(), serde_json::json!(false));
+        assert!(resp.result.is_none());
+        assert_eq!(resp.error.unwrap().code, INTERNAL_ERROR);
     }
 
     #[test]
@@ -832,13 +774,12 @@ mod tests {
         let txid = "aaaa000000000000000000000000000000000000000000000000000000000001";
         let req = make_request(METHOD_PRIORITISETRANSACTION, serde_json::json!([txid]));
         let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        assert_eq!(resp.result.unwrap(), serde_json::json!(false));
+        assert!(resp.result.is_none());
+        assert_eq!(resp.error.unwrap().code, INTERNAL_ERROR);
     }
 
     #[test]
     fn test_prioritisetransaction_two_param_form() {
-        // When only 2 params: txid and fee_delta (no dummy in between)
         let handler = RpcHandler::new();
         let txid = "bbbb000000000000000000000000000000000000000000000000000000000002";
         let req = make_request(
@@ -846,15 +787,33 @@ mod tests {
             serde_json::json!([txid, 7000]),
         );
         let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        assert_eq!(resp.result.unwrap(), serde_json::json!(true));
-        assert_eq!(handler.get_priority_delta(txid), Some(7000));
+        assert!(resp.result.is_none());
+        assert_eq!(resp.error.unwrap().code, INTERNAL_ERROR);
     }
 
     #[test]
-    fn test_get_priority_delta_nonexistent() {
-        let handler = RpcHandler::new();
-        assert_eq!(handler.get_priority_delta("doesnotexist"), None);
+    fn fee_operations_delegate_to_the_actual_backend_without_shadow_state() {
+        struct Backend(std::sync::Mutex<Vec<(String, Value)>>);
+        impl ChainBackend for Backend {
+            fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+                self.0.lock().unwrap().push((method.into(), params));
+                Err(RpcError::new(METHOD_NOT_FOUND, "fee backend unavailable"))
+            }
+        }
+        let backend = Arc::new(Backend(std::sync::Mutex::new(Vec::new())));
+        let handler = RpcHandler::new().with_chain_backend(backend.clone());
+        for method in [METHOD_ESTIMATEFEE, METHOD_PRIORITISETRANSACTION] {
+            let response = handler.handle(&make_request(method, serde_json::json!([1])));
+            assert!(response.result.is_none());
+            assert_eq!(response.error.unwrap().code, METHOD_NOT_FOUND);
+        }
+        assert_eq!(
+            *backend.0.lock().unwrap(),
+            vec![
+                (METHOD_ESTIMATEFEE.into(), serde_json::json!([1])),
+                (METHOD_PRIORITISETRANSACTION.into(), serde_json::json!([1]))
+            ]
+        );
     }
 
     // -- Mining helper function tests --
