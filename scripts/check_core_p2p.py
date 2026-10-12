@@ -436,9 +436,15 @@ def check_reference_execution(core_port, rust_port, p2p_port, clock, address, mo
     funded_raw = core_rpc(core_port, "fundrawtransaction", [raw_funding, {"changePosition": len(tests)}])["hex"]
     signed_funding = core_rpc(core_port, "signrawtransactionwithwallet", [funded_raw])
     assert signed_funding["complete"] is True
-    funding = core_rpc(core_port, "sendrawtransaction", [signed_funding["hex"]])
-    wait_for_tx_relay(core_port, rust_port, clock, funding, from_core=True)
-    funded_tip = core_rpc(core_port, "generatetoaddress", [1, address])[-1]
+    if getattr(module, "fund_in_block", False):
+        # Future witness outputs may be nonstandard. Core builds and validates
+        # a real funding block; no mempool/consensus bypass is claimed.
+        funding = core_rpc(core_port, "decoderawtransaction", [signed_funding["hex"]])["txid"]
+        funded_tip = core_rpc(core_port, "generateblock", [address, [signed_funding["hex"]]])["hash"]
+    else:
+        funding = core_rpc(core_port, "sendrawtransaction", [signed_funding["hex"]])
+        wait_for_tx_relay(core_port, rust_port, clock, funding, from_core=True)
+        funded_tip = core_rpc(core_port, "generatetoaddress", [1, address])[-1]
     wait_until(lambda: rust_rpc(rust_port, "getbestblockhash", []) == funded_tip)
     funded = core_rpc(core_port, "decoderawtransaction", [core_rpc(core_port, "gettransaction", [funding])["hex"]])
     coins = funded["vout"][:len(tests)]
@@ -586,8 +592,10 @@ def check_reorg_and_mempool(core_port, rust_port, p2p_port, outbound, encrypted,
     if not outbound and not encrypted:
         import core29_tapscript
         import core29_scriptcode
+        import core29_witness_policy
         check_reference_execution(core_port, rust_port, p2p_port, clock, address, core29_tapscript, "Taproot script/key")
         check_reference_execution(core_port, rust_port, p2p_port, clock, address, core29_scriptcode, "legacy/BIP143 scriptCode and policy")
+        check_reference_execution(core_port, rust_port, p2p_port, clock, address, core29_witness_policy, "witness/key policy boundaries")
     # Separate branches, including a real spend in the branch to be disconnected.
     core_rpc(core_port, "setnetworkactive", [False])
     wait_until(lambda: not rust_rpc(rust_port, "getpeerinfo", []))

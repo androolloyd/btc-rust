@@ -75,6 +75,12 @@ pub enum ScriptError {
     ConstScriptCode,
     #[error("constant scriptCode: signature removal changed the legacy script")]
     SigFindAndDelete,
+    #[error("witness-v0 public key must be compressed")]
+    WitnessPubkeyType,
+    #[error("discourage tapscript OP_SUCCESS")]
+    DiscourageOpSuccess,
+    #[error("discourage upgradable tapscript public key type")]
+    DiscourageUpgradablePubkeyType,
 }
 
 const MAX_STACK_SIZE: usize = 1000;
@@ -219,6 +225,10 @@ pub struct ScriptFlags {
     pub verify_discourage_upgradable_nops: bool,
     pub verify_discourage_upgradable_witness_program: bool,
     pub verify_const_scriptcode: bool,
+    pub verify_witness_pubkey_type: bool,
+    pub verify_discourage_op_success: bool,
+    pub verify_discourage_upgradable_taproot_version: bool,
+    pub verify_discourage_upgradable_pubkey_type: bool,
 }
 
 impl ScriptFlags {
@@ -241,6 +251,10 @@ impl ScriptFlags {
             verify_discourage_upgradable_nops: true,
             verify_discourage_upgradable_witness_program: true,
             verify_const_scriptcode: true,
+            verify_witness_pubkey_type: true,
+            verify_discourage_op_success: true,
+            verify_discourage_upgradable_taproot_version: true,
+            verify_discourage_upgradable_pubkey_type: true,
         }
     }
 
@@ -283,6 +297,11 @@ impl ScriptFlags {
             verify_nullfail: true,
             verify_minimalif: true,
             verify_const_scriptcode: true,
+            verify_witness_pubkey_type: true,
+            verify_discourage_op_success: true,
+            verify_discourage_upgradable_taproot_version: true,
+            verify_discourage_upgradable_pubkey_type: true,
+            verify_discourage_upgradable_witness_program: true,
             ..ScriptFlags::default()
         }
     }
@@ -606,6 +625,9 @@ impl<'a> ScriptEngine<'a> {
     /// tapscript-specific rules applied (via `tapscript_mode`).
     pub fn execute_tapscript(&mut self, script: &Script) -> Result<(), ScriptError> {
         if Self::tapscript_has_op_success(script)? {
+            if self.flags.verify_discourage_op_success {
+                return Err(ScriptError::DiscourageOpSuccess);
+            }
             // Represent the unconditional outcome for this standalone engine
             // API without imposing a stack limit on OP_SUCCESS itself.
             self.stack = vec![encode_num(1)];
@@ -623,6 +645,9 @@ impl<'a> ScriptEngine<'a> {
         arguments: impl IntoIterator<Item = &'b [u8]>,
     ) -> Result<(), ScriptError> {
         if self.tapscript_mode && Self::tapscript_has_op_success(script)? {
+            if self.flags.verify_discourage_op_success {
+                return Err(ScriptError::DiscourageOpSuccess);
+            }
             return Ok(());
         }
         self.stack.clear();
@@ -718,37 +743,44 @@ impl<'a> ScriptEngine<'a> {
         pubkey: &[u8],
         script_code: &[u8],
     ) -> Result<bool, ScriptError> {
-        // Empty signature always fails (not an error, just false)
-        if sig.is_empty() {
-            return Ok(false);
-        }
-
         // DERSIG, STRICTENC, or LOW_S all require strict DER encoding
-        if self.flags.verify_dersig || self.flags.verify_strictenc || self.flags.verify_low_s {
+        if !sig.is_empty()
+            && (self.flags.verify_dersig || self.flags.verify_strictenc || self.flags.verify_low_s)
+        {
             let der_sig = &sig[..sig.len() - 1];
             if !is_valid_der_signature(der_sig) {
                 return Err(ScriptError::SigVerify("non-strict DER signature".into()));
             }
         }
 
-        // STRICTENC: validate sighash type and pubkey encoding
-        if self.flags.verify_strictenc {
+        // LOW_S is checked before hash type/public-key encoding, as in Core.
+        if !sig.is_empty() && self.flags.verify_low_s {
+            let der_sig = &sig[..sig.len() - 1];
+            if !is_low_der_signature(der_sig) {
+                return Err(ScriptError::SigVerify("non-low-S signature".into()));
+            }
+        }
+        if !sig.is_empty() && self.flags.verify_strictenc {
             let hash_type_byte = sig[sig.len() - 1];
             if !is_defined_hashtype(hash_type_byte) {
                 return Err(ScriptError::SigVerify("undefined hashtype".into()));
             }
-            // Also validate pubkey encoding
+        }
+        // Empty signatures exempt signature encoding, not public-key encoding.
+        if self.flags.verify_strictenc {
             if !is_valid_pubkey_encoding(pubkey) {
                 return Err(ScriptError::SigVerify("invalid pubkey type".into()));
             }
         }
 
-        // LOW_S: check for low S value
-        if self.flags.verify_low_s {
-            let der_sig = &sig[..sig.len() - 1];
-            if !is_low_der_signature(der_sig) {
-                return Err(ScriptError::SigVerify("non-low-S signature".into()));
-            }
+        if self.use_segwit_sighash
+            && self.flags.verify_witness_pubkey_type
+            && !(pubkey.len() == 33 && matches!(pubkey[0], 2 | 3))
+        {
+            return Err(ScriptError::WitnessPubkeyType);
+        }
+        if sig.is_empty() {
+            return Ok(false);
         }
 
         // Need transaction context to compute sighash
@@ -813,6 +845,9 @@ impl<'a> ScriptEngine<'a> {
         }
         if pubkey.is_empty() {
             return Err(ScriptError::SchnorrSigFailed);
+        }
+        if pubkey.len() != 32 && self.flags.verify_discourage_upgradable_pubkey_type {
+            return Err(ScriptError::DiscourageUpgradablePubkeyType);
         }
         // Empty signatures still check public-key validity, but neither
         // invoke the equation verifier nor consume the signature budget.
@@ -1576,12 +1611,6 @@ impl<'a> ScriptEngine<'a> {
                 while success && n_sigs_remaining > 0 {
                     let sig = &sigs[sig_idx];
 
-                    if sig.is_empty() {
-                        // Empty signatures always fail
-                        success = false;
-                        break;
-                    }
-
                     let result = self.verify_signature(sig, &pubkeys[key_idx], &script_code)?;
                     if result {
                         sig_idx += 1;
@@ -1939,6 +1968,82 @@ mod tests {
     fn make_engine() -> ScriptEngine<'static> {
         static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
         ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none())
+    }
+
+    #[test]
+    fn empty_signatures_still_apply_key_encoding_and_witness_type_flags() {
+        let secp = secp256k1::Secp256k1::new();
+        let public = secp256k1::PublicKey::from_secret_key(
+            &secp,
+            &secp256k1::SecretKey::from_slice(&[31; 32]).unwrap(),
+        );
+        for (key, valid) in [
+            (public.serialize().to_vec(), true),
+            (public.serialize_uncompressed().to_vec(), false),
+            (vec![], false),
+        ] {
+            let mut script = ScriptBuf::new();
+            if key.is_empty() {
+                script.push_opcode(Opcode::OP_0);
+            } else {
+                script.push_slice(&key);
+            }
+            script.push_opcode(Opcode::OP_CHECKSIG);
+            script.push_opcode(Opcode::OP_NOT);
+            let mut engine = make_engine();
+            engine.flags.verify_witness_pubkey_type = true;
+            engine.set_segwit_sighash(true);
+            engine.push_item(vec![]).unwrap();
+            let result = engine.execute(script.as_script());
+            if valid {
+                result.unwrap();
+                assert!(engine.success());
+            } else {
+                assert!(matches!(result, Err(ScriptError::WitnessPubkeyType)));
+            }
+            // That flag alone cannot restrict legacy public-key encodings.
+            let mut legacy = make_engine();
+            legacy.flags.verify_witness_pubkey_type = true;
+            legacy.push_item(vec![]).unwrap();
+            legacy.execute(script.as_script()).unwrap();
+            assert!(legacy.success());
+        }
+        let mut engine = make_engine();
+        engine.flags.verify_strictenc = true;
+        engine.push_item(vec![]).unwrap();
+        let code = ScriptBuf::from_bytes(vec![0, 0xac, 0x91]);
+        assert!(matches!(
+            engine.execute(code.as_script()),
+            Err(ScriptError::SigVerify(_))
+        ));
+    }
+
+    #[test]
+    fn discourage_success_precedes_witness_limits_and_preserves_opcode_decoding() {
+        for bytes in [vec![0xbb], vec![0xbb, 0x4c], vec![0, 0x63, 0xbb, 0x68]] {
+            let mut engine = make_engine();
+            engine.set_tapscript_mode([0; 32], vec![], None, 0);
+            engine.flags.verify_discourage_op_success = true;
+            assert!(matches!(
+                engine.execute_tapscript(Script::from_bytes(&bytes)),
+                Err(ScriptError::DiscourageOpSuccess)
+            ));
+            assert!(matches!(
+                engine.verify_witness_script(Script::from_bytes(&bytes), [vec![0; 521].as_slice()]),
+                Err(ScriptError::DiscourageOpSuccess)
+            ));
+        }
+        let mut engine = make_engine();
+        engine.set_tapscript_mode([0; 32], vec![], None, 0);
+        engine.flags.verify_discourage_op_success = true;
+        engine
+            .verify_witness_script(Script::from_bytes(&[1, 0xbb, 0x75, 0x51]), [])
+            .unwrap();
+        // A malformed push before OP_SUCCESS must still fail decoding.
+        assert!(matches!(
+            engine.execute_tapscript(Script::from_bytes(&[0x4c, 2, 0xbb])),
+            Err(ScriptError::Encode(_))
+        ));
     }
 
     #[test]

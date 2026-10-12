@@ -74,7 +74,12 @@ fuzz_target!(|data: &[u8]| {
                 },
                 lock_time: 0,
             };
-            let mut flags = ScriptFlags::consensus();
+            let witness_flags = if mask & 128 != 0 {
+                ScriptFlags::all()
+            } else {
+                ScriptFlags::consensus()
+            };
+            let mut flags = witness_flags;
             flags.verify_p2sh = mask & 1 != 0;
             flags.verify_witness = mask & 2 != 0;
             flags.verify_cleanstack = mask & 8 != 0;
@@ -97,13 +102,8 @@ fuzz_target!(|data: &[u8]| {
                 value: Amount::from_sat(50_000),
                 script_pubkey: ScriptBuf::p2wsh(&sha256(redeem)),
             };
-            let _ = verify_input_with_prevouts(
-                &witness_tx,
-                0,
-                &[previous],
-                &verifier,
-                &ScriptFlags::consensus(),
-            );
+            let _ =
+                verify_input_with_prevouts(&witness_tx, 0, &[previous], &verifier, &witness_flags);
             use btc_consensus::taproot::{
                 compute_taprootoutput_key, tap_branch_hash, tap_leaf_hash,
             };
@@ -128,7 +128,7 @@ fuzz_target!(|data: &[u8]| {
                     0,
                     &[previous],
                     &verifier,
-                    &ScriptFlags::consensus(),
+                    &witness_flags,
                 );
             }
             // Treat the prefix as an arbitrary control proof and derive its
@@ -153,7 +153,7 @@ fuzz_target!(|data: &[u8]| {
                         0,
                         &[previous],
                         &verifier,
-                        &ScriptFlags::consensus(),
+                        &witness_flags,
                     );
                 }
             }

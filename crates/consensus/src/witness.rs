@@ -38,6 +38,8 @@ pub enum WitnessError {
 
     #[error("witness program version {0} not supported")]
     UnsupportedVersion(u8),
+    #[error("discourage upgradable witness program")]
+    DiscourageUpgradableWitnessProgram,
 
     #[error("empty witness for segwit input")]
     EmptyWitness,
@@ -97,6 +99,31 @@ pub fn verify_witness_program(
     sig_verifier: &dyn SignatureVerifier,
     flags: &ScriptFlags,
 ) -> Result<(), WitnessError> {
+    verify_witness_program_inner(
+        version,
+        program,
+        witness,
+        tx,
+        input_index,
+        input_amount,
+        sig_verifier,
+        flags,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_witness_program_inner(
+    version: u8,
+    program: &[u8],
+    witness: &Witness,
+    tx: &Transaction,
+    input_index: usize,
+    input_amount: i64,
+    sig_verifier: &dyn SignatureVerifier,
+    flags: &ScriptFlags,
+    is_p2sh: bool,
+) -> Result<(), WitnessError> {
     // Per Bitcoin Core: the empty witness check is done per-version,
     // NOT globally. Unknown future versions (v1 non-32-byte, v2-v16)
     // succeed even with empty witness (soft-fork safe).
@@ -131,7 +158,7 @@ pub fn verify_witness_program(
                 }),
             }
         }
-        1 if program.len() == 32 => {
+        1 if program.len() == 32 && !is_p2sh => {
             if !flags.verify_taproot {
                 return Ok(());
             }
@@ -156,13 +183,14 @@ pub fn verify_witness_program(
             )
             .map_err(|e| WitnessError::SigVerify(e.to_string()))
         }
-        v if v >= 2 => {
-            // Future witness versions: succeed unconditionally (soft-fork safe).
-            // This is required by BIP141 so that old nodes don't reject future upgrades.
-            Ok(())
-        }
+        // Core v29's native pay-to-anchor exception is not an unknown witness
+        // upgrade. P2SH wrapping does not inherit that exception.
+        1 if program == [0x4e, 0x73] && !is_p2sh => Ok(()),
         _ => {
-            // v1 with non-32-byte program: also future-safe
+            if flags.verify_discourage_upgradable_witness_program {
+                return Err(WitnessError::DiscourageUpgradableWitnessProgram);
+            }
+            // Unknown versions remain consensus-forward-compatible.
             Ok(())
         }
     }
@@ -423,11 +451,9 @@ pub fn verify_input(
             let bytes = redeem.as_bytes();
             let version = if bytes[0] == 0 { 0 } else { bytes[0] - 0x50 };
             let witness = tx.witness.get(input_index).cloned().unwrap_or_default();
-            let mut nested_flags = *flags;
             // BIP341 applies only to native v1/32-byte outputs. P2SH-wrapped
             // v1 programs retain the future-version consensus semantics.
-            nested_flags.verify_taproot = false;
-            return verify_witness_program(
+            return verify_witness_program_inner(
                 version,
                 &bytes[2..],
                 &witness,
@@ -435,7 +461,8 @@ pub fn verify_input(
                 input_index,
                 input_amount,
                 sig_verifier,
-                &nested_flags,
+                flags,
+                true,
             );
         }
         redeem_engine.check_cleanstack()?;
@@ -571,6 +598,92 @@ fn extract_all_pushes(script: &[u8]) -> Vec<&[u8]> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn future_program_policy_distinguishes_native_anchors_and_inactive_taproot() {
+        let verifier = Secp256k1Verifier;
+        let witness = Witness::new();
+        let tx = make_simple_tx(witness.clone());
+        let flags = ScriptFlags::all();
+        assert!(verify_witness_program(
+            1,
+            &[0x4e, 0x73],
+            &witness,
+            &tx,
+            0,
+            50_000,
+            &verifier,
+            &flags
+        )
+        .is_ok());
+        assert!(matches!(
+            verify_witness_program_inner(
+                1,
+                &[0x4e, 0x73],
+                &witness,
+                &tx,
+                0,
+                50_000,
+                &verifier,
+                &flags,
+                true
+            ),
+            Err(WitnessError::DiscourageUpgradableWitnessProgram)
+        ));
+        let mut inactive = flags;
+        inactive.verify_taproot = false;
+        assert!(verify_witness_program(
+            1,
+            &[0x11; 32],
+            &witness,
+            &tx,
+            0,
+            50_000,
+            &verifier,
+            &inactive
+        )
+        .is_ok());
+        assert!(matches!(
+            verify_witness_program_inner(
+                1,
+                &[0x11; 32],
+                &witness,
+                &tx,
+                0,
+                50_000,
+                &verifier,
+                &inactive,
+                true
+            ),
+            Err(WitnessError::DiscourageUpgradableWitnessProgram)
+        ));
+        for version in [1, 2, 16] {
+            assert!(verify_witness_program(
+                version,
+                &[0x11; 20],
+                &witness,
+                &tx,
+                0,
+                50_000,
+                &verifier,
+                &ScriptFlags::consensus()
+            )
+            .is_ok());
+            assert!(matches!(
+                verify_witness_program(
+                    version,
+                    &[0x11; 20],
+                    &witness,
+                    &tx,
+                    0,
+                    50_000,
+                    &verifier,
+                    &flags
+                ),
+                Err(WitnessError::DiscourageUpgradableWitnessProgram)
+            ));
+        }
+    }
+
     use super::*;
     use crate::sig_verify::Secp256k1Verifier;
     use btc_primitives::amount::Amount;
@@ -1628,7 +1741,7 @@ mod tests {
     #[test]
     fn test_future_witness_version_succeeds() {
         let verifier = Secp256k1Verifier;
-        let flags = ScriptFlags::all();
+        let flags = ScriptFlags::consensus();
         let program = [0u8; 20];
         let witness = Witness::from_items(vec![vec![0x01]]);
 
@@ -2015,7 +2128,7 @@ mod tests {
     fn test_future_witness_versions_succeed_in_verify_witness_program() {
         // Future witness versions (2-16) must succeed unconditionally.
         let verifier = Secp256k1Verifier;
-        let flags = ScriptFlags::all();
+        let flags = ScriptFlags::consensus();
         let witness = Witness::from_items(vec![vec![0x01]]);
         let tx = make_simple_tx(witness.clone());
 
@@ -2181,7 +2294,7 @@ mod tests {
         // Ensure that a native segwit v2 output (which doesn't exist yet) passes
         // verify_input -- future witness versions must succeed for soft-fork safety.
         let verifier = Secp256k1Verifier;
-        let flags = ScriptFlags::all();
+        let flags = ScriptFlags::consensus();
 
         // Build a v2 witness program: OP_2 (0x52) OP_PUSH20 <20 bytes>
         let mut spk_bytes = vec![0x52u8]; // OP_2
@@ -2884,7 +2997,7 @@ mod tests {
         // Test that native segwit with OP_1 through OP_16 version bytes are
         // correctly extracted in the verify_input path.
         let verifier = Secp256k1Verifier;
-        let flags = ScriptFlags::all();
+        let flags = ScriptFlags::consensus();
 
         // Test multiple witness versions through verify_input
         for version_byte in 0x51u8..=0x60u8 {
@@ -2929,7 +3042,7 @@ mod tests {
     fn test_p2sh_wrapped_segwit_version_op1_through_op16() {
         // Test P2SH-wrapped segwit with OP_1..OP_16 versions in the redeem script.
         let verifier = Secp256k1Verifier;
-        let flags = ScriptFlags::all();
+        let flags = ScriptFlags::consensus();
 
         for version_byte in 0x51u8..=0x60u8 {
             // Build a redeem script that is a witness program with this version
@@ -3241,7 +3354,7 @@ mod tests {
         // Native segwit where input_index >= tx.witness.len() -- should use empty
         // witness. For future versions this is fine (soft-fork safe).
         let verifier = Secp256k1Verifier;
-        let flags = ScriptFlags::all();
+        let flags = ScriptFlags::consensus();
 
         // Build a v2 witness program
         let mut spk_bytes = vec![0x52u8]; // OP_2

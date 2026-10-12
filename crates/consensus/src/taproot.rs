@@ -41,6 +41,8 @@ pub enum TaprootError {
     SighashError(String),
     #[error("script execution failed: {0}")]
     ScriptFailed(#[from] ScriptError),
+    #[error("discourage upgradable Taproot leaf version")]
+    DiscourageUpgradableTaprootVersion,
 }
 
 pub use btc_primitives::taproot::{tagged_hash, tap_branch_hash, tap_leaf_hash, tap_tweak_hash};
@@ -263,6 +265,9 @@ pub fn verify_script_path(
     } else {
         // Unknown leaf version — treat as anyone-can-spend per BIP342
         // (success for forward compatibility)
+        if flags.verify_discourage_upgradable_taproot_version {
+            return Err(TaprootError::DiscourageUpgradableTaprootVersion);
+        }
         Ok(())
     }
 }
