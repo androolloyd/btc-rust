@@ -28,6 +28,7 @@ jobs:
       - run: cargo check --locked --package btc-consensus --no-default-features
       - run: cargo check --locked --package btc-network --no-default-features
       - run: cargo check --locked --package btc-network --no-default-features --features erlay
+      - run: cargo check --locked --package btc-network --no-default-features --features compact-blocks
       - run: cargo check --locked --package btc-storage --no-default-features
   advisories:
     runs-on: ubuntu-latest

@@ -93,3 +93,9 @@ name = "fuzz_erlay"
 path = "fuzz_targets/fuzz_erlay.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_compact_blocks"
+path = "fuzz_targets/fuzz_compact_blocks.rs"
+test = false
+doc = false

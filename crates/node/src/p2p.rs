@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use btc_network::compact_blocks::{BlockTxnResponse, CompactBlock, CompactVersion, PartialBlock};
 use btc_network::message::{GetHeadersMessage, InvItem, InvType, NetworkMessage, VersionMessage};
 use btc_network::{Connection, ProtocolVersion};
 use btc_primitives::block::Block;
@@ -147,6 +148,18 @@ async fn send(connection: &mut Connection, message: NetworkMessage) -> eyre::Res
     Ok(())
 }
 
+async fn request_full_block(connection: &mut Connection, hash: BlockHash) -> eyre::Result<()> {
+    tracing::debug!(%hash, "compact block fallback to full witness block");
+    send(
+        connection,
+        NetworkMessage::GetData(vec![InvItem {
+            inv_type: InvType::WitnessBlock,
+            hash: Hash256::from_bytes(hash.to_bytes()),
+        }]),
+    )
+    .await
+}
+
 async fn request_headers(
     connection: &mut Connection,
     backend: &NodeChainBackend,
@@ -227,6 +240,17 @@ pub(crate) async fn run_peer_session(
     let wtxid_relay = connection.peer_wtxid_relay();
     let mut pending_txs = HashSet::new();
     let mut orphan_txs = HashMap::<TxHash, btc_primitives::Transaction>::new();
+    let compact_capable = connection.peer_compact_capable();
+    if compact_capable {
+        send(
+            connection,
+            NetworkMessage::SendCmpct {
+                announce: false,
+                version: 2,
+            },
+        )
+        .await?;
+    }
     send(connection, NetworkMessage::SendHeaders).await?;
     request_headers(connection, &backend).await?;
     // RPC/inbound commits during outbound IBD preceded this subscription. Make
@@ -245,7 +269,13 @@ pub(crate) async fn run_peer_session(
     let mut send_headers = false;
     let mut pending = HashSet::new();
     let mut queued: HashMap<BlockHash, Block> = HashMap::new();
+    let mut compact_negotiated = compact_capable && connection.peer_compact_v2_offered();
+    let mut compact_requests = HashSet::<BlockHash>::new();
+    let mut partials = HashMap::<BlockHash, PartialBlock>::new();
+    let mut compact_deadlines = HashMap::<BlockHash, tokio::time::Instant>::new();
+    let mut compact_served = HashSet::<BlockHash>::new();
     loop {
+        let compact_deadline = compact_deadlines.values().min().copied();
         let message = tokio::select! {
             biased;
             _ = async {
@@ -255,6 +285,18 @@ pub(crate) async fn run_peer_session(
                     std::future::pending::<()>().await;
                 }
             } => return Ok(()),
+            _ = async {
+                if let Some(deadline) = compact_deadline { tokio::time::sleep_until(deadline).await; }
+                else { std::future::pending::<()>().await; }
+            } => {
+                let now = tokio::time::Instant::now();
+                let expired: Vec<_> = compact_deadlines.iter().filter_map(|(&hash, &deadline)| (deadline <= now).then_some(hash)).collect();
+                for hash in expired {
+                    compact_deadlines.remove(&hash); partials.remove(&hash); compact_requests.remove(&hash);
+                    request_full_block(connection, hash).await?;
+                }
+                continue;
+            }
             event = transactions.recv(), if relay_transactions => {
                 let ids = match event {
                     Ok(id) => vec![id],
@@ -289,10 +331,133 @@ pub(crate) async fn run_peer_session(
             }
             result = tokio::time::timeout(Duration::from_secs(20 * 60), connection.recv_message()) => result??,
         };
+        // Compact completion feeds exactly the existing requested-body path.
+        // Neither short-ID matches nor successful reconstruction commit state.
+        let message = match message {
+            NetworkMessage::CompactBlock(compact) => {
+                let hash = compact.header.block_hash();
+                if !compact_negotiated
+                    || !pending.contains(&hash)
+                    || !compact_requests.contains(&hash)
+                    || partials.contains_key(&hash)
+                {
+                    continue;
+                }
+                compact_deadlines.remove(&hash);
+                btc_consensus::validation::BlockValidator::validate_header(&compact.header)?;
+                let pool = backend
+                    .mempool_transactions()
+                    .map_err(|e| eyre::eyre!(e.message))?;
+                let prepared = match compact.prepare(&pool, CompactVersion::V2) {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        tracing::debug!(%hash, %error, "compact reconstruction requires full block");
+                        compact_requests.remove(&hash);
+                        request_full_block(connection, hash).await?;
+                        continue;
+                    }
+                };
+                let request = prepared.request();
+                if request.indices.is_empty() {
+                    match prepared.finish(BlockTxnResponse {
+                        block_hash: hash,
+                        transactions: Vec::new(),
+                    }) {
+                        Ok(block) => {
+                            tracing::debug!(%hash, "compact block reconstructed from mempool");
+                            NetworkMessage::Block(block)
+                        }
+                        Err(_) => {
+                            compact_requests.remove(&hash);
+                            request_full_block(connection, hash).await?;
+                            continue;
+                        }
+                    }
+                } else {
+                    let buffered: usize = queued.values().map(Block::weight).sum::<usize>()
+                        + partials
+                            .values()
+                            .map(PartialBlock::buffered_size)
+                            .sum::<usize>();
+                    if buffered + prepared.buffered_size() > MAX_BUFFERED_WEIGHT {
+                        compact_requests.remove(&hash);
+                        request_full_block(connection, hash).await?;
+                        continue;
+                    }
+                    tracing::debug!(%hash, missing = request.indices.len(), "requesting compact block transactions");
+                    partials.insert(hash, prepared);
+                    compact_deadlines.insert(hash, tokio::time::Instant::now() + IO_TIMEOUT);
+                    send(connection, NetworkMessage::GetBlockTxn(request)).await?;
+                    continue;
+                }
+            }
+            NetworkMessage::BlockTxn(response) => {
+                let hash = response.block_hash;
+                let Some(prepared) = partials.remove(&hash) else {
+                    continue;
+                };
+                compact_deadlines.remove(&hash);
+                match prepared.finish(response) {
+                    Ok(block) => {
+                        tracing::debug!(%hash, "compact block completed from blocktxn");
+                        NetworkMessage::Block(block)
+                    }
+                    Err(error) => {
+                        tracing::debug!(%hash, %error, "blocktxn completion requires full block");
+                        compact_requests.remove(&hash);
+                        request_full_block(connection, hash).await?;
+                        continue;
+                    }
+                }
+            }
+            message => message,
+        };
         let is_blocks_request = matches!(&message, NetworkMessage::GetBlocks(_));
         match message {
             NetworkMessage::Ping(nonce) => send(connection, NetworkMessage::Pong(nonce)).await?,
             NetworkMessage::SendHeaders => send_headers = true,
+            NetworkMessage::SendCmpct { version: 2, .. } if compact_capable => {
+                compact_negotiated = true;
+            }
+            NetworkMessage::GetBlockTxn(request) => {
+                if !compact_negotiated || !compact_served.contains(&request.block_hash) {
+                    continue;
+                }
+                let Some(block) = backend
+                    .block(&request.block_hash)
+                    .map_err(|e| eyre::eyre!(e.message))?
+                else {
+                    continue;
+                };
+                if request
+                    .indices
+                    .iter()
+                    .any(|&index| index as usize >= block.transactions.len())
+                {
+                    return Err(eyre::eyre!("getblocktxn index outside committed block"));
+                }
+                let height = backend
+                    .header_height(&request.block_hash)
+                    .map_err(|e| eyre::eyre!(e.message))?
+                    .ok_or_else(|| eyre::eyre!("committed block has no stored header"))?;
+                if height < backend.tip()?.0.saturating_sub(10) {
+                    send(connection, NetworkMessage::Block(block)).await?;
+                } else {
+                    let transactions = request
+                        .indices
+                        .into_iter()
+                        .map(|index| block.transactions[index as usize].clone())
+                        .collect();
+                    send(
+                        connection,
+                        NetworkMessage::BlockTxn(BlockTxnResponse {
+                            block_hash: request.block_hash,
+                            transactions,
+                        }),
+                    )
+                    .await?;
+                }
+            }
             NetworkMessage::GetHeaders(request) | NetworkMessage::GetBlocks(request) => {
                 let is_blocks = is_blocks_request;
                 let headers = backend
@@ -324,11 +489,38 @@ pub(crate) async fn run_peer_session(
                 let mut missing = Vec::new();
                 for item in items {
                     match item.inv_type {
-                        InvType::Block | InvType::WitnessBlock => {
+                        InvType::Block | InvType::WitnessBlock | InvType::CompactBlock => {
+                            if item.inv_type == InvType::CompactBlock && !compact_negotiated {
+                                missing.push(item);
+                                continue;
+                            }
                             let block = backend
                                 .block(&BlockHash::from_bytes(item.hash.to_bytes()))
                                 .map_err(|e| eyre::eyre!(e.message))?;
                             if let Some(mut block) = block {
+                                if item.inv_type == InvType::CompactBlock && compact_negotiated {
+                                    let hash = block.block_hash();
+                                    let height = backend
+                                        .header_height(&hash)
+                                        .map_err(|e| eyre::eyre!(e.message))?
+                                        .ok_or_else(|| {
+                                            eyre::eyre!("committed block has no stored header")
+                                        })?;
+                                    if height >= backend.tip()?.0.saturating_sub(5) {
+                                        let compact = CompactBlock::for_relay(&block)?;
+                                        if compact_served.len() >= MAX_PENDING_BLOCKS {
+                                            if let Some(old) = compact_served.iter().next().copied()
+                                            {
+                                                compact_served.remove(&old);
+                                            }
+                                        }
+                                        compact_served.insert(hash);
+                                        tracing::debug!(%hash, "served committed compact block");
+                                        send(connection, NetworkMessage::CompactBlock(compact))
+                                            .await?;
+                                        continue;
+                                    }
+                                }
                                 if item.inv_type == InvType::Block {
                                     for tx in &mut block.transactions {
                                         tx.witness.clear();
@@ -414,6 +606,9 @@ pub(crate) async fn run_peer_session(
                 }
             }
             NetworkMessage::Headers(headers) => {
+                // Keep IBD multi-block batches on full bodies; low-bandwidth
+                // compact requests cover individual announced near-tip blocks.
+                let use_compact = compact_negotiated && headers.len() == 1;
                 if let Some(first) = headers.first() {
                     if backend
                         .header(&first.block_hash())
@@ -447,8 +642,16 @@ pub(crate) async fn run_peer_session(
                     }
                     btc_consensus::validation::BlockValidator::validate_header(&header)?;
                     pending.insert(hash);
+                    if use_compact {
+                        compact_requests.insert(hash);
+                        compact_deadlines.insert(hash, tokio::time::Instant::now() + IO_TIMEOUT);
+                    }
                     requests.push(InvItem {
-                        inv_type: InvType::WitnessBlock,
+                        inv_type: if use_compact {
+                            InvType::CompactBlock
+                        } else {
+                            InvType::WitnessBlock
+                        },
                         hash: Hash256::from_bytes(hash.to_bytes()),
                     });
                 }
@@ -462,6 +665,9 @@ pub(crate) async fn run_peer_session(
             }
             NetworkMessage::Block(block) => {
                 let hash = block.block_hash();
+                compact_requests.remove(&hash);
+                partials.remove(&hash);
+                compact_deadlines.remove(&hash);
                 if !pending.remove(&hash) {
                     continue;
                 }
@@ -472,7 +678,11 @@ pub(crate) async fn run_peer_session(
                     .map_err(|e| eyre::eyre!(e.message))?
                     .is_none()
                 {
-                    let weight: usize = queued.values().map(Block::weight).sum();
+                    let weight: usize = queued.values().map(Block::weight).sum::<usize>()
+                        + partials
+                            .values()
+                            .map(PartialBlock::buffered_size)
+                            .sum::<usize>();
                     if weight + block.weight() > MAX_BUFFERED_WEIGHT {
                         return Err(eyre::eyre!("pending block buffer limit exceeded"));
                     }
@@ -526,6 +736,13 @@ pub(crate) async fn run_peer_session(
             NetworkMessage::NotFound(items) => {
                 for item in items {
                     pending_txs.remove(&TxHash::from_bytes(item.hash.to_bytes()));
+                    let hash = BlockHash::from_bytes(item.hash.to_bytes());
+                    if item.inv_type == InvType::CompactBlock && compact_requests.remove(&hash) {
+                        partials.remove(&hash);
+                        compact_deadlines.remove(&hash);
+                        request_full_block(connection, hash).await?;
+                        continue;
+                    }
                     if matches!(item.inv_type, InvType::Block | InvType::WitnessBlock)
                         && pending.contains(&BlockHash::from_bytes(item.hash.to_bytes()))
                     {
@@ -647,6 +864,17 @@ mod tests {
                 .unwrap();
             assert!(matches!(
                 receive(&mut connection).await,
+                NetworkMessage::SendCmpct {
+                    announce: false,
+                    version: 2
+                }
+            ));
+            assert!(
+                connection.peer_compact_v2_offered(),
+                "offer must survive later IBD reads"
+            );
+            assert!(matches!(
+                receive(&mut connection).await,
                 NetworkMessage::SendHeaders
             ));
             assert!(matches!(
@@ -684,6 +912,18 @@ mod tests {
             let hash = BlockHash::from_hex(hashes[0].as_str().unwrap()).unwrap();
             connection
                 .send_message(NetworkMessage::GetData(vec![InvItem {
+                    inv_type: InvType::CompactBlock,
+                    hash: Hash256::from_bytes(hash.to_bytes()),
+                }]))
+                .await
+                .unwrap();
+            let NetworkMessage::NotFound(items) = receive(&mut connection).await else {
+                panic!("unnegotiated compact request must not invent protocol support");
+            };
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].inv_type, InvType::CompactBlock);
+            connection
+                .send_message(NetworkMessage::GetData(vec![InvItem {
                     inv_type: InvType::WitnessBlock,
                     hash: Hash256::from_bytes(hash.to_bytes()),
                 }]))
@@ -694,6 +934,34 @@ mod tests {
             };
             assert_eq!(block.block_hash(), hash);
             assert!(block.header.check_proof_of_work());
+            connection
+                .send_message(NetworkMessage::SendCmpct {
+                    announce: false,
+                    version: 2,
+                })
+                .await
+                .unwrap();
+            connection
+                .send_message(NetworkMessage::GetData(vec![InvItem {
+                    inv_type: InvType::CompactBlock,
+                    hash: Hash256::from_bytes(hash.to_bytes()),
+                }]))
+                .await
+                .unwrap();
+            let NetworkMessage::CompactBlock(compact) = receive(&mut connection).await else {
+                panic!("expected negotiated compact block");
+            };
+            let partial = compact.prepare(&[], CompactVersion::V2).unwrap();
+            assert!(partial.request().indices.is_empty());
+            assert_eq!(
+                partial
+                    .finish(BlockTxnResponse {
+                        block_hash: hash,
+                        transactions: Vec::new()
+                    })
+                    .unwrap(),
+                block
+            );
             connection
                 .send_message(NetworkMessage::Ping(42))
                 .await
@@ -743,6 +1011,13 @@ mod tests {
             .perform_handshake(Network::Regtest, 0)
             .await
             .unwrap();
+        assert!(matches!(
+            receive(&mut connection).await,
+            NetworkMessage::SendCmpct {
+                announce: false,
+                version: 2
+            }
+        ));
         receive(&mut connection).await;
         receive(&mut connection).await;
         let mut miner = TestNode::new();

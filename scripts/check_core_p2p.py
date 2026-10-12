@@ -631,6 +631,8 @@ def check_reorg_and_mempool(core_port, rust_port, p2p_port, outbound, encrypted,
     raw_immature = core_rpc(core_port, "signrawtransactionwithwallet", [raw_immature])["hex"]
     assert core_rpc(core_port, "testmempoolaccept", [[raw_immature]])[0]["allowed"] is False
     assert rust_rpc(rust_port, "testmempoolaccept", [[raw_immature]])[0]["allowed"] is False
+    import core29_compact_runtime
+    compact_missing, compact_shared = core29_compact_runtime.check(core_port, rust_port, p2p_port, outbound, encrypted, clock, address)
     check_p2sh_runtime(core_port, rust_port, p2p_port, outbound, encrypted, clock, address, scripts["p2sh"])
     for kind in ["p2wpkh", "p2wsh", "taproot"]:
         check_witness_runtime(core_port, rust_port, p2p_port, outbound, encrypted, clock, address, scripts[kind], kind)
@@ -666,7 +668,7 @@ def check_reorg_and_mempool(core_port, rust_port, p2p_port, outbound, encrypted,
     assert fork_txid in core_rpc(core_port, "getblock", [final])["tx"]
     assert core_rpc(core_port, "getblock", [final, 0]) == rust_rpc(rust_port, "getblock", [final, 0])
     assert rust_rpc(rust_port, "getrawmempool", []) == []
-    return final, old_hashes[-1]
+    return final, old_hashes[-1], compact_missing, compact_shared
 
 
 def scenario(args, encrypted, outbound):
@@ -774,7 +776,7 @@ def scenario(args, encrypted, outbound):
                     rust_hashes = rust_rpc(rust_port, "generatetoaddress", [1, address])
                     wait_until(lambda: core_rpc(core_port, "getbestblockhash", []) == rust_hashes[-1])
                     assert core_rpc(core_port, "getblock", [rust_hashes[-1], 0]) == rust_rpc(rust_port, "getblock", [rust_hashes[-1], 0])
-                final, stale = check_reorg_and_mempool(core_port, rust_port, p2p_port, outbound, encrypted, clock)
+                final, stale, compact_missing, compact_shared = check_reorg_and_mempool(core_port, rust_port, p2p_port, outbound, encrypted, clock)
                 rust_rpc(rust_port, "stop", [])
                 assert rust.wait(10) == 0
                 wait_until(lambda: not core_rpc(core_port, "getpeerinfo", []))
@@ -783,6 +785,10 @@ def scenario(args, encrypted, outbound):
                 wait_until(lambda: rust_rpc(rust_port, "getbestblockhash", []) == final)
                 assert rust_rpc(rust_port, "getblockheader", [stale])["confirmations"] == -1
                 assert rust_rpc(rust_port, "getrawmempool", []) == []
+                compact_log = (root / "rust.log").read_text()
+                for hash, message in [(compact_missing, "compact block completed from blocktxn"), (compact_shared, "compact block reconstructed from mempool")]:
+                    assert any(hash in line and message in line for line in compact_log.splitlines()), (hash, message)
+                assert "served committed compact block" in compact_log, "expected actual outgoing compact serving"
                 rust_rpc(rust_port, "stop", [])
                 core_rpc(core_port, "stop", [])
                 assert rust.wait(10) == core.wait(10) == 0

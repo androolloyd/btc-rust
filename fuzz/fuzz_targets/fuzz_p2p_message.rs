@@ -28,6 +28,10 @@ const COMMANDS: &[&str] = &[
     "notfound",
     "reject",
     "mempool",
+    "sendcmpct",
+    "cmpctblock",
+    "getblocktxn",
+    "blocktxn",
 ];
 
 fuzz_target!(|data: &[u8]| {

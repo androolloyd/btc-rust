@@ -27,6 +27,8 @@ pub struct Connection {
     framed: Transport,
     peer_wtxid_relay: bool,
     peer_relay: bool,
+    peer_compact_capable: bool,
+    peer_compact_v2_offered: bool,
 }
 
 enum Transport {
@@ -58,6 +60,8 @@ impl Connection {
                         framed: Transport::V2(Framed::new(stream, codec)),
                         peer_wtxid_relay: false,
                         peer_relay: true,
+                        peer_compact_capable: false,
+                        peer_compact_v2_offered: false,
                     });
                 }
                 #[cfg(not(feature = "v2"))]
@@ -72,12 +76,22 @@ impl Connection {
             framed: Transport::V1(framed),
             peer_wtxid_relay: false,
             peer_relay: true,
+            peer_compact_capable: false,
+            peer_compact_v2_offered: false,
         })
     }
 
     pub fn peer_wtxid_relay(&self) -> bool {
         self.peer_wtxid_relay
     }
+    pub fn peer_compact_v2_offered(&self) -> bool {
+        self.peer_compact_v2_offered
+    }
+
+    pub fn peer_compact_capable(&self) -> bool {
+        self.peer_compact_capable
+    }
+
     pub fn peer_relay(&self) -> bool {
         self.peer_relay
     }
@@ -126,6 +140,9 @@ impl Connection {
             if hs.is_ready() {
                 self.peer_wtxid_relay = hs.peer_wtxid_relay();
                 self.peer_relay = hs.peer_version().is_some_and(|version| version.relay);
+                self.peer_compact_capable = hs.peer_version().is_some_and(|version| {
+                    version.version >= 70015 && version.services & (1 << 3) != 0
+                });
                 return Ok(hs);
             }
             if hs.state() == HandshakeState::Failed {
@@ -148,6 +165,8 @@ impl Connection {
             framed: Transport::V1(framed),
             peer_wtxid_relay: false,
             peer_relay: true,
+            peer_compact_capable: false,
+            peer_compact_v2_offered: false,
         })
     }
 
@@ -185,6 +204,8 @@ impl Connection {
             framed: Transport::V2(Framed::new(stream, codec)),
             peer_wtxid_relay: false,
             peer_relay: true,
+            peer_compact_capable: false,
+            peer_compact_v2_offered: false,
         })
     }
     pub fn is_encrypted(&self) -> bool {
@@ -203,6 +224,8 @@ impl Connection {
             framed: Transport::V1(framed),
             peer_wtxid_relay: false,
             peer_relay: true,
+            peer_compact_capable: false,
+            peer_compact_v2_offered: false,
         }
     }
 
@@ -225,7 +248,14 @@ impl Connection {
             Transport::V2(framed) => framed.next().await,
         };
         match next {
-            Some(Ok(msg)) => Ok(msg),
+            Some(Ok(msg)) => {
+                if self.peer_compact_capable
+                    && matches!(msg, NetworkMessage::SendCmpct { version: 2, .. })
+                {
+                    self.peer_compact_v2_offered = true;
+                }
+                Ok(msg)
+            }
             Some(Err(e)) => {
                 tracing::debug!(error = %e, "message decode/io error");
                 Err(ConnectionError::Io(e))
@@ -272,6 +302,9 @@ impl Connection {
             if hs.is_ready() {
                 self.peer_wtxid_relay = hs.peer_wtxid_relay();
                 self.peer_relay = hs.peer_version().is_some_and(|version| version.relay);
+                self.peer_compact_capable = hs.peer_version().is_some_and(|version| {
+                    version.version >= 70015 && version.services & (1 << 3) != 0
+                });
                 return Ok(hs);
             }
             if hs.state() == HandshakeState::Failed {

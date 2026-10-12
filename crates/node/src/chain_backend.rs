@@ -214,6 +214,14 @@ impl NodeChainBackend {
             .map(|entry| entry.header))
     }
 
+    pub fn header_height(&self, hash: &BlockHash) -> Result<Option<u64>, RpcError> {
+        Ok(self
+            .lock()?
+            .headers
+            .get_header(hash)
+            .map(|entry| entry.height))
+    }
+
     pub fn headers_after(
         &self,
         locator: &[BlockHash],

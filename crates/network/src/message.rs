@@ -99,6 +99,12 @@ pub enum NetworkMessage {
         announce: bool,
         version: u64,
     },
+    #[cfg(feature = "compact-blocks")]
+    CompactBlock(crate::compact_blocks::CompactBlock),
+    #[cfg(feature = "compact-blocks")]
+    GetBlockTxn(crate::compact_blocks::BlockTxnRequest),
+    #[cfg(feature = "compact-blocks")]
+    BlockTxn(crate::compact_blocks::BlockTxnResponse),
     Unknown(String, Vec<u8>),
 }
 
@@ -125,6 +131,12 @@ impl NetworkMessage {
             NetworkMessage::MemPool => "mempool",
             NetworkMessage::GetAddr => "getaddr",
             NetworkMessage::SendCmpct { .. } => "sendcmpct",
+            #[cfg(feature = "compact-blocks")]
+            NetworkMessage::CompactBlock(_) => "cmpctblock",
+            #[cfg(feature = "compact-blocks")]
+            NetworkMessage::GetBlockTxn(_) => "getblocktxn",
+            #[cfg(feature = "compact-blocks")]
+            NetworkMessage::BlockTxn(_) => "blocktxn",
             NetworkMessage::Unknown(cmd, _) => cmd,
         }
     }

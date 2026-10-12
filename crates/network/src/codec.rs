@@ -327,6 +327,18 @@ pub fn encode_payload(msg: &NetworkMessage) -> Result<Vec<u8>, EncodeError> {
             buf.write_u8(if *announce { 1 } else { 0 })?;
             buf.write_u64_le(*version)?;
         }
+        #[cfg(feature = "compact-blocks")]
+        NetworkMessage::CompactBlock(block) => {
+            buf = block.serialize(crate::compact_blocks::CompactVersion::V2)?;
+        }
+        #[cfg(feature = "compact-blocks")]
+        NetworkMessage::GetBlockTxn(request) => {
+            buf = request.serialize()?;
+        }
+        #[cfg(feature = "compact-blocks")]
+        NetworkMessage::BlockTxn(response) => {
+            buf = response.serialize(crate::compact_blocks::CompactVersion::V2)?;
+        }
         NetworkMessage::Unknown(_, data) => {
             buf.extend_from_slice(data);
         }
@@ -390,10 +402,37 @@ pub fn decode_payload(command: &str, payload: &[u8]) -> Result<NetworkMessage, E
         "mempool" => Ok(NetworkMessage::MemPool),
         "getaddr" => Ok(NetworkMessage::GetAddr),
         "sendcmpct" => {
-            let announce = cursor.read_u8()? != 0;
+            if payload.len() != 9 {
+                return Err(EncodeError::InvalidData(
+                    "sendcmpct must contain exactly nine bytes".into(),
+                ));
+            }
+            let flag = cursor.read_u8()?;
+            if flag > 1 {
+                return Err(EncodeError::InvalidData("invalid sendcmpct boolean".into()));
+            }
+            let announce = flag == 1;
             let version = cursor.read_u64_le()?;
             Ok(NetworkMessage::SendCmpct { announce, version })
         }
+        #[cfg(feature = "compact-blocks")]
+        "cmpctblock" => Ok(NetworkMessage::CompactBlock(
+            crate::compact_blocks::CompactBlock::deserialize(
+                payload,
+                crate::compact_blocks::CompactVersion::V2,
+            )?,
+        )),
+        #[cfg(feature = "compact-blocks")]
+        "getblocktxn" => Ok(NetworkMessage::GetBlockTxn(
+            crate::compact_blocks::BlockTxnRequest::deserialize(payload)?,
+        )),
+        #[cfg(feature = "compact-blocks")]
+        "blocktxn" => Ok(NetworkMessage::BlockTxn(
+            crate::compact_blocks::BlockTxnResponse::deserialize(
+                payload,
+                crate::compact_blocks::CompactVersion::V2,
+            )?,
+        )),
         other => Ok(NetworkMessage::Unknown(other.to_string(), payload.to_vec())),
     }
 }
