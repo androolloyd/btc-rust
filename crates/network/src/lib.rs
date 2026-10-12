@@ -8,6 +8,12 @@ pub mod peer;
 pub mod protocol;
 pub mod tx_relay;
 
+#[cfg(any(feature = "erlay", feature = "compact-blocks"))]
+mod siphash;
+
+#[cfg(feature = "erlay")]
+mod minisketch;
+
 #[cfg(feature = "compact-blocks")]
 pub mod compact_blocks;
 

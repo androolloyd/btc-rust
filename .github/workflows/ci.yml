@@ -27,6 +27,7 @@ jobs:
       - run: cargo check --locked --package btc-primitives --no-default-features --features descriptor
       - run: cargo check --locked --package btc-consensus --no-default-features
       - run: cargo check --locked --package btc-network --no-default-features
+      - run: cargo check --locked --package btc-network --no-default-features --features erlay
       - run: cargo check --locked --package btc-storage --no-default-features
   advisories:
     runs-on: ubuntu-latest
@@ -68,3 +69,4 @@ jobs:
               source.extractall(directory, filter="data")
       - run: python3 scripts/check_core_p2p.py --bitcoind "$RUNNER_TEMP/btc-core29/bitcoin-29.0/bin/bitcoind"
       - run: python3 scripts/check_core_psbt.py --bitcoind "$RUNNER_TEMP/btc-core29/bitcoin-29.0/bin/bitcoind"
+      - run: python3 scripts/check_erlay.py

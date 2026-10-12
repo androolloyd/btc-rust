@@ -65,6 +65,66 @@ pub fn script_type(script: &Script) -> &str {
 // Decode helpers
 // ---------------------------------------------------------------------------
 
+fn erlay_set(
+    salt_a: u64,
+    salt_b: u64,
+    wtxids: &[String],
+) -> eyre::Result<btc_network::erlay::ReconciliationSet> {
+    use btc_network::erlay::{ReconciliationSet, ShortIdKey, MAX_SET_SIZE};
+    use btc_primitives::hash::TxHash;
+    eyre::ensure!(
+        wtxids.len() <= MAX_SET_SIZE,
+        "too many witness transaction IDs"
+    );
+    let hashes = wtxids
+        .iter()
+        .map(|hash| TxHash::from_hex(hash))
+        .collect::<Result<std::collections::HashSet<_>, _>>()?;
+    Ok(ReconciliationSet::new(
+        ShortIdKey::new(salt_a, salt_b),
+        &hashes,
+    )?)
+}
+
+/// Offline BIP330 primitive tooling; this does not activate live Erlay relay.
+pub fn erlay_sketch(
+    capacity: usize,
+    salt_a: u64,
+    salt_b: u64,
+    wtxids: &[String],
+) -> eyre::Result<serde_json::Value> {
+    // Check capacity before hashing/allocating the caller's local set.
+    btc_network::erlay::Minisketch::new(capacity)?;
+    let snapshot = erlay_set(salt_a, salt_b, wtxids)?;
+    let sketch = snapshot.build_sketch(capacity)?;
+    Ok(serde_json::json!({
+        "scope": "experimental_bip330_sketch", "capacity": sketch.capacity(),
+        "hex": hex::encode(sketch.serialize()), "live_relay": false,
+    }))
+}
+
+pub fn erlay_reconcile(
+    text: &str,
+    salt_a: u64,
+    salt_b: u64,
+    wtxids: &[String],
+) -> eyre::Result<serde_json::Value> {
+    use btc_network::erlay::{Minisketch, MAX_CAPACITY};
+    eyre::ensure!(
+        text.len() <= MAX_CAPACITY * 8,
+        "sketch exceeds local capacity"
+    );
+    let peer = Minisketch::deserialize(&hex::decode(text)?)?;
+    let snapshot = erlay_set(salt_a, salt_b, wtxids)?;
+    let result = snapshot.reconcile(&peer)?;
+    Ok(serde_json::json!({
+        "scope": "experimental_bip330_reconciliation", "capacity": peer.capacity(),
+        "they_need_wtxids": result.they_need.iter().map(|hash| hash.to_hex()).collect::<Vec<_>>(),
+        "we_need_ids": result.we_need_ids, "live_relay": false,
+        "original_difference_verified": false,
+    }))
+}
+
 /// Derive scripts/addresses from public descriptors without wallet/chain claims.
 pub fn derive_descriptor(
     text: &str,

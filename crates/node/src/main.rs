@@ -182,6 +182,31 @@ enum Commands {
         index: Option<u32>,
     },
 
+    /// Build an experimental BIP330 sketch of supplied witness transaction IDs
+    ErlaySketch {
+        #[arg(long)]
+        capacity: usize,
+        #[arg(long)]
+        salt_a: u64,
+        #[arg(long)]
+        salt_b: u64,
+        /// Display-order wtxid hex; repeat for each local transaction
+        #[arg(long = "wtxid")]
+        wtxids: Vec<String>,
+    },
+
+    /// Reconcile received BIP330 sketch bytes against supplied local wtxids
+    ErlayReconcile {
+        /// Raw BIP330 skdata hex (without a CompactSize message wrapper)
+        hex: String,
+        #[arg(long)]
+        salt_a: u64,
+        #[arg(long)]
+        salt_b: u64,
+        #[arg(long = "wtxid")]
+        wtxids: Vec<String>,
+    },
+
     /// Verify supported PSBT signatures against supplied prevouts (offline)
     VerifyPsbt {
         hex: String,
@@ -338,6 +363,30 @@ async fn main() -> eyre::Result<()> {
         }
         Some(Commands::VerifyPsbtDerivations { hex }) => {
             output::emit(format, &cli::verify_psbt_derivations(&hex)?);
+            Ok(())
+        }
+        Some(Commands::ErlaySketch {
+            capacity,
+            salt_a,
+            salt_b,
+            wtxids,
+        }) => {
+            output::emit(
+                format,
+                &cli::erlay_sketch(capacity, salt_a, salt_b, &wtxids)?,
+            );
+            Ok(())
+        }
+        Some(Commands::ErlayReconcile {
+            hex,
+            salt_a,
+            salt_b,
+            wtxids,
+        }) => {
+            output::emit(
+                format,
+                &cli::erlay_reconcile(&hex, salt_a, salt_b, &wtxids)?,
+            );
             Ok(())
         }
         Some(Commands::DeriveDescriptor { descriptor, index }) => {

@@ -87,3 +87,9 @@ name = "fuzz_bip32"
 path = "fuzz_targets/fuzz_bip32.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_erlay"
+path = "fuzz_targets/fuzz_erlay.rs"
+test = false
+doc = false
