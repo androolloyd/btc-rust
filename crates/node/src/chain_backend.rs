@@ -909,6 +909,138 @@ impl NodeChainBackend {
         }
         Ok(result)
     }
+
+    fn rpc_undo(&self, hash: BlockHash) -> Result<HashMap<OutPoint, UtxoEntry>, RpcError> {
+        let mut coins = HashMap::new();
+        for (outpoint, coin) in self.undo(hash)?.spent {
+            if coins.insert(outpoint, coin).is_some() {
+                return Err(internal("duplicate input in block undo"));
+            }
+        }
+        Ok(coins)
+    }
+
+    fn raw_transaction_json(
+        &self,
+        data: &ValidatedChain,
+        params: &Value,
+    ) -> Result<Value, RpcError> {
+        use crate::rpc_transaction::{transaction_json, verbosity};
+        let txid = TxHash::from_hex(string_param(params, 0)?)
+            .map_err(|e| RpcError::new(-8, e.to_string()))?;
+        if txid
+            == data
+                .headers
+                .get_header_by_height(0)
+                .unwrap()
+                .header
+                .merkle_root
+        {
+            return Err(RpcError::new(
+                -5,
+                "the genesis coinbase cannot be retrieved as an ordinary transaction",
+            ));
+        }
+        let level = verbosity(params, 0)?;
+        let explicit = match params.get(2) {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(
+                BlockHash::from_hex(
+                    value
+                        .as_str()
+                        .ok_or_else(|| RpcError::new(-3, "blockhash must be a string"))?,
+                )
+                .map_err(|e| RpcError::new(-8, e.to_string()))?,
+            ),
+        };
+        let reader = self.db.tx().map_err(internal)?;
+        let (tx, block_hash) = if let Some(hash) = explicit {
+            if data.headers.get_header(&hash).is_none() {
+                return Err(RpcError::new(-5, "block hash not found"));
+            }
+            let block = reader
+                .get_block(&hash)
+                .map_err(internal)?
+                .ok_or_else(|| RpcError::new(-1, "block body unavailable"))?;
+            let tx = block
+                .transactions
+                .into_iter()
+                .find(|tx| tx.txid() == txid)
+                .ok_or_else(|| RpcError::new(-5, "transaction not found in the provided block"))?;
+            (tx, Some(hash))
+        } else if let Some(entry) = data.mempool.entries.get(&txid) {
+            (entry.tx.clone(), None)
+        } else {
+            // The persistent index describes the active chain. Retained side
+            // bodies must be queried with their explicit block hash; a detached
+            // transaction record alone cannot supply confirmation context.
+            let location = reader.get_tx_block_index(&txid).map_err(internal)?
+                .ok_or_else(|| RpcError::new(-5, "transaction not found in mempool or active chain; provide a block hash for retained branches"))?;
+            let entry = data
+                .headers
+                .get_header(&location.block_hash)
+                .ok_or_else(|| internal("indexed transaction block header missing"))?;
+            if !data
+                .headers
+                .get_header_by_height(entry.height)
+                .is_some_and(|header| header.header.block_hash() == location.block_hash)
+            {
+                return Err(internal(
+                    "transaction index points outside the active chain",
+                ));
+            }
+            let block = reader
+                .get_block(&location.block_hash)
+                .map_err(internal)?
+                .ok_or_else(|| internal("indexed transaction block body missing"))?;
+            let tx = block
+                .transactions
+                .get(location.tx_position as usize)
+                .filter(|tx| tx.txid() == txid)
+                .cloned()
+                .ok_or_else(|| internal("transaction location disagrees with block body"))?;
+            (tx, Some(location.block_hash))
+        };
+        drop(reader);
+        if level <= 0 {
+            return Ok(json!(hex::encode(encode(&tx))));
+        }
+        let undo = if level >= 2 && !tx.is_coinbase() {
+            block_hash.map(|hash| self.rpc_undo(hash)).transpose()?
+        } else {
+            None
+        };
+        let mut result = transaction_json(&tx, self.state.network, undo.as_ref(), level >= 2)?;
+        if let Some(hash) = block_hash {
+            let entry = data
+                .headers
+                .get_header(&hash)
+                .ok_or_else(|| internal("transaction block header missing"))?;
+            let active = data
+                .headers
+                .get_header_by_height(entry.height)
+                .is_some_and(|entry| entry.header.block_hash() == hash);
+            if explicit.is_none() && !active {
+                return Err(internal(
+                    "transaction index points outside the active chain",
+                ));
+            }
+            result["blockhash"] = json!(hash.to_string());
+            result["confirmations"] = json!(if active {
+                data.headers.best_height() - entry.height + 1
+            } else {
+                0
+            });
+            if active {
+                result["time"] = json!(entry.header.time);
+                result["blocktime"] = json!(entry.header.time);
+            }
+            if explicit.is_some() {
+                result["in_active_chain"] = json!(active);
+            }
+        }
+        Ok(result)
+    }
 }
 
 impl ChainBackend for NodeChainBackend {
@@ -1107,6 +1239,7 @@ impl ChainBackend for NodeChainBackend {
                         }
                     }
                     "getblock" => {
+                        use crate::rpc_transaction::{transaction_json, verbosity};
                         let hash = block_hash_param(&params)?;
                         let block = self
                             .db
@@ -1115,50 +1248,37 @@ impl ChainBackend for NodeChainBackend {
                             .get_block(&hash)
                             .map_err(internal)?
                             .ok_or_else(|| RpcError::new(-5, "block body unavailable"))?;
-                        let verbosity = params.get(1).and_then(Value::as_u64).unwrap_or(1);
-                        if verbosity == 0 {
+                        let level = verbosity(&params, 1)?;
+                        if level <= 0 {
                             return Ok(json!(hex::encode(encode(&block))));
                         }
-                        if verbosity != 1 {
-                            return Err(RpcError::new(
-                                -8,
-                                "only block verbosity 0 and 1 are supported",
-                            ));
-                        }
                         let mut result = self.header_json(headers, hash)?;
-                        result["tx"] = json!(block
-                            .transactions
-                            .iter()
-                            .map(|t| t.txid().to_string())
-                            .collect::<Vec<_>>());
-                        result["size"] = json!(encode(&block).len());
+                        result["tx"] = if level == 1 {
+                            json!(block
+                                .transactions
+                                .iter()
+                                .map(|t| t.txid().to_string())
+                                .collect::<Vec<_>>())
+                        } else {
+                            let undo = self.rpc_undo(hash)?;
+                            json!(block
+                                .transactions
+                                .iter()
+                                .map(|tx| transaction_json(
+                                    tx,
+                                    self.state.network,
+                                    Some(&undo),
+                                    level >= 3
+                                ))
+                                .collect::<Result<Vec<_>, _>>()?)
+                        };
+                        let size = encode(&block).len();
+                        result["size"] = json!(size);
+                        result["strippedsize"] = json!((block.weight() - size) / 3);
                         result["weight"] = json!(block.weight());
                         Ok(result)
                     }
-                    "getrawtransaction" => {
-                        let txid = TxHash::from_hex(string_param(&params, 0)?)
-                            .map_err(|e| RpcError::new(-8, e.to_string()))?;
-                        if params
-                            .get(1)
-                            .is_some_and(|v| *v != Value::Bool(false) && *v != json!(0))
-                        {
-                            return Err(RpcError::new(
-                                -8,
-                                "verbose transaction output is unavailable",
-                            ));
-                        }
-                        let tx = match data.mempool.entries.get(&txid) {
-                            Some(entry) => entry.tx.clone(),
-                            None => self
-                                .db
-                                .tx()
-                                .map_err(internal)?
-                                .get_transaction(&txid)
-                                .map_err(internal)?
-                                .ok_or_else(|| RpcError::new(-5, "transaction not found"))?,
-                        };
-                        Ok(json!(hex::encode(encode(&tx))))
-                    }
+                    "getrawtransaction" => self.raw_transaction_json(&data, &params),
                     "gettxout" => {
                         let txid = TxHash::from_hex(string_param(&params, 0)?)
                             .map_err(|e| RpcError::new(-8, e.to_string()))?;
@@ -1179,10 +1299,18 @@ impl ChainBackend for NodeChainBackend {
                         let Some(entry) = entry else {
                             return Ok(Value::Null);
                         };
+                        // Older local databases retain provably unspendable
+                        // outputs. They are never spendable coins in Core's RPC
+                        // view, including when supplied by a mempool overlay.
+                        if entry.txout.script_pubkey.is_op_return()
+                            || entry.txout.script_pubkey.len() > 10_000
+                        {
+                            return Ok(Value::Null);
+                        }
                         Ok(
                             json!({ "bestblock": tip.header.block_hash().to_string(), "confirmations": tip.height.saturating_add(1).saturating_sub(entry.height),
                             "value": entry.txout.value.as_sat() as f64 / 100_000_000.0, "coinbase": entry.is_coinbase,
-                            "scriptPubKey": { "hex": hex::encode(entry.txout.script_pubkey.as_bytes()) } }),
+                            "scriptPubKey": crate::rpc_transaction::script_pubkey_json(&entry.txout.script_pubkey, self.state.network) }),
                         )
                     }
                     "getnetworkhashps" => Ok(json!(Self::network_hashps(
@@ -1356,6 +1484,45 @@ mod tests {
         block.header.nonce = 0;
         while !block.header.check_proof_of_work() {
             block.header.nonce += 1;
+        }
+    }
+
+    #[test]
+    fn txout_view_excludes_retained_unspendable_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rpc-coins.redb");
+        let backend = NodeChainBackend::open(&path, NodeState::new(Network::Regtest)).unwrap();
+        let mut block = backend
+            .candidate(ScriptBuf::from_bytes(vec![0x51]))
+            .unwrap();
+        for script in [vec![0x6a, 0x4c], vec![0; 10_001]] {
+            block.transactions[0].outputs.push(TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::from_bytes(script),
+            });
+        }
+        mine(&mut block);
+        backend.submit_block(&block).unwrap();
+        let txid = block.transactions[0].txid().to_string();
+        for pool in [false, true] {
+            assert!(backend
+                .call("gettxout", json!([txid, 0, pool]))
+                .unwrap()
+                .is_object());
+            for n in 1..block.transactions[0].outputs.len() {
+                assert!(backend
+                    .call("gettxout", json!([txid, n, pool]))
+                    .unwrap()
+                    .is_null());
+            }
+        }
+        drop(backend);
+        let backend = NodeChainBackend::open(&path, NodeState::new(Network::Regtest)).unwrap();
+        for n in 1..block.transactions[0].outputs.len() {
+            assert!(backend
+                .call("gettxout", json!([txid, n]))
+                .unwrap()
+                .is_null());
         }
     }
 
@@ -2137,6 +2304,21 @@ mod tests {
         assert!(a.mempool_transactions().unwrap().is_empty());
         a.submit_transaction(parent.clone()).unwrap();
         a.submit_transaction(child.clone()).unwrap();
+        let mempool_view = a
+            .call("getrawtransaction", json!([parent.txid().to_string(), 2]))
+            .unwrap();
+        for field in ["blockhash", "confirmations", "time", "fee"] {
+            assert!(mempool_view.get(field).is_none(), "mempool {field}");
+        }
+        assert_eq!(
+            a.call(
+                "getrawtransaction",
+                json!([parent.txid().to_string(), true, hashes[0]])
+            )
+            .unwrap_err()
+            .code,
+            -5
+        );
         assert!(a
             .call("gettxout", json!([op.txid.to_string(), 0]))
             .unwrap()
@@ -2165,6 +2347,76 @@ mod tests {
         );
         a.submit_block(&block_a).unwrap();
         assert!(a.mempool_transactions().unwrap().is_empty());
+        let block_a_hash = block_a.block_hash().to_string();
+        let confirmed_view = a
+            .call("getrawtransaction", json!([parent.txid().to_string(), 2]))
+            .unwrap();
+        assert_eq!(confirmed_view["confirmations"], 1);
+        assert_eq!(confirmed_view["fee"], json!(0.00001));
+        assert_eq!(confirmed_view["vin"][0]["prevout"]["height"], 1);
+        assert_eq!(confirmed_view["vin"][0]["prevout"]["generated"], true);
+        assert!(confirmed_view.get("in_active_chain").is_none());
+        let full_block = a.call("getblock", json!([block_a_hash, 3])).unwrap();
+        assert_eq!(full_block["tx"][2]["vin"][0]["prevout"]["height"], 101);
+        assert_eq!(full_block["tx"][2]["vin"][0]["prevout"]["generated"], false);
+        assert_eq!(full_block["tx"][2]["fee"], json!(0.00001));
+        assert!(full_block["tx"][0].get("fee").is_none());
+        assert!(full_block["tx"][1].get("blockhash").is_none());
+        let details = a.call("getblock", json!([block_a_hash, 2])).unwrap();
+        assert!(details["tx"][2]["vin"][0].get("prevout").is_none());
+        assert_eq!(details["tx"][2]["fee"], json!(0.00001));
+        let raw_undo =
+            a.db.tx()
+                .unwrap()
+                .get_block_undo(&block_a.block_hash())
+                .unwrap()
+                .unwrap();
+        let write = a.db.tx_mut().unwrap();
+        write
+            .put_block_undo(&block_a.block_hash(), b"corrupt")
+            .unwrap();
+        write.commit().unwrap();
+        assert_eq!(
+            a.call("getrawtransaction", json!([parent.txid().to_string(), 2]))
+                .unwrap_err()
+                .code,
+            INTERNAL_ERROR
+        );
+        assert_eq!(
+            a.call("getblock", json!([block_a_hash, 3]))
+                .unwrap_err()
+                .code,
+            INTERNAL_ERROR
+        );
+        assert_eq!(
+            a.call("getrawtransaction", json!([parent.txid().to_string(), 1]))
+                .unwrap()["confirmations"],
+            1
+        );
+        // Even a checksummed undo cannot silently substitute missing inputs.
+        let empty_undo = btc_storage::undo::encode_undo(
+            block_a.block_hash(),
+            &UtxoSetUpdate {
+                spent: vec![],
+                created: vec![],
+            },
+        );
+        let write = a.db.tx_mut().unwrap();
+        write
+            .put_block_undo(&block_a.block_hash(), &empty_undo)
+            .unwrap();
+        write.commit().unwrap();
+        assert_eq!(
+            a.call("getrawtransaction", json!([parent.txid().to_string(), 2]))
+                .unwrap_err()
+                .code,
+            INTERNAL_ERROR
+        );
+        let write = a.db.tx_mut().unwrap();
+        write
+            .put_block_undo(&block_a.block_hash(), &raw_undo)
+            .unwrap();
+        write.commit().unwrap();
         let mut block_b = b.candidate(other.p2pkh_script()).unwrap();
         mine(&mut block_b);
         b.submit_block(&block_b).unwrap();
@@ -2189,6 +2441,21 @@ mod tests {
         b.submit_block(&b2).unwrap();
         a.submit_block(&b2).unwrap();
         assert_eq!(a.tip().unwrap(), b.tip().unwrap());
+        let stale_view = a
+            .call(
+                "getrawtransaction",
+                json!([parent.txid().to_string(), 2, block_a_hash]),
+            )
+            .unwrap();
+        assert_eq!(stale_view["confirmations"], 0);
+        assert_eq!(stale_view["in_active_chain"], false);
+        assert!(stale_view.get("time").is_none() && stale_view.get("blocktime").is_none());
+        assert_eq!(stale_view["fee"], confirmed_view["fee"]);
+        assert_eq!(
+            a.call("getrawtransaction", json!([parent.txid().to_string(), 2]))
+                .unwrap(),
+            mempool_view
+        );
         assert_eq!(
             a.call("getblockheader", json!([block_a.block_hash().to_string()]))
                 .unwrap()["confirmations"],
@@ -2217,6 +2484,18 @@ mod tests {
             a.header(&block_a.block_hash()).unwrap().is_some(),
             "side branch survives restart"
         );
+        assert_eq!(
+            a.call(
+                "getrawtransaction",
+                json!([parent.txid().to_string(), 2, block_a_hash])
+            )
+            .unwrap(),
+            stale_view
+        );
+        assert_eq!(
+            a.call("getblock", json!([block_a_hash, 3])).unwrap()["tx"],
+            full_block["tx"]
+        );
         let mut a3 = a.candidate(key.p2pkh_script()).unwrap();
         mine(&mut a3);
         a.submit_block(&a3).unwrap();
@@ -2234,6 +2513,20 @@ mod tests {
         assert!(
             a.mempool_transactions().unwrap().is_empty(),
             "conflicting resurrected parent and descendant are removed"
+        );
+        assert_eq!(
+            a.call("getrawtransaction", json!([parent.txid().to_string(), 1]))
+                .unwrap_err()
+                .code,
+            -5
+        );
+        assert_eq!(
+            a.call(
+                "getrawtransaction",
+                json!([parent.txid().to_string(), 2, block_a_hash])
+            )
+            .unwrap(),
+            stale_view
         );
         assert!(a
             .db

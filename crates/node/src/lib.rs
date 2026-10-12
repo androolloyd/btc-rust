@@ -7,6 +7,7 @@ pub mod nostr;
 pub mod output;
 pub mod p2p;
 mod rpc_cookie;
+mod rpc_transaction;
 pub mod state;
 pub mod sync;
 pub mod wallet;

@@ -10,6 +10,9 @@ restart rotates stale credentials. Replaced cookies are not removed by the old
 owner. Windows uses inherited directory ACLs and replaces a stale destination
 before starting the listener; Unix atomic replacement was acceptance-tested.
 
+Actual verbose transaction/block/coin views and their supported boundaries are
+documented in [TRANSACTION_RPC.md](TRANSACTION_RPC.md).
+
 Released Bitcoin Core's client can query and mutate actual runtime state:
 
 ```sh
