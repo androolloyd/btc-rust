@@ -31,6 +31,38 @@ fuzz_target!(|data: &[u8]| {
             // Exercise the exact wallet equations/finalizer with a bounded
             // sanitizer work budget, including unselected threshold records.
             let _ = wallet::verify_partial_signatures(&psbt);
+            // Public test keys from the independent signer fixture; every
+            // successful result still has its real equations checked.
+            static KEYS: std::sync::OnceLock<Vec<btc_primitives::wif::WifPrivateKey>> =
+                std::sync::OnceLock::new();
+            let keys = KEYS.get_or_init(|| {
+                [
+                    "5HpHagT65TZzG1PH3CSu63k8DbpvD8s5ip4nEB3kEsreBR6zCMU",
+                    "KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU73sVHnoWn",
+                    "KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU74NMTptX4",
+                    "KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU74sHUHy8S",
+                    "KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU76rnZwVdz",
+                ]
+                .iter()
+                .map(|key| {
+                    btc_primitives::wif::WifPrivateKey::from_wif(
+                        key,
+                        btc_primitives::Network::Mainnet,
+                    )
+                    .unwrap()
+                })
+                .collect()
+            });
+            if let Ok(signed) = wallet::sign_ecdsa_psbt(&psbt, keys, 1_000_000) {
+                assert_eq!(signed.psbt.unsigned_tx, psbt.unsigned_tx);
+                wallet::verify_partial_signatures(&signed.psbt)
+                    .expect("signer verified every record");
+                assert!(signed
+                    .verified
+                    .txid_linked_prevouts
+                    .iter()
+                    .all(|linked| *linked));
+            }
             let _ = wallet::verify_finalized_psbt(&psbt);
             if let Ok(result) = wallet::finalize_psbt(&psbt) {
                 wallet::verify_finalized_psbt(&result.psbt).expect("finalizer verified its spend");

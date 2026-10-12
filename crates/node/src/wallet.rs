@@ -46,6 +46,14 @@ pub struct FinalizedPsbt {
     pub partial_signatures_per_input: Vec<usize>,
 }
 
+#[derive(Debug)]
+pub struct SignedEcdsaPsbt {
+    pub psbt: Psbt,
+    pub verified: VerifiedPartialSignatures,
+    pub signatures_added: usize,
+    pub signatures_added_per_input: Vec<usize>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,6 +113,214 @@ mod tests {
 
     fn verify_cli(psbt: &Psbt) -> serde_json::Value {
         crate::cli::verify_psbt(&hex::encode(psbt.try_serialize().unwrap())).unwrap()
+    }
+
+    fn signer_vectors() -> serde_json::Value {
+        serde_json::from_str(include_str!(
+            "../../primitives/tests/data/ecdsa-signer.json"
+        ))
+        .unwrap()
+    }
+
+    fn signer_keys(vector: &serde_json::Value) -> Vec<btc_primitives::wif::WifPrivateKey> {
+        vector["wifs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|key| {
+                btc_primitives::wif::WifPrivateKey::from_wif(
+                    key.as_str().unwrap(),
+                    btc_primitives::Network::Mainnet,
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn independent_core_signer_equations_both_psbt_versions_and_atomic_metadata() {
+        let fixture = signer_vectors();
+        assert_eq!(fixture["vectors"].as_array().unwrap().len(), 25);
+        for vector in fixture["vectors"].as_array().unwrap() {
+            let base =
+                Psbt::deserialize(&hex::decode(vector["psbt"].as_str().unwrap()).unwrap()).unwrap();
+            let keys = signer_keys(vector);
+            for version in [0, 2] {
+                let mut psbt = base.convert_version(version).unwrap();
+                if version == 2 {
+                    psbt.tx_modifiable = Some(7);
+                }
+                psbt.unknown.push((vec![0x9e], vec![7, 8]));
+                psbt.inputs[0].unknown.push((vec![0x9e], vec![1, 2]));
+                let before = psbt.try_serialize().unwrap();
+                let signed = sign_ecdsa_psbt(&psbt, &keys, 1000).unwrap();
+                assert_eq!(psbt.try_serialize().unwrap(), before);
+                assert_eq!(signed.psbt.unsigned_tx, psbt.unsigned_tx);
+                assert_eq!(signed.psbt.unknown, psbt.unknown);
+                assert_eq!(signed.psbt.inputs[0].unknown, psbt.inputs[0].unknown);
+                assert_eq!(signed.psbt.tx_modifiable, (version == 2).then_some(4));
+                let mut expected_count = 0;
+                for (input, expected) in signed
+                    .psbt
+                    .inputs
+                    .iter()
+                    .zip(vector["signatures"].as_array().unwrap())
+                {
+                    let expected = expected.as_array().unwrap();
+                    assert_eq!(input.partial_sigs.len(), expected.len());
+                    for record in expected {
+                        let public = hex::decode(record["public_key"].as_str().unwrap()).unwrap();
+                        let signature = &input
+                            .partial_sigs
+                            .iter()
+                            .find(|(key, _)| key == &public)
+                            .unwrap()
+                            .1;
+                        assert_eq!(
+                            hex::encode(signature),
+                            record["signature"],
+                            "{}",
+                            vector["name"]
+                        );
+                    }
+                    expected_count += expected.len();
+                }
+                assert_eq!(signed.signatures_added, expected_count);
+                assert_eq!(signed.verified.signatures_checked, expected_count);
+                assert_eq!(signed.verified.fee_sat, 1000);
+                assert!(signed
+                    .verified
+                    .txid_linked_prevouts
+                    .iter()
+                    .all(|linked| *linked));
+                let again = sign_ecdsa_psbt(&signed.psbt, &keys, 1000).unwrap();
+                assert_eq!(again.signatures_added, 0);
+                assert_eq!(again.psbt, signed.psbt);
+                assert_eq!(
+                    finalize_psbt(&signed.psbt).is_ok(),
+                    vector["sufficient"].as_bool().unwrap()
+                );
+                assert!(sign_ecdsa_psbt(&psbt, &keys, 999).is_err());
+                assert_eq!(psbt.try_serialize().unwrap(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn signer_rejects_fee_attack_unproven_parents_and_bad_existing_records() {
+        let fixture = signer_vectors();
+        let vector = fixture["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == "two-segwit-inputs")
+            .unwrap();
+        let original =
+            Psbt::deserialize(&hex::decode(vector["psbt"].as_str().unwrap()).unwrap()).unwrap();
+        let keys = signer_keys(vector);
+        let mut forged = original.clone();
+        for input in &mut forged.inputs {
+            input.non_witness_utxo = None;
+        }
+        forged.inputs[1].witness_utxo.as_mut().unwrap().value = Amount::from_sat(99_999);
+        // The first independently generated equation still succeeds while the
+        // other input's amount/claimed fee changed, illustrating BIP174 note 7.
+        let first = &vector["signatures"][0][0];
+        let public = hex::decode(first["public_key"].as_str().unwrap()).unwrap();
+        let hash = sighash_segwit_v0(
+            &forged.unsigned_tx,
+            0,
+            &p2wpkh_script_code(&hash160(&public)),
+            100_000,
+            SighashType::ALL,
+        )
+        .unwrap();
+        assert_eq!(hex::encode(hash), first["digest"]);
+        let signature = hex::decode(first["signature"].as_str().unwrap()).unwrap();
+        assert!(Secp256k1Verifier
+            .verify_ecdsa(&hash, &signature[..signature.len() - 1], &public)
+            .unwrap());
+        assert!(sign_ecdsa_psbt(&forged, &keys, 999)
+            .unwrap_err()
+            .to_string()
+            .contains("full parent"));
+        let mut forged = original.clone();
+        forged.inputs[1].witness_utxo.as_mut().unwrap().value = Amount::from_sat(99_999);
+        assert!(sign_ecdsa_psbt(&forged, &keys, 999).is_err());
+        let signed = sign_ecdsa_psbt(&original, &keys, 1000).unwrap().psbt;
+        let mut corrupt = signed.clone();
+        corrupt.inputs[1].partial_sigs[0].1[12] ^= 1;
+        assert!(sign_ecdsa_psbt(&corrupt, &keys, 1000).is_err());
+        assert_eq!(
+            sign_ecdsa_psbt(&original, &keys, 1000).unwrap().psbt,
+            signed
+        );
+        for kind in 0..5 {
+            let mut invalid = original.clone();
+            match kind {
+                0 => invalid.inputs[1].sighash_type = Some(2),
+                1 => invalid.inputs[1].final_script_witness = Some(vec![]),
+                2 => {
+                    invalid.inputs[1].non_witness_utxo.as_mut().unwrap().outputs[1].value =
+                        Amount::from_sat(99_999)
+                }
+                3 => {
+                    invalid.unsigned_tx.inputs[1].previous_output =
+                        invalid.unsigned_tx.inputs[0].previous_output;
+                    invalid.inputs[1] = invalid.inputs[0].clone();
+                }
+                _ => {
+                    invalid.inputs[1]
+                        .witness_utxo
+                        .as_mut()
+                        .unwrap()
+                        .script_pubkey = ScriptBuf::from_bytes(vec![0x51])
+                }
+            }
+            assert!(sign_ecdsa_psbt(&invalid, &keys, 1000).is_err());
+        }
+        assert!(sign_ecdsa_psbt(&original, &[], 1000).is_err());
+        assert!(sign_ecdsa_psbt(&original, &vec![keys[0].clone(); 1025], 1000).is_err());
+        assert!(sign_ecdsa_psbt(&original, &[keys[0].clone(), keys[0].clone()], 1000).is_err());
+        assert!(sign_ecdsa_psbt(&original, &keys[..1], 1000).is_err());
+        assert!(sign_ecdsa_psbt(&original, &keys, u64::MAX).is_err());
+        let mut oversized = original.clone();
+        oversized.inputs.resize(129, original.inputs[0].clone());
+        assert!(sign_ecdsa_psbt(&oversized, &keys, 1000)
+            .unwrap_err()
+            .to_string()
+            .contains("input limit"));
+        let mut taproot = original.clone();
+        let mut parent = taproot.inputs[0].non_witness_utxo.clone().unwrap();
+        parent.outputs[0].script_pubkey = ScriptBuf::p2tr(
+            &hex::decode("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
+        for (i, input) in taproot.inputs.iter_mut().enumerate() {
+            input.non_witness_utxo = Some(parent.clone());
+            input.witness_utxo = Some(parent.outputs[i].clone());
+            taproot.unsigned_tx.inputs[i].previous_output.txid = parent.txid();
+        }
+        assert!(sign_ecdsa_psbt(&taproot, &keys, 1000)
+            .unwrap_err()
+            .to_string()
+            .contains("Taproot signing is unsupported"));
+        let vector = fixture["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == "pkh-compressed")
+            .unwrap();
+        let mut legacy =
+            Psbt::deserialize(&hex::decode(vector["psbt"].as_str().unwrap()).unwrap()).unwrap();
+        legacy.inputs[0].witness_utxo =
+            Some(legacy.inputs[0].non_witness_utxo.as_ref().unwrap().outputs[0].clone());
+        assert!(sign_ecdsa_psbt(&legacy, &signer_keys(vector), 1000)
+            .unwrap_err()
+            .to_string()
+            .contains("non-witness signature"));
     }
 
     #[test]
@@ -1081,6 +1297,14 @@ enum EcdsaTemplate<'a> {
     },
 }
 
+fn ecdsa_key_belongs(template: &EcdsaTemplate<'_>, key: &[u8]) -> bool {
+    match template {
+        EcdsaTemplate::KeyHash(expected) => hash160(key).as_slice() == *expected,
+        EcdsaTemplate::Key(expected) => key == *expected,
+        EcdsaTemplate::Multisig { keys, .. } => keys.contains(&key),
+    }
+}
+
 fn ecdsa_template(script: &Script, witness: bool) -> eyre::Result<EcdsaTemplate<'_>> {
     let code = script.as_bytes();
     if script.is_p2pkh() {
@@ -1510,13 +1734,8 @@ fn verify_partial_input(
         let template = ecdsa_template(code.as_script(), witness)?;
         for (key, sig) in &input.partial_sigs {
             ensure!(valid_key(key, witness), "unsupported partial signature key");
-            let belongs = match &template {
-                EcdsaTemplate::KeyHash(expected) => hash160(key).as_slice() == *expected,
-                EcdsaTemplate::Key(expected) => key.as_slice() == *expected,
-                EcdsaTemplate::Multisig { keys, .. } => keys.contains(&key.as_slice()),
-            };
             ensure!(
-                belongs,
+                ecdsa_key_belongs(&template, key),
                 "partial signature key does not belong to spending script"
             );
             let hash_type = check_sighash(sig, false, input.sighash_type)?;
@@ -1568,6 +1787,139 @@ pub fn verify_partial_signatures(psbt: &Psbt) -> eyre::Result<VerifiedPartialSig
             .iter()
             .map(|input| input.non_witness_utxo.is_some())
             .collect(),
+    })
+}
+
+/// Offline BIP174/370 signer for known legacy and witness-v0 ECDSA templates.
+/// All inputs must have a matching supplied WIF key and a txid-linked full
+/// parent, including witness inputs (BIP174's multi-input fee attack). Only
+/// SIGHASH_ALL is created; no final, origin, change or active-chain proof is
+/// implied. Input PSBT/key material is never mutated or echoed on failure.
+pub fn sign_ecdsa_psbt(
+    psbt: &Psbt,
+    keys: &[btc_primitives::wif::WifPrivateKey],
+    max_fee_sat: u64,
+) -> eyre::Result<SignedEcdsaPsbt> {
+    use secp256k1::{Message, Secp256k1};
+    ensure!(
+        !keys.is_empty() && keys.len() <= 1024,
+        "signer requires 1..1024 keys"
+    );
+    ensure!(psbt.inputs.len() <= 128, "signer input limit (128)");
+    ensure!(
+        max_fee_sat <= Amount::MAX_MONEY.as_sat() as u64,
+        "fee cap exceeds money range"
+    );
+    psbt.try_serialize()?;
+    let (prevouts, fee_sat) = verification_context(psbt, &psbt.unsigned_tx)?;
+    ensure!(
+        fee_sat as u64 <= max_fee_sat,
+        "transaction fee exceeds explicit fee cap"
+    );
+    let mut public_keys = HashMap::new();
+    for key in keys {
+        ensure!(
+            public_keys.insert(key.public_key(), key).is_none(),
+            "duplicate signing public key"
+        );
+    }
+    let secp = Secp256k1::new();
+    let verifier = WalletVerifier::default();
+    let mut result = psbt.clone();
+    let mut signatures_added_per_input = Vec::with_capacity(psbt.inputs.len());
+    for (index, (input, output)) in psbt.inputs.iter().zip(&prevouts).enumerate() {
+        ensure!(
+            input.final_script_sig.is_none() && input.final_script_witness.is_none(),
+            "input {index}: signing requires unfinalized inputs"
+        );
+        ensure!(
+            input.non_witness_utxo.is_some(),
+            "input {index}: signing requires txid-linked full parent even for witness-v0"
+        );
+        ensure!(
+            !output.script_pubkey.is_p2tr(),
+            "input {index}: Taproot signing is unsupported"
+        );
+        ensure!(
+            input.sighash_type.unwrap_or(1) == 1
+                && input
+                    .partial_sigs
+                    .iter()
+                    .all(|(_, sig)| sig.last() == Some(&1)),
+            "input {index}: signer supports SIGHASH_ALL only"
+        );
+        let (code, witness) = partial_script_code(output.script_pubkey.as_script(), input)
+            .wrap_err_with(|| format!("input {index}: unsupported signing context"))?;
+        ensure!(
+            witness || input.witness_utxo.is_none(),
+            "input {index}: witness UTXO must not authorize a non-witness signature"
+        );
+        let template = ecdsa_template(code.as_script(), witness)
+            .wrap_err_with(|| format!("input {index}: unsupported signing template"))?;
+        // Existing records, including records from other cosigners, must pass
+        // before any additions; malformed or bad unused records are not erased.
+        if !input.partial_sigs.is_empty()
+            || input.tap_key_sig.is_some()
+            || !input.tap_script_sigs.is_empty()
+        {
+            verify_partial_input(psbt, index, &prevouts, &verifier).wrap_err_with(|| {
+                format!("input {index}: existing signature verification failed")
+            })?;
+        }
+        let mut matched = public_keys
+            .iter()
+            .filter(|(public, _)| {
+                valid_key(public, witness) && ecdsa_key_belongs(&template, public)
+            })
+            .collect::<Vec<_>>();
+        ensure!(
+            !matched.is_empty(),
+            "input {index}: no supplied key matches the committed spending script"
+        );
+        matched.sort_by(|a, b| a.0.cmp(b.0));
+        let hash = if witness {
+            sighash_segwit_v0(
+                &psbt.unsigned_tx,
+                index,
+                code.as_bytes(),
+                output.value.as_sat(),
+                SighashType::ALL,
+            )?
+        } else {
+            sighash_legacy(&psbt.unsigned_tx, index, code.as_bytes(), SighashType::ALL)?
+        };
+        let mut added = 0;
+        for (public, key) in matched {
+            if input.partial_sigs.iter().any(|(old, _)| old == public) {
+                continue;
+            }
+            let mut sig = secp
+                .sign_ecdsa(&Message::from_digest(hash), key.secret_key())
+                .serialize_der()
+                .to_vec();
+            sig.push(1);
+            result.inputs[index]
+                .partial_sigs
+                .push((public.clone(), sig));
+            added += 1;
+        }
+        signatures_added_per_input.push(added);
+    }
+    // Every created ALL signature forbids both input and output changes. Keep
+    // an existing SINGLE-pairing flag for other construction metadata.
+    if result.version == 2 {
+        result.tx_modifiable = Some(result.tx_modifiable.unwrap_or(0) & !3);
+    }
+    let verified = verify_partial_signatures(&result)?;
+    ensure!(
+        verified.unsigned_transaction == psbt.unsigned_tx && verified.fee_sat == fee_sat,
+        "signing changed the transaction or fee"
+    );
+    Ok(SignedEcdsaPsbt {
+        psbt: result,
+        verified,
+        signatures_added: signatures_added_per_input.iter().sum(),
+        signatures_added_per_input,
     })
 }
 

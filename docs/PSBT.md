@@ -14,6 +14,7 @@ btc-node --json verify-psbt "$PARTIALLY_SIGNED_PSBT_HEX" --partial
 btc-node --json finalize-psbt "$PARTIALLY_SIGNED_PSBT_HEX"
 btc-node --json verify-psbt-derivations "$PSBT_WITH_XPUB_ANCHORS_HEX"
 btc-node --json finalize-psbt @partially-signed.psbt
+btc-node --json --network regtest sign-psbt @unsigned.psbt --key-file /path/to/keys.wif --max-fee-sat 2000
 ```
 
 Every PSBT tool also accepts `@path` to a regular file containing binary PSBT
@@ -270,8 +271,8 @@ records validates these relationships before changing the receiver.
 These checks validate encoding and metadata consistency. Parsing does not
 validate signature equations, complete sighash context, full claimed key
 derivations or script satisfactions. Remaining
-BIP174/371 general-script/annex context and full key-origin verification, witness-only legacy signing restrictions,
-active-chain/unspentness checks, wallet signing and generalized finalization,
+BIP174/371 general-script/annex context and full key-origin verification,
+active-chain/unspentness checks, Taproot/HD/general signing and generalized finalization,
 descriptor operations and MuSig2 remain unfinished. Empty v2 creator maps can be
 represented; converting an empty-input creator to v0 is rejected by the legacy
 transaction decoder.
@@ -362,3 +363,68 @@ Signature references: [BIP66 strict DER](https://github.com/bitcoin/bips/blob/ma
 [BIP340 vectors](https://github.com/bitcoin/bips/blob/master/bip-0340/test-vectors.csv),
 [Core v29 script vectors](https://github.com/bitcoin/bitcoin/blob/v29.0/src/test/data/script_tests.json),
 and the BIP174/BIP341/BIP370 signing rules linked above.
+
+## Bounded ECDSA signer
+
+`wallet::sign_ecdsa_psbt` and compiled `sign-psbt` now create real deterministic
+RFC6979, low-S ECDSA partial signatures for the existing exact P2PK/P2PKH,
+P2SH-wrapped, P2WPKH, wrapped P2WPKH and P2WSH/wrapped P2WSH key/hash/multisig
+templates. Multisig supports at most sixteen keys in this wallet template set.
+The signer creates only SIGHASH_ALL and rejects other requested or supplied
+signature types. Every input must be unfinalized and have at least one matching
+supplied key; multisig may still need other cosigners afterward.
+
+```sh
+btc-node --json --network regtest sign-psbt @unsigned.psbt --key-file /path/to/keys.wif --max-fee-sat 2000
+```
+
+The key file is a regular UTF-8 file, one network-matching WIF per line, with
+at most 65,536 bytes and 1,024 keys; blank lines are ignored. Compressed and
+uncompressed WIF encodings have strict checksum/version/scalar/marker checks.
+Witness-v0 signing requires compressed keys. Private file data and keys are
+not interpolated into diagnostics; the WIF wrapper's Debug omits its scalar.
+The source and transient key data use ordinary process memory, not a protected
+keystore. HD/Taproot/general-script signing remains unsupported.
+
+All inputs require txid-linked full parent transactions, including witness-v0,
+with dual UTXO agreement and redeem/witness commitments checked by the shared
+PSBT parser. This prevents BIP174 note 7's repeated-signing fee attack caused
+by unauthenticated amounts in other inputs. A required absolute fee cap is
+checked against those parents before signing; every output value/script and
+that fee are returned as a receipt. The cap does not prove recipient or change
+ownership, active-chain membership, maturity/finality or unspent status.
+
+Existing partial records, including unused cosigner records, are verified.
+Only missing records for matching supplied keys are added to an isolated PSBT;
+a failure leaves its input unchanged. Re-signing valid records is idempotent.
+BIP370 input/output modification bits are cleared while its SINGLE-pairing
+bit and construction metadata survive. Every returned signature equation is
+verified again. Scope `ecdsa_sighash_all_partial_signing` reports final-spend,
+origin, change and active-chain verification as false. Use `finalize-psbt` as
+an explicit subsequent step; no transaction is broadcast by this tool.
+
+`ecdsa-signer.json` records independent Core v29 scripts, preimages and exact
+RFC6979/low-S signatures from checksum-pinned, unchanged reference modules.
+Synthetic txid-linked parents establish offline equations only. The separate
+`check_core_signer.py` harness funds actual outputs from a disposable Core HD
+wallet, has Rust sign the spends in both PSBT versions, checks Core final
+bytes/admission/fees and mines them. Core receives v0 after verified Rust v2
+conversion; these checks do not claim Core v29 native PSBT v2 support.
+
+Primary rules: [BIP174 signer checks and fee-attack note 7](https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki),
+[BIP370 signer modification flags](https://github.com/bitcoin/bips/blob/master/bip-0370.mediawiki),
+[BIP143 signature preimages](https://github.com/bitcoin/bips/blob/master/bip-0143.mediawiki) and
+[Core v29 reference ECDSA signing](https://github.com/bitcoin/bitcoin/blob/v29.0/test/functional/test_framework/key.py).
+
+Acceptance passed: all twenty-five independently generated signature cases match
+exact RFC6979/low-S bytes in both PSBT versions, including modification flags,
+idempotence, partial multisig and unchanged opaque metadata. Core funded actual
+outputs and accepted/mined all twenty-five Rust-signed spends, with exact Core
+finalizer bytes, 2,000-satoshi fees, full-parent/fee-cap/corrupt-record rejection
+and sequential cosigning. The shared WIF decoder also passes all thirty-seven
+published private descriptor outputs and eight malformed-key/context checks.
+The final gate passes 3,379 tests across 43 suites, formatting, Clippy, isolated
+features and release build (two preexisting ignored tests). Twenty-five fresh
+independent sanitizer seeds completed 1,365,693 executions in 31 seconds without
+failure. Live acceptance uses disposable regtest coins; full-chain/keystore and
+remaining wallet signing qualification remain separate.

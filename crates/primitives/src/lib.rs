@@ -25,6 +25,9 @@ pub mod bip21;
 #[cfg(feature = "bip32")]
 pub mod bip32;
 
+#[cfg(feature = "bip32")]
+pub mod wif;
+
 #[cfg(feature = "bip39")]
 pub mod bip39;
 

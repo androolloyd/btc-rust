@@ -1,10 +1,10 @@
 //! Bounded descriptor expansion. Origin annotations are unauthenticated.
 use super::{Descriptor, DescriptorError, TapTree};
 use crate::{
-    bip32::{base58check_decode, ChildNumber, ExtendedPrivKey, ExtendedPubKey},
+    bip32::{ChildNumber, ExtendedPrivKey, ExtendedPubKey},
     hash160, sha256, taproot, Address, Network, Opcode, ScriptBuf,
 };
-use secp256k1::{PublicKey, Secp256k1, SecretKey, XOnlyPublicKey};
+use secp256k1::{PublicKey, XOnlyPublicKey};
 
 #[derive(Debug, Clone)]
 pub struct ExpandedTapLeaf {
@@ -252,27 +252,9 @@ impl Expansion {
             if parts.next().is_some() {
                 return Err(key_error("suffix requires an extended key"));
             }
-            let payload =
-                base58check_decode(base).map_err(|_| key_error("invalid WIF private key"))?;
-            if ![33, 34].contains(&payload.len()) || (payload.len() == 34 && payload[33] != 1) {
-                return Err(key_error("invalid WIF private key encoding"));
-            }
-            let version = if self.network == Network::Mainnet {
-                0x80
-            } else {
-                0xef
-            };
-            if payload[0] != version {
-                return Err(key_error("WIF version does not match selected network"));
-            }
-            let secret = SecretKey::from_slice(&payload[1..33])
-                .map_err(|_| key_error("invalid WIF private scalar"))?;
-            let key = PublicKey::from_secret_key(&Secp256k1::new(), &secret);
-            if payload.len() == 34 {
-                key.serialize().to_vec()
-            } else {
-                key.serialize_uncompressed().to_vec()
-            }
+            crate::wif::WifPrivateKey::from_wif(base, self.network)
+                .map_err(|_| key_error("invalid WIF private key or selected network"))?
+                .public_key()
         } else {
             if parts.next().is_some() {
                 return Err(key_error("suffix requires an extended public key"));

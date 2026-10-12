@@ -448,6 +448,72 @@ pub fn finalize_psbt(hex_str: &str) -> eyre::Result<serde_json::Value> {
     }))
 }
 
+/// WIF secrets enter only through a bounded regular file, one key per line.
+pub fn sign_psbt(
+    hex_str: &str,
+    key_file: &std::path::Path,
+    max_fee_sat: u64,
+    network: Network,
+) -> eyre::Result<serde_json::Value> {
+    use btc_primitives::wif::WifPrivateKey;
+    use eyre::{ensure, WrapErr};
+    use std::io::Read;
+    const MAX_KEY_FILE_SIZE: usize = 65_536;
+    let psbt = parse_psbt_hex(hex_str)?;
+    let file = std::fs::File::open(key_file).wrap_err("could not open WIF key file")?;
+    let metadata = file.metadata().wrap_err("could not inspect WIF key file")?;
+    ensure!(metadata.is_file(), "WIF key input must be a regular file");
+    ensure!(
+        metadata.len() <= MAX_KEY_FILE_SIZE as u64,
+        "WIF key file exceeds size limit"
+    );
+    let mut bytes = Vec::new();
+    file.take((MAX_KEY_FILE_SIZE + 1) as u64)
+        .read_to_end(&mut bytes)
+        .wrap_err("could not read WIF key file")?;
+    ensure!(
+        bytes.len() <= MAX_KEY_FILE_SIZE,
+        "WIF key file exceeds size limit"
+    );
+    let text = std::str::from_utf8(&bytes).map_err(|_| eyre::eyre!("invalid WIF key file text"))?;
+    let mut keys = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        ensure!(keys.len() < 1024, "WIF key count exceeds 1024");
+        keys.push(
+            WifPrivateKey::from_wif(line, network)
+                .wrap_err_with(|| format!("invalid WIF at line {}", index + 1))?,
+        );
+    }
+    let signed = crate::wallet::sign_ecdsa_psbt(&psbt, &keys, max_fee_sat)?;
+    Ok(serde_json::json!({
+        "psbt_hex": hex::encode(signed.psbt.try_serialize()?),
+        "psbt_version": signed.psbt.version,
+        "signing_scope": "ecdsa_sighash_all_partial_signing",
+        "unsigned_txid": signed.verified.unsigned_transaction.txid().to_hex(),
+        "outputs": signed.verified.unsigned_transaction.outputs.iter().map(|out| serde_json::json!({
+            "value_sat": out.value.as_sat(), "script_pubkey": hex::encode(out.script_pubkey.as_bytes()),
+        })).collect::<Vec<_>>(),
+        "fee_sat": signed.verified.fee_sat,
+        "max_fee_sat": max_fee_sat,
+        "signatures_added": signed.signatures_added,
+        "signatures_added_per_input": signed.signatures_added_per_input,
+        "signatures_checked": signed.verified.signatures_checked,
+        "signatures_per_input": signed.verified.signatures_per_input,
+        "signatures_verified": true,
+        "partial_signatures_verified": true,
+        "spending_conditions_verified": false,
+        "final_fields_verified": false,
+        "key_origins_verified": false,
+        "change_outputs_verified": false,
+        "active_chain_verified": false,
+        "txid_linked_prevouts": signed.verified.txid_linked_prevouts,
+    }))
+}
+
 /// Verify supported finalized spends against supplied prevouts, without a chain lookup.
 pub fn verify_psbt(hex_str: &str) -> eyre::Result<serde_json::Value> {
     let verified = crate::wallet::verify_finalized_psbt(&parse_psbt_hex(hex_str)?)?;
@@ -1000,6 +1066,63 @@ mod tests {
     use btc_primitives::hash::TxHash;
     use btc_primitives::script::ScriptBuf;
     use btc_primitives::transaction::{OutPoint, TxIn, TxOut};
+
+    #[test]
+    fn signer_key_file_scope_bounds_and_secret_diagnostics() {
+        use std::io::{Seek, Write};
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../primitives/tests/data/ecdsa-signer.json"
+        ))
+        .unwrap();
+        let vector = &fixture["vectors"][0];
+        let psbt = vector["psbt"].as_str().unwrap();
+        let secret = vector["wifs"][0].as_str().unwrap();
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "{secret}").unwrap();
+        let signed = sign_psbt(psbt, file.path(), 1000, Network::Mainnet).unwrap();
+        assert!(!signed.to_string().contains(secret));
+        assert_eq!(signed["signing_scope"], "ecdsa_sighash_all_partial_signing");
+        assert_eq!(signed["signatures_added"], 1);
+        assert_eq!(signed["signatures_verified"], true);
+        for field in [
+            "spending_conditions_verified",
+            "final_fields_verified",
+            "key_origins_verified",
+            "change_outputs_verified",
+            "active_chain_verified",
+        ] {
+            assert_eq!(signed[field], false);
+        }
+        assert_eq!(signed["txid_linked_prevouts"], serde_json::json!([true]));
+        assert!(sign_psbt(psbt, file.path(), 999, Network::Mainnet).is_err());
+        assert!(sign_psbt(psbt, file.path(), 1000, Network::Regtest).is_err());
+        for bad in [
+            format!("{secret}\n{secret}"),
+            format!("{secret}/0"),
+            format!("[bad]{secret}"),
+            "".to_owned(),
+            "\u{ffff}".to_owned(),
+        ] {
+            file.as_file().set_len(0).unwrap();
+            file.rewind().unwrap();
+            write!(file, "{bad}").unwrap();
+            let error = sign_psbt(psbt, file.path(), 1000, Network::Mainnet).unwrap_err();
+            assert!(!format!("{error:?}").contains(secret));
+        }
+        file.as_file().set_len(65_537).unwrap();
+        assert!(sign_psbt(psbt, file.path(), 1000, Network::Mainnet)
+            .unwrap_err()
+            .to_string()
+            .contains("size limit"));
+        #[cfg(unix)]
+        assert!(sign_psbt(
+            psbt,
+            std::path::Path::new("/dev/null"),
+            1000,
+            Network::Mainnet
+        )
+        .is_err());
+    }
 
     // -----------------------------------------------------------------------
     // parse_network
