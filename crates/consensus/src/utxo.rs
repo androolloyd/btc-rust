@@ -75,6 +75,8 @@ pub enum UtxoError {
     NonFinalTransaction,
     #[error("BIP68 relative time lock is not satisfied")]
     Bip68RelativeTimeLock,
+    #[error("bad-blk-sigops: signature-operation cost {cost} exceeds {max}")]
+    TooManySigops { cost: usize, max: usize },
     #[error("BIP68: relative height lock not satisfied for {outpoint:?}: need {required_depth}, have {actual_depth}")]
     Bip68RelativeLockTime {
         outpoint: OutPoint,
@@ -135,7 +137,7 @@ pub fn connect_block(
     height: u64,
     utxo_view: &dyn UtxoSet,
 ) -> Result<UtxoSetUpdate, UtxoError> {
-    connect_block_with_subsidy(block, height, utxo_view, block_subsidy(height))
+    connect_block_with_subsidy(block, height, utxo_view, block_subsidy(height), None)
 }
 
 fn connect_block_with_subsidy(
@@ -143,6 +145,7 @@ fn connect_block_with_subsidy(
     height: u64,
     utxo_view: &dyn UtxoSet,
     subsidy: Amount,
+    flags: Option<&crate::script_engine::ScriptFlags>,
 ) -> Result<UtxoSetUpdate, UtxoError> {
     let mut spent: Vec<(OutPoint, UtxoEntry)> = Vec::new();
     let mut created: Vec<(OutPoint, UtxoEntry)> = Vec::new();
@@ -155,8 +158,10 @@ fn connect_block_with_subsidy(
 
     // Track total fees for coinbase reward validation.
     let mut total_fees = Amount::ZERO;
+    let mut sigops = 0usize;
 
     for tx in block.transactions.iter() {
+        sigops = sigops.saturating_add(crate::sigops::legacy_sigop_cost(tx));
         let is_coinbase = tx.is_coinbase();
         let txid = tx.txid();
         if tx.outputs.is_empty() {
@@ -174,7 +179,7 @@ fn connect_block_with_subsidy(
                     "non-coinbase transaction has no inputs".into(),
                 ));
             }
-            for input in &tx.inputs {
+            for (input_index, input) in tx.inputs.iter().enumerate() {
                 let outpoint = &input.previous_output;
                 if !spent_outpoints.insert(*outpoint) {
                     return Err(UtxoError::UtxoNotFound(*outpoint));
@@ -199,8 +204,23 @@ fn connect_block_with_subsidy(
                 }
 
                 input_sum = checked_money_sum(input_sum, entry.txout.value)?;
+                if let Some(flags) = flags {
+                    sigops = sigops.saturating_add(crate::sigops::input_sigop_cost(
+                        input.script_sig.as_script(),
+                        entry.txout.script_pubkey.as_script(),
+                        tx.witness.get(input_index),
+                        flags,
+                    ));
+                }
                 spent.push((*outpoint, entry));
             }
+        }
+
+        if sigops > crate::sigops::MAX_BLOCK_SIGOPS_COST {
+            return Err(UtxoError::TooManySigops {
+                cost: sigops,
+                max: crate::sigops::MAX_BLOCK_SIGOPS_COST,
+            });
         }
 
         // --- Process outputs ---
@@ -356,6 +376,7 @@ pub fn connect_block_with_context(
         height,
         utxo_view,
         block_subsidy_with_params(height, params),
+        Some(&params.script_flags(height)),
     )?;
 
     // --- BIP68: relative lock-time ---
@@ -612,6 +633,82 @@ mod tests {
     // -----------------------------------------------------------------------
     // Test: connecting a coinbase-only block creates UTXOs
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn sigops_count_same_block_prevouts_and_historical_activation() {
+        let op = OutPoint::new(TxHash::from_bytes([42; 32]), 0);
+        let mut coins = InMemoryUtxoSet::new();
+        coins.insert(
+            op,
+            UtxoEntry {
+                txout: TxOut {
+                    value: Amount::from_sat(1_000_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                },
+                height: 1,
+                is_coinbase: false,
+            },
+        );
+        let redeem = [vec![0, 0x63], vec![0xae; 198], vec![0x68, 0x51]].concat();
+        let mut parent = make_spend_tx(vec![op], vec![Amount::from_sat(100_000); 6]);
+        for output in &mut parent.outputs {
+            output.script_pubkey = ScriptBuf::p2sh(&btc_primitives::hash::hash160(&redeem));
+        }
+        let mut coinbase = make_coinbase_tx(Amount::ZERO);
+        coinbase.inputs[0].script_sig =
+            ScriptBuf::from_bytes(crate::validation::encode_bip34_height(200));
+        let mut block = make_block(vec![coinbase, parent.clone()]);
+        for index in 0..6 {
+            let mut child = make_spend_tx(
+                vec![OutPoint::new(parent.txid(), index)],
+                vec![Amount::from_sat(90_000)],
+            );
+            child.inputs[0].script_sig.push_slice(&redeem);
+            block.transactions.push(child);
+        }
+        let mut params = ChainParams::regtest();
+        assert!(matches!(
+            connect_block_with_params(&block, 200, &coins, &params),
+            Err(UtxoError::TooManySigops { cost: 95_040, .. })
+        ));
+        assert!(coins.contains(&op));
+        let last = block.transactions.pop().unwrap();
+        assert!(connect_block_with_params(&block, 200, &coins, &params).is_ok());
+        block.transactions.push(last);
+        params.network = btc_primitives::network::Network::Mainnet;
+        params.bip34_height = u64::MAX;
+        assert!(connect_block_with_params(&block, 173_804, &coins, &params).is_ok());
+        assert!(matches!(
+            connect_block_with_params(&block, 173_805, &coins, &params),
+            Err(UtxoError::TooManySigops { .. })
+        ));
+        // Witness costs are inactive before SegWit, independently of P2SH.
+        params.network = btc_primitives::network::Network::Regtest;
+        params.segwit_height = 201;
+        let witness_script = [vec![0, 0x63], vec![0xae; 198], vec![0x68, 0x51]].concat();
+        parent.outputs[0].script_pubkey =
+            ScriptBuf::p2wsh(&btc_primitives::hash::sha256(&witness_script));
+        let mut child = make_spend_tx(
+            vec![OutPoint::new(parent.txid(), 0)],
+            vec![Amount::from_sat(90_000)],
+        );
+        child.witness = vec![btc_primitives::transaction::Witness::from_items(vec![
+            witness_script,
+        ])];
+        let mut legacy = vec![0x6a];
+        legacy.extend(vec![0xae; 1_000]);
+        child.outputs.push(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(legacy),
+        });
+        block.transactions.truncate(1);
+        block.transactions.extend([parent, child]);
+        assert!(connect_block_with_params(&block, 200, &coins, &params).is_ok());
+        assert!(matches!(
+            connect_block_with_params(&block, 201, &coins, &params),
+            Err(UtxoError::TooManySigops { cost: 83_960, .. })
+        ));
+    }
 
     #[test]
     fn test_connect_coinbase_creates_utxos() {

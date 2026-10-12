@@ -20,6 +20,9 @@ fuzz_target!(|data: &[u8]| {
     }
 
     let script = ScriptBuf::from_bytes(data.to_vec());
+    for accurate in [false, true] {
+        let _ = btc_consensus::sigops::script_sigops(script.as_script(), accurate);
+    }
 
     // --- Instruction iterator must not panic ---
     for _instr in script.as_script().instructions() {
@@ -84,6 +87,15 @@ fuzz_target!(|data: &[u8]| {
             flags.verify_witness = mask & 2 != 0;
             flags.verify_cleanstack = mask & 8 != 0;
             flags.verify_const_scriptcode = mask & 64 != 0;
+            let _ = btc_consensus::sigops::p2sh_sigops(
+                tx.inputs[0].script_sig.as_script(),
+                previous.script_pubkey.as_script(),
+            );
+            let _ = btc_consensus::sigops::transaction_sigop_cost(
+                &tx,
+                std::slice::from_ref(&previous),
+                &flags,
+            );
             let _ = verify_input_with_prevouts(&tx, 0, &[previous], &verifier, &flags);
 
             // Exercise native witness initialization/completion and the

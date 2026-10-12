@@ -8,6 +8,7 @@ pub mod script_engine;
 pub mod sig_verify;
 pub mod sighash;
 pub mod signet;
+pub mod sigops;
 pub mod utxo;
 pub mod validation;
 pub mod versionbits;

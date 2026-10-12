@@ -25,6 +25,8 @@ pub enum ValidationError {
     CoinbaseRewardTooHigh { got: Amount, max: Amount },
     #[error("block too large: {size} weight units > {max} weight units")]
     BlockTooLarge { size: usize, max: usize },
+    #[error("bad-blk-sigops: signature-operation cost {cost} exceeds {max}")]
+    TooManySigops { cost: usize, max: usize },
     #[error("block version too low")]
     BadVersion,
     #[error("duplicate transaction")]
@@ -113,7 +115,15 @@ impl BlockValidator {
 
         // CVE-2012-2459: check for duplicate transactions
         let mut seen_txids = std::collections::HashSet::new();
+        let mut sigops = 0usize;
         for tx in &block.transactions {
+            sigops = sigops.saturating_add(crate::sigops::legacy_sigop_cost(tx));
+            if sigops > crate::sigops::MAX_BLOCK_SIGOPS_COST {
+                return Err(ValidationError::TooManySigops {
+                    cost: sigops,
+                    max: crate::sigops::MAX_BLOCK_SIGOPS_COST,
+                });
+            }
             if !seen_txids.insert(tx.txid()) {
                 return Err(ValidationError::DuplicateTransaction);
             }

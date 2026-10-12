@@ -2,6 +2,10 @@
 use btc_consensus::{
     script_engine::ScriptFlags,
     sig_verify::Secp256k1Verifier,
+    sigops::{
+        p2sh_sigops, transaction_sigop_cost, virtual_size, MAX_P2SH_SIGOPS,
+        MAX_STANDARD_TX_SIGOPS_COST,
+    },
     utxo::{UtxoEntry, UtxoSet, COINBASE_MATURITY},
     witness::verify_input_with_prevouts,
     ChainState,
@@ -17,6 +21,8 @@ pub struct Entry {
     pub tx: Transaction,
     pub fee: i64,
     pub time: u64,
+    pub sigop_cost: usize,
+    pub vsize: usize,
 }
 #[derive(Clone)]
 pub struct RuntimeMempool {
@@ -190,14 +196,14 @@ impl RuntimeMempool {
         candidate.remove_set(&removed);
         let id = candidate.admit_unconflicted(tx, base, chain, tip)?;
         let new = &candidate.entries[&id];
-        let new_size = new.tx.weight().div_ceil(4) as i64;
+        let new_size = new.vsize as i64;
         if new.fee < old_fees + new_size {
             return Err(reject("insufficient replacement fee increment"));
         }
         for conflict in direct {
             let old = &self.entries[&conflict];
             if (new.fee as i128) * 1000 / new_size as i128
-                <= (old.fee as i128) * 1000 / old.tx.weight().div_ceil(4) as i128
+                <= (old.fee as i128) * 1000 / old.vsize as i128
             {
                 return Err(reject(
                     "replacement feerate is not higher than its direct conflict",
@@ -283,6 +289,13 @@ impl RuntimeMempool {
             let coin = view
                 .get_utxo(&op)
                 .ok_or_else(|| RpcError::new(-25, "missing inputs"))?;
+            if p2sh_sigops(
+                input.script_sig.as_script(),
+                coin.txout.script_pubkey.as_script(),
+            ) > MAX_P2SH_SIGOPS
+            {
+                return Err(reject("bad-txns-nonstandard-inputs: too many P2SH sigops"));
+            }
             if coin.is_coinbase && height < coin.height + COINBASE_MATURITY {
                 return Err(reject("premature coinbase spend"));
             }
@@ -347,10 +360,17 @@ impl RuntimeMempool {
             .checked_sub(output_value)
             .filter(|v| *v >= 0)
             .ok_or_else(|| reject("inputs below outputs"))?;
-        // Rate is 1000 sat/kvB (one sat/vB), using witness virtual size.
+        // Resource accounting cannot be disabled by configurable script policy.
+        // Core uses STANDARD_SCRIPT_VERIFY_FLAGS for this admission counter.
+        let sigop_cost =
+            transaction_sigop_cost(&tx, &prevouts, &ScriptFlags::consensus()).map_err(reject)?;
+        if sigop_cost > MAX_STANDARD_TX_SIGOPS_COST {
+            return Err(reject("bad-txns-too-many-sigops"));
+        }
+        let vsize = virtual_size(tx.weight(), sigop_cost);
+        // Relay and replacement fees use the sigop-adjusted policy size.
         let mut policy = self.policy.clone();
-        let relay_fee =
-            (tx.weight().div_ceil(4) as i128 * policy.min_relay_fee.as_sat() as i128 + 999) / 1000;
+        let relay_fee = (vsize as i128 * policy.min_relay_fee.as_sat() as i128 + 999) / 1000;
         policy.min_relay_fee = btc_primitives::Amount::from_sat(
             i64::try_from(relay_fee).map_err(|_| reject("relay fee out of range"))?,
         );
@@ -376,7 +396,16 @@ impl RuntimeMempool {
         }
         self.bytes += size;
         self.order.push(id);
-        self.entries.insert(id, Entry { tx, fee, time });
+        self.entries.insert(
+            id,
+            Entry {
+                tx,
+                fee,
+                time,
+                sigop_cost,
+                vsize,
+            },
+        );
         Ok(id)
     }
     fn collect_ancestors(&self, id: TxHash, seen: &mut HashSet<TxHash>) {
@@ -427,5 +456,101 @@ impl RuntimeMempool {
             }
         }
         pool
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use btc_consensus::{utxo::InMemoryUtxoSet, validation::ChainParams};
+    use btc_primitives::{Amount, ScriptBuf, TxIn, TxOut, Witness};
+
+    #[test]
+    fn permissive_script_flags_cannot_bypass_sigop_resource_policy() {
+        let code = [vec![0, 0x63], vec![0xae; 198], vec![0x68, 0x51]].concat();
+        let op = OutPoint::new(TxHash::from_bytes([45; 32]), 0);
+        let mut coins = InMemoryUtxoSet::new();
+        coins.insert(
+            op,
+            UtxoEntry {
+                txout: TxOut {
+                    value: Amount::from_sat(1_000_000),
+                    script_pubkey: ScriptBuf::p2wsh(&btc_primitives::hash::sha256(&code)),
+                },
+                height: 0,
+                is_coinbase: false,
+            },
+        );
+        let tx = Transaction {
+            version: 2,
+            inputs: vec![TxIn {
+                previous_output: op,
+                script_sig: ScriptBuf::new(),
+                sequence: u32::MAX,
+            }],
+            outputs: vec![
+                TxOut {
+                    value: Amount::from_sat(900_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                },
+                TxOut {
+                    value: Amount::ZERO,
+                    script_pubkey: ScriptBuf::from_bytes([vec![0x6a], vec![0xae; 151]].concat()),
+                },
+            ],
+            witness: vec![Witness::from_items(vec![code])],
+            lock_time: 0,
+        };
+        let mut pool = RuntimeMempool {
+            flags: ScriptFlags::none(),
+            ..Default::default()
+        };
+        let chain = ChainState::new(ChainParams::regtest());
+        assert!(pool
+            .admit(tx, &coins, &chain)
+            .unwrap_err()
+            .message
+            .contains("too-many-sigops"));
+        assert!(pool.entries.is_empty());
+        assert!(pool.spent.is_empty());
+        assert!(coins.contains(&op));
+        // The separate P2SH cap is also resource policy, regardless of flags.
+        for (count, accepted) in [(16, false), (15, true)] {
+            let redeem = [vec![0, 0x63], vec![0xac; count], vec![0x68, 0x51]].concat();
+            let mut sig = ScriptBuf::new();
+            sig.push_slice(&redeem);
+            coins.insert(
+                op,
+                UtxoEntry {
+                    txout: TxOut {
+                        value: Amount::from_sat(1_000_000),
+                        script_pubkey: ScriptBuf::p2sh(&btc_primitives::hash::hash160(&redeem)),
+                    },
+                    height: 0,
+                    is_coinbase: false,
+                },
+            );
+            let tx = Transaction {
+                version: 2,
+                inputs: vec![TxIn {
+                    previous_output: op,
+                    script_sig: sig,
+                    sequence: u32::MAX,
+                }],
+                outputs: vec![TxOut {
+                    value: Amount::from_sat(900_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+                witness: vec![],
+                lock_time: 0,
+            };
+            let result = pool.admit(tx, &coins, &chain);
+            if accepted {
+                assert_eq!(pool.entries[&result.unwrap()].sigop_cost, 60);
+            } else {
+                assert!(result.unwrap_err().message.contains("nonstandard-inputs"));
+                assert!(pool.entries.is_empty());
+            }
+        }
     }
 }

@@ -725,6 +725,7 @@ impl NodeChainBackend {
         };
         let mut selected = HashSet::new();
         let mut fees = 0i64;
+        let mut sigops = btc_consensus::sigops::legacy_sigop_cost(&block.transactions[0]);
         for id in &data.mempool.order {
             let entry = &data.mempool.entries[id];
             if entry.tx.inputs.iter().any(|input| {
@@ -738,6 +739,12 @@ impl NodeChainBackend {
             if block.weight() + entry.tx.weight() + 1000 > 4_000_000 {
                 continue;
             }
+            if sigops.saturating_add(entry.sigop_cost)
+                > btc_consensus::sigops::MAX_BLOCK_SIGOPS_COST
+            {
+                continue;
+            }
+            sigops += entry.sigop_cost;
             fees = fees
                 .checked_add(entry.fee)
                 .ok_or_else(|| internal("template fee overflow"))?;
@@ -895,13 +902,17 @@ impl ChainBackend for NodeChainBackend {
                 let accepted = pool
                     .admit(tx.clone(), &data.utxos, &data.headers)
                     .and_then(|id| {
-                        limits.check(&tx, pool.entries[&id].fee)?;
+                        limits.check_with_size(
+                            &tx,
+                            pool.entries[&id].fee,
+                            pool.entries[&id].vsize,
+                        )?;
                         Ok(id)
                     });
                 match accepted {
                     Ok(_) => Ok(
                         json!([{ "txid": id.to_string(), "wtxid": tx.wtxid().to_string(), "allowed": true,
-                        "vsize": (tx.weight() + 3) / 4, "fees": { "base": pool.entries[&id].fee as f64 / 100_000_000.0 } }]),
+                        "vsize": pool.entries[&id].vsize, "fees": { "base": pool.entries[&id].fee as f64 / 100_000_000.0 } }]),
                     ),
                     Err(error) => Ok(
                         json!([{ "txid": id.to_string(), "wtxid": tx.wtxid().to_string(), "allowed": false, "reject-reason": error.message }]),
@@ -971,7 +982,7 @@ impl ChainBackend for NodeChainBackend {
                         .filter(|(_, parent)| tx.inputs.iter().any(|input| input.previous_output.txid == parent.txid()))
                         .map(|(position, _)| position + 1).collect();
                     Ok(json!({ "data": hex::encode(encode(tx)), "txid": tx.txid().to_string(), "hash": tx.wtxid().to_string(),
-                        "depends": depends, "fee": data.mempool.entries.get(&tx.txid()).map(|e| e.fee).ok_or_else(|| internal("template changed while reading metadata"))?, "weight": tx.weight() }))
+                        "depends": depends, "fee": data.mempool.entries.get(&tx.txid()).map(|e| e.fee).ok_or_else(|| internal("template changed while reading metadata"))?, "sigops": data.mempool.entries.get(&tx.txid()).map(|e| e.sigop_cost).ok_or_else(|| internal("template changed while reading metadata"))?, "weight": tx.weight() }))
                 }).collect::<Result<Vec<_>, RpcError>>()?;
                 let mut result = json!({ "version": block.header.version, "previousblockhash": block.header.prev_blockhash.to_string(),
                     "transactions": transactions, "coinbasevalue": block.transactions[0].outputs[0].value.as_sat(),
@@ -1168,10 +1179,12 @@ impl RpcFeeLimits {
         })
     }
     fn check(&self, tx: &Transaction, fee: i64) -> Result<(), RpcError> {
-        let vsize = tx.weight().div_ceil(4) as i64;
-        if self.rate_sat_per_kvb != 0
-            && (fee as i128) * 1000 / vsize as i128 > self.rate_sat_per_kvb as i128
-        {
+        self.check_with_size(tx, fee, tx.weight().div_ceil(4))
+    }
+    fn check_with_size(&self, tx: &Transaction, fee: i64, vsize: usize) -> Result<(), RpcError> {
+        // Core CFeeRate::GetFee rounds upward to a whole satoshi.
+        let maximum = (self.rate_sat_per_kvb as i128 * vsize as i128 + 999) / 1000;
+        if self.rate_sat_per_kvb != 0 && fee as i128 > maximum {
             return Err(RpcError::new(-25, "max feerate exceeded"));
         }
         if let Some(limit) = self.burn_sat {
@@ -1222,7 +1235,7 @@ fn mempool_entry_json(
         .map(|child| child.tx.txid().to_string())
         .collect();
     Ok(
-        json!({ "vsize": (entry.tx.weight() + 3) / 4, "weight": entry.tx.weight(), "time": entry.time,
+        json!({ "vsize": entry.vsize, "weight": entry.tx.weight(), "time": entry.time,
         "fees": { "base": entry.fee as f64 / 100_000_000.0 }, "depends": depends, "spentby": spent_by, "wtxid": entry.tx.wtxid().to_string() }),
     )
 }
@@ -1289,6 +1302,115 @@ mod tests {
         while !block.header.check_proof_of_work() {
             block.header.nonce += 1;
         }
+    }
+
+    #[test]
+    fn sigop_budget_controls_admission_mining_and_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sigops.redb");
+        let backend =
+            Arc::new(NodeChainBackend::open(&path, NodeState::new(Network::Regtest)).unwrap());
+        let mut funding = Vec::new();
+        for _ in 0..106 {
+            let mut block = backend
+                .candidate(ScriptBuf::from_bytes(vec![0x51]))
+                .unwrap();
+            mine(&mut block);
+            funding.push(block.transactions[0].clone());
+            backend.submit_block(&block).unwrap();
+        }
+        let spend = |index: usize, count: usize| {
+            let mut operations = vec![0x6a];
+            operations.extend(vec![0xae; count]);
+            Transaction {
+                version: 2,
+                inputs: vec![TxIn {
+                    previous_output: OutPoint::new(funding[index].txid(), 0),
+                    script_sig: ScriptBuf::new(),
+                    sequence: u32::MAX,
+                }],
+                outputs: vec![
+                    TxOut {
+                        value: Amount::from_sat(funding[index].outputs[0].value.as_sat() - 100_000),
+                        script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                    },
+                    TxOut {
+                        value: Amount::ZERO,
+                        script_pubkey: ScriptBuf::from_bytes(operations),
+                    },
+                ],
+                witness: vec![],
+                lock_time: 0,
+            }
+        };
+        let rejected = spend(6, 201);
+        assert!(backend
+            .submit_transaction(rejected)
+            .unwrap_err()
+            .message
+            .contains("too-many-sigops"));
+        let mut ids = Vec::new();
+        for index in 0..6 {
+            ids.push(backend.submit_transaction(spend(index, 200)).unwrap());
+        }
+        let mut child = spend(7, 0);
+        child.inputs[0].previous_output = OutPoint::new(ids[5], 0);
+        child.outputs[0].value =
+            Amount::from_sat(spend(5, 200).outputs[0].value.as_sat() - 100_000);
+        let child_id = backend.submit_transaction(child).unwrap();
+        let rpc_handler = handler(&backend);
+        assert_eq!(
+            rpc(&rpc_handler, "getmempoolentry", json!([ids[0].to_string()]))["vsize"],
+            80_000
+        );
+        let template = rpc(&rpc_handler, "getblocktemplate", json!([]));
+        assert_eq!(template["transactions"].as_array().unwrap().len(), 5);
+        assert!(template["transactions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tx| tx["sigops"] == 16_000));
+        let mut block = backend
+            .candidate(ScriptBuf::from_bytes(vec![0x51]))
+            .unwrap();
+        assert_eq!(block.transactions.len(), 6);
+        let tip = backend.tip().unwrap();
+        let mut invalid = block.clone();
+        invalid.transactions.push(spend(5, 200));
+        mine(&mut invalid);
+        assert!(backend
+            .submit_block(&invalid)
+            .unwrap_err()
+            .message
+            .contains("bad-blk-sigops"));
+        assert_eq!(backend.tip().unwrap(), tip);
+        assert_eq!(backend.mempool_transactions().unwrap().len(), 7);
+        drop(rpc_handler);
+        drop(backend);
+        let backend =
+            Arc::new(NodeChainBackend::open(&path, NodeState::new(Network::Regtest)).unwrap());
+        assert_eq!(backend.mempool_transactions().unwrap().len(), 7);
+        assert_eq!(
+            backend.lock().unwrap().mempool.entries[&ids[0]].sigop_cost,
+            16_000
+        );
+        mine(&mut block);
+        backend.submit_block(&block).unwrap();
+        assert_eq!(backend.mempool_transactions().unwrap().len(), 2);
+        let mut next = backend
+            .candidate(ScriptBuf::from_bytes(vec![0x51]))
+            .unwrap();
+        assert_eq!(
+            next.transactions
+                .iter()
+                .skip(1)
+                .map(Transaction::txid)
+                .collect::<Vec<_>>(),
+            vec![ids[5], child_id]
+        );
+        mine(&mut next);
+        backend.submit_block(&next).unwrap();
+        assert!(backend.mempool_transactions().unwrap().is_empty());
     }
 
     #[test]
