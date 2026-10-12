@@ -7,7 +7,7 @@ use redb::{ReadableTableMetadata, TableHandle};
 
 const PREFIX: &str = "LegacyCheckpointV1.";
 const RECORD: TableDefinition<&str, &[u8]> = TableDefinition::new("LegacyCheckpointResyncV1");
-const BYTE_TABLES: [TableDefinition<&[u8], &[u8]>; 9] = [
+const BYTE_TABLES: [TableDefinition<&[u8], &[u8]>; 11] = [
     UNDO,
     MEMPOOL,
     HEADERS,
@@ -17,6 +17,8 @@ const BYTE_TABLES: [TableDefinition<&[u8], &[u8]>; 9] = [
     UTXOS,
     TX_BLOCK_INDEX,
     ADDRESS_INDEX,
+    script_index::HISTORY,
+    script_index::MANIFEST,
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -303,7 +305,7 @@ mod tests {
     #[test]
     fn every_staged_recovery_failure_preserves_all_raw_tables_on_restart() {
         // before renames, each rename/recreation, and before the single commit.
-        for fail_at in 0..22 {
+        for fail_at in 0..(2 * BYTE_TABLES.len() + 4) {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("legacy.redb");
             let db = fixture(&path);

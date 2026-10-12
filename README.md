@@ -385,7 +385,7 @@ Built-in example plugins:
 
 ### APIs
 - **JSON-RPC** — 9 Bitcoin Core-compatible methods wired to real chain state
-- **Experimental Electrum subset** — opt-in loopback chain/transaction queries, verified admission, merkle proofs and header notifications; wallet indexing and full protocol negotiation remain unfinished. See [supported methods and setup](docs/ELECTRUM.md).
+- **Experimental Electrum subset** — opt-in loopback chain/transaction queries, verified admission, merkle proofs and header notifications; validated history/balance/unspent/pool queries are available, while status subscriptions and full protocol negotiation remain unfinished. See [supported methods and setup](docs/ELECTRUM.md).
 - **Esplora REST** — 9 endpoints matching Blockstream's API format
 - **Prometheus** — `/metrics` endpoint with 7 gauges (chain height, peers, mempool, sync progress, etc.)
 - **ZMQ notifications** — hashblock, hashtx, rawblock, rawtx, sequence via ExEx

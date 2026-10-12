@@ -38,6 +38,14 @@ pub struct TxBlockLocation {
     pub tx_position: u32,
 }
 
+/// One validated transaction touching a script, ordered by active height/position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptHistoryEntry {
+    pub txid: TxHash,
+    pub height: u64,
+    pub tx_position: u32,
+}
+
 /// An entry in the per-address (per-script) index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddressIndexValue {
@@ -55,6 +63,19 @@ pub struct AddressIndexValue {
 
 /// Read-only database transaction
 pub trait DbTx: Send + Sync {
+    /// None means the validated script index has never been enabled.
+    fn script_index_tip(&self) -> Result<Option<(u64, BlockHash)>, StorageError> {
+        Ok(None)
+    }
+    fn script_history(
+        &self,
+        _hash: &[u8; 32],
+        _limit: usize,
+    ) -> Result<Vec<ScriptHistoryEntry>, StorageError> {
+        Err(StorageError::Database(
+            "validated script history unsupported".into(),
+        ))
+    }
     fn get_block_undo(&self, _hash: &BlockHash) -> Result<Option<Vec<u8>>, StorageError> {
         Err(StorageError::Database(
             "undo records unsupported by this backend".into(),
@@ -84,6 +105,22 @@ pub trait DbTx: Send + Sync {
 
 /// Read-write database transaction
 pub trait DbTxMut: DbTx {
+    fn index_script_block(
+        &self,
+        _height: u64,
+        _block: &Block,
+        _undo: &btc_consensus::utxo::UtxoSetUpdate,
+        _remove: bool,
+    ) -> Result<(), StorageError> {
+        Err(StorageError::Database(
+            "validated script indexing unsupported".into(),
+        ))
+    }
+    fn set_script_index_tip(&self, _height: u64, _hash: &BlockHash) -> Result<(), StorageError> {
+        Err(StorageError::Database(
+            "validated script indexing unsupported".into(),
+        ))
+    }
     fn put_block_undo(&self, _hash: &BlockHash, _bytes: &[u8]) -> Result<(), StorageError> {
         Err(StorageError::Database(
             "undo records unsupported by this backend".into(),

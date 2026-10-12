@@ -1,4 +1,4 @@
-# Experimental Electrum chain service
+# Experimental Electrum chain and script service
 
 The compiled node can serve actual chain/transaction queries on an explicitly
 enabled **loopback** TCP port. It is disabled by default:
@@ -11,10 +11,11 @@ This is an implemented subset, not a complete wallet server. `server.version`
 and `server.features` return explicit unsupported errors; failed version
 negotiation closes that connection. The service advertises no completed Electrum
 protocol version. The protocol requires every nonoptional method of an advertised
-version to work, and this repository still lacks the validated script-history
-index, balance/listunspent/status providers, header checkpoint proofs and other
-wallet methods. Those methods and fee estimation return errors, never invented
-zero balances, empty histories, headers or fixed estimates.
+version to work. Status subscriptions, header checkpoint proofs, fee estimation
+and other required methods remain unfinished and return explicit errors.
+Script history, balances, mempool and unspent queries now use an independently
+maintained validated index and the actual pool. Unknown scripts return real
+empty state only when that index is complete for the active tip.
 
 | Implemented method | Actual data/operation |
 | --- | --- |
@@ -24,6 +25,10 @@ zero balances, empty histories, headers or fixed estimates.
 | `blockchain.transaction.get(tx_hash, verbose=false)` | Actual pool/active-chain transaction, raw or the shared Core-style verbose view |
 | `blockchain.transaction.broadcast(raw_tx)` | Ordinary validated admission, durable pool update and the existing transaction relay event |
 | `blockchain.transaction.get_merkle(tx_hash, height)` | Actual active-block position and txid merkle branch |
+| `blockchain.scripthash.get_history(scripthash)` | Confirmed transactions in block order, then actual pool touches/fees with height 0 or -1 |
+| `blockchain.scripthash.get_mempool(scripthash)` | Actual transactions receiving or spending the script, including unconfirmed parents |
+| `blockchain.scripthash.get_balance(scripthash)` | Durable coin balance including immature coinbases; signed net mempool delta |
+| `blockchain.scripthash.listunspent(scripthash)` | Confirmed outputs in block order followed by unspent pool outputs; pool-spent outputs excluded |
 | `server.ping()` / `server.banner()` | Connection keepalive / explicit subset description |
 
 Queries use the same mutex-protected validated backend as HTTP RPC, mining and
@@ -44,6 +49,33 @@ connection and disappear when it closes; there is no global fake status map.
 If a provider's event source closes, subscribed clients disconnect rather than
 remaining attached to an apparently active subscription without updates.
 
+The validated index has one row per script/transaction, so multiple receipts,
+self payments and input/output overlap cannot duplicate history. Input scripts
+come from checksummed spent-coin undo, including outputs consumed in the same
+block. Side branches are excluded until they win; disconnect/reconnect updates
+history, per-block counts/checksums, coins, the revalidated pool and the index tip
+in the same transaction. Genesis coinbase, OP_RETURN and oversized unspendable
+outputs are excluded. Stored coin heights prevent historical duplicate txids
+from counting the same active coin twice. Physical unspendable-coin pruning in
+the underlying consensus store remains separate work.
+
+Databases without this index undergo full script-verified body replay, with
+exact stored-undo and durable-coin agreement, before a single transaction
+publishes the index. Stage address rows never supply wallet results. An existing
+index is checked against active block hashes and its complete row counts/digests
+on every reopen; malformed receipts, missing/extra rows and mismatched manifests
+fail explicitly. This adds a full index scan on reopen and a verified chain replay
+on first upgrade; it is not a fast migration or pruning claim.
+
+A script query uses one chain lock and one database snapshot. Script hashes use
+Electrum's reversed SHA256 byte order and accept either hex case. History and
+unspent results are bounded to 10,000 entries; queries also cap inspected
+inputs/outputs at 1,000,000 and loaded block weight at 64 MiB. Exceeding a bound
+returns an explicit error rather than truncating balances or history. Balances
+ignore pool spends in the confirmed total, while the unconfirmed signed delta
+includes every actual pool receipt and spend. Unspent pool outputs always have
+height zero; pool history uses -1 whenever any parent remains unconfirmed.
+
 The transport handles positional/named implemented arguments, sequential batches
 up to 128 members, v2 notifications and legacy/v2 response envelopes. Empty or
 oversized batches are rejected before dispatch. Batches are not atomic; if a
@@ -63,7 +95,8 @@ this port, and TLS/public hosting are not provided.
 Primary references are [ElectrumX protocol basics](https://electrumx.readthedocs.io/en/latest/protocol-basics.html),
 [ElectrumX 1.4 method semantics](https://electrumx.readthedocs.io/en/latest/protocol-methods.html),
 Core v29's [transaction RPC](https://github.com/bitcoin/bitcoin/blob/v29.0/src/rpc/rawtransaction.cpp)
-and [block/merkle primitives](https://github.com/bitcoin/bitcoin/blob/v29.0/src/consensus/merkle.cpp).
+and [block/merkle primitives](https://github.com/bitcoin/bitcoin/blob/v29.0/src/consensus/merkle.cpp),
+plus Core's [coin handling](https://github.com/bitcoin/bitcoin/blob/v29.0/src/coins.cpp).
 
 Independent acceptance runs the compiled listener against released Core v29
 using real wallet signatures, identical validated blocks, independently computed
@@ -77,11 +110,26 @@ Acceptance passed released Core genesis/header/range comparisons, three actual
 wallet-signed witness admissions and mined transactions, exact raw/verbose views,
 independent even/odd merkle proofs, notification during a partial inbound frame,
 real reorg/pool restoration and restart at height 104, unsupported/malformed/batch
-responses, shutdown and occupied-port startup failure. The final local gate
-passes 3,333 tests in 43 suites, formatting, Clippy, minimal feature checks and
+responses, shutdown and occupied-port startup failure. That chain-service milestone's local gate
+passed 3,333 tests in 43 suites, formatting, Clippy, minimal feature checks and
 release build (two preexisting ignored tests). Eighty-two obsolete mock/placeholder
 checks were replaced by seven handler/real-transport regressions plus the separate
 native Core harness. Existing crypto, consensus and fuzz artifacts are preserved;
 no package versions or ordinary consensus rules changed.
 The closed-provider-stream regression also passes; existing released Core HTTP
 acceptance and all 350 verbose transaction/block/coin comparisons still pass.
+
+The validated script-query milestone adds 200 exact Core-derived comparisons
+across ten real snapshots and five scripts. They cover empty/genesis/unspendable
+state, immature coinbases, negative pool deltas, self payments, RBF, dependent
+parents, same-block child execution, fork restoration and restart at 105. Core's
+explicit invalidation temporarily drops a height-3 spend as immature at height
+101; it independently re-admits the original signed bytes at height 104 before
+comparing identical pools. No expected query results are taken from Rust and no
+maturity check is relaxed. All five actual Core-wallet-signed transactions are
+admitted and mined. The local gate passes 3,337 tests; verified old-body upgrade,
+transaction/unwind aborts, corrupt receipt/row/manifest and query bounds pass.
+Legacy archival preserves both index tables and tests all 26 rollback stages.
+Status subscriptions and complete protocol negotiation remain unfinished.
+Existing HTTP acceptance, all 350 verbose RPC comparisons and both v1/v2 legacy
+checkpoint crash/resync/restart scenarios also pass with the index enabled.

@@ -16,3 +16,5 @@ pub mod wallet_hd;
 pub mod zmq;
 
 mod mempool;
+
+mod electrum_wallet;

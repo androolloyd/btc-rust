@@ -62,11 +62,11 @@ impl ElectrumHandler {
             METHOD_TRANSACTION_GET => (&["tx_hash", "verbose"], 1),
             METHOD_TRANSACTION_BROADCAST => (&["raw_tx"], 1),
             METHOD_TRANSACTION_GET_MERKLE => (&["tx_hash", "height"], 2),
+            METHOD_SCRIPTHASH_GET_HISTORY | METHOD_SCRIPTHASH_GET_MEMPOOL | METHOD_SCRIPTHASH_GET_BALANCE | METHOD_SCRIPTHASH_LISTUNSPENT => (&["scripthash"],1),
             // An advertised Electrum version requires *all* its nonoptional
-            // methods. Do not claim wallet compatibility while the index is absent.
+            // methods. Do not claim compatibility before every required method works.
             METHOD_SERVER_VERSION | METHOD_SERVER_FEATURES => return Err(error(METHOD_NOT_FOUND, "complete Electrum protocol negotiation is unavailable; this is an experimental chain/transaction subset")),
-            METHOD_ESTIMATEFEE | METHOD_SCRIPTHASH_GET_HISTORY | METHOD_SCRIPTHASH_GET_BALANCE |
-            METHOD_SCRIPTHASH_LISTUNSPENT | METHOD_SCRIPTHASH_SUBSCRIBE => return Err(error(METHOD_NOT_FOUND, "wallet index or fee estimator is not implemented")),
+            METHOD_ESTIMATEFEE | METHOD_SCRIPTHASH_SUBSCRIBE => return Err(error(METHOD_NOT_FOUND, "status subscriptions or fee estimator are not implemented")),
             _ => return Err(error(METHOD_NOT_FOUND, "unknown or unsupported Electrum method")),
         };
         let params = match params {
@@ -95,7 +95,7 @@ impl ElectrumHandler {
         };
         match method {
             METHOD_SERVER_PING => Ok(Value::Null),
-            METHOD_SERVER_BANNER => Ok(json!("btc-rust experimental validated chain/transaction service; wallet indexing and full protocol negotiation are unavailable")),
+            METHOD_SERVER_BANNER => Ok(json!("btc-rust experimental validated chain/transaction service; full protocol negotiation and status subscriptions are unavailable")),
             _ => self.backend.as_ref().ok_or_else(|| error(INTERNAL_ERROR, "validated chain provider unavailable"))?.call(method, params),
         }
     }
@@ -252,6 +252,10 @@ mod tests {
             (METHOD_BLOCK_HEADERS, json!([0, 2])),
             (METHOD_TRANSACTION_GET, json!(["00".repeat(32)])),
             (METHOD_TRANSACTION_BROADCAST, json!(["ff"])),
+            (METHOD_SCRIPTHASH_GET_BALANCE, json!(["00".repeat(32)])),
+            (METHOD_SCRIPTHASH_GET_HISTORY, json!(["00".repeat(32)])),
+            (METHOD_SCRIPTHASH_GET_MEMPOOL, json!(["00".repeat(32)])),
+            (METHOD_SCRIPTHASH_LISTUNSPENT, json!(["00".repeat(32)])),
         ] {
             let response = handler.handle(&ElectrumRequest {
                 id: json!(4),
@@ -266,9 +270,6 @@ mod tests {
             METHOD_SERVER_VERSION,
             METHOD_SERVER_FEATURES,
             METHOD_ESTIMATEFEE,
-            METHOD_SCRIPTHASH_GET_BALANCE,
-            METHOD_SCRIPTHASH_GET_HISTORY,
-            METHOD_SCRIPTHASH_LISTUNSPENT,
             METHOD_SCRIPTHASH_SUBSCRIBE,
         ] {
             let response: Value = serde_json::from_str(

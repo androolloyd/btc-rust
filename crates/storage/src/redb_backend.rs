@@ -16,6 +16,8 @@ use crate::traits::{AddressIndexValue, Database, DbTx, DbTxMut, StorageError, Tx
 
 #[path = "legacy_checkpoint.rs"]
 mod legacy_checkpoint;
+#[path = "script_index.rs"]
+mod script_index;
 pub use legacy_checkpoint::LegacyCheckpointArchive;
 
 /// Table definitions for redb.
@@ -55,6 +57,12 @@ impl RedbDatabase {
             .map_err(|e| StorageError::Database(e.to_string()))?;
         write_txn
             .open_table(MEMPOOL)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        write_txn
+            .open_table(script_index::HISTORY)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        write_txn
+            .open_table(script_index::MANIFEST)
             .map_err(|e| StorageError::Database(e.to_string()))?;
         // Opening a table inside a write-transaction creates it if missing.
         write_txn
@@ -301,6 +309,23 @@ pub struct RedbTx {
 unsafe impl Sync for RedbTx {}
 
 impl DbTx for RedbTx {
+    fn script_index_tip(&self) -> Result<Option<(u64, BlockHash)>, StorageError> {
+        script_index::read_tip(&self.inner.open_table(META).map_err(script_index::error)?)
+    }
+    fn script_history(
+        &self,
+        hash: &[u8; 32],
+        limit: usize,
+    ) -> Result<Vec<crate::traits::ScriptHistoryEntry>, StorageError> {
+        script_index::history(
+            &self
+                .inner
+                .open_table(script_index::HISTORY)
+                .map_err(script_index::error)?,
+            hash,
+            limit,
+        )
+    }
     fn get_block_undo(&self, hash: &BlockHash) -> Result<Option<Vec<u8>>, StorageError> {
         let table = self
             .inner
@@ -541,6 +566,23 @@ pub struct RedbTxMut {
 unsafe impl Sync for RedbTxMut {}
 
 impl DbTx for RedbTxMut {
+    fn script_index_tip(&self) -> Result<Option<(u64, BlockHash)>, StorageError> {
+        script_index::read_tip(&self.inner.open_table(META).map_err(script_index::error)?)
+    }
+    fn script_history(
+        &self,
+        hash: &[u8; 32],
+        limit: usize,
+    ) -> Result<Vec<crate::traits::ScriptHistoryEntry>, StorageError> {
+        script_index::history(
+            &self
+                .inner
+                .open_table(script_index::HISTORY)
+                .map_err(script_index::error)?,
+            hash,
+            limit,
+        )
+    }
     fn get_block_undo(&self, hash: &BlockHash) -> Result<Option<Vec<u8>>, StorageError> {
         let table = self
             .inner
@@ -760,6 +802,25 @@ impl DbTx for RedbTxMut {
 }
 
 impl DbTxMut for RedbTxMut {
+    fn index_script_block(
+        &self,
+        height: u64,
+        block: &Block,
+        undo: &btc_consensus::utxo::UtxoSetUpdate,
+        remove: bool,
+    ) -> Result<(), StorageError> {
+        script_index::index_block(self, height, block, undo, remove)
+    }
+    fn set_script_index_tip(&self, height: u64, hash: &BlockHash) -> Result<(), StorageError> {
+        let mut bytes = height.to_be_bytes().to_vec();
+        bytes.extend_from_slice(hash.as_bytes());
+        self.inner
+            .open_table(META)
+            .map_err(script_index::error)?
+            .insert(script_index::RECEIPT, bytes.as_slice())
+            .map_err(script_index::error)?;
+        Ok(())
+    }
     fn put_block_undo(&self, hash: &BlockHash, bytes: &[u8]) -> Result<(), StorageError> {
         self.inner
             .open_table(UNDO)

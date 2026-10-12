@@ -114,6 +114,13 @@ impl<DB: Database> PersistentUtxoSet<DB> {
     ) -> Result<(), StorageError> {
         self.flush_cache()?;
         let tx = self.db.tx_mut()?;
+        let indexed = tx.script_index_tip()?;
+        let old_hash = tx.get_best_block_hash()?;
+        if indexed.is_some_and(|tip| tip != (change.old_height, old_hash)) {
+            return Err(StorageError::Corruption(
+                "script index/chain transition tip mismatch".into(),
+            ));
+        }
         let hash = change.incoming.block_hash();
         tx.put_block_header(&hash, &change.incoming.header)?;
         tx.put_block(&hash, change.incoming)?;
@@ -147,7 +154,36 @@ impl<DB: Database> PersistentUtxoSet<DB> {
                 self.delete_utxo_meta(&tx, outpoint)?;
             }
         }
+        if indexed.is_some() && change.tip.is_some() {
+            for (height, block) in change.detached {
+                let hash = block.block_hash();
+                let raw = tx.get_block_undo(&hash)?.ok_or_else(|| {
+                    StorageError::Corruption("missing detached script-index undo".into())
+                })?;
+                tx.index_script_block(
+                    *height,
+                    block,
+                    &crate::undo::decode_undo(hash, &raw)?,
+                    true,
+                )?;
+            }
+            for (height, block) in change.attached {
+                let hash = block.block_hash();
+                let raw = tx.get_block_undo(&hash)?.ok_or_else(|| {
+                    StorageError::Corruption("missing attached script-index undo".into())
+                })?;
+                tx.index_script_block(
+                    *height,
+                    block,
+                    &crate::undo::decode_undo(hash, &raw)?,
+                    false,
+                )?;
+            }
+        }
         if let Some((height, tip)) = change.tip {
+            if indexed.is_some() {
+                tx.set_script_index_tip(height, &tip)?;
+            }
             for h in height + 1..=change.old_height {
                 tx.delete_block_hash_by_height(h)?;
             }
@@ -189,6 +225,17 @@ impl<DB: Database> PersistentUtxoSet<DB> {
 
         if let Some((block, height)) = block {
             let hash = block.block_hash();
+            if let Some((old_height, old_hash)) = tx.script_index_tip()? {
+                if old_height.checked_add(1) != Some(height)
+                    || old_hash != block.header.prev_blockhash
+                {
+                    return Err(StorageError::Corruption(
+                        "script index extension mismatch".into(),
+                    ));
+                }
+                tx.index_script_block(height, block, update, false)?;
+                tx.set_script_index_tip(height, &hash)?;
+            }
             tx.put_block_header(&hash, &block.header)?;
             tx.put_block_hash_by_height(height, &hash)?;
             tx.put_block(&hash, block)?;

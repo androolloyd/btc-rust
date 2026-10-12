@@ -31,16 +31,16 @@ use serde_json::{json, Value};
 
 use crate::state::NodeState;
 
-struct ValidatedChain {
-    headers: ChainState,
+pub(super) struct ValidatedChain {
+    pub(super) headers: ChainState,
     utxos: PersistentUtxoSet<RedbDatabase>,
-    mempool: crate::mempool::RuntimeMempool,
+    pub(super) mempool: crate::mempool::RuntimeMempool,
     exex: Option<tokio::sync::broadcast::Sender<btc_exex::ExExNotification>>,
 }
 
 pub struct NodeChainBackend {
     data: Mutex<ValidatedChain>,
-    db: Arc<RedbDatabase>,
+    pub(super) db: Arc<RedbDatabase>,
     state: NodeState,
     block_events: tokio::sync::broadcast::Sender<BlockHash>,
     tx_events: tokio::sync::broadcast::Sender<TxHash>,
@@ -199,6 +199,7 @@ impl NodeChainBackend {
             ));
         }
         Self::backfill_undo(&db, &headers, &utxos).map_err(|e| eyre::eyre!(e.message))?;
+        Self::initialize_script_index(&db, &headers, &utxos).map_err(|e| eyre::eyre!(e.message))?;
         let persisted_pool = db.mempool_transactions()?;
         let reader = db.tx()?;
         let mut confirmed = HashSet::new();
@@ -731,6 +732,65 @@ impl NodeChainBackend {
         write.commit().map_err(internal)
     }
 
+    /// Existing bodies become script history only after script-verified replay
+    /// produces exactly the durable coins. A single commit publishes all rows.
+    fn initialize_script_index(
+        db: &RedbDatabase,
+        headers: &ChainState,
+        coins: &dyn UtxoSet,
+    ) -> Result<(), RpcError> {
+        if db.verify_script_index().map_err(internal)? {
+            return Ok(());
+        }
+        let mut replay = InMemoryUtxoSet::new();
+        let write = db.tx_mut().map_err(internal)?;
+        write.reset_uninitialized_script_index().map_err(internal)?;
+        for height in 1..=headers.best_height() {
+            let header = &headers
+                .get_header_by_height(height)
+                .ok_or_else(|| internal("script index migration header missing"))?
+                .header;
+            let hash = header.block_hash();
+            let body = write
+                .get_block(&hash)
+                .map_err(internal)?
+                .ok_or_else(|| internal("script index migration requires validated bodies"))?;
+            if body.header != *header {
+                return Err(internal("script index migration body/header mismatch"));
+            }
+            let update = Self::validate_block_against(&body, height, headers, &replay)?;
+            let raw = write
+                .get_block_undo(&hash)
+                .map_err(internal)?
+                .ok_or_else(|| internal("script index migration requires undo"))?;
+            if raw != btc_storage::undo::encode_undo(hash, &update) {
+                return Err(internal(
+                    "script index migration undo does not match verified replay",
+                ));
+            }
+            write
+                .index_script_block(height, &body, &update, false)
+                .map_err(internal)?;
+            replay.apply_update(&update);
+        }
+        if db.coin_count().map_err(internal)? != replay.len()
+            || replay
+                .iter()
+                .any(|(op, entry)| coins.get_utxo(op).as_ref() != Some(entry))
+        {
+            return Err(internal(
+                "script index migration replay does not match committed coins",
+            ));
+        }
+        write
+            .set_script_index_tip(
+                headers.best_height(),
+                &headers.best_header().header.block_hash(),
+            )
+            .map_err(internal)?;
+        write.commit().map_err(internal)
+    }
+
     fn candidate(&self, output_script: ScriptBuf) -> Result<Block, RpcError> {
         let data = self.lock()?;
         let height = data.headers.best_height() + 1;
@@ -1089,6 +1149,29 @@ impl btc_electrum::ElectrumBackend for NodeChainBackend {
                 .map_err(map_error);
         }
         let data = self.lock().map_err(map_error)?;
+        if matches!(
+            method,
+            METHOD_SCRIPTHASH_GET_HISTORY
+                | METHOD_SCRIPTHASH_GET_MEMPOOL
+                | METHOD_SCRIPTHASH_GET_BALANCE
+                | METHOD_SCRIPTHASH_LISTUNSPENT
+        ) {
+            let script = string(0)?;
+            if script.len() != 64 {
+                return Err(fail(
+                    INVALID_PARAMS,
+                    "scripthash must be 32-byte hexadecimal",
+                ));
+            }
+            let mut hash: [u8; 32] = hex::decode(script)
+                .ok()
+                .and_then(|v| v.try_into().ok())
+                .ok_or_else(|| fail(INVALID_PARAMS, "scripthash must be 32-byte hexadecimal"))?;
+            hash.reverse();
+            return self
+                .electrum_wallet(&data, method, &hash)
+                .map_err(map_error);
+        }
         let header = |height| {
             data.headers
                 .get_header_by_height(height)
@@ -1586,7 +1669,7 @@ fn block_hash_param(params: &Value) -> Result<BlockHash, RpcError> {
 fn rejection(error: impl std::fmt::Display) -> RpcError {
     RpcError::new(-26, error.to_string())
 }
-fn internal(error: impl std::fmt::Display) -> RpcError {
+pub(super) fn internal(error: impl std::fmt::Display) -> RpcError {
     RpcError::new(INTERNAL_ERROR, error.to_string())
 }
 
@@ -1626,6 +1709,78 @@ mod tests {
         while !block.header.check_proof_of_work() {
             block.header.nonce += 1;
         }
+    }
+
+    #[test]
+    fn validated_script_index_upgrades_real_body_history_and_ignores_stage_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = NodeChainBackend::open(
+            &dir.path().join("source.redb"),
+            NodeState::new(Network::Regtest),
+        )
+        .unwrap();
+        let key = TestKeyPair::from_secret(secp256k1::SecretKey::from_slice(&[11; 32]).unwrap());
+        let address = Address::p2pkh_from_pubkey(&key.pubkey_bytes(), Network::Regtest).to_string();
+        ChainBackend::call(&source, "generatetoaddress", json!([3, address])).unwrap();
+        let path = dir.path().join("old.redb");
+        {
+            let db = Arc::new(RedbDatabase::new(&path).unwrap());
+            db.init_tables().unwrap();
+            let mut coins = PersistentUtxoSet::new(db.clone());
+            let source_read = source.db.tx().unwrap();
+            for height in 1..=3 {
+                let hash = source_read
+                    .get_block_hash_by_height(height)
+                    .unwrap()
+                    .unwrap();
+                let block = source_read.get_block(&hash).unwrap().unwrap();
+                let raw = source_read.get_block_undo(&hash).unwrap().unwrap();
+                coins
+                    .apply_block_update(
+                        &block,
+                        height,
+                        &btc_storage::undo::decode_undo(hash, &raw).unwrap(),
+                    )
+                    .unwrap();
+            }
+            let write = db.tx_mut().unwrap();
+            write
+                .put_address_tx(
+                    &[0; 32],
+                    &btc_storage::AddressIndexValue {
+                        txid: TxHash::ZERO,
+                        height: 2,
+                        tx_position: 0,
+                        value: 100,
+                        output_index: 0,
+                    },
+                )
+                .unwrap();
+            write.commit().unwrap();
+            assert!(!db.verify_script_index().unwrap());
+        }
+        let upgraded = NodeChainBackend::open(&path, NodeState::new(Network::Regtest)).unwrap();
+        let hash = btc_primitives::hash::sha256(key.p2pkh_script().as_bytes());
+        assert_eq!(
+            upgraded.db.tx().unwrap().script_history(&hash, 10).unwrap(),
+            source.db.tx().unwrap().script_history(&hash, 10).unwrap()
+        );
+        assert!(upgraded
+            .db
+            .tx()
+            .unwrap()
+            .script_history(&[0; 32], 10)
+            .unwrap()
+            .is_empty());
+        assert!(upgraded.db.verify_script_index().unwrap());
+        drop(upgraded);
+        assert!(
+            NodeChainBackend::open(&path, NodeState::new(Network::Regtest))
+                .unwrap()
+                .db
+                .verify_script_index()
+                .unwrap()
+        );
     }
 
     #[test]
