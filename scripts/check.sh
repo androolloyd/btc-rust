@@ -7,6 +7,7 @@ cargo test --workspace --all-features --locked
 cargo clippy --workspace --all-targets --all-features --locked
 cargo check --locked --package btc-primitives --no-default-features
 cargo check --locked --package btc-primitives --no-default-features --features psbt
+cargo check --locked --package btc-primitives --no-default-features --features descriptor
 cargo check --locked --package btc-consensus --no-default-features
 cargo check --locked --package btc-network --no-default-features
 cargo check --locked --package btc-storage --no-default-features

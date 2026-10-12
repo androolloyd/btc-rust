@@ -75,3 +75,9 @@ name = "fuzz_psbt_decode"
 path = "fuzz_targets/fuzz_psbt_decode.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_descriptor"
+path = "fuzz_targets/fuzz_descriptor.rs"
+test = false
+doc = false

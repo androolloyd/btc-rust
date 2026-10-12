@@ -65,6 +65,39 @@ pub fn script_type(script: &Script) -> &str {
 // Decode helpers
 // ---------------------------------------------------------------------------
 
+/// Derive scripts/addresses from public descriptors without wallet/chain claims.
+pub fn derive_descriptor(
+    text: &str,
+    index: Option<u32>,
+    network: Network,
+) -> eyre::Result<serde_json::Value> {
+    use btc_primitives::descriptor::{descriptor_checksum, Descriptor};
+    let descriptor = Descriptor::parse(text)?;
+    let expanded = descriptor.expand(index, network)?;
+    let text = descriptor.to_string();
+    Ok(serde_json::json!({
+        "expansion_scope": "public_descriptor_scripts",
+        "descriptor": format!("{}#{}", text, descriptor_checksum(&text)?),
+        "is_ranged": expanded.is_ranged,
+        "index": index,
+        "derivation_steps": expanded.derivation_steps,
+        "script_pubkey": hex::encode(expanded.script_pubkey.as_bytes()),
+        "address": expanded.address.map(|address| address.to_string()),
+        "redeem_script": expanded.redeem_script.map(|script| hex::encode(script.as_bytes())),
+        "witness_script": expanded.witness_script.map(|script| hex::encode(script.as_bytes())),
+        "internal_key": expanded.internal_key.map(hex::encode),
+        "merkle_root": expanded.merkle_root.map(hex::encode),
+        "tap_leaves": expanded.tap_leaves.iter().map(|leaf| serde_json::json!({
+            "script": hex::encode(leaf.script.as_bytes()), "leaf_version": 0xc0,
+            "leaf_hash": hex::encode(leaf.leaf_hash), "control_block": hex::encode(&leaf.control_block),
+        })).collect::<Vec<_>>(),
+        "key_origins_verified": false,
+        "wallet_ownership_verified": false,
+        "signatures_verified": false,
+        "active_chain_verified": false,
+    }))
+}
+
 fn parse_psbt_hex(hex_str: &str) -> eyre::Result<btc_primitives::psbt::Psbt> {
     if hex_str.len() > btc_primitives::psbt::MAX_PSBT_SIZE * 2 {
         eyre::bail!("PSBT exceeds parser size limit");

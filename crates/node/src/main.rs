@@ -174,6 +174,14 @@ enum Commands {
     /// Verify public key derivations from supplied PSBT global xpubs (offline)
     VerifyPsbtDerivations { hex: String },
 
+    /// Expand a public descriptor into scripts, an address and control proofs
+    DeriveDescriptor {
+        descriptor: String,
+        /// Required for a final /* wildcard; forbidden for fixed descriptors
+        #[arg(long)]
+        index: Option<u32>,
+    },
+
     /// Verify supported PSBT signatures against supplied prevouts (offline)
     VerifyPsbt {
         hex: String,
@@ -330,6 +338,20 @@ async fn main() -> eyre::Result<()> {
         }
         Some(Commands::VerifyPsbtDerivations { hex }) => {
             output::emit(format, &cli::verify_psbt_derivations(&hex)?);
+            Ok(())
+        }
+        Some(Commands::DeriveDescriptor { descriptor, index }) => {
+            eyre::ensure!(
+                matches!(
+                    cli.network.as_str(),
+                    "mainnet" | "testnet" | "testnet4" | "signet" | "regtest"
+                ),
+                "unsupported descriptor network"
+            );
+            output::emit(
+                format,
+                &cli::derive_descriptor(&descriptor, index, network)?,
+            );
             Ok(())
         }
         Some(Commands::VerifyPsbt { hex, partial }) => {

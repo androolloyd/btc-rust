@@ -134,6 +134,115 @@ def encode_maps(maps):
     return wire.hex()
 
 
+def derive_descriptor(args, text, index=None, network="regtest"):
+    extra = ["--network", network]
+    if index is not None:
+        extra += ["--index", str(index)]
+    result = cli(args.node, "derive-descriptor", text, *extra)
+    assert result["expansion_scope"] == "public_descriptor_scripts"
+    assert all(result[field] is False for field in ["key_origins_verified", "wallet_ownership_verified", "signatures_verified", "active_chain_verified"])
+    return result
+
+
+def regtest_descriptor(text):
+    # Core's regtest descriptor parser requires tpub versions. Keep every
+    # published cryptographic/header byte after the version unchanged; do not
+    # derive replacement keys or regenerate expected scripts.
+    alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    def replace(match):
+        value = 0
+        for char in match[0]:
+            value = value * 58 + alphabet.index(char)
+        raw = value.to_bytes((value.bit_length() + 7) // 8, "big")
+        assert len(raw) == 82 and raw[:4] == bytes.fromhex("0488b21e")
+        assert hashlib.sha256(hashlib.sha256(raw[:-4]).digest()).digest()[:4] == raw[-4:]
+        payload = bytes.fromhex("043587cf") + raw[4:-4]
+        converted = payload + hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
+        value = int.from_bytes(converted, "big")
+        result = ""
+        while value:
+            value, digit = divmod(value, 58)
+            result = alphabet[digit] + result
+        assert result.startswith("tpub")
+        return result
+    return re.sub(r"xpub[1-9A-HJ-NP-Za-km-z]+", replace, text)
+
+
+def check_public_descriptor_vectors(args, port):
+    source = Path(__file__).resolve().parents[1] / "crates/primitives/tests/data/descriptors.json"
+    count = 0
+    for vector in json.loads(source.read_text())["vectors"]:
+        original = vector["descriptor"]
+        text = regtest_descriptor(original)
+        info = core_rpc(port, "getdescriptorinfo", [text])
+        assert not info["hasprivatekeys"]
+        for index, script in enumerate(vector["scripts"]):
+            index = index if info["isrange"] else None
+            assert derive_descriptor(args, original, index, network="mainnet")["script_pubkey"] == script
+            checked = derive_descriptor(args, text, index)
+            assert checked["script_pubkey"] == script
+            assert checked["is_ranged"] == info["isrange"]
+            assert derive_descriptor(args, f"raw({script})")["script_pubkey"] == script
+            output = checked["descriptor"]
+            assert core_rpc(port, "getdescriptorinfo", [output])["checksum"] == output.split("#")[1]
+            params = [info["descriptor"]] + ([[index, index]] if index is not None else [])
+            if checked["address"] is not None:
+                assert core_rpc(port, "deriveaddresses", params) == [checked["address"]]
+                assert core_rpc(port, "getaddressinfo", [checked["address"]])["scriptPubKey"] == script
+                assert derive_descriptor(args, f"addr({checked['address']})")["script_pubkey"] == script
+            else:
+                try:
+                    core_rpc(port, "deriveaddresses", params)
+                    raise AssertionError("Core unexpectedly produced a bare-script address")
+                except RuntimeError as failure:
+                    assert "address" in str(failure).lower()
+            count += 1
+        if original != text:
+            for wrong, network in [(original, "regtest"), (text, "mainnet")]:
+                result = subprocess.run([str(args.node), "--json", "--network", network, "derive-descriptor", wrong, "--index", "0"] if info["isrange"] else [str(args.node), "--json", "--network", network, "derive-descriptor", wrong], capture_output=True, text=True, timeout=30)
+                assert result.returncode != 0 and "selected network" in result.stderr
+    key = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+    # Independently checked context/count boundaries, including minimally
+    # encoded 17..20 multisig integers and the actual P2SH element-size cap.
+    for outer, n, k in [("wsh", 20, 17), ("sh", 15, 1), ("sh-wsh", 20, 17)]:
+        text = f"multi({k},{','.join([key] * n)})"
+        text = f"sh(wsh({text}))" if outer == "sh-wsh" else f"{outer}({text})"
+        checked = derive_descriptor(args, text)
+        info = core_rpc(port, "getdescriptorinfo", [text])
+        assert core_rpc(port, "deriveaddresses", [info["descriptor"]]) == [checked["address"]]
+        assert core_rpc(port, "getaddressinfo", [checked["address"]])["scriptPubKey"] == checked["script_pubkey"]
+    invalid = ["pk(aa)", "pkh(aa)", "wpkh(aa)", f"sh(sh(pk({key})))", f"wsh(wpkh({key}))", f"wsh(wsh(pk({key})))", f"sh(tr({key}))", f"multi(0,{key})", f"multi(1,{','.join([key] * 4)})", f"sh(multi(1,{','.join([key] * 16)}))", f"wsh(multi(1,{','.join([key] * 21)}))", f"pk([12345]{key})", f"pk({key}/*)"]
+    for text in invalid:
+        result = subprocess.run([str(args.node), "--json", "derive-descriptor", text], capture_output=True, text=True, timeout=30)
+        assert result.returncode != 0 and not result.stdout.strip(), text
+        try:
+            core_rpc(port, "getdescriptorinfo", [text])
+            raise AssertionError(f"Core accepted invalid descriptor: {text}")
+        except RuntimeError:
+            pass
+    print(f"PASSED: {count} published public descriptor scripts, Core addresses/checksums, 3 multisig boundaries and {len(invalid)} shared rejections", flush=True)
+
+
+def check_funded_descriptor(args, port, address, raw, kind, expected_maps=3, input_index=0):
+    # Core exports the actual public descriptor for this funded output.
+    info = core_rpc(port, "getaddressinfo", [address])
+    checked = derive_descriptor(args, info["desc"])
+    assert checked["script_pubkey"] == info["scriptPubKey"] and checked["address"] == address
+    maps = psbt_maps(raw, expected_maps)
+    records = maps[1 + input_index]
+    for key, field in [(b"\x04", "redeem_script"), (b"\x05", "witness_script")]:
+        if key in records:
+            assert checked[field] == records[key].hex(), (kind, field)
+    leaves = {(leaf["control_block"], leaf["script"]) for leaf in checked["tap_leaves"]}
+    expected = {(key[1:].hex(), value[:-1].hex()) for key, value in records.items() if key[0] == 0x15}
+    assert expected <= leaves, (kind, expected, leaves)
+    if b"\x17" in records:
+        assert checked["internal_key"] == records[b"\x17"].hex()
+    if b"\x18" in records:
+        assert checked["merkle_root"] == records[b"\x18"].hex()
+    print(f"PASSED: Core {kind} funded descriptor, wrapped scripts and {len(expected)} independent control proofs", flush=True)
+
+
 def public_xpub_records(port):
     alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
     records = {}
@@ -728,6 +837,7 @@ def check_wallet(args, port, kind, script_pair=None):
     original_hex = base64.b64decode(signed, validate=True).hex()
     reject_verification(args, original_hex, "not finalized")
     decoded = cli(args.node, "decode-psbt", original_hex)
+    check_funded_descriptor(args, port, address, original_hex, kind)
     check_key_derivation_proofs(args, port, original_hex, kind)
     check_partial_verification(args, port, original_hex)
     independent = core_rpc(port, "decodepsbt", [signed])
@@ -814,6 +924,7 @@ def check_two_input_taproot_verification(args, port):
                                             {destination: round(sum(coin["amount"] for coin in coins) - 0.00002, 8)}, 23])
     signed = core_rpc(port, "walletprocesspsbt", [original, True, "DEFAULT", True, False])["psbt"]
     partial_hex = base64.b64decode(signed).hex()
+    check_funded_descriptor(args, port, address, partial_hex, "two-input Taproot", expected_maps=4)
     check_key_derivation_proofs(args, port, partial_hex, "two-input Taproot", expected_maps=4)
     for encoded in [partial_hex, cli(args.node, "convert-psbt", partial_hex, "--version", "2")["psbt_hex"]]:
         checked = cli(args.node, "verify-psbt", encoded, "--partial")
@@ -866,6 +977,7 @@ def check_legacy_multisig_partials(args, port, addresses):
                                            {destination: round(coin["amount"] - 0.00002, 8)}, 23])
     signed = core_rpc(port, "walletprocesspsbt", [original, True, "ALL", True, False])["psbt"]
     raw = base64.b64decode(signed).hex()
+    check_funded_descriptor(args, port, address, raw, "legacy P2SH multisig")
     check_key_derivation_proofs(args, port, raw, "legacy P2SH multisig")
     check_partial_verification(args, port, raw)
     finalized = core_rpc(port, "finalizepsbt", [signed])
@@ -916,6 +1028,7 @@ def main():
                 descriptors = core_rpc(port, "listdescriptors", [True])["descriptors"]
                 script_pairs = {kind: script_addresses(port, kind, descriptors)
                                 for kind in ["wsh", "sh-wsh", "taproot-script", "taproot-unbalanced", "wsh-multisig", "sh-wsh-multisig", "sh-multisig", "wsh-multisig-2of3"]}
+                check_public_descriptor_vectors(args, port)
                 check_published_taproot_vectors(args, port)
                 check_published_spending_vectors(args, port)
                 check_published_key_vectors(args, port)

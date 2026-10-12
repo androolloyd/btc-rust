@@ -1,7 +1,7 @@
-//! Output Descriptors (BIP380-387).
+//! Public output descriptors (BIP380-386 subset).
 //!
 //! Output descriptors are a human-readable language for describing how to
-//! derive `scriptPubKey`s for wallet operations. They cover all standard
+//! derive `scriptPubKey`s for wallet operations. Supported expansion covers
 //! Bitcoin output types (P2PK, P2PKH, P2WPKH, P2SH, P2WSH, P2TR, multisig)
 //! and support a checksum for safe copy-pasting.
 //!
@@ -9,13 +9,16 @@
 //! - `Descriptor` enum covering all standard descriptor types
 //! - Parsing from descriptor strings (`Descriptor::parse`)
 //! - Serialization back to descriptor strings (`Descriptor::to_string`)
-//! - Simplified `script_pubkey` derivation (pk, pkh, wpkh)
+//! - Public key/HD expansion into scripts, addresses and Taproot control proofs
 //! - BIP380 descriptor checksum computation (`descriptor_checksum`)
 
-use crate::hash::hash160;
 use crate::script::ScriptBuf;
 use std::fmt;
 use thiserror::Error;
+
+#[path = "descriptor_expand.rs"]
+mod expand;
+pub use expand::{DescriptorExpansion, ExpandedTapLeaf};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -45,6 +48,8 @@ pub enum DescriptorError {
     UnsupportedScriptPubkey,
     #[error("invalid hex in raw descriptor: {0}")]
     InvalidHex(String),
+    #[error("descriptor expansion failed: {0}")]
+    Expansion(&'static str),
 }
 
 // ---------------------------------------------------------------------------
@@ -191,11 +196,13 @@ impl Descriptor {
     /// Parse a descriptor from a string.
     ///
     /// Accepts optional `#checksum` suffix. If present, the checksum is verified.
+    /// Key validity and supported script contexts are checked by `expand`.
     pub fn parse(s: &str) -> Result<Self, DescriptorError> {
         let s = s.trim();
         if s.is_empty() {
             return Err(DescriptorError::Empty);
         }
+        check_structure(s)?;
 
         // Strip and verify checksum if present.
         let desc_str = if let Some(hash_pos) = s.rfind('#') {
@@ -276,40 +283,10 @@ impl Descriptor {
 
     /// Derive the `scriptPubKey` for this descriptor.
     ///
-    /// Currently supports: `pk`, `pkh`, `wpkh`, `raw`.
-    /// Other types return `DescriptorError::UnsupportedScriptPubkey`.
+    /// Fixed public descriptors use mainnet address interpretation. Use
+    /// `expand` for ranged descriptors or a different address network.
     pub fn script_pubkey(&self) -> Result<ScriptBuf, DescriptorError> {
-        match self {
-            Descriptor::Pk(key_hex) => {
-                // pk(KEY) -> <KEY> OP_CHECKSIG
-                let key_bytes = hex::decode(key_hex)
-                    .map_err(|_| DescriptorError::InvalidKey(key_hex.clone()))?;
-                let mut script = ScriptBuf::new();
-                script.push_slice(&key_bytes);
-                script.push_opcode(crate::script::Opcode::OP_CHECKSIG);
-                Ok(script)
-            }
-            Descriptor::Pkh(key_hex) => {
-                // pkh(KEY) -> OP_DUP OP_HASH160 <HASH160(KEY)> OP_EQUALVERIFY OP_CHECKSIG
-                let key_bytes = hex::decode(key_hex)
-                    .map_err(|_| DescriptorError::InvalidKey(key_hex.clone()))?;
-                let pkh = hash160(&key_bytes);
-                Ok(ScriptBuf::p2pkh(&pkh))
-            }
-            Descriptor::Wpkh(key_hex) => {
-                // wpkh(KEY) -> OP_0 <HASH160(KEY)>
-                let key_bytes = hex::decode(key_hex)
-                    .map_err(|_| DescriptorError::InvalidKey(key_hex.clone()))?;
-                let pkh = hash160(&key_bytes);
-                Ok(ScriptBuf::p2wpkh(&pkh))
-            }
-            Descriptor::Raw(hex_str) => {
-                let bytes = hex::decode(hex_str)
-                    .map_err(|_| DescriptorError::InvalidHex(hex_str.clone()))?;
-                Ok(ScriptBuf::from_bytes(bytes))
-            }
-            _ => Err(DescriptorError::UnsupportedScriptPubkey),
-        }
+        Ok(self.expand(None, crate::Network::Mainnet)?.script_pubkey)
     }
 }
 
@@ -350,6 +327,44 @@ impl fmt::Display for Descriptor {
 // ---------------------------------------------------------------------------
 // Parsing helpers
 // ---------------------------------------------------------------------------
+
+/// Bound recursion before parsing, and prevent mismatched delimiter underflow.
+fn check_structure(s: &str) -> Result<(), DescriptorError> {
+    if s.len() > 65_536 || !s.is_ascii() {
+        return Err(DescriptorError::Expansion(
+            "descriptor size/character limit",
+        ));
+    }
+    let body = s.split('#').next().unwrap_or(s);
+    let mut stack = Vec::new();
+    for byte in body.bytes() {
+        match byte {
+            b'(' | b'{' | b'[' => {
+                if stack.len() >= 132 {
+                    return Err(DescriptorError::Expansion("descriptor nesting limit"));
+                }
+                stack.push(byte);
+            }
+            b')' | b'}' | b']' => {
+                let expected = match byte {
+                    b')' => b'(',
+                    b'}' => b'{',
+                    _ => b'[',
+                };
+                if stack.pop() != Some(expected) {
+                    return Err(DescriptorError::Expansion(
+                        "mismatched descriptor delimiters",
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    if !stack.is_empty() {
+        return Err(DescriptorError::MissingCloseParen);
+    }
+    Ok(())
+}
 
 /// Find the index of the closing parenthesis that matches the opening paren at `open`.
 fn find_matching_paren(s: &str, open: usize) -> Option<usize> {
@@ -703,13 +718,13 @@ mod tests {
     }
 
     #[test]
-    fn test_unsupported_script_pubkey() {
+    fn test_addr_script_pubkey() {
         let desc = Descriptor::Addr("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string());
-        let result = desc.script_pubkey();
-        assert!(matches!(
-            result,
-            Err(DescriptorError::UnsupportedScriptPubkey)
-        ));
+        assert_eq!(
+            hex::encode(desc.script_pubkey().unwrap().as_bytes()),
+            "0014751e76e8199196d454941c45d1b3a323f1433bd6"
+        );
+        assert!(desc.expand(None, crate::Network::Regtest).is_err());
     }
 
     #[test]
@@ -927,47 +942,47 @@ mod tests {
     }
 
     #[test]
-    fn test_sh_unsupported_script_pubkey() {
+    fn test_sh_invalid_public_key() {
         let desc = Descriptor::Sh(Box::new(Descriptor::Pk("aa".to_string())));
         assert!(matches!(
             desc.script_pubkey(),
-            Err(DescriptorError::UnsupportedScriptPubkey)
+            Err(DescriptorError::InvalidKey(_))
         ));
     }
 
     #[test]
-    fn test_wsh_unsupported_script_pubkey() {
+    fn test_wsh_invalid_public_key() {
         let desc = Descriptor::Wsh(Box::new(Descriptor::Pk("aa".to_string())));
         assert!(matches!(
             desc.script_pubkey(),
-            Err(DescriptorError::UnsupportedScriptPubkey)
+            Err(DescriptorError::InvalidKey(_))
         ));
     }
 
     #[test]
-    fn test_tr_unsupported_script_pubkey() {
+    fn test_tr_invalid_public_key() {
         let desc = Descriptor::Tr("key".to_string(), None);
         assert!(matches!(
             desc.script_pubkey(),
-            Err(DescriptorError::UnsupportedScriptPubkey)
+            Err(DescriptorError::InvalidKey(_))
         ));
     }
 
     #[test]
-    fn test_multi_unsupported_script_pubkey() {
+    fn test_multi_invalid_public_key() {
         let desc = Descriptor::Multi(1, vec!["k1".to_string()]);
         assert!(matches!(
             desc.script_pubkey(),
-            Err(DescriptorError::UnsupportedScriptPubkey)
+            Err(DescriptorError::InvalidKey(_))
         ));
     }
 
     #[test]
-    fn test_sortedmulti_unsupported_script_pubkey() {
+    fn test_sortedmulti_invalid_public_key() {
         let desc = Descriptor::SortedMulti(1, vec!["k1".to_string()]);
         assert!(matches!(
             desc.script_pubkey(),
-            Err(DescriptorError::UnsupportedScriptPubkey)
+            Err(DescriptorError::InvalidKey(_))
         ));
     }
 

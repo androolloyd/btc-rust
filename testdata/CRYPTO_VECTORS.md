@@ -7,6 +7,18 @@ Downloaded on 2026-10-11 from the canonical bitcoin/bips repository:
 
 These fixtures must remain independent expected values. Update them deliberately from the upstream source and rerun every case; do not regenerate expected cryptographic values from our implementation.
 
+`crates/primitives/tests/data/descriptors.json` retains twenty public-only
+descriptor examples and twenty-four unchanged expected scripts from BIP381,
+BIP382, BIP383 and BIP386. Source URLs, SHA256s and BSD-2-Clause licenses are
+recorded in the fixture. Private/WIF examples were omitted, without rewriting
+their keys into new expected values. Ranged descriptors retain all three
+published child scripts. Live Core v29 acceptance separately compares public
+descriptor checksums/addresses, context and multisig boundaries, and public
+descriptors for funded outputs against Core's actual PSBT spending metadata.
+Published xpubs are checked unchanged by the mainnet CLI; the regtest/Core
+comparison changes only their network version and Base58 checksum to tpub,
+preserving every cryptographic/header byte and independent expected script.
+
 The public derivation proof regression reuses all 17 published points, xpub headers
 and path indices in `crates/primitives/tests/data/bip32-keys.json`. Expected child
 points are copied from the unchanged published serialization, rather than derived
