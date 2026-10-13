@@ -27,3 +27,6 @@ pub const METHOD_TRANSACTION_GET_MERKLE: &str = "blockchain.transaction.get_merk
 pub const METHOD_ESTIMATEFEE: &str = "blockchain.estimatefee";
 
 pub const METHOD_SCRIPTHASH_GET_MEMPOOL: &str = "blockchain.scripthash.get_mempool";
+
+pub const METHOD_RELAYFEE: &str = "blockchain.relayfee";
+pub const METHOD_FEE_HISTOGRAM: &str = "mempool.get_fee_histogram";

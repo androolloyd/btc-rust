@@ -132,7 +132,7 @@ impl ElectrumHandler {
         session: Option<&mut ScriptSession>,
     ) -> Result<Value, ElectrumError> {
         let (names, required): (&[&str], usize) = match method {
-            METHOD_SERVER_PING | METHOD_SERVER_BANNER | METHOD_HEADERS_SUBSCRIBE => (&[], 0),
+            METHOD_SERVER_PING | METHOD_SERVER_BANNER | METHOD_HEADERS_SUBSCRIBE | METHOD_RELAYFEE | METHOD_FEE_HISTOGRAM => (&[], 0),
             METHOD_BLOCK_HEADER => (&["height", "cp_height"], 1),
             METHOD_BLOCK_HEADERS => (&["start_height", "count", "cp_height"], 2),
             METHOD_TRANSACTION_GET => (&["tx_hash", "verbose"], 1),
@@ -142,7 +142,7 @@ impl ElectrumHandler {
             // An advertised Electrum version requires *all* its nonoptional
             // methods. Do not claim compatibility before every required method works.
             METHOD_SERVER_VERSION | METHOD_SERVER_FEATURES => return Err(error(METHOD_NOT_FOUND, "complete Electrum protocol negotiation is unavailable; this is an experimental chain/transaction subset")),
-            METHOD_ESTIMATEFEE => return Err(error(METHOD_NOT_FOUND, "fee estimator is not implemented")),
+            METHOD_ESTIMATEFEE => (&["number","mode"],1),
             _ => return Err(error(METHOD_NOT_FOUND, "unknown or unsupported Electrum method")),
         };
         let params = match params {
@@ -392,6 +392,9 @@ mod tests {
             (METHOD_SCRIPTHASH_LISTUNSPENT, json!(["00".repeat(32)])),
             (METHOD_SCRIPTHASH_SUBSCRIBE, json!(["00".repeat(32)])),
             (METHOD_SCRIPTHASH_UNSUBSCRIBE, json!(["00".repeat(32)])),
+            (METHOD_ESTIMATEFEE, json!([6])),
+            (METHOD_RELAYFEE, json!([])),
+            (METHOD_FEE_HISTOGRAM, json!([])),
         ] {
             let response = handler.handle(&ElectrumRequest {
                 id: json!(4),
@@ -402,11 +405,7 @@ mod tests {
             assert_eq!(response.error.unwrap().code, INTERNAL_ERROR);
             assert!(response.result.is_none());
         }
-        for method in [
-            METHOD_SERVER_VERSION,
-            METHOD_SERVER_FEATURES,
-            METHOD_ESTIMATEFEE,
-        ] {
+        for method in [METHOD_SERVER_VERSION, METHOD_SERVER_FEATURES] {
             let response: Value = serde_json::from_str(
                 &handler.handle_raw(&json!({"id":4,"method":method,"params":[]}).to_string()),
             )

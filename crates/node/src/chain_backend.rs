@@ -35,6 +35,7 @@ pub(super) struct ValidatedChain {
     pub(super) headers: ChainState,
     utxos: PersistentUtxoSet<RedbDatabase>,
     pub(super) mempool: crate::mempool::RuntimeMempool,
+    fees: crate::fees::FeeObservations,
     exex: Option<tokio::sync::broadcast::Sender<btc_exex::ExExNotification>>,
 }
 
@@ -219,6 +220,15 @@ impl NodeChainBackend {
             None,
             None,
         );
+        let height = headers.best_height();
+        let hash = headers.best_header().header.block_hash();
+        let mut fees = match db.tx()?.fee_observations()? {
+            Some(bytes) => crate::fees::FeeObservations::decode(&bytes, height, hash)
+                .map_err(|e| eyre::eyre!(e.message))?,
+            None => crate::fees::FeeObservations::new(height, hash),
+        };
+        // Reopening does not invent historical admission times for restored txs.
+        fees.update(height, hash, &mempool, &HashSet::new(), false);
         state.update_mempool(mempool.entries.len() as u64, mempool.bytes as u64);
         state.update_chain_tip(
             headers.best_height(),
@@ -229,6 +239,7 @@ impl NodeChainBackend {
                 headers,
                 utxos,
                 mempool,
+                fees,
                 exex: None,
             }),
             db,
@@ -526,22 +537,36 @@ impl NodeChainBackend {
         } else {
             (data.mempool.empty_like(), HashMap::new())
         };
+        let mut fees = data.fees.clone();
+        let fee_bytes = if active {
+            let mined = attached
+                .iter()
+                .flat_map(|(_, b)| b.transactions.iter().skip(1).map(Transaction::txid))
+                .collect();
+            fees.update(height, hash, &pool, &mined, !extension);
+            Some(fees.encode()?)
+        } else {
+            None
+        };
         let pool_transactions = pool.transactions();
         let ValidatedChain { headers, utxos, .. } = &mut *data;
         headers
             .accept_header_with_commit(block.header, || {
                 utxos
-                    .commit_chain_transition(btc_storage::utxo_store::ChainTransition {
-                        incoming: block,
-                        height,
-                        undo: &update,
-                        detached: if active { &detached } else { &[] },
-                        attached: if active { &attached } else { &[] },
-                        coins: &changes,
-                        tip: active.then_some((height, hash)),
-                        old_height,
-                        mempool: &pool_transactions,
-                    })
+                    .commit_chain_transition_with_fees(
+                        btc_storage::utxo_store::ChainTransition {
+                            incoming: block,
+                            height,
+                            undo: &update,
+                            detached: if active { &detached } else { &[] },
+                            attached: if active { &attached } else { &[] },
+                            coins: &changes,
+                            tip: active.then_some((height, hash)),
+                            old_height,
+                            mempool: &pool_transactions,
+                        },
+                        fee_bytes.as_deref(),
+                    )
                     .map_err(|e| e.to_string())
             })
             .map_err(|error| match error {
@@ -549,6 +574,7 @@ impl NodeChainBackend {
                 other => rejection(other),
             })?;
         if active {
+            data.fees = fees;
             data.mempool = pool;
             self.state
                 .update_mempool(data.mempool.entries.len() as u64, data.mempool.bytes as u64);
@@ -601,6 +627,9 @@ impl NodeChainBackend {
         policy: btc_mempool::policy::TxValidationPolicy,
         flags: btc_consensus::script_engine::ScriptFlags,
     ) -> Result<(), RpcError> {
+        if policy.min_relay_fee.as_sat() < 0 {
+            return Err(RpcError::new(-8, "negative relay fee policy"));
+        }
         let mut data = self.lock()?;
         let mut settings = data.mempool.empty_like();
         settings.full_rbf = full_rbf;
@@ -614,11 +643,22 @@ impl NodeChainBackend {
             Some(&settings),
             None,
         );
+        let mut fees = data.fees.clone();
+        fees.update(
+            data.headers.best_height(),
+            data.headers.best_header().header.block_hash(),
+            &pool,
+            &HashSet::new(),
+            false,
+        );
+        let fee_bytes = fees.encode()?;
         let write = self.db.tx_mut().map_err(internal)?;
         write
             .replace_mempool(&pool.transactions())
             .map_err(internal)?;
+        write.set_fee_observations(&fee_bytes).map_err(internal)?;
         write.commit().map_err(internal)?;
+        data.fees = fees;
         data.mempool = pool;
         self.state
             .update_mempool(data.mempool.entries.len() as u64, data.mempool.bytes as u64);
@@ -661,11 +701,22 @@ impl NodeChainBackend {
         if let Some(limits) = limits {
             limits.check(&tx, pool.entries[&id].fee)?;
         }
+        let mut fees = data.fees.clone();
+        fees.update(
+            data.headers.best_height(),
+            data.headers.best_header().header.block_hash(),
+            &pool,
+            &HashSet::new(),
+            false,
+        );
+        let fee_bytes = fees.encode()?;
         let write = self.db.tx_mut().map_err(internal)?;
         write
             .replace_mempool(&pool.transactions())
             .map_err(internal)?;
+        write.set_fee_observations(&fee_bytes).map_err(internal)?;
         write.commit().map_err(internal)?;
+        data.fees = fees;
         data.mempool = pool;
         self.state
             .update_mempool(data.mempool.entries.len() as u64, data.mempool.bytes as u64);
@@ -1203,6 +1254,25 @@ impl btc_electrum::ElectrumBackend for NodeChainBackend {
                 .ok_or_else(|| fail(1, "header height unavailable"))
         };
         match method {
+            METHOD_RELAYFEE => Ok(json!(
+                data.mempool.policy.min_relay_fee.as_sat() as f64 / 100_000_000.0
+            )),
+            METHOD_FEE_HISTOGRAM => crate::fees::histogram(&data.mempool).map_err(map_error),
+            METHOD_ESTIMATEFEE => {
+                let target = number(0)?;
+                if target == 0 {
+                    return Err(fail(INVALID_PARAMS, "confirmation target must be positive"));
+                }
+                let economical = fee_mode(&params, 1).map_err(map_error)?;
+                Ok(data
+                    .fees
+                    .estimate(
+                        target,
+                        economical,
+                        data.mempool.policy.min_relay_fee.as_sat(),
+                    )
+                    .map_or(json!(-1), |rate| json!(rate as f64 / 100_000_000.0)))
+            }
             METHOD_HEADERS_SUBSCRIBE => Ok(
                 json!({"height":data.headers.best_height(), "hex":hex::encode(encode(&data.headers.best_header().header))}),
             ),
@@ -1448,9 +1518,47 @@ impl ChainBackend for NodeChainBackend {
                 let headers = &data.headers;
                 let tip = headers.best_header();
                 match method {
+                    "estimatefee" | "estimatesmartfee" => {
+                        let target = params
+                            .get(0)
+                            .and_then(Value::as_u64)
+                            .filter(|n| *n > 0 && *n <= 1008)
+                            .ok_or_else(|| {
+                                RpcError::new(-8, "confirmation target must be between 1 and 1008")
+                            })?;
+                        let economical = fee_mode(&params, 1)?;
+                        let estimate = data.fees.estimate(
+                            target,
+                            economical,
+                            data.mempool.policy.min_relay_fee.as_sat(),
+                        );
+                        if method == "estimatefee" {
+                            Ok(estimate
+                                .map_or(json!(-1), |rate| json!(rate as f64 / 100_000_000.0)))
+                        } else {
+                            Ok(match estimate {
+                                Some(rate) => {
+                                    json!({"feerate":rate as f64 / 100_000_000.0,"blocks":target})
+                                }
+                                None => {
+                                    json!({"errors":["Insufficient observed confirmation data"],"blocks":target})
+                                }
+                            })
+                        }
+                    }
+                    "getmempoolfees" => {
+                        let histogram = crate::fees::histogram(&data.mempool)?;
+                        let total = data.mempool.entries.values().try_fold(0i64, |sum, e| {
+                            sum.checked_add(e.fee)
+                                .ok_or_else(|| internal("pool fee total overflow"))
+                        })?;
+                        Ok(
+                            json!({"count":data.mempool.entries.len(),"vsize":data.mempool.entries.values().map(|e|e.vsize).sum::<usize>(),"total_fee":total,"fee_histogram":histogram}),
+                        )
+                    }
                     "getmempoolinfo" => Ok(
-                        json!({ "loaded": true, "size": data.mempool.entries.len(), "bytes": data.mempool.bytes,
-                        "maxmempool": crate::mempool::MAX_BYTES, "mempoolminfee": 0.00001, "minrelaytxfee": 0.00001 }),
+                        json!({ "loaded": true, "size": data.mempool.entries.len(), "bytes": data.mempool.entries.values().map(|e|e.vsize).sum::<usize>(),
+                        "maxmempool": crate::mempool::MAX_BYTES, "mempoolminfee": data.mempool.policy.min_relay_fee.as_sat() as f64 / 100_000_000.0, "minrelaytxfee": data.mempool.policy.min_relay_fee.as_sat() as f64 / 100_000_000.0 }),
                     ),
                     "getrawmempool" => {
                         if params.get(0).and_then(Value::as_bool).unwrap_or(false) {
@@ -1648,6 +1756,15 @@ impl RpcFeeLimits {
             }
         }
         Ok(())
+    }
+}
+
+fn fee_mode(params: &Value, index: usize) -> Result<bool, RpcError> {
+    match params.get(index) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::String(s)) if s == "CONSERVATIVE" => Ok(false),
+        Some(Value::String(s)) if s == "ECONOMICAL" => Ok(true),
+        _ => Err(RpcError::new(-8, "unknown fee estimation mode")),
     }
 }
 
@@ -3224,5 +3341,116 @@ mod tests {
             !backend.lock().unwrap().mempool.full_rbf,
             "block commits preserve configured policy"
         );
+    }
+
+    #[test]
+    fn fee_policy_is_authoritative_and_failed_receipts_preserve_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fees.redb");
+        let backend = NodeChainBackend::open(&path, NodeState::new(Network::Regtest)).unwrap();
+        let key = TestKeyPair::from_secret(secp256k1::SecretKey::from_slice(&[15; 32]).unwrap());
+        let address = Address::p2pkh_from_pubkey(&key.pubkey_bytes(), Network::Regtest).to_string();
+        ChainBackend::call(&backend, "generatetoaddress", json!([1, address])).unwrap();
+        let policy = btc_mempool::policy::TxValidationPolicy {
+            min_relay_fee: btc_primitives::Amount::from_sat(5000),
+            ..Default::default()
+        };
+        backend
+            .configure_mempool(
+                true,
+                policy,
+                btc_consensus::script_engine::ScriptFlags::core_compliant(),
+            )
+            .unwrap();
+        assert_eq!(
+            btc_electrum::ElectrumBackend::call(&backend, "blockchain.relayfee", json!([]))
+                .unwrap(),
+            json!(0.00005)
+        );
+        assert_eq!(
+            ChainBackend::call(&backend, "getmempoolinfo", json!([])).unwrap()["minrelaytxfee"],
+            json!(0.00005)
+        );
+        assert_eq!(
+            btc_electrum::ElectrumBackend::call(&backend, "blockchain.estimatefee", json!([6]))
+                .unwrap(),
+            json!(-1)
+        );
+        let before = backend
+            .db
+            .tx()
+            .unwrap()
+            .fee_observations()
+            .unwrap()
+            .unwrap();
+        let tip = backend.tip().unwrap();
+        {
+            let write = backend.db.tx_mut().unwrap();
+            write.set_best_block(tip.0 + 1, &tip.1).unwrap();
+            assert!(write
+                .set_fee_observations(&vec![0; btc_storage::traits::MAX_FEE_STATE_BYTES + 1])
+                .is_err());
+            // Deliberately drop the failed transaction, as the runtime does.
+        }
+        assert_eq!(
+            backend
+                .db
+                .tx()
+                .unwrap()
+                .fee_observations()
+                .unwrap()
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            backend.db.tx().unwrap().get_best_block_height().unwrap(),
+            tip.0
+        );
+        assert_eq!(backend.lock().unwrap().fees.encode().unwrap(), before);
+        drop(backend);
+        assert_eq!(
+            NodeChainBackend::open(&path, NodeState::new(Network::Regtest))
+                .unwrap()
+                .tip()
+                .unwrap(),
+            tip
+        );
+    }
+
+    #[test]
+    fn reopened_fee_receipts_reject_checksum_and_stale_tip() {
+        for corrupt in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("fees.redb");
+            let backend = NodeChainBackend::open(&path, NodeState::new(Network::Regtest)).unwrap();
+            let key =
+                TestKeyPair::from_secret(secp256k1::SecretKey::from_slice(&[16; 32]).unwrap());
+            let address =
+                Address::p2pkh_from_pubkey(&key.pubkey_bytes(), Network::Regtest).to_string();
+            ChainBackend::call(&backend, "generatetoaddress", json!([1, address])).unwrap();
+            let mut receipt = backend
+                .db
+                .tx()
+                .unwrap()
+                .fee_observations()
+                .unwrap()
+                .unwrap();
+            ChainBackend::call(&backend, "generatetoaddress", json!([1, address])).unwrap();
+            if corrupt {
+                receipt[0] ^= 1;
+            }
+            let write = backend.db.tx_mut().unwrap();
+            write.set_fee_observations(&receipt).unwrap();
+            write.commit().unwrap();
+            drop(backend);
+            let error = NodeChainBackend::open(&path, NodeState::new(Network::Regtest))
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(
+                error.contains(if corrupt { "checksum" } else { "validated tip" }),
+                "{error}"
+            );
+        }
     }
 }

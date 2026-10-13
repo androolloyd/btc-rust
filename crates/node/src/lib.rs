@@ -19,4 +19,5 @@ mod mempool;
 
 mod electrum_wallet;
 
+mod fees;
 mod header_proofs;

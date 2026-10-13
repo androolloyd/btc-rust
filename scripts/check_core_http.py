@@ -65,8 +65,8 @@ def check_envelopes(core_port, rust_port, cookie):
         {"jsonrpc": "2.0", "method": "getblockhash", "params": [0], "id": "v2"},
         {"jsonrpc": "2.0", "method": "getblockcount", "id": None},
         {"jsonrpc": None, "method": "getblockcount", "params": None, "id": 7},
-        {"method": "estimatefee", "params": [6], "id": "fee"},
-        {"jsonrpc": "2.0", "method": "estimatefee", "params": [6], "id": "fee"},
+        {"method": "unavailable_fee_method", "params": [6], "id": "fee"},
+        {"jsonrpc": "2.0", "method": "unavailable_fee_method", "params": [6], "id": "fee"},
         {"method": "no_such_method", "id": "missing"},
         {"jsonrpc": "2.0", "method": "no_such_method", "id": "missing"},
         {"method": "getblockhash", "params": [-1], "id": 8},
@@ -175,7 +175,7 @@ def main():
                 mined = bitcoin_cli(args, root, rust_port, "generatetoaddress", [1, address])[-1]
                 wait_until(lambda: core_rpc(core_port, "getbestblockhash", []) == mined)
                 assert txid in core_rpc(core_port, "getblock", [mined])["tx"]
-                assert "-32601" in bitcoin_cli(args, root, rust_port, "estimatefee", [6], reject=True)
+                assert bitcoin_cli(args, root, rust_port, "estimatesmartfee", [6]) == {"blocks":6,"errors":["Insufficient observed confirmation data"]}
                 assert "-32601" in bitcoin_cli(args, root, rust_port, "prioritisetransaction", [txid, 0, 5000], reject=True)
                 before = bitcoin_cli(args, root, rust_port, "getbestblockhash")
                 assert "-22" in bitcoin_cli(args, root, rust_port, "sendrawtransaction", ["ff"], reject=True)

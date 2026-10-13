@@ -11,9 +11,10 @@ This is an implemented subset, not a complete wallet server. `server.version`
 and `server.features` return explicit unsupported errors; failed version
 negotiation closes that connection. The service advertises no completed Electrum
 protocol version. The protocol requires every nonoptional method of an advertised
-version to work. Fee estimation and other required methods remain unfinished and
-return explicit errors. Header checkpoint proofs now use the actual validated
-active-chain prefix.
+version to work. Remaining mandatory protocol methods are still unfinished.
+Header checkpoint proofs use the actual validated active-chain prefix. Relay
+fees, pool histograms and bounded empirical confirmation estimates now use real
+providers; their scope and insufficient-data behavior are in [FEES.md](FEES.md).
 Script history, balances, mempool and unspent queries now use an independently
 maintained validated index and the actual pool. Unknown scripts return real
 empty state only when that index is complete for the active tip.
@@ -32,6 +33,9 @@ empty state only when that index is complete for the active tip.
 | `blockchain.scripthash.listunspent(scripthash)` | Confirmed outputs in block order followed by unspent pool outputs; pool-spent outputs excluded |
 | `blockchain.scripthash.subscribe(scripthash)` | Actual history status plus connection-owned notifications after durable chain/pool changes |
 | `blockchain.scripthash.unsubscribe(scripthash)` | Removes only this connection's script subscription; returns whether it existed |
+| `blockchain.relayfee()` | Actual configured pool admission floor |
+| `mempool.get_fee_histogram()` | Actual current pool fee/virtual-size bins using released ElectrumX compression |
+| `blockchain.estimatefee(number, mode)` | Actual observed confirmation quote, or `-1` for insufficient data |
 | `server.ping()` / `server.banner()` | Connection keepalive / explicit subset description |
 
 Queries use the same mutex-protected validated backend as HTTP RPC, mining and
@@ -238,6 +242,6 @@ before source reads, and failed-prefix cache publication. The first native run
 found an obsolete fixture expecting checkpoint support to be absent; that
 expectation was corrected to the actual window error. The complete rerun and
 strengthened warm-cache reorg follow-up both pass. No dependency versions,
-lockfiles or ordinary consensus rules changed. Fee providers and remaining
-mandatory protocol methods, full negotiation, TLS and broad public-chain/load
+lockfiles or ordinary consensus rules changed. Fee providers are accepted in
+[FEES.md](FEES.md); remaining mandatory protocol methods, full negotiation, TLS and broad public-chain/load
 qualification remain unfinished.

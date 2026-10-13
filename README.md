@@ -384,9 +384,10 @@ Built-in example plugins:
 - BIP331 package relay for Lightning safety
 
 ### APIs
-- **JSON-RPC** — 9 Bitcoin Core-compatible methods wired to real chain state
+- **JSON-RPC** — validated chain, transaction, mining and pool queries over authenticated HTTP and local newline RPC
 - **Experimental Electrum subset** — opt-in loopback chain/transaction queries, verified admission, transaction and header checkpoint proofs, and header notifications; validated history/balance/unspent/pool queries and connection-owned script-status notifications are available; full protocol negotiation remains unfinished. See [supported methods and setup](docs/ELECTRUM.md).
-- **Esplora REST** — 9 endpoints matching Blockstream's API format
+- **Fee providers** — actual relay policy and pool histograms, plus bounded empirical confirmation estimates with explicit insufficient-data results. See [fee scope](docs/FEES.md).
+- **Esplora REST** — experimental endpoint scaffolding; validated fee/pool providers are not installed on that separate service
 - **Prometheus** — `/metrics` endpoint with 7 gauges (chain height, peers, mempool, sync progress, etc.)
 - **ZMQ notifications** — hashblock, hashtx, rawblock, rawtx, sequence via ExEx
 

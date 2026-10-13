@@ -309,6 +309,19 @@ pub struct RedbTx {
 unsafe impl Sync for RedbTx {}
 
 impl DbTx for RedbTx {
+    fn fee_observations(&self) -> Result<Option<Vec<u8>>, StorageError> {
+        let table = self.inner.open_table(META).map_err(script_index::error)?;
+        let value = table
+            .get("validated_fees_v1")
+            .map_err(script_index::error)?;
+        match value {
+            Some(value) if value.value().len() > crate::traits::MAX_FEE_STATE_BYTES => Err(
+                StorageError::Corruption("fee observation receipt exceeds limit".into()),
+            ),
+            Some(value) => Ok(Some(value.value().to_vec())),
+            None => Ok(None),
+        }
+    }
     fn script_index_tip(&self) -> Result<Option<(u64, BlockHash)>, StorageError> {
         script_index::read_tip(&self.inner.open_table(META).map_err(script_index::error)?)
     }
@@ -566,6 +579,19 @@ pub struct RedbTxMut {
 unsafe impl Sync for RedbTxMut {}
 
 impl DbTx for RedbTxMut {
+    fn fee_observations(&self) -> Result<Option<Vec<u8>>, StorageError> {
+        let table = self.inner.open_table(META).map_err(script_index::error)?;
+        let value = table
+            .get("validated_fees_v1")
+            .map_err(script_index::error)?;
+        match value {
+            Some(value) if value.value().len() > crate::traits::MAX_FEE_STATE_BYTES => Err(
+                StorageError::Corruption("fee observation receipt exceeds limit".into()),
+            ),
+            Some(value) => Ok(Some(value.value().to_vec())),
+            None => Ok(None),
+        }
+    }
     fn script_index_tip(&self) -> Result<Option<(u64, BlockHash)>, StorageError> {
         script_index::read_tip(&self.inner.open_table(META).map_err(script_index::error)?)
     }
@@ -810,6 +836,19 @@ impl DbTxMut for RedbTxMut {
         remove: bool,
     ) -> Result<(), StorageError> {
         script_index::index_block(self, height, block, undo, remove)
+    }
+    fn set_fee_observations(&self, bytes: &[u8]) -> Result<(), StorageError> {
+        if bytes.len() > crate::traits::MAX_FEE_STATE_BYTES {
+            return Err(StorageError::Database(
+                "fee observation receipt exceeds limit".into(),
+            ));
+        }
+        self.inner
+            .open_table(META)
+            .map_err(script_index::error)?
+            .insert("validated_fees_v1", bytes)
+            .map_err(script_index::error)?;
+        Ok(())
     }
     fn set_script_index_tip(&self, height: u64, hash: &BlockHash) -> Result<(), StorageError> {
         let mut bytes = height.to_be_bytes().to_vec();

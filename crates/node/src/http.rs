@@ -668,16 +668,12 @@ fn handle_broadcast_tx(req: &HttpRequest, _metrics: &MetricsCollector) -> HttpRe
 
 /// `GET /api/fee-estimates` -- fee rate estimates keyed by confirmation target.
 fn handle_fee_estimates(_metrics: &MetricsCollector) -> HttpResponse {
-    // Stub: return reasonable defaults.
-    HttpResponse::json(r#"{"1":20.0,"3":10.0,"6":5.0,"12":2.0,"24":1.0}"#)
+    HttpResponse::internal_error("validated fee provider unavailable on this REST service")
 }
 
-/// `GET /api/mempool` -- mempool statistics.
-fn handle_mempool(metrics: &MetricsCollector) -> HttpResponse {
-    let size = metrics.mempool_size.load(Ordering::Relaxed);
-    let bytes = metrics.mempool_bytes.load(Ordering::Relaxed);
-    let json = format!(r#"{{"count":{size},"vsize":{bytes},"total_fee":0,"fee_histogram":[]}}"#,);
-    HttpResponse::json(&json)
+/// No pool provider is installed in this separate metrics-only REST service.
+fn handle_mempool(_metrics: &MetricsCollector) -> HttpResponse {
+    HttpResponse::internal_error("validated mempool provider unavailable on this REST service")
 }
 
 // ---------------------------------------------------------------------------
@@ -1085,29 +1081,17 @@ mod tests {
     }
 
     #[test]
-    fn test_fee_estimates() {
+    fn rest_fees_without_a_provider_cannot_return_invented_quotes() {
         let m = make_metrics();
-        let resp = handle_request(&make_request("/api/fee-estimates"), &m);
-        assert_eq!(resp.status, 200);
-        let body = std::str::from_utf8(&resp.body).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
-        // Should have targets 1, 3, 6, 12, 24.
-        assert!(parsed["1"].is_number());
-        assert!(parsed["3"].is_number());
-        assert!(parsed["6"].is_number());
-        assert!(parsed["12"].is_number());
-        assert!(parsed["24"].is_number());
-    }
-
-    #[test]
-    fn test_mempool_endpoint() {
-        let m = make_metrics();
-        let resp = handle_request(&make_request("/api/mempool"), &m);
-        assert_eq!(resp.status, 200);
-        let body = std::str::from_utf8(&resp.body).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
-        assert_eq!(parsed["count"].as_u64().unwrap(), 1234);
-        assert_eq!(parsed["vsize"].as_u64().unwrap(), 567_890);
+        for path in ["/api/fee-estimates", "/api/mempool"] {
+            let resp = handle_request(&make_request(path), &m);
+            assert_eq!(resp.status, 500);
+            let parsed: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+            assert!(parsed["error"]
+                .as_str()
+                .unwrap()
+                .contains("provider unavailable"));
+        }
     }
 
     #[test]

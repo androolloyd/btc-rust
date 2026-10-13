@@ -516,13 +516,15 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_api_mempool() {
+    fn explorer_propagates_unavailable_pool_provider() {
         let m = make_metrics();
         let resp = handle_explorer_request(&make_request("/api/mempool"), &m);
-        assert_eq!(resp.status, 200);
-        let body = std::str::from_utf8(&resp.body).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
-        assert_eq!(parsed["count"].as_u64().unwrap(), 1234);
+        assert_eq!(resp.status, 500);
+        let parsed: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert!(parsed["error"]
+            .as_str()
+            .unwrap()
+            .contains("provider unavailable"));
     }
 
     #[test]

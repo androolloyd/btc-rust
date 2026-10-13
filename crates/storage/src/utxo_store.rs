@@ -112,6 +112,14 @@ impl<DB: Database> PersistentUtxoSet<DB> {
         &mut self,
         change: ChainTransition<'_>,
     ) -> Result<(), StorageError> {
+        self.commit_chain_transition_with_fees(change, None)
+    }
+    /// Optional bounded fee observations publish with the actual active tip/pool.
+    pub fn commit_chain_transition_with_fees(
+        &mut self,
+        change: ChainTransition<'_>,
+        fees: Option<&[u8]>,
+    ) -> Result<(), StorageError> {
         self.flush_cache()?;
         let tx = self.db.tx_mut()?;
         let indexed = tx.script_index_tip()?;
@@ -181,6 +189,9 @@ impl<DB: Database> PersistentUtxoSet<DB> {
             }
         }
         if let Some((height, tip)) = change.tip {
+            if let Some(bytes) = fees {
+                tx.set_fee_observations(bytes)?;
+            }
             if indexed.is_some() {
                 tx.set_script_index_tip(height, &tip)?;
             }

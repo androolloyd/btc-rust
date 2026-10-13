@@ -3,6 +3,8 @@ use btc_primitives::hash::{BlockHash, TxHash};
 use btc_primitives::transaction::{OutPoint, Transaction, TxOut};
 use thiserror::Error;
 
+pub const MAX_FEE_STATE_BYTES: usize = 8 * 1024 * 1024;
+
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("database error: {0}")]
@@ -63,6 +65,9 @@ pub struct AddressIndexValue {
 
 /// Read-only database transaction
 pub trait DbTx: Send + Sync {
+    fn fee_observations(&self) -> Result<Option<Vec<u8>>, StorageError> {
+        Ok(None)
+    }
     /// None means the validated script index has never been enabled.
     fn script_index_tip(&self) -> Result<Option<(u64, BlockHash)>, StorageError> {
         Ok(None)
@@ -105,6 +110,11 @@ pub trait DbTx: Send + Sync {
 
 /// Read-write database transaction
 pub trait DbTxMut: DbTx {
+    fn set_fee_observations(&self, _bytes: &[u8]) -> Result<(), StorageError> {
+        Err(StorageError::Database(
+            "fee observation persistence unsupported".into(),
+        ))
+    }
     fn index_script_block(
         &self,
         _height: u64,

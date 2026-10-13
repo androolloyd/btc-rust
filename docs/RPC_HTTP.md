@@ -12,6 +12,9 @@ before starting the listener; Unix atomic replacement was acceptance-tested.
 
 Actual verbose transaction/block/coin views and their supported boundaries are
 documented in [TRANSACTION_RPC.md](TRANSACTION_RPC.md).
+Actual relay/pool fees and bounded empirical confirmation estimates are described
+in [FEES.md](FEES.md). Their algorithm is distinct from Core's fee estimator;
+inadequate observations produce an explicit unavailable result.
 
 Released Bitcoin Core's client can query and mutate actual runtime state:
 

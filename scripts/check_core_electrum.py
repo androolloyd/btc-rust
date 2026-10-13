@@ -238,8 +238,11 @@ def main():
                 assert client.call("blockchain.block.header",[0]) == genesis_header
                 assert client.call("blockchain.headers.subscribe") == {"height":0,"hex":genesis_header}
                 assert client.call("blockchain.block.headers",{"start_height":0,"count":5000}) == {"count":1,"hex":genesis_header,"max":2016}
-                for method, params in [("server.features",[]),("blockchain.estimatefee",[6])]:
+                for method, params in [("server.features",[])]:
                     assert client.call(method,params,True)["code"] == -32601
+                assert client.call("blockchain.estimatefee",[6]) == -1
+                assert client.call("blockchain.relayfee") == 0.00001
+                assert client.call("mempool.get_fee_histogram") == []
                 assert client.call("blockchain.block.header",[0,1],True)["code"] == 1
                 assert client.call("blockchain.block.headers",[0,0,1]) == {"count":0,"hex":"","max":2016}
                 unsupported = Client(electrum_port); clients.append(unsupported)
