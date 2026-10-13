@@ -120,6 +120,19 @@ impl<DB: Database> PersistentUtxoSet<DB> {
         change: ChainTransition<'_>,
         fees: Option<&[u8]>,
     ) -> Result<(), StorageError> {
+        self.commit_chain_transition_with_stage_plan(change, fees, None)
+    }
+    pub fn commit_chain_transition_with_stage_plan(
+        &mut self,
+        change: ChainTransition<'_>,
+        fees: Option<&[u8]>,
+        plan: Option<&crate::index_plan::BlockIndexPlan>,
+    ) -> Result<(), StorageError> {
+        if plan.is_some_and(|plan| !plan.matches(change.height, change.incoming, change.undo)) {
+            return Err(StorageError::Corruption(
+                "prepared stage indices do not match input".into(),
+            ));
+        }
         self.flush_cache()?;
         let tx = self.db.tx_mut()?;
         let indexed = tx.script_index_tip()?;
@@ -128,6 +141,18 @@ impl<DB: Database> PersistentUtxoSet<DB> {
             return Err(StorageError::Corruption(
                 "script index/chain transition tip mismatch".into(),
             ));
+        }
+        if let Some(tip) = tx.stage_checkpoint()? {
+            if tip != (change.old_height, old_hash) {
+                return Err(StorageError::Corruption(
+                    "stage checkpoint/chain transition mismatch".into(),
+                ));
+            }
+            if change.tip.is_some() && plan.is_none() {
+                return Err(StorageError::Database(
+                    "active stage-enabled transition requires prepared indices".into(),
+                ));
+            }
         }
         let hash = change.incoming.block_hash();
         tx.put_block_header(&hash, &change.incoming.header)?;
@@ -149,8 +174,18 @@ impl<DB: Database> PersistentUtxoSet<DB> {
         }
         for (height, block) in change.attached {
             tx.put_block_hash_by_height(*height, &block.block_hash())?;
-            for (position, transaction) in block.transactions.iter().enumerate() {
-                tx.put_tx_block_index(&transaction.txid(), &block.block_hash(), position as u32)?;
+            if let Some(plan) = plan.filter(|_| block.block_hash() == hash) {
+                for (id, location) in plan.transactions() {
+                    tx.put_tx_block_index(id, &location.block_hash, location.tx_position)?;
+                }
+            } else {
+                for (position, transaction) in block.transactions.iter().enumerate() {
+                    tx.put_tx_block_index(
+                        &transaction.txid(),
+                        &block.block_hash(),
+                        position as u32,
+                    )?;
+                }
             }
         }
         for (outpoint, value) in change.coins {
@@ -180,12 +215,12 @@ impl<DB: Database> PersistentUtxoSet<DB> {
                 let raw = tx.get_block_undo(&hash)?.ok_or_else(|| {
                     StorageError::Corruption("missing attached script-index undo".into())
                 })?;
-                tx.index_script_block(
-                    *height,
-                    block,
-                    &crate::undo::decode_undo(hash, &raw)?,
-                    false,
-                )?;
+                let decoded = crate::undo::decode_undo(hash, &raw)?;
+                if let Some(plan) = plan.filter(|plan| plan.matches(*height, block, &decoded)) {
+                    tx.index_script_plan(plan, false)?;
+                } else {
+                    tx.index_script_block(*height, block, &decoded, false)?;
+                }
             }
         }
         if let Some((height, tip)) = change.tip {
@@ -199,6 +234,9 @@ impl<DB: Database> PersistentUtxoSet<DB> {
                 tx.delete_block_hash_by_height(h)?;
             }
             tx.set_best_block(height, &tip)?;
+            if plan.is_some() {
+                tx.set_stage_checkpoint(height, &tip)?;
+            }
             tx.replace_mempool(change.mempool)?;
         }
         tx.commit()?;
@@ -523,6 +561,12 @@ mod tests {
         }
     }
     impl DbTx for FailCommitTx {
+        fn stage_checkpoint(&self) -> Result<Option<(u64, BlockHash)>, StorageError> {
+            self.inner.stage_checkpoint()
+        }
+        fn script_index_tip(&self) -> Result<Option<(u64, BlockHash)>, StorageError> {
+            self.inner.script_index_tip()
+        }
         fn get_block_undo(&self, hash: &BlockHash) -> Result<Option<Vec<u8>>, StorageError> {
             self.inner.get_block_undo(hash)
         }
@@ -567,6 +611,19 @@ mod tests {
         }
     }
     impl DbTxMut for FailCommitTx {
+        fn set_stage_checkpoint(&self, height: u64, hash: &BlockHash) -> Result<(), StorageError> {
+            self.inner.set_stage_checkpoint(height, hash)
+        }
+        fn set_script_index_tip(&self, height: u64, hash: &BlockHash) -> Result<(), StorageError> {
+            self.inner.set_script_index_tip(height, hash)
+        }
+        fn index_script_plan(
+            &self,
+            plan: &crate::index_plan::BlockIndexPlan,
+            remove: bool,
+        ) -> Result<(), StorageError> {
+            self.inner.index_script_plan(plan, remove)
+        }
         fn put_block_undo(&self, hash: &BlockHash, bytes: &[u8]) -> Result<(), StorageError> {
             self.inner.put_block_undo(hash, bytes)
         }
@@ -634,6 +691,88 @@ mod tests {
                 self.inner.commit()
             }
         }
+    }
+
+    #[test]
+    fn prepared_stage_commit_failure_rolls_back_receipt_and_actual_indices_with_coins() {
+        let (db, _dir) = temp_db();
+        let genesis =
+            btc_consensus::chain::genesis_block(&btc_consensus::validation::ChainParams::regtest());
+        let old = genesis.block_hash();
+        let write = db.tx_mut().unwrap();
+        write.set_best_block(0, &old).unwrap();
+        write.set_script_index_tip(0, &old).unwrap();
+        write.set_stage_checkpoint(0, &old).unwrap();
+        write.commit().unwrap();
+        // Actual serialized body/txid/script rows, used to exercise the storage transaction.
+        let mut block = genesis.clone();
+        block.header.prev_blockhash = old;
+        block.header.time += 1;
+        block.transactions[0].inputs[0].script_sig = ScriptBuf::from_bytes(vec![0x51, 0x00]);
+        block.header.merkle_root = block.compute_merkle_root();
+        let hash = block.block_hash();
+        let id = block.transactions[0].txid();
+        let op = OutPoint::new(id, 0);
+        let entry = UtxoEntry {
+            txout: block.transactions[0].outputs[0].clone(),
+            height: 1,
+            is_coinbase: true,
+        };
+        let undo = UtxoSetUpdate {
+            spent: vec![],
+            created: vec![(op, entry.clone())],
+        };
+        let plan = crate::index_plan::BlockIndexPlan::new(
+            1,
+            &block,
+            &undo,
+            crate::index_plan::BlockIndexPlan::transaction_rows(&block).unwrap(),
+        )
+        .unwrap();
+        let changes = HashMap::from([(op, Some(entry.clone()))]);
+        let attached = vec![(1, block.clone())];
+        let mut coins = PersistentUtxoSet::new(Arc::new(FailCommitDb {
+            inner: db.clone(),
+            fail: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }));
+        let transition = || ChainTransition {
+            incoming: &block,
+            height: 1,
+            undo: &undo,
+            detached: &[],
+            attached: &attached,
+            coins: &changes,
+            tip: Some((1, hash)),
+            old_height: 0,
+            mempool: &[],
+        };
+        assert!(coins
+            .commit_chain_transition_with_stage_plan(transition(), None, Some(&plan))
+            .is_err());
+        assert!(!coins.contains(&op));
+        let read = db.tx().unwrap();
+        assert_eq!(read.stage_checkpoint().unwrap(), Some((0, old)));
+        assert_eq!(read.script_index_tip().unwrap(), Some((0, old)));
+        assert_eq!(read.get_best_block_hash().unwrap(), old);
+        assert!(read.get_block(&hash).unwrap().is_none());
+        assert!(read.get_block_undo(&hash).unwrap().is_none());
+        assert!(read.get_tx_block_index(&id).unwrap().is_none());
+        let script = btc_primitives::hash::sha256(entry.txout.script_pubkey.as_bytes());
+        assert!(read.script_history(&script, 10).unwrap().is_empty());
+        drop(read);
+        assert!(coins.commit_chain_transition(transition()).is_err()); // no legacy shortcut after stages are enabled
+        coins
+            .commit_chain_transition_with_stage_plan(transition(), None, Some(&plan))
+            .unwrap();
+        let read = db.tx().unwrap();
+        assert_eq!(read.stage_checkpoint().unwrap(), Some((1, hash)));
+        assert_eq!(read.script_index_tip().unwrap(), Some((1, hash)));
+        assert_eq!(
+            read.get_tx_block_index(&id).unwrap().unwrap().block_hash,
+            hash
+        );
+        assert_eq!(read.script_history(&script, 10).unwrap()[0].txid, id);
+        assert_eq!(coins.get_utxo(&op), Some(entry));
     }
 
     #[test]

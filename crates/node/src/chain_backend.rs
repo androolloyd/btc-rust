@@ -30,6 +30,8 @@ use btc_storage::utxo_store::PersistentUtxoSet;
 use serde_json::{json, Value};
 
 use crate::state::NodeState;
+#[path = "stage_backend.rs"]
+mod stage_backend;
 
 pub(super) struct ValidatedChain {
     pub(super) headers: ChainState,
@@ -40,6 +42,7 @@ pub(super) struct ValidatedChain {
 }
 
 pub struct NodeChainBackend {
+    pipeline: Mutex<btc_stages::Pipeline>,
     data: Mutex<ValidatedChain>,
     pub(super) db: Arc<RedbDatabase>,
     state: NodeState,
@@ -235,6 +238,14 @@ impl NodeChainBackend {
                 "stored branch work disagrees with committed tip"
             ));
         }
+        if db.tx()?.stage_checkpoint()?.is_some_and(|tip| {
+            tip != (
+                headers.best_height(),
+                headers.best_header().header.block_hash(),
+            )
+        }) {
+            return Err(eyre::eyre!("stage checkpoint does not match validated tip"));
+        }
         Self::backfill_undo(&db, &headers, &utxos).map_err(|e| eyre::eyre!(e.message))?;
         Self::initialize_script_index(&db, &headers, &utxos).map_err(|e| eyre::eyre!(e.message))?;
         let persisted_pool = db.mempool_transactions()?;
@@ -287,12 +298,14 @@ impl NodeChainBackend {
             write.put_block(&hash, &canonical_genesis)?;
             write.commit()?;
         }
+        Self::initialize_stages(&db, &headers, &utxos).map_err(|e| eyre::eyre!(e.message))?;
         state.update_mempool(mempool.entries.len() as u64, mempool.bytes as u64);
         state.update_chain_tip(
             headers.best_height(),
             &headers.best_header().header.block_hash().to_string(),
         );
         Ok(Self {
+            pipeline: Mutex::new(btc_stages::build_default_pipeline()),
             data: Mutex::new(ValidatedChain {
                 headers,
                 utxos,
@@ -308,6 +321,156 @@ impl NodeChainBackend {
             header_proofs: Mutex::new(crate::header_proofs::HeaderProofCache::default()),
             legacy_checkpoint,
         })
+    }
+
+    pub fn configure_pipeline(&self, pipeline: btc_stages::Pipeline) -> Result<(), RpcError> {
+        use btc_stages::stage::*;
+        let pipeline = if pipeline.is_empty() {
+            btc_stages::build_default_pipeline()
+        } else {
+            pipeline
+        };
+        if pipeline.stage_ids() != [HEADERS, BODIES, VALIDATION, TX_INDEX, ADDRESS_INDEX] {
+            return Err(internal(
+                "node pipeline must include the ordered validated stages",
+            ));
+        }
+        *self
+            .pipeline
+            .lock()
+            .map_err(|_| internal("stage pipeline lock poisoned"))? = pipeline;
+        Ok(())
+    }
+
+    fn initialize_stages(
+        db: &RedbDatabase,
+        headers: &ChainState,
+        coins: &PersistentUtxoSet<RedbDatabase>,
+    ) -> Result<(), RpcError> {
+        let reader = db.tx().map_err(internal)?;
+        let tip = (
+            headers.best_height(),
+            headers.best_header().header.block_hash(),
+        );
+        if let Some(receipt) = reader.stage_checkpoint().map_err(internal)? {
+            if receipt != tip {
+                return Err(internal("stage checkpoint does not match validated tip"));
+            }
+            return Ok(());
+        }
+        // Old counters are not evidence. First adoption replays actual scripts,
+        // matches all undo/coins and checks actual active transaction locations.
+        let mut replay = InMemoryUtxoSet::new();
+        for height in 1..=headers.best_height() {
+            let hash = headers
+                .get_header_by_height(height)
+                .ok_or_else(|| internal("stage replay header missing"))?
+                .header
+                .block_hash();
+            let block = reader
+                .get_block(&hash)
+                .map_err(internal)?
+                .ok_or_else(|| internal("stage replay body missing"))?;
+            if block.block_hash() != hash {
+                return Err(internal("stage replay body hash mismatch"));
+            }
+            let update = Self::validate_block_against(&block, height, headers, &replay)?;
+            let raw = reader
+                .get_block_undo(&hash)
+                .map_err(internal)?
+                .ok_or_else(|| internal("stage replay undo missing"))?;
+            if raw != btc_storage::undo::encode_undo(hash, &update) {
+                return Err(internal("stage replay undo differs from execution"));
+            }
+            for tx in &block.transactions {
+                let Some(location) = reader.get_tx_block_index(&tx.txid()).map_err(internal)?
+                else {
+                    // A genuine older body store can predate transaction rows.
+                    // Rebuild from fully executed history before stamping adoption.
+                    continue;
+                };
+                let entry = headers
+                    .get_header(&location.block_hash)
+                    .ok_or_else(|| internal("stage transaction header missing"))?;
+                if headers
+                    .get_header_by_height(entry.height)
+                    .map(|e| e.header.block_hash())
+                    != Some(location.block_hash)
+                {
+                    return Err(internal(
+                        "stage transaction index points outside active chain",
+                    ));
+                }
+                let indexed = if location.block_hash == hash {
+                    &block
+                } else {
+                    // Historical duplicate txids can resolve to a later active block.
+                    let body = reader
+                        .get_block(&location.block_hash)
+                        .map_err(internal)?
+                        .ok_or_else(|| internal("stage duplicate transaction body missing"))?;
+                    if body.block_hash() != location.block_hash
+                        || !body.check_merkle_root()
+                        || body
+                            .transactions
+                            .get(location.tx_position as usize)
+                            .map(Transaction::txid)
+                            != Some(tx.txid())
+                    {
+                        return Err(internal("stage duplicate transaction location mismatch"));
+                    }
+                    continue;
+                };
+                if indexed
+                    .transactions
+                    .get(location.tx_position as usize)
+                    .map(Transaction::txid)
+                    != Some(tx.txid())
+                {
+                    return Err(internal("stage transaction location mismatch"));
+                }
+            }
+            replay.apply_update(&update);
+        }
+        if db.coin_count().map_err(internal)? != replay.len()
+            || replay
+                .iter()
+                .any(|(op, entry)| coins.get_utxo(op).as_ref() != Some(entry))
+        {
+            return Err(internal("stage replay differs from durable coins"));
+        }
+        if reader.script_index_tip().map_err(internal)? != Some(tip) {
+            return Err(internal("stage replay script index missing"));
+        }
+        // Derive actual rows after the entire coin/signature replay succeeded.
+        // Height order preserves the active latest occurrence of historical txids.
+        let write = db.tx_mut().map_err(internal)?;
+        for height in 1..=tip.0 {
+            let hash = headers
+                .get_header_by_height(height)
+                .ok_or_else(|| internal("stage index rebuild header missing"))?
+                .header
+                .block_hash();
+            let block = reader
+                .get_block(&hash)
+                .map_err(internal)?
+                .ok_or_else(|| internal("stage index rebuild body missing"))?;
+            for (id, location) in btc_storage::index_plan::BlockIndexPlan::transaction_rows(&block)
+                .map_err(internal)?
+            {
+                write
+                    .put_tx_block_index(&id, &location.block_hash, location.tx_position)
+                    .map_err(internal)?;
+            }
+            for tx in &block.transactions {
+                write.put_transaction(&tx.txid(), tx).map_err(internal)?;
+            }
+        }
+        drop(reader);
+        write
+            .set_stage_checkpoint(tip.0, &tip.1)
+            .map_err(internal)?;
+        write.commit().map_err(internal)
     }
 
     pub fn subscribe_blocks(&self) -> tokio::sync::broadcast::Receiver<BlockHash> {
@@ -492,191 +655,22 @@ impl NodeChainBackend {
     /// winning chain only after the entire disconnect/reconnect commits.
     pub fn submit_block(&self, block: &Block) -> Result<AcceptedBlock, RpcError> {
         let mut data = self.lock()?;
-        let hash = block.block_hash();
-        if data.headers.get_header(&hash).is_some() {
-            return Err(RpcError::new(-27, "duplicate"));
-        }
-        let parent = data
-            .headers
-            .get_header(&block.header.prev_blockhash)
-            .ok_or_else(|| RpcError::new(-25, "unknown block parent"))?
-            .clone();
-        let height = parent.height + 1;
-        let old_tip = data.headers.best_header().header.block_hash();
-        let old_height = data.headers.best_height();
-        let extension = block.header.prev_blockhash == old_tip;
-        let mut branch = None;
-        let mut detached = Vec::new();
-        let mut attached = Vec::new();
-        let mut attached_updates = HashMap::new();
-        let mut overlay = CoinOverlay {
-            base: &data.utxos,
-            changes: HashMap::new(),
-        };
-        let mut fork_hash = old_tip;
-        if !extension {
-            let mut cursor = block.header.prev_blockhash;
-            let mut reconnect = Vec::new();
-            loop {
-                let entry = data
-                    .headers
-                    .get_header(&cursor)
-                    .ok_or_else(|| internal("fork ancestry missing"))?;
-                if data
-                    .headers
-                    .get_header_by_height(entry.height)
-                    .is_some_and(|active| active.header.block_hash() == cursor)
-                {
-                    fork_hash = cursor;
-                    break;
-                }
-                reconnect.push((entry.height, cursor));
-                cursor = entry.header.prev_blockhash;
-            }
-            let mut cursor = old_tip;
-            while cursor != fork_hash {
-                let entry = data
-                    .headers
-                    .get_header(&cursor)
-                    .ok_or_else(|| internal("active ancestry missing"))?;
-                let body = self
-                    .block(&cursor)?
-                    .ok_or_else(|| internal("active body missing"))?;
-                overlay.disconnect(&self.undo(cursor)?);
-                detached.push((entry.height, body));
-                cursor = entry.header.prev_blockhash;
-            }
-            for (height, hash) in reconnect.into_iter().rev() {
-                let undo = self.undo(hash)?;
-                overlay.connect(&undo);
-                attached_updates.insert(hash, undo);
-                attached.push((
-                    height,
-                    self.block(&hash)?
-                        .ok_or_else(|| internal("branch body missing"))?,
-                ));
-            }
-            let mut context = data.headers.clone();
-            context
-                .select_tip(block.header.prev_blockhash)
-                .map_err(rejection)?;
-            context.accept_header(block.header).map_err(rejection)?;
-            branch = Some(context);
-        }
-        let context = branch.as_ref().unwrap_or(&data.headers);
-        let update = Self::validate_block_against(block, height, context, &overlay)?;
-        overlay.connect(&update);
-        let active = extension
-            || context.best_header().cumulative_work > data.headers.best_header().cumulative_work;
-        let (pool, changes) = if active {
-            attached.push((height, block.clone()));
-            attached_updates.insert(hash, update.clone());
-            let mut candidates = data.mempool.transactions();
-            for (_, body) in detached.iter().rev() {
-                candidates.extend(body.transactions.iter().skip(1).cloned());
-            }
-            let confirmed: HashSet<_> = attached
-                .iter()
-                .flat_map(|(_, b)| b.transactions.iter().map(Transaction::txid))
-                .collect();
-            // Evaluate new lock points from the actual candidate header without
-            // cloning the complete chain on every linear extension.
-            let next_pool = {
-                crate::mempool::RuntimeMempool::rebuild(
-                    candidates,
-                    &confirmed,
-                    &overlay,
-                    context,
-                    Some(&data.mempool),
-                    extension.then_some(&block.header),
-                )
-            };
-            (next_pool, overlay.changes)
-        } else {
-            (data.mempool.empty_like(), HashMap::new())
-        };
-        let mut fees = data.fees.clone();
-        let fee_bytes = if active {
-            let mined = attached
-                .iter()
-                .flat_map(|(_, b)| b.transactions.iter().skip(1).map(Transaction::txid))
-                .collect();
-            fees.update(height, hash, &pool, &mined, !extension);
-            Some(fees.encode()?)
-        } else {
-            None
-        };
-        let pool_transactions = pool.transactions();
-        let ValidatedChain { headers, utxos, .. } = &mut *data;
-        headers
-            .accept_header_with_commit(block.header, || {
-                utxos
-                    .commit_chain_transition_with_fees(
-                        btc_storage::utxo_store::ChainTransition {
-                            incoming: block,
-                            height,
-                            undo: &update,
-                            detached: if active { &detached } else { &[] },
-                            attached: if active { &attached } else { &[] },
-                            coins: &changes,
-                            tip: active.then_some((height, hash)),
-                            old_height,
-                            mempool: &pool_transactions,
-                        },
-                        fee_bytes.as_deref(),
-                    )
-                    .map_err(|e| e.to_string())
-            })
+        let mut pipeline = self
+            .pipeline
+            .lock()
+            .map_err(|_| internal("stage pipeline lock poisoned"))?;
+        let mut batch = stage_backend::Batch::new(self, &mut data, block)?;
+        let height = batch.height;
+        pipeline
+            .run_with(&mut batch, height)
             .map_err(|error| match error {
-                btc_consensus::chain::ChainError::CommitFailed(message) => internal(message),
-                other => rejection(other),
+                btc_stages::StageError::Backend { code, message } => RpcError::new(code, message),
+                other => internal(other),
             })?;
-        if active {
-            data.fees = fees;
-            data.mempool = pool;
-            self.state
-                .update_mempool(data.mempool.entries.len() as u64, data.mempool.bytes as u64);
-            self.state.update_chain_tip(height, &hash.to_string());
-            if let Some(sender) = &data.exex {
-                for (height, body) in &detached {
-                    let _ = sender.send(btc_exex::ExExNotification::BlockReverted {
-                        height: *height,
-                        hash: body.block_hash(),
-                    });
-                }
-                for (height, body) in &attached {
-                    let undo = attached_updates[&body.block_hash()].clone();
-                    let _ = sender.send(btc_exex::ExExNotification::BlockCommitted {
-                        height: *height,
-                        hash: body.block_hash(),
-                        block: body.clone(),
-                        utxo_changes: undo,
-                    });
-                }
-                if !detached.is_empty() {
-                    let _ = sender.send(btc_exex::ExExNotification::ChainReorged {
-                        old_tip,
-                        new_tip: hash,
-                        fork_height: data.headers.get_header(&fork_hash).unwrap().height,
-                        reverted: detached.iter().map(|(_, b)| b.block_hash()).collect(),
-                        committed: attached.iter().map(|(h, b)| (*h, b.block_hash())).collect(),
-                    });
-                }
-            }
-            self.wallet_events
-                .send_modify(|revision| *revision = revision.wrapping_add(1));
-            let _ = self.block_events.send(hash);
-            // Reaccepted disconnected transactions must be announced again.
-            for txid in &data.mempool.order {
-                let _ = self.tx_events.send(*txid);
-            }
-        }
-        Ok(AcceptedBlock {
-            height,
-            hash,
-            update,
-            active,
-        })
+        batch
+            .accepted
+            .take()
+            .ok_or_else(|| internal("stage commit missing accepted block"))
     }
 
     pub fn configure_mempool(
@@ -1693,6 +1687,22 @@ impl ChainBackend for NodeChainBackend {
                             .map_err(|e| RpcError::new(-8, e.to_string()))?;
                         mempool_entry_json(&data.mempool, id)
                     }
+                    "getstageinfo" => {
+                        let receipt = self
+                            .db
+                            .tx()
+                            .map_err(internal)?
+                            .stage_checkpoint()
+                            .map_err(internal)?
+                            .ok_or_else(|| internal("stage checkpoint unavailable"))?;
+                        if receipt != (tip.height, tip.header.block_hash()) {
+                            return Err(internal("stage checkpoint disagrees with active tip"));
+                        }
+                        let stages = ["Headers", "Bodies", "Validation", "TxIndex", "AddressIndex"].iter().map(|name| json!({"name":name,"height":receipt.0,"blockhash":receipt.1.to_string()})).collect::<Vec<_>>();
+                        Ok(
+                            json!({"height":receipt.0,"bestblockhash":receipt.1.to_string(),"stages":stages}),
+                        )
+                    }
                     "getblockcount" => Ok(json!(tip.height)),
                     "getbestblockhash" => Ok(json!(tip.header.block_hash().to_string())),
                     "getblockhash" => {
@@ -1952,6 +1962,141 @@ mod tests {
     use btc_primitives::amount::Amount;
     use btc_rpc::handler::{RpcHandler, RpcRequest};
     use btc_test::TestKeyPair;
+
+    #[test]
+    fn stages_publish_only_actual_data_after_all_phases_and_preserve_history_on_failure() {
+        use btc_electrum::ElectrumBackend;
+        use btc_stages::{ExecOutput, Stage, StageBackend, StageError, StageId};
+        struct FailAddress;
+        impl Stage for FailAddress {
+            fn id(&self) -> StageId {
+                btc_stages::stage::ADDRESS_INDEX
+            }
+            fn execute_with(
+                &mut self,
+                _: &mut dyn StageBackend,
+                _: u64,
+            ) -> Result<ExecOutput, StageError> {
+                Err(StageError::Database(
+                    "injected address preparation failure".into(),
+                ))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stages.redb");
+        let node = NodeChainBackend::open(&path, NodeState::new(Network::Regtest)).unwrap();
+        let mut first = node.candidate(ScriptBuf::from_bytes(vec![0x51])).unwrap();
+        mine(&mut first);
+        node.submit_block(&first).unwrap();
+        let expected = ChainBackend::call(&node, "getstageinfo", json!([])).unwrap();
+        let old = (1, first.block_hash());
+        assert_eq!(node.db.tx().unwrap().stage_checkpoint().unwrap(), Some(old));
+        let mut next = node.candidate(ScriptBuf::from_bytes(vec![0x52])).unwrap();
+        mine(&mut next);
+        let actual_hash = next.block_hash();
+        let txid = next.transactions[0].txid();
+        let script =
+            btc_primitives::hash::sha256(next.transactions[0].outputs[0].script_pubkey.as_bytes());
+        let (sender, mut events) = tokio::sync::broadcast::channel(10);
+        node.set_exex_sender(sender).unwrap();
+        let mut blocks = node.subscribe_blocks();
+        let scripts = node.subscribe_scripts().unwrap();
+        {
+            let mut data = node.lock().unwrap();
+            let mut pipeline = node.pipeline.lock().unwrap();
+            let mut batch = stage_backend::Batch::new(&node, &mut data, &next).unwrap();
+            assert!(pipeline.run_with(&mut batch, 3).is_err());
+            assert_eq!(
+                pipeline.checkpoint_record(btc_stages::stage::HEADERS),
+                Some(btc_stages::StageCheckpoint {
+                    height: old.0,
+                    hash: old.1
+                })
+            );
+        }
+        let mut failed = btc_stages::Pipeline::new();
+        failed.add_stage(Box::new(btc_stages::HeadersStage::new()));
+        failed.add_stage(Box::new(btc_stages::BodiesStage::new()));
+        failed.add_stage(Box::new(btc_stages::ExecutionStage::new()));
+        failed.add_stage(Box::new(btc_stages::IndexingStage::new()));
+        failed.add_stage(Box::new(FailAddress));
+        node.configure_pipeline(failed).unwrap();
+        assert!(node
+            .submit_block(&next)
+            .unwrap_err()
+            .message
+            .contains("injected address"));
+        assert_eq!(
+            ChainBackend::call(&node, "getstageinfo", json!([])).unwrap(),
+            expected
+        );
+        assert_eq!(node.tip().unwrap(), old);
+        assert!(node.header(&actual_hash).unwrap().is_none());
+        let reader = node.db.tx().unwrap();
+        assert_eq!(reader.stage_checkpoint().unwrap(), Some(old));
+        assert!(reader.get_block(&actual_hash).unwrap().is_none());
+        assert!(reader.get_block_undo(&actual_hash).unwrap().is_none());
+        assert!(reader.get_tx_block_index(&txid).unwrap().is_none());
+        assert!(reader.script_history(&script, 10).unwrap().is_empty());
+        assert_eq!(node.db.coin_count().unwrap(), 1);
+        drop(reader);
+        assert!(events.try_recv().is_err());
+        assert!(blocks.try_recv().is_err());
+        assert!(!scripts.has_changed().unwrap());
+        node.configure_pipeline(btc_stages::build_default_pipeline())
+            .unwrap();
+        node.submit_block(&next).unwrap();
+        let reader = node.db.tx().unwrap();
+        assert_eq!(reader.stage_checkpoint().unwrap(), Some((2, actual_hash)));
+        assert_eq!(
+            reader
+                .get_tx_block_index(&txid)
+                .unwrap()
+                .unwrap()
+                .block_hash,
+            actual_hash
+        );
+        assert_eq!(reader.script_history(&script, 10).unwrap()[0].txid, txid);
+        drop(reader);
+        assert!(
+            matches!(events.try_recv().unwrap(),btc_exex::ExExNotification::BlockCommitted {height:2,hash,..} if hash==actual_hash)
+        );
+        assert_eq!(blocks.try_recv().unwrap(), actual_hash);
+        assert!(scripts.has_changed().unwrap());
+        let expected = ChainBackend::call(&node, "getstageinfo", json!([])).unwrap();
+        drop(node);
+        let reopened = NodeChainBackend::open(&path, NodeState::new(Network::Regtest)).unwrap();
+        assert_eq!(
+            ChainBackend::call(&reopened, "getstageinfo", json!([])).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn stale_stage_receipt_reopen_fails_without_replacing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale.redb");
+        let node = NodeChainBackend::open(&path, NodeState::new(Network::Regtest)).unwrap();
+        let mut block = node.candidate(ScriptBuf::from_bytes(vec![0x51])).unwrap();
+        mine(&mut block);
+        node.submit_block(&block).unwrap();
+        let wrong = (0, ChainParams::regtest().genesis_hash);
+        let write = node.db.tx_mut().unwrap();
+        write.set_stage_checkpoint(wrong.0, &wrong.1).unwrap();
+        write.commit().unwrap();
+        drop(node);
+        let error = NodeChainBackend::open(&path, NodeState::new(Network::Regtest))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("stage checkpoint"));
+        let db = RedbDatabase::new(&path).unwrap();
+        assert_eq!(db.tx().unwrap().stage_checkpoint().unwrap(), Some(wrong));
+        assert_eq!(
+            db.tx().unwrap().get_best_block_hash().unwrap(),
+            block.block_hash()
+        );
+    }
 
     #[test]
     fn genesis_body_upgrade_cannot_create_spendable_coins_or_replace_corruption() {
@@ -2223,6 +2368,7 @@ mod tests {
                 .unwrap();
             write.commit().unwrap();
             assert!(!db.verify_script_index().unwrap());
+            assert!(db.tx().unwrap().stage_checkpoint().unwrap().is_none());
         }
         let upgraded = NodeChainBackend::open(&path, NodeState::new(Network::Regtest)).unwrap();
         let hash = btc_primitives::hash::sha256(key.p2pkh_script().as_bytes());
@@ -2238,6 +2384,10 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(upgraded.db.verify_script_index().unwrap());
+        assert_eq!(
+            upgraded.db.tx().unwrap().stage_checkpoint().unwrap(),
+            Some(source.tip().unwrap())
+        );
         drop(upgraded);
         assert!(
             NodeChainBackend::open(&path, NodeState::new(Network::Regtest))
@@ -3469,6 +3619,27 @@ mod tests {
         drop(db);
         let reopened = NodeChainBackend::open(&path, NodeState::new(Network::Regtest)).unwrap();
         assert_eq!(reopened.tip().unwrap(), (1, block.block_hash()));
+        let reader = reopened.db.tx().unwrap();
+        assert_eq!(
+            reader.stage_checkpoint().unwrap(),
+            Some((1, block.block_hash()))
+        );
+        assert_eq!(
+            reader
+                .get_tx_block_index(&block.transactions[0].txid())
+                .unwrap()
+                .unwrap()
+                .block_hash,
+            block.block_hash()
+        );
+        assert_eq!(
+            reader
+                .get_transaction(&block.transactions[0].txid())
+                .unwrap()
+                .unwrap(),
+            block.transactions[0]
+        );
+        drop(reader);
         assert_eq!(
             reopened.undo(block.block_hash()).unwrap().created,
             accepted.update.created

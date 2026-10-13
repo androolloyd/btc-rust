@@ -128,16 +128,8 @@ impl ChainState {
         self.accept_header_with_commit(header, || Ok(()))
     }
 
-    /// Validate first, persist through `commit`, then publish the new header.
-    /// A failed commit leaves the header chain unchanged.
-    pub fn accept_header_with_commit<F>(
-        &mut self,
-        header: BlockHeader,
-        commit: F,
-    ) -> Result<BlockHash, ChainError>
-    where
-        F: FnOnce() -> Result<(), String>,
-    {
+    /// Check a candidate against its actual ancestry without publishing it.
+    pub fn validate_header(&self, header: BlockHeader) -> Result<HeaderEntry, ChainError> {
         let hash = header.block_hash();
 
         // Reject duplicates.
@@ -208,12 +200,27 @@ impl ChainState {
         let header_work = calculate_header_work(&header);
         let cumulative_work = add_u256(&prev_entry.cumulative_work, &header_work);
 
-        let entry = HeaderEntry {
+        Ok(HeaderEntry {
             header,
             height: new_height,
             cumulative_work,
-        };
+        })
+    }
 
+    /// Validate first, persist through `commit`, then publish the new header.
+    /// A failed commit leaves the header chain unchanged.
+    pub fn accept_header_with_commit<F>(
+        &mut self,
+        header: BlockHeader,
+        commit: F,
+    ) -> Result<BlockHash, ChainError>
+    where
+        F: FnOnce() -> Result<(), String>,
+    {
+        let entry = self.validate_header(header)?;
+        let hash = header.block_hash();
+        let new_height = entry.height;
+        let cumulative_work = entry.cumulative_work;
         commit().map_err(ChainError::CommitFailed)?;
         self.headers.insert(hash, entry);
 

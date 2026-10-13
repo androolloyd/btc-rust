@@ -65,6 +65,10 @@ pub struct AddressIndexValue {
 
 /// Read-only database transaction
 pub trait DbTx: Send + Sync {
+    fn stage_checkpoint(&self) -> Result<Option<(u64, BlockHash)>, StorageError> {
+        Ok(None)
+    }
+
     fn fee_observations(&self) -> Result<Option<Vec<u8>>, StorageError> {
         Ok(None)
     }
@@ -110,6 +114,21 @@ pub trait DbTx: Send + Sync {
 
 /// Read-write database transaction
 pub trait DbTxMut: DbTx {
+    fn set_stage_checkpoint(&self, _height: u64, _hash: &BlockHash) -> Result<(), StorageError> {
+        Err(StorageError::Database(
+            "stage checkpoints unsupported".into(),
+        ))
+    }
+    fn index_script_plan(
+        &self,
+        _plan: &crate::index_plan::BlockIndexPlan,
+        _remove: bool,
+    ) -> Result<(), StorageError> {
+        Err(StorageError::Database(
+            "prepared script indices unsupported".into(),
+        ))
+    }
+
     fn set_fee_observations(&self, _bytes: &[u8]) -> Result<(), StorageError> {
         Err(StorageError::Database(
             "fee observation persistence unsupported".into(),

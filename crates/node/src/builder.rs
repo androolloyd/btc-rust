@@ -255,6 +255,10 @@ impl Node {
         );
 
         chain_backend
+            .configure_pipeline(self.pipeline)
+            .map_err(|error| eyre::eyre!(error.message))?;
+
+        chain_backend
             .configure_mempool(
                 self.config.full_rbf,
                 self.config.mempool_policy.clone(),

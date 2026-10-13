@@ -4,10 +4,9 @@
 use super::*;
 use crate::traits::ScriptHistoryEntry;
 use btc_consensus::utxo::UtxoSetUpdate;
-use btc_primitives::hash::sha256;
 use redb::ReadableTable;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::HashMap;
 
 pub(super) const HISTORY: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("ValidatedScriptHistoryV1");
@@ -81,49 +80,6 @@ pub(super) fn history(
 
 // One row per touched script/transaction, regardless of input/output multiplicity.
 // Consumed coins include same-block spends and come from the validated undo.
-fn rows(
-    height: u64,
-    block: &Block,
-    undo: &UtxoSetUpdate,
-) -> Result<BTreeMap<[u8; 44], TxHash>, StorageError> {
-    let spent: HashMap<_, _> = undo.spent.iter().map(|(op, coin)| (*op, coin)).collect();
-    if spent.len() != undo.spent.len() {
-        return Err(bad("duplicate spent script-index undo coin"));
-    }
-    let mut rows = BTreeMap::new();
-    let mut consumed = HashSet::new();
-    for (position, tx) in block.transactions.iter().enumerate() {
-        let position =
-            u32::try_from(position).map_err(|_| bad("script-index position overflow"))?;
-        let mut scripts = HashSet::new();
-        for output in &tx.outputs {
-            // Provably unspendable outputs are not coins. Genesis is excluded by
-            // the caller, matching Electrum's explicitly unindexed coinbase.
-            if !output.script_pubkey.is_op_return() && output.script_pubkey.len() <= 10_000 {
-                scripts.insert(sha256(output.script_pubkey.as_bytes()));
-            }
-        }
-        if !tx.is_coinbase() {
-            for input in &tx.inputs {
-                let op = input.previous_output;
-                if !consumed.insert(op) {
-                    return Err(bad("duplicate consumed script-index coin"));
-                }
-                let coin = spent
-                    .get(&op)
-                    .ok_or_else(|| bad("missing spent script-index coin"))?;
-                scripts.insert(sha256(coin.txout.script_pubkey.as_bytes()));
-            }
-        }
-        for script in scripts {
-            rows.insert(key(&script, height, position), tx.txid());
-        }
-    }
-    if spent.len() != consumed.len() {
-        return Err(bad("extra spent script-index undo coin"));
-    }
-    Ok(rows)
-}
 pub(super) fn index_block(
     tx: &RedbTxMut,
     height: u64,
@@ -134,10 +90,24 @@ pub(super) fn index_block(
     if height == 0 {
         return Err(bad("genesis must not enter script index"));
     }
-    let rows = rows(height, block, undo)?;
+    let plan = crate::index_plan::BlockIndexPlan::new(
+        height,
+        block,
+        undo,
+        crate::index_plan::BlockIndexPlan::transaction_rows(block)?,
+    )?;
+    index_plan(tx, &plan, remove)
+}
+pub(super) fn index_plan(
+    tx: &RedbTxMut,
+    plan: &crate::index_plan::BlockIndexPlan,
+    remove: bool,
+) -> Result<(), StorageError> {
+    let height = plan.height;
+    let rows = &plan.rows;
     let mut digest = Sha256::new();
     let mut history = tx.inner.open_table(HISTORY).map_err(error)?;
-    for (k, id) in &rows {
+    for (k, id) in rows {
         digest.update(k);
         digest.update(id.as_bytes());
         if remove {
@@ -156,7 +126,7 @@ pub(super) fn index_block(
             return Err(bad("script index already contains attached row"));
         }
     }
-    let mut manifest = block.block_hash().as_bytes().to_vec();
+    let mut manifest = plan.hash.as_bytes().to_vec();
     manifest.extend_from_slice(&(rows.len() as u64).to_be_bytes());
     manifest.extend_from_slice(&digest.finalize());
     let mut table = tx.inner.open_table(MANIFEST).map_err(error)?;
@@ -259,6 +229,7 @@ impl RedbTxMut {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use btc_primitives::hash::sha256;
     use btc_primitives::{Amount, CompactTarget, ScriptBuf, TxIn, TxOut};
     fn fixture() -> (RedbDatabase, tempfile::TempDir, Block, UtxoSetUpdate) {
         let dir = tempfile::tempdir().unwrap();
@@ -301,7 +272,7 @@ mod tests {
             )],
             created: vec![],
         };
-        let block = Block {
+        let mut block = Block {
             header: BlockHeader {
                 version: 4,
                 prev_blockhash: BlockHash::ZERO,
@@ -312,6 +283,7 @@ mod tests {
             },
             transactions: vec![coinbase, child],
         };
+        block.header.merkle_root = block.compute_merkle_root();
         (db, dir, block, undo)
     }
     #[test]

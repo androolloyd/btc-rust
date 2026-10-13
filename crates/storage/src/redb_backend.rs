@@ -308,7 +308,33 @@ pub struct RedbTx {
 // produces its own `ReadOnlyTable` value (not a shared mutable reference).
 unsafe impl Sync for RedbTx {}
 
+fn stage_checkpoint(
+    tx: &impl ReadableTable<&'static str, &'static [u8]>,
+) -> Result<Option<(u64, BlockHash)>, StorageError> {
+    tx.get("validated_stages_v1")
+        .map_err(script_index::error)?
+        .map(|v| {
+            let b = v.value();
+            if b.len() != 76
+                || &b[..4] != b"STG1"
+                || btc_primitives::hash::sha256(&b[..44]) != b[44..]
+            {
+                return Err(StorageError::Corruption(
+                    "invalid stage checkpoint receipt".into(),
+                ));
+            }
+            Ok((
+                u64::from_be_bytes(b[4..12].try_into().unwrap()),
+                BlockHash::from_slice(&b[12..44]),
+            ))
+        })
+        .transpose()
+}
 impl DbTx for RedbTx {
+    fn stage_checkpoint(&self) -> Result<Option<(u64, BlockHash)>, StorageError> {
+        stage_checkpoint(&self.inner.open_table(META).map_err(script_index::error)?)
+    }
+
     fn fee_observations(&self) -> Result<Option<Vec<u8>>, StorageError> {
         let table = self.inner.open_table(META).map_err(script_index::error)?;
         let value = table
@@ -579,6 +605,10 @@ pub struct RedbTxMut {
 unsafe impl Sync for RedbTxMut {}
 
 impl DbTx for RedbTxMut {
+    fn stage_checkpoint(&self) -> Result<Option<(u64, BlockHash)>, StorageError> {
+        stage_checkpoint(&self.inner.open_table(META).map_err(script_index::error)?)
+    }
+
     fn fee_observations(&self) -> Result<Option<Vec<u8>>, StorageError> {
         let table = self.inner.open_table(META).map_err(script_index::error)?;
         let value = table
@@ -828,6 +858,27 @@ impl DbTx for RedbTxMut {
 }
 
 impl DbTxMut for RedbTxMut {
+    fn set_stage_checkpoint(&self, height: u64, hash: &BlockHash) -> Result<(), StorageError> {
+        let mut bytes = b"STG1".to_vec();
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.extend_from_slice(hash.as_bytes());
+        let digest = btc_primitives::hash::sha256(&bytes);
+        bytes.extend_from_slice(&digest);
+        self.inner
+            .open_table(META)
+            .map_err(script_index::error)?
+            .insert("validated_stages_v1", bytes.as_slice())
+            .map_err(script_index::error)?;
+        Ok(())
+    }
+    fn index_script_plan(
+        &self,
+        plan: &crate::index_plan::BlockIndexPlan,
+        remove: bool,
+    ) -> Result<(), StorageError> {
+        script_index::index_plan(self, plan, remove)
+    }
+
     fn index_script_block(
         &self,
         height: u64,
@@ -1068,6 +1119,47 @@ mod tests {
             time: 1231006505,
             bits: CompactTarget::MAX_TARGET,
             nonce: 2083236893,
+        }
+    }
+
+    #[test]
+    fn corrupt_stage_receipts_fail_and_aborted_writes_preserve_previous_bytes() {
+        let (db, _dir) = temp_db();
+        let hash = btc_consensus::validation::ChainParams::regtest().genesis_hash;
+        let write = db.tx_mut().unwrap();
+        write.set_stage_checkpoint(0, &hash).unwrap();
+        write.commit().unwrap();
+        {
+            let write = db.tx_mut().unwrap();
+            write.set_stage_checkpoint(1, &hash).unwrap();
+        }
+        assert_eq!(
+            db.tx().unwrap().stage_checkpoint().unwrap(),
+            Some((0, hash))
+        );
+        let mut good = b"STG1".to_vec();
+        good.extend_from_slice(&0u64.to_be_bytes());
+        good.extend_from_slice(hash.as_bytes());
+        good.extend_from_slice(&btc_primitives::hash::sha256(&good));
+        for bytes in [
+            vec![],
+            good[..75].to_vec(),
+            {
+                let mut b = good.clone();
+                b[12] ^= 1;
+                b
+            },
+            vec![0; 1024],
+        ] {
+            let write = db.tx_mut().unwrap();
+            {
+                let mut table = write.inner.open_table(META).unwrap();
+                table
+                    .insert("validated_stages_v1", bytes.as_slice())
+                    .unwrap();
+            }
+            write.commit().unwrap();
+            assert!(db.tx().unwrap().stage_checkpoint().is_err());
         }
     }
 

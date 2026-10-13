@@ -110,6 +110,20 @@ def rust_rpc(port, method, params):
     return result["result"]
 
 
+def stage_snapshot(rust_port, core_port=None, height=None, block_hash=None):
+    """Assert every persisted phase is pinned to an independently known active tip."""
+    if core_port is not None:
+        height=core_rpc(core_port,"getblockcount",[])
+        block_hash=core_rpc(core_port,"getbestblockhash",[])
+    assert height is not None and block_hash is not None
+    actual=rust_rpc(rust_port,"getstageinfo",[])
+    expected={"height":height,"bestblockhash":block_hash,"stages":[
+        {"name":name,"height":height,"blockhash":block_hash}
+        for name in ["Headers","Bodies","Validation","TxIndex","AddressIndex"]]}
+    assert actual==expected,(actual,expected)
+    return actual
+
+
 def check_base58_address_rejections(core_port, rust_port, address):
     assert core_rpc(core_port, "validateaddress", [address])["isvalid"]
     aliases = ["Ա" + address, address[0] + chr(0x100 + ord(address[1])) + address[2:], "3" * 1000]
@@ -523,6 +537,7 @@ def check_reference_execution(core_port, rust_port, p2p_port, clock, address, mo
         body = (header + b"\x02" + coinbase.serialize() + raw).hex()
         block_hash = sha256d(header)[::-1].hex()
         before = rust_rpc(rust_port, "gettxout", [funding, coin["n"], False])
+        stages_before = rust_rpc(rust_port, "getstageinfo", [])
         result = core_rpc(core_port, "submitblock", [body])
         if case["allowed"]:
             assert result is None, (case["name"], result)
@@ -540,6 +555,7 @@ def check_reference_execution(core_port, rust_port, p2p_port, clock, address, mo
         else:
             assert isinstance(actual, str) and case.get("reject_contains", "script") in actual.lower(), (case["name"], actual)
         assert rust_rpc(rust_port, "getbestblockhash", []) == rust_tip
+        assert rust_rpc(rust_port, "getstageinfo", []) == stages_before
         assert rust_rpc(rust_port, "gettxout", [funding, coin["n"], False]) == before
         assert rust_rpc(rust_port, "getrawmempool", []) == []
     core_rpc(core_port, "setnetworkactive", [True])
@@ -736,6 +752,7 @@ def scenario(args, encrypted, outbound):
                 assert rust_peers[0]["inbound"] is (not outbound)
                 assert core_peers[0]["inbound"] is outbound
                 wait_until(lambda: rust_rpc(rust_port, "getblockcount", []) == initial_height)
+                stage_snapshot(rust_port,core_port)
                 assert core_peers[0]["relaytxes"] is True
                 assert core_peers[0]["permissions"] == [], "acceptance must use ordinary peer validation"
                 if encrypted:
@@ -750,6 +767,7 @@ def scenario(args, encrypted, outbound):
                 wait_until(lambda: rust_rpc(rust_port, "getbestblockhash", []) == core_hashes[-1])
                 assert rust_rpc(rust_port, "getblockcount", []) == initial_height + 5
                 assert core_rpc(core_port, "getblock", [core_hashes[-1], 0]) == rust_rpc(rust_port, "getblock", [core_hashes[-1], 0])
+                stage_snapshot(rust_port,core_port)
                 if outbound:
                     # Core drops our outbound connection; recover missing history
                     # across more than one live-download window, then keep relaying.
@@ -783,6 +801,7 @@ def scenario(args, encrypted, outbound):
                 rust = subprocess.Popen(rust_command, stdout=rust_log, stderr=rust_log)
                 processes.append(rust)
                 wait_until(lambda: rust_rpc(rust_port, "getbestblockhash", []) == final)
+                stage_snapshot(rust_port,core_port)
                 assert rust_rpc(rust_port, "getblockheader", [stale])["confirmations"] == -1
                 assert rust_rpc(rust_port, "getrawmempool", []) == []
                 compact_log = (root / "rust.log").read_text()

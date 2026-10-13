@@ -12,8 +12,45 @@ from pathlib import Path
 import socket
 import subprocess
 import tempfile
-from check_core_p2p import core_rpc, reserve_ports, rust_rpc, wait_until
+from check_core_p2p import core_rpc, reserve_ports, rust_rpc, wait_until, stage_snapshot
 from electrumx_reference import merkle_reference, protocol_reference, methods_1_4_reference
+
+
+def reject_unverified_stage_inputs(core_port,rust_port,raw):
+    from core29_tapscript import reference
+    from io import BytesIO
+    import copy
+    _,_,messages=reference()
+    actual=messages.CBlock();actual.deserialize(BytesIO(bytes.fromhex(raw)))
+    frozen=stage_snapshot(rust_port,height=0,block_hash=core_rpc(core_port,"getblockhash",[0]))
+    header=bytearray(bytes.fromhex(raw)[:80]);bits=int.from_bytes(header[72:76],"little")
+    target=(bits&0x7fffff) << (8*((bits>>24)-3))
+    sha256d=lambda b:hashlib.sha256(hashlib.sha256(b).digest()).digest()
+    while int.from_bytes(sha256d(header),"little") <= target:
+        header[76:80]=(int.from_bytes(header[76:80],"little")+1).to_bytes(4,"little")
+    pow_bad=(header+bytes.fromhex(raw)[80:]).hex()
+    unknown=copy.deepcopy(actual);unknown.nTime+=1;unknown.solve()
+    body_bad=bytearray(unknown.serialize());body_bad[-1]^=1
+    reward=copy.deepcopy(actual);reward.vtx[0].vout[0].nValue+=1
+    reward.vtx[0].rehash();reward.hashMerkleRoot=reward.calc_merkle_root();reward.solve()
+    # Core only runs contextual rewards when activating a candidate. Rewind its
+    # real mined history so these height-one candidates must connect at genesis.
+    # Restore the genuine chain afterward; a low-work side acceptance is no oracle.
+    old_tip=core_rpc(core_port,"getbestblockhash",[])
+    first_hash=sha256d(bytes.fromhex(raw)[:80])[::-1].hex()
+    core_rpc(core_port,"invalidateblock",[first_hash],timeout=60)
+    assert core_rpc(core_port,"getblockcount",[])==0
+    try:
+        for label,body,rejection in [("header PoW",pow_bad,"high-hash"),("body commitment",body_bad.hex(),"bad-txnmrklroot"),("executed reward",reward.serialize().hex(),"bad-cb-amount")]:
+            result=core_rpc(core_port,"submitblock",[body])
+            assert result==rejection,(label,result)
+            assert isinstance(rust_rpc(rust_port,"submitblock",[body]),str),label
+            assert core_rpc(core_port,"getblockcount",[])==0,label
+            assert rust_rpc(rust_port,"getstageinfo",[])==frozen,label
+    finally:
+        core_rpc(core_port,"reconsiderblock",[first_hash],timeout=60)
+    assert core_rpc(core_port,"getbestblockhash",[])==old_tip
+    print("Stages: independently rejected header/body/execution cannot advance durable phases",flush=True)
 
 
 class Client:
@@ -345,6 +382,7 @@ def main():
                 wait_until(lambda: rust_rpc(rust_port,"getblockcount",[]) == 0)
                 client = Client(electrum_port); clients.append(client)
                 genesis = core_rpc(core_port,"getblockhash",[0]); genesis_header = core_rpc(core_port,"getblockheader",[genesis,False])
+                stage_snapshot(rust_port,core_port)
                 identity=server_identity(client,electrum_port,genesis)
                 version_oracle(electrum_port)
                 assert client.call("blockchain.block.header",[0]) == genesis_header
@@ -374,9 +412,11 @@ def main():
                 for method in ["blockchain.scripthash.subscribe","blockchain.scripthash.unsubscribe"]:
                     assert client.call(method,{"scripthash":42},True)["code"] == -32602
                 hashes = core_rpc(core_port,"generatetoaddress",[101,address]); raw_headers = []
-                for block_hash in hashes:
+                reject_unverified_stage_inputs(core_port,rust_port,core_rpc(core_port,"getblock",[hashes[0],0]))
+                for height,block_hash in enumerate(hashes,1):
                     assert rust_rpc(rust_port,"submitblock",[core_rpc(core_port,"getblock",[block_hash,0])]) is None
                     raw_headers.append(core_rpc(core_port,"getblockheader",[block_hash,False]))
+                    stage_snapshot(rust_port,height=height,block_hash=block_hash)
                 assert client.header(101) == {"height":101,"hex":raw_headers[-1]}
                 assert client.call("blockchain.block.headers",[100,100]) == {"count":2,"hex":"".join(raw_headers[99:]),"max":2016}
                 checkpoint_proofs(client,core_port,full=True)
@@ -441,13 +481,16 @@ def main():
                 # arrive; it must change only once the new branch is active.
                 old_cached = client.call("blockchain.block.header",[100,103])
                 client.unsubscribe(main_script); unsubscribed_count = client.status_counts[main_script]
+                old_stages=stage_snapshot(rust_port,core_port)
                 core_rpc(core_port,"invalidateblock",[mined]); fork_address = core_rpc(core_port,"getnewaddress",[])
                 for _ in range(3):
                     fork = core_rpc(core_port,"generateblock",[fork_address,[]])["hash"]
                     assert rust_rpc(rust_port,"submitblock",[core_rpc(core_port,"getblock",[fork,0])]) is None
                     if core_rpc(core_port,"getblockcount",[]) <= 103:
                         assert client.call("blockchain.block.header",[100,103]) == old_cached
+                        assert rust_rpc(rust_port,"getstageinfo",[])==old_stages
                         assert client.call("blockchain.transaction.id_from_pos",[102,1,True]) == old_position
+                stage_snapshot(rust_port,core_port)
                 # Query the warmed prefix before another checkpoint can evict
                 # it, so a cache keyed only by height would fail this regression.
                 changed = client.call("blockchain.block.header",[100,103])
@@ -545,6 +588,7 @@ def main():
                 assert second.stream.readline() == b""; second.close(); clients.remove(second)
                 rust = subprocess.Popen(command,stdout=rust_log,stderr=rust_log); processes.append(rust)
                 wait_until(lambda: rust_rpc(rust_port,"getbestblockhash",[]) == before)
+                stage_snapshot(rust_port,core_port)
                 client = Client(electrum_port); clients.append(client)
                 assert client.call("blockchain.headers.subscribe") == {"height":105,"hex":core_rpc(core_port,"getblockheader",[fork,False])}
                 assert server_identity(client,electrum_port,genesis)==identity
@@ -568,6 +612,7 @@ def main():
                     for block_hash in core_rpc(core_port,"generatetoaddress",[count,long_address]):
                         assert rust_rpc(rust_port,"submitblock",[core_rpc(core_port,"getblock",[block_hash,0])]) is None
                     remaining -= count
+                    stage_snapshot(rust_port,core_port)
                 client = Client(electrum_port); clients.append(client)
                 position_proofs(client,core_port,[2015,2016,2017,2018])
                 long_results = chunk_boundary(client,core_port)
@@ -576,6 +621,7 @@ def main():
                 client.close(); clients.remove(client)
                 rust = subprocess.Popen(command,stdout=rust_log,stderr=rust_log); processes.append(rust)
                 wait_until(lambda: rust_rpc(rust_port,"getbestblockhash",[]) == long_tip)
+                stage_snapshot(rust_port,core_port)
                 client = Client(electrum_port); clients.append(client)
                 assert chunk_boundary(client,core_port) == long_results
                 assert server_identity(client,electrum_port,genesis)==identity

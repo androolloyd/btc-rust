@@ -316,7 +316,7 @@ btc-consensus    → Script engine, sighash, segwit, taproot, UTXO, chain state,
 btc-storage      → Database traits, QMDB backend, redb fallback, UTXO persistence, pruning
 btc-network      → P2P codec, handshake, DNS seeds, peer manager, compact blocks, tx relay
 btc-mempool      → Fee-sorted pool, RBF (BIP125), cluster mempool, fee estimation
-btc-stages       → Pipeline: Headers → Bodies → Execution → Indexing → AddressIndex
+btc-stages       → Actual block preparation: Headers → Bodies → Validation → TxIndex → AddressIndex
 btc-rpc          → JSON-RPC 2.0 server with Bitcoin Core-compatible methods
 btc-exex         → Execution Extensions plugin system (ordinals indexer included)
 btc-electrum     → Opt-in local validated Bitcoin Electrum 1.4 service
@@ -392,7 +392,9 @@ Built-in example plugins:
 - **ZMQ notifications** — hashblock, hashtx, rawblock, rawtx, sequence via ExEx
 
 ### Execution Extensions (ExEx)
-Subscribe to chain events without forking the node:
+The shared validated backend emits committed block/UTXO data, reversions and reorg summaries after successful persistence. ZMQ consumes this live feed. The current 1,024-event broadcast channel has no durable replay or acknowledged cursor; lagging consumers can lose events. Manager registration tracks names but does not spawn or supervise extensions. Durable recovery remains required work in [the build plan](docs/BUILD_PLAN.md).
+
+Manually started extensions can subscribe to future chain events:
 
 ```rust
 use btc_exex::{ExEx, ExExContext, ExExNotification};
@@ -416,10 +418,12 @@ impl ExEx for MyPlugin {
 }
 ```
 
-Built-in ExEx plugins:
-- **OrdinalsExEx** — inscription detection and indexing
-- **MetricsExEx** — chain height, tx count, UTXO set tracking
-- **LoggingExEx** — structured event logging
+Example extensions:
+- **OrdinalsExEx / RunesExEx** — candidate detection and observation counters; no durable protocol index or reorg undo.
+- **MetricsExEx** — in-memory counters; transaction/coin totals are not restored on reverts or dropped events.
+- **LoggingExEx** — live structured event logging.
+
+The real stage backend prepares downloaded bodies and commits actual indexes and a hash-bound checkpoint with chain state. Query `getstageinfo` for all five validated phases; see [stage semantics and migration](docs/STAGES.md).
 
 ### Test Harness
 In-process regtest for BIP development — `cargo add btc-test --dev`:
