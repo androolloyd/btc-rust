@@ -14,6 +14,8 @@ use crate::tables::{
 };
 use crate::traits::{AddressIndexValue, Database, DbTx, DbTxMut, StorageError, TxBlockLocation};
 
+#[path = "exex_journal.rs"]
+mod exex_journal;
 #[path = "legacy_checkpoint.rs"]
 mod legacy_checkpoint;
 #[path = "script_index.rs"]
@@ -64,6 +66,11 @@ impl RedbDatabase {
         write_txn
             .open_table(script_index::MANIFEST)
             .map_err(|e| StorageError::Database(e.to_string()))?;
+        for definition in [exex_journal::EVENTS, exex_journal::STATES] {
+            write_txn
+                .open_table(definition)
+                .map_err(script_index::error)?;
+        }
         // Opening a table inside a write-transaction creates it if missing.
         write_txn
             .open_table(BLOCKS)
@@ -331,6 +338,30 @@ fn stage_checkpoint(
         .transpose()
 }
 impl DbTx for RedbTx {
+    fn exex_journal_tip(&self) -> Result<Option<crate::exex::JournalTip>, StorageError> {
+        exex_journal::read_tip(&self.inner.open_table(META).map_err(script_index::error)?)
+    }
+    fn exex_journal_entry(
+        &self,
+        sequence: u64,
+    ) -> Result<Option<crate::exex::JournalEntry>, StorageError> {
+        exex_journal::read_entry(
+            &self
+                .inner
+                .open_table(exex_journal::EVENTS)
+                .map_err(script_index::error)?,
+            sequence,
+        )
+    }
+    fn exex_state(&self, name: &str) -> Result<Option<crate::exex::ExtensionState>, StorageError> {
+        exex_journal::read_state(
+            &self
+                .inner
+                .open_table(exex_journal::STATES)
+                .map_err(script_index::error)?,
+            name,
+        )
+    }
     fn stage_checkpoint(&self) -> Result<Option<(u64, BlockHash)>, StorageError> {
         stage_checkpoint(&self.inner.open_table(META).map_err(script_index::error)?)
     }
@@ -605,6 +636,30 @@ pub struct RedbTxMut {
 unsafe impl Sync for RedbTxMut {}
 
 impl DbTx for RedbTxMut {
+    fn exex_journal_tip(&self) -> Result<Option<crate::exex::JournalTip>, StorageError> {
+        exex_journal::read_tip(&self.inner.open_table(META).map_err(script_index::error)?)
+    }
+    fn exex_journal_entry(
+        &self,
+        sequence: u64,
+    ) -> Result<Option<crate::exex::JournalEntry>, StorageError> {
+        exex_journal::read_entry(
+            &self
+                .inner
+                .open_table(exex_journal::EVENTS)
+                .map_err(script_index::error)?,
+            sequence,
+        )
+    }
+    fn exex_state(&self, name: &str) -> Result<Option<crate::exex::ExtensionState>, StorageError> {
+        exex_journal::read_state(
+            &self
+                .inner
+                .open_table(exex_journal::STATES)
+                .map_err(script_index::error)?,
+            name,
+        )
+    }
     fn stage_checkpoint(&self) -> Result<Option<(u64, BlockHash)>, StorageError> {
         stage_checkpoint(&self.inner.open_table(META).map_err(script_index::error)?)
     }
@@ -858,6 +913,24 @@ impl DbTx for RedbTxMut {
 }
 
 impl DbTxMut for RedbTxMut {
+    fn initialize_exex_journal(&self, genesis: BlockHash) -> Result<(), StorageError> {
+        exex_journal::initialize(self, genesis)
+    }
+    fn append_exex_event(
+        &self,
+        connected: bool,
+        height: u64,
+        block: &Block,
+    ) -> Result<(), StorageError> {
+        exex_journal::append(self, connected, height, block)
+    }
+    fn set_exex_state(
+        &self,
+        name: &str,
+        state: &crate::exex::ExtensionState,
+    ) -> Result<(), StorageError> {
+        exex_journal::set_state(self, name, state)
+    }
     fn set_stage_checkpoint(&self, height: u64, hash: &BlockHash) -> Result<(), StorageError> {
         let mut bytes = b"STG1".to_vec();
         bytes.extend_from_slice(&height.to_be_bytes());

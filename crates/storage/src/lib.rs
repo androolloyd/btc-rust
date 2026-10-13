@@ -1,3 +1,4 @@
+pub mod exex;
 pub mod index_plan;
 pub mod provider;
 pub mod pruning;

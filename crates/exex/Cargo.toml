@@ -13,6 +13,7 @@ ordinals = []        # Ordinals/inscriptions indexer
 [dependencies]
 btc-primitives = { workspace = true }
 btc-consensus = { workspace = true }
+btc-storage = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 eyre = { workspace = true }

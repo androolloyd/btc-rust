@@ -282,6 +282,19 @@ impl Node {
         // 2. Create ExExManager for chain event notifications
         // -----------------------------------------------------------------
         let exex_manager = ExExManager::new(self.config.network);
+        chain_backend
+            .set_exex_sender(exex_manager.sender().clone())
+            .map_err(|e| eyre::eyre!(e.message))?;
+        let mut durable = btc_exex::durable::DurableManager::new(
+            Arc::new(btc_exex::durable::DatabaseStore::new(
+                chain_backend.db.clone(),
+            )),
+            chain_backend.exex_wakeup(),
+        );
+        durable.register(btc_exex::durable::ValidatedMetrics)?;
+        chain_backend
+            .set_exex_registry(durable.registry())
+            .map_err(|e| eyre::eyre!(e.message))?;
 
         // -----------------------------------------------------------------
         // 3. Build MetricsCollector from NodeState (shares atomics)
@@ -408,6 +421,7 @@ impl Node {
         let result = tokio::select! {
             result = tokio::signal::ctrl_c() => result.map_err(Into::into),
             _ = rpc_handler.wait_for_shutdown() => Ok(()),
+            error = durable.wait_failed() => Err(error),
             result = &mut p2p_handle => match result {
                 Ok(result) => result, Err(error) => Err(error.into()),
             },
@@ -420,6 +434,7 @@ impl Node {
             },
         };
         info!("shutting down");
+        durable.shutdown().await;
         rpc_handler.request_shutdown();
         let _ = electrum_shutdown.send(true);
         if let Some(handle) = electrum_handle.as_mut() {

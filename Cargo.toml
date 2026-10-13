@@ -70,6 +70,9 @@ rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/androolloyd/btc-rust"
 
+[dev-dependencies]
+btc-storage = { workspace = true }
+
 [workspace.dependencies]
 # Internal crates
 btc-primitives = { path = "crates/primitives" }

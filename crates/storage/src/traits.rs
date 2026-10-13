@@ -65,6 +65,22 @@ pub struct AddressIndexValue {
 
 /// Read-only database transaction
 pub trait DbTx: Send + Sync {
+    fn exex_journal_tip(&self) -> Result<Option<crate::exex::JournalTip>, StorageError> {
+        Ok(None)
+    }
+    fn exex_journal_entry(
+        &self,
+        _sequence: u64,
+    ) -> Result<Option<crate::exex::JournalEntry>, StorageError> {
+        Err(StorageError::Database(
+            "durable ExEx journal unsupported".into(),
+        ))
+    }
+    fn exex_state(&self, _name: &str) -> Result<Option<crate::exex::ExtensionState>, StorageError> {
+        Err(StorageError::Database(
+            "durable extension state unsupported".into(),
+        ))
+    }
     fn stage_checkpoint(&self) -> Result<Option<(u64, BlockHash)>, StorageError> {
         Ok(None)
     }
@@ -114,6 +130,30 @@ pub trait DbTx: Send + Sync {
 
 /// Read-write database transaction
 pub trait DbTxMut: DbTx {
+    fn initialize_exex_journal(&self, _genesis: BlockHash) -> Result<(), StorageError> {
+        Err(StorageError::Database(
+            "durable ExEx initialization unsupported".into(),
+        ))
+    }
+    fn append_exex_event(
+        &self,
+        _connected: bool,
+        _height: u64,
+        _block: &Block,
+    ) -> Result<(), StorageError> {
+        Err(StorageError::Database(
+            "durable ExEx publication unsupported".into(),
+        ))
+    }
+    fn set_exex_state(
+        &self,
+        _name: &str,
+        _state: &crate::exex::ExtensionState,
+    ) -> Result<(), StorageError> {
+        Err(StorageError::Database(
+            "durable extension state unsupported".into(),
+        ))
+    }
     fn set_stage_checkpoint(&self, _height: u64, _hash: &BlockHash) -> Result<(), StorageError> {
         Err(StorageError::Database(
             "stage checkpoints unsupported".into(),

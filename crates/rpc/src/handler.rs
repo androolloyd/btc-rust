@@ -96,6 +96,8 @@ pub const CHAIN_METHODS: &[&str] = &[
     "estimatesmartfee",
     "getmempoolfees",
     "getstageinfo",
+    "getexexinfo",
+    "getexexjournal",
     METHOD_PRIORITISETRANSACTION,
     METHOD_GENERATETOADDRESS,
     "sendrawtransaction",

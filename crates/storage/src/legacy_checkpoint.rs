@@ -7,7 +7,7 @@ use redb::{ReadableTableMetadata, TableHandle};
 
 const PREFIX: &str = "LegacyCheckpointV1.";
 const RECORD: TableDefinition<&str, &[u8]> = TableDefinition::new("LegacyCheckpointResyncV1");
-const BYTE_TABLES: [TableDefinition<&[u8], &[u8]>; 11] = [
+const BYTE_TABLES: [TableDefinition<&[u8], &[u8]>; 13] = [
     UNDO,
     MEMPOOL,
     HEADERS,
@@ -19,6 +19,8 @@ const BYTE_TABLES: [TableDefinition<&[u8], &[u8]>; 11] = [
     ADDRESS_INDEX,
     script_index::HISTORY,
     script_index::MANIFEST,
+    exex_journal::EVENTS,
+    exex_journal::STATES,
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -260,6 +262,16 @@ mod tests {
             .unwrap()
             .insert([8; 48].as_slice(), [0xcc].as_slice())
             .unwrap();
+        // Unverified journal/state bytes must also survive archival unchanged,
+        // without being decoded or becoming fresh validated consumer progress.
+        for table in [exex_journal::EVENTS, exex_journal::STATES] {
+            write
+                .inner
+                .open_table(table)
+                .unwrap()
+                .insert(b"unverified-exex".as_slice(), [0xdd, 0xee].as_slice())
+                .unwrap();
+        }
         write
             .put_block_header(&genesis().block_hash(), &genesis())
             .unwrap();

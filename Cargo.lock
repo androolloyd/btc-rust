@@ -207,6 +207,7 @@ version = "0.1.0"
 dependencies = [
  "btc-consensus",
  "btc-primitives",
+ "btc-storage",
  "eyre",
  "tokio",
  "tracing",
@@ -334,6 +335,7 @@ dependencies = [
  "btc-exex",
  "btc-forge",
  "btc-primitives",
+ "btc-storage",
  "btc-test",
  "eyre",
  "hex",

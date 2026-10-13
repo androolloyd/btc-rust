@@ -632,17 +632,10 @@ async fn test_block_reverted_flows_to_all_subscribers() {
 fn test_exex_manager_register_all_plugins() {
     let mut manager = ExExManager::new(Network::Regtest);
 
-    manager.register("logging");
-    manager.register("metrics");
-    manager.register("ordinals");
-    manager.register("runes");
-
-    let ext = manager.registered_extensions();
-    assert_eq!(ext.len(), 4);
-    assert_eq!(ext[0], "logging");
-    assert_eq!(ext[1], "metrics");
-    assert_eq!(ext[2], "ordinals");
-    assert_eq!(ext[3], "runes");
+    for name in ["logging", "metrics", "ordinals", "runes"] {
+        assert!(manager.register(name).is_err());
+    }
+    assert!(manager.registered_extensions().is_empty());
 }
 
 // ---------------------------------------------------------------------------

@@ -51,7 +51,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install 1.88.0 --profile minimal
-      - run: cargo build --release --locked --package btc-node --bin btc-node --example legacy_checkpoint_fixture
+      - run: cargo build --release --locked --package btc-node --bin btc-node --example legacy_checkpoint_fixture --example exex_fixture
       - name: Fetch checksum-verified Bitcoin Core v29
         shell: python
         run: |
@@ -76,6 +76,7 @@ jobs:
       - run: python3 scripts/check_core_verbose.py --bitcoind "$RUNNER_TEMP/btc-core29/bitcoin-29.0/bin/bitcoind"
       - run: python3 scripts/check_core_genesis.py --bitcoind "$RUNNER_TEMP/btc-core29/bitcoin-29.0/bin/bitcoind"
       - run: python3 scripts/check_core_electrum.py --bitcoind "$RUNNER_TEMP/btc-core29/bitcoin-29.0/bin/bitcoind"
+      - run: python3 scripts/check_core_exex.py --bitcoind "$RUNNER_TEMP/btc-core29/bitcoin-29.0/bin/bitcoind"
       - run: python3 scripts/check_core_fees.py --bitcoind "$RUNNER_TEMP/btc-core29/bitcoin-29.0/bin/bitcoind"
       - run: python3 scripts/check_core_psbt.py --bitcoind "$RUNNER_TEMP/btc-core29/bitcoin-29.0/bin/bitcoind"
       - run: python3 scripts/check_core_signer.py --bitcoind "$RUNNER_TEMP/btc-core29/bitcoin-29.0/bin/bitcoind"

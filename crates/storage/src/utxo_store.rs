@@ -154,6 +154,18 @@ impl<DB: Database> PersistentUtxoSet<DB> {
                 ));
             }
         }
+        let journal = tx.exex_journal_tip()?;
+        if let Some(tip) = journal {
+            if (tip.height, tip.hash) != (change.old_height, old_hash) {
+                return Err(StorageError::Corruption(
+                    "ExEx journal/chain transition mismatch".into(),
+                ));
+            }
+        } else if plan.is_some() {
+            return Err(StorageError::Database(
+                "validated stages require durable ExEx journal".into(),
+            ));
+        }
         let hash = change.incoming.block_hash();
         tx.put_block_header(&hash, &change.incoming.header)?;
         tx.put_block(&hash, change.incoming)?;
@@ -238,6 +250,19 @@ impl<DB: Database> PersistentUtxoSet<DB> {
                 tx.set_stage_checkpoint(height, &tip)?;
             }
             tx.replace_mempool(change.mempool)?;
+            if journal.is_some() {
+                for (height, block) in change.detached {
+                    tx.append_exex_event(false, *height, block)?;
+                }
+                for (height, block) in change.attached {
+                    tx.append_exex_event(true, *height, block)?;
+                }
+                if tx.exex_journal_tip()?.map(|tip| (tip.height, tip.hash)) != Some((height, tip)) {
+                    return Err(StorageError::Corruption(
+                        "ExEx journal did not reach actual committed tip".into(),
+                    ));
+                }
+            }
         }
         tx.commit()?;
         self.cache.get_mut().clear();
@@ -561,6 +586,21 @@ mod tests {
         }
     }
     impl DbTx for FailCommitTx {
+        fn exex_state(
+            &self,
+            name: &str,
+        ) -> Result<Option<crate::exex::ExtensionState>, StorageError> {
+            self.inner.exex_state(name)
+        }
+        fn exex_journal_tip(&self) -> Result<Option<crate::exex::JournalTip>, StorageError> {
+            self.inner.exex_journal_tip()
+        }
+        fn exex_journal_entry(
+            &self,
+            sequence: u64,
+        ) -> Result<Option<crate::exex::JournalEntry>, StorageError> {
+            self.inner.exex_journal_entry(sequence)
+        }
         fn stage_checkpoint(&self) -> Result<Option<(u64, BlockHash)>, StorageError> {
             self.inner.stage_checkpoint()
         }
@@ -611,6 +651,21 @@ mod tests {
         }
     }
     impl DbTxMut for FailCommitTx {
+        fn set_exex_state(
+            &self,
+            name: &str,
+            state: &crate::exex::ExtensionState,
+        ) -> Result<(), StorageError> {
+            self.inner.set_exex_state(name, state)
+        }
+        fn append_exex_event(
+            &self,
+            connected: bool,
+            height: u64,
+            block: &Block,
+        ) -> Result<(), StorageError> {
+            self.inner.append_exex_event(connected, height, block)
+        }
         fn set_stage_checkpoint(&self, height: u64, hash: &BlockHash) -> Result<(), StorageError> {
             self.inner.set_stage_checkpoint(height, hash)
         }
@@ -703,6 +758,7 @@ mod tests {
         write.set_best_block(0, &old).unwrap();
         write.set_script_index_tip(0, &old).unwrap();
         write.set_stage_checkpoint(0, &old).unwrap();
+        write.initialize_exex_journal(old).unwrap();
         write.commit().unwrap();
         // Actual serialized body/txid/script rows, used to exercise the storage transaction.
         let mut block = genesis.clone();
@@ -710,6 +766,9 @@ mod tests {
         block.header.time += 1;
         block.transactions[0].inputs[0].script_sig = ScriptBuf::from_bytes(vec![0x51, 0x00]);
         block.header.merkle_root = block.compute_merkle_root();
+        while !block.header.check_proof_of_work() {
+            block.header.nonce += 1;
+        }
         let hash = block.block_hash();
         let id = block.transactions[0].txid();
         let op = OutPoint::new(id, 0);
@@ -731,10 +790,12 @@ mod tests {
         .unwrap();
         let changes = HashMap::from([(op, Some(entry.clone()))]);
         let attached = vec![(1, block.clone())];
-        let mut coins = PersistentUtxoSet::new(Arc::new(FailCommitDb {
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let fault_db = Arc::new(FailCommitDb {
             inner: db.clone(),
-            fail: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        }));
+            fail: fail.clone(),
+        });
+        let mut coins = PersistentUtxoSet::new(fault_db.clone());
         let transition = || ChainTransition {
             incoming: &block,
             height: 1,
@@ -752,6 +813,8 @@ mod tests {
         assert!(!coins.contains(&op));
         let read = db.tx().unwrap();
         assert_eq!(read.stage_checkpoint().unwrap(), Some((0, old)));
+        assert_eq!(read.exex_journal_tip().unwrap().unwrap().sequence, 0);
+        assert!(read.exex_journal_entry(1).unwrap().is_none());
         assert_eq!(read.script_index_tip().unwrap(), Some((0, old)));
         assert_eq!(read.get_best_block_hash().unwrap(), old);
         assert!(read.get_block(&hash).unwrap().is_none());
@@ -766,6 +829,8 @@ mod tests {
             .unwrap();
         let read = db.tx().unwrap();
         assert_eq!(read.stage_checkpoint().unwrap(), Some((1, hash)));
+        assert_eq!(read.exex_journal_tip().unwrap().unwrap().sequence, 1);
+        assert_eq!(read.exex_journal_entry(1).unwrap().unwrap().hash, hash);
         assert_eq!(read.script_index_tip().unwrap(), Some((1, hash)));
         assert_eq!(
             read.get_tx_block_index(&id).unwrap().unwrap().block_hash,
@@ -773,6 +838,27 @@ mod tests {
         );
         assert_eq!(read.script_history(&script, 10).unwrap()[0].txid, id);
         assert_eq!(coins.get_utxo(&op), Some(entry));
+        let checkpoint = crate::exex::ExtensionState {
+            cursor: read.exex_journal_tip().unwrap().unwrap(),
+            state: vec![1, 2, 3],
+        };
+        drop(read);
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let write = fault_db.tx_mut().unwrap();
+        write.set_exex_state("atomic-v1", &checkpoint).unwrap();
+        assert!(write.commit().is_err());
+        assert!(db.tx().unwrap().exex_state("atomic-v1").unwrap().is_none());
+        assert_eq!(
+            db.tx().unwrap().exex_journal_tip().unwrap().unwrap(),
+            checkpoint.cursor
+        );
+        let write = fault_db.tx_mut().unwrap();
+        write.set_exex_state("atomic-v1", &checkpoint).unwrap();
+        write.commit().unwrap();
+        assert_eq!(
+            db.tx().unwrap().exex_state("atomic-v1").unwrap(),
+            Some(checkpoint)
+        );
     }
 
     #[test]

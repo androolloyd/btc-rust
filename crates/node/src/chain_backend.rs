@@ -43,6 +43,7 @@ pub(super) struct ValidatedChain {
 
 pub struct NodeChainBackend {
     pipeline: Mutex<btc_stages::Pipeline>,
+    exex_registry: Mutex<Option<btc_exex::durable::Registry>>,
     data: Mutex<ValidatedChain>,
     pub(super) db: Arc<RedbDatabase>,
     state: NodeState,
@@ -299,6 +300,7 @@ impl NodeChainBackend {
             write.commit()?;
         }
         Self::initialize_stages(&db, &headers, &utxos).map_err(|e| eyre::eyre!(e.message))?;
+        Self::initialize_exex(&db, &headers).map_err(|e| eyre::eyre!(e.message))?;
         state.update_mempool(mempool.entries.len() as u64, mempool.bytes as u64);
         state.update_chain_tip(
             headers.best_height(),
@@ -306,6 +308,7 @@ impl NodeChainBackend {
         );
         Ok(Self {
             pipeline: Mutex::new(btc_stages::build_default_pipeline()),
+            exex_registry: Mutex::new(None),
             data: Mutex::new(ValidatedChain {
                 headers,
                 utxos,
@@ -321,6 +324,17 @@ impl NodeChainBackend {
             header_proofs: Mutex::new(crate::header_proofs::HeaderProofCache::default()),
             legacy_checkpoint,
         })
+    }
+
+    pub fn exex_wakeup(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.wallet_events.subscribe()
+    }
+    pub fn set_exex_registry(&self, registry: btc_exex::durable::Registry) -> Result<(), RpcError> {
+        *self
+            .exex_registry
+            .lock()
+            .map_err(|_| internal("ExEx registry binding poisoned"))? = Some(registry);
+        Ok(())
     }
 
     pub fn configure_pipeline(&self, pipeline: btc_stages::Pipeline) -> Result<(), RpcError> {
@@ -340,6 +354,44 @@ impl NodeChainBackend {
             .lock()
             .map_err(|_| internal("stage pipeline lock poisoned"))? = pipeline;
         Ok(())
+    }
+
+    fn initialize_exex(db: &RedbDatabase, headers: &ChainState) -> Result<(), RpcError> {
+        let genesis = headers
+            .get_header_by_height(0)
+            .ok_or_else(|| internal("ExEx genesis missing"))?
+            .header
+            .block_hash();
+        if let Some(tip) = db.verify_exex_journal(genesis).map_err(internal)? {
+            if (tip.height, tip.hash)
+                != (
+                    headers.best_height(),
+                    headers.best_header().header.block_hash(),
+                )
+            {
+                return Err(internal("ExEx journal does not match validated tip"));
+            }
+            return Ok(());
+        }
+        // First adoption bootstraps the *actual validated canonical history*.
+        // Past orphan/event timing is not fabricated or reconstructed.
+        let write = db.tx_mut().map_err(internal)?;
+        write.initialize_exex_journal(genesis).map_err(internal)?;
+        for height in 1..=headers.best_height() {
+            let hash = headers
+                .get_header_by_height(height)
+                .ok_or_else(|| internal("ExEx bootstrap header missing"))?
+                .header
+                .block_hash();
+            let block = write
+                .get_block(&hash)
+                .map_err(internal)?
+                .ok_or_else(|| internal("ExEx bootstrap body missing"))?;
+            write
+                .append_exex_event(true, height, &block)
+                .map_err(internal)?;
+        }
+        write.commit().map_err(internal)
     }
 
     fn initialize_stages(
@@ -1687,6 +1739,78 @@ impl ChainBackend for NodeChainBackend {
                             .map_err(|e| RpcError::new(-8, e.to_string()))?;
                         mempool_entry_json(&data.mempool, id)
                     }
+                    "getexexinfo" => {
+                        let reader = self.db.tx().map_err(internal)?;
+                        let journal = reader
+                            .exex_journal_tip()
+                            .map_err(internal)?
+                            .ok_or_else(|| internal("ExEx journal unavailable"))?;
+                        if (journal.height, journal.hash) != (tip.height, tip.header.block_hash()) {
+                            return Err(internal("ExEx journal disagrees with actual tip"));
+                        }
+                        let mut consumers = Vec::new();
+                        if let Some(registry) = self
+                            .exex_registry
+                            .lock()
+                            .map_err(|_| internal("ExEx registry binding poisoned"))?
+                            .as_ref()
+                        {
+                            for (name, status) in registry
+                                .lock()
+                                .map_err(|_| internal("ExEx registry poisoned"))?
+                                .iter()
+                            {
+                                let state = reader.exex_state(name).map_err(internal)?;
+                                let cursor = state.as_ref().map(|s| s.cursor).unwrap_or(
+                                    btc_storage::exex::JournalTip::initial(journal.genesis),
+                                );
+                                let metrics = if name == "validated-metrics-v1" {
+                                    state.as_ref().map(|s|btc_exex::durable::MetricsState::decode(&s.state)).transpose().map_err(internal)?.map(|m|json!({"transactions":m.transactions,"spendable_coins":m.spendable_coins}))
+                                } else {
+                                    None
+                                };
+                                consumers.push(json!({"name":name,"status":status.status,"failures":status.failures,"last_error":status.last_error,"sequence":cursor.sequence,"height":cursor.height,"blockhash":cursor.hash.to_string(),"caught_up":cursor==journal,"metrics":metrics}));
+                            }
+                        }
+                        Ok(
+                            json!({"sequence":journal.sequence,"height":journal.height,"blockhash":journal.hash.to_string(),"genesis_hash":journal.genesis.to_string(),"bootstrap_height":journal.bootstrap_height,"consumers":consumers}),
+                        )
+                    }
+                    "getexexjournal" => {
+                        let after = params
+                            .get(0)
+                            .map(|_| unsigned_param(&params, 0))
+                            .transpose()?
+                            .unwrap_or(0);
+                        let count = params
+                            .get(1)
+                            .map(|_| unsigned_param(&params, 1))
+                            .transpose()?
+                            .unwrap_or(8);
+                        let reader = self.db.tx().map_err(internal)?;
+                        let tip = reader
+                            .exex_journal_tip()
+                            .map_err(internal)?
+                            .ok_or_else(|| internal("ExEx journal unavailable"))?;
+                        if count > 64 || after > tip.sequence {
+                            return Err(RpcError::new(-8, "journal cursor/count outside bounds"));
+                        }
+                        let mut events = Vec::new();
+                        let end = after.saturating_add(count).min(tip.sequence);
+                        for sequence in after.saturating_add(1)..=end {
+                            let entry = reader
+                                .exex_journal_entry(sequence)
+                                .map_err(internal)?
+                                .ok_or_else(|| internal("ExEx journal sequence gap"))?;
+                            let event = entry.resolve(&reader).map_err(internal)?;
+                            let (created, spent) =
+                                btc_exex::durable::MetricsState::coin_counts(&event);
+                            events.push(json!({"sequence":sequence,"event":if entry.connected {"connect"}else{"disconnect"},"height":entry.height,"blockhash":entry.hash.to_string(),"parent":entry.parent.to_string(),"transactions":event.block.transactions.len(),"created_coins":created,"spent_coins":spent}));
+                        }
+                        Ok(
+                            json!({"sequence":tip.sequence,"height":tip.height,"blockhash":tip.hash.to_string(),"events":events}),
+                        )
+                    }
                     "getstageinfo" => {
                         let receipt = self
                             .db
@@ -1964,6 +2088,326 @@ mod tests {
     use btc_test::TestKeyPair;
 
     #[test]
+    fn durable_exex_replays_real_offline_commits_and_reorgs_with_atomic_cursors() {
+        use btc_exex::durable::{
+            DatabaseStore, DurableExtension, DurableStore, MetricsState, ValidatedMetrics,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.redb");
+        let node = NodeChainBackend::open(&path, NodeState::new(Network::Regtest)).unwrap();
+        let (sender, mut receiver) = tokio::sync::broadcast::channel(1);
+        node.set_exex_sender(sender).unwrap();
+        for _ in 0..10 {
+            let mut body = node.candidate(ScriptBuf::from_bytes(vec![0x51])).unwrap();
+            mine(&mut body);
+            node.submit_block(&body).unwrap();
+        }
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_))
+        ));
+        let store = DatabaseStore::new(node.db.clone());
+        let metrics = ValidatedMetrics;
+        let mut count = 0;
+        while store.step(&metrics).unwrap() {
+            count += 1;
+        }
+        assert_eq!(count, 10);
+        let checkpoint = node
+            .db
+            .tx()
+            .unwrap()
+            .exex_state(metrics.name())
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.cursor.sequence, 10);
+        assert_eq!(
+            MetricsState::decode(&checkpoint.state).unwrap(),
+            MetricsState {
+                transactions: 10,
+                spendable_coins: 10
+            }
+        );
+        let branch = NodeChainBackend::open(
+            &dir.path().join("fork.redb"),
+            NodeState::new(Network::Regtest),
+        )
+        .unwrap();
+        for height in 1..=11 {
+            let mut body = branch.candidate(ScriptBuf::from_bytes(vec![0x52])).unwrap();
+            mine(&mut body);
+            branch.submit_block(&body).unwrap();
+            let result = node.submit_block(&body).unwrap();
+            if height <= 10 {
+                assert!(!result.active);
+                assert_eq!(
+                    node.db
+                        .tx()
+                        .unwrap()
+                        .exex_journal_tip()
+                        .unwrap()
+                        .unwrap()
+                        .sequence,
+                    10
+                );
+            }
+        }
+        let read = node.db.tx().unwrap();
+        let tip = read.exex_journal_tip().unwrap().unwrap();
+        assert_eq!(tip.sequence, 31);
+        assert_eq!(tip.height, 11);
+        for sequence in 11..=20 {
+            let entry = read.exex_journal_entry(sequence).unwrap().unwrap();
+            assert!(!entry.connected);
+            assert_eq!(entry.height, 21 - sequence);
+        }
+        for sequence in 21..=31 {
+            let entry = read.exex_journal_entry(sequence).unwrap().unwrap();
+            assert!(entry.connected);
+            assert_eq!(entry.height, sequence - 20);
+        }
+        drop(read);
+        struct Reject;
+        impl DurableExtension for Reject {
+            fn validate_state(
+                &self,
+                _: Option<&[u8]>,
+            ) -> Result<(), btc_storage::traits::StorageError> {
+                Ok(())
+            }
+
+            fn name(&self) -> &str {
+                "reject-v1"
+            }
+            fn apply(
+                &self,
+                _: &btc_storage::exex::JournalEvent,
+                _: Option<&[u8]>,
+            ) -> Result<Vec<u8>, btc_storage::traits::StorageError> {
+                Err(btc_storage::traits::StorageError::Database(
+                    "injected consumer failure".into(),
+                ))
+            }
+        }
+        assert!(store.step(&Reject).is_err());
+        assert!(node
+            .db
+            .tx()
+            .unwrap()
+            .exex_state("reject-v1")
+            .unwrap()
+            .is_none());
+        struct InvalidState;
+        impl DurableExtension for InvalidState {
+            fn name(&self) -> &str {
+                "invalid-result-v1"
+            }
+            fn validate_state(
+                &self,
+                previous: Option<&[u8]>,
+            ) -> Result<(), btc_storage::traits::StorageError> {
+                ValidatedMetrics.validate_state(previous)
+            }
+            fn apply(
+                &self,
+                _: &btc_storage::exex::JournalEvent,
+                _: Option<&[u8]>,
+            ) -> Result<Vec<u8>, btc_storage::traits::StorageError> {
+                Ok(b"invalid returned application state".to_vec())
+            }
+        }
+        assert!(store.step(&InvalidState).is_err());
+        assert!(node
+            .db
+            .tx()
+            .unwrap()
+            .exex_state("invalid-result-v1")
+            .unwrap()
+            .is_none());
+        drop(store);
+        drop(node);
+        let reopened = NodeChainBackend::open(&path, NodeState::new(Network::Regtest)).unwrap();
+        let store = DatabaseStore::new(reopened.db.clone());
+        assert_eq!(
+            reopened
+                .db
+                .tx()
+                .unwrap()
+                .exex_state(metrics.name())
+                .unwrap()
+                .unwrap(),
+            checkpoint
+        );
+        let mut count = 0;
+        while store.step(&metrics).unwrap() {
+            count += 1;
+        }
+        assert_eq!(count, 21);
+        let state = reopened
+            .db
+            .tx()
+            .unwrap()
+            .exex_state(metrics.name())
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.cursor, tip);
+        assert_eq!(
+            MetricsState::decode(&state.state).unwrap(),
+            MetricsState {
+                transactions: 11,
+                spendable_coins: 11
+            }
+        );
+        assert!(!store.step(&metrics).unwrap());
+    }
+
+    #[tokio::test]
+    async fn durable_supervisor_retries_actual_events_after_panic_and_error_then_shuts_down() {
+        use btc_exex::durable::*;
+        struct Flaky(std::sync::atomic::AtomicUsize);
+        impl DurableExtension for Flaky {
+            fn validate_state(
+                &self,
+                previous: Option<&[u8]>,
+            ) -> Result<(), btc_storage::traits::StorageError> {
+                ValidatedMetrics.validate_state(previous)
+            }
+
+            fn name(&self) -> &str {
+                "validated-metrics-v1"
+            }
+            fn apply(
+                &self,
+                event: &btc_storage::exex::JournalEvent,
+                previous: Option<&[u8]>,
+            ) -> Result<Vec<u8>, btc_storage::traits::StorageError> {
+                match self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                    0 => panic!("injected extension worker panic"),
+                    1 => Err(btc_storage::traits::StorageError::Database(
+                        "injected extension error".into(),
+                    )),
+                    _ => ValidatedMetrics.apply(event, previous),
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let node = NodeChainBackend::open(
+            &dir.path().join("workers.redb"),
+            NodeState::new(Network::Regtest),
+        )
+        .unwrap();
+        let mut body = node.candidate(ScriptBuf::from_bytes(vec![0x51])).unwrap();
+        mine(&mut body);
+        node.submit_block(&body).unwrap();
+        let mut manager = DurableManager::new(
+            Arc::new(DatabaseStore::new(node.db.clone())),
+            node.exex_wakeup(),
+        );
+        manager
+            .register(Flaky(std::sync::atomic::AtomicUsize::new(0)))
+            .unwrap();
+        assert!(manager.register(ValidatedMetrics).is_err());
+        node.set_exex_registry(manager.registry()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if node
+                    .db
+                    .tx()
+                    .unwrap()
+                    .exex_state("validated-metrics-v1")
+                    .unwrap()
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let state = node
+            .db
+            .tx()
+            .unwrap()
+            .exex_state("validated-metrics-v1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.cursor.sequence, 1);
+        assert_eq!(
+            MetricsState::decode(&state.state).unwrap(),
+            MetricsState {
+                transactions: 1,
+                spendable_coins: 1
+            }
+        );
+        manager.shutdown().await;
+        assert!(manager.register(ValidatedMetrics).is_err());
+        assert_eq!(
+            manager.registry().lock().unwrap()["validated-metrics-v1"].status,
+            "stopped"
+        );
+        assert_eq!(
+            ChainBackend::call(&node, "getexexinfo", json!([])).unwrap()["consumers"][0]
+                ["sequence"],
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_durable_metrics_state_is_checked_and_fatal_failure_cannot_acknowledge_more() {
+        use btc_exex::durable::*;
+        let dir = tempfile::tempdir().unwrap();
+        let node = NodeChainBackend::open(
+            &dir.path().join("invalid-metrics.redb"),
+            NodeState::new(Network::Regtest),
+        )
+        .unwrap();
+        let mut body = node.candidate(ScriptBuf::from_bytes(vec![0x51])).unwrap();
+        mine(&mut body);
+        node.submit_block(&body).unwrap();
+        let state = btc_storage::exex::ExtensionState {
+            cursor: node.db.tx().unwrap().exex_journal_tip().unwrap().unwrap(),
+            state: b"invalid metrics application state".to_vec(),
+        };
+        let write = node.db.tx_mut().unwrap();
+        write
+            .set_exex_state("validated-metrics-v1", &state)
+            .unwrap();
+        write.commit().unwrap();
+        let store = Arc::new(DatabaseStore::new(node.db.clone()));
+        assert!(store.step(&ValidatedMetrics).is_err());
+        let mut manager = DurableManager::new(store, node.exex_wakeup());
+        manager.register(ValidatedMetrics).unwrap();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(10), manager.wait_failed())
+            .await
+            .unwrap();
+        assert!(error.to_string().contains("invalid durable metrics state"));
+        manager.shutdown().await;
+        assert_eq!(
+            manager.registry().lock().unwrap()["validated-metrics-v1"].status,
+            "failed"
+        );
+        assert_eq!(
+            node.db
+                .tx()
+                .unwrap()
+                .exex_state("validated-metrics-v1")
+                .unwrap(),
+            Some(state)
+        );
+        assert_eq!(
+            node.db
+                .tx()
+                .unwrap()
+                .exex_journal_tip()
+                .unwrap()
+                .unwrap()
+                .sequence,
+            1
+        );
+    }
+
+    #[test]
     fn stages_publish_only_actual_data_after_all_phases_and_preserve_history_on_failure() {
         use btc_electrum::ElectrumBackend;
         use btc_stages::{ExecOutput, Stage, StageBackend, StageError, StageId};
@@ -2036,6 +2480,8 @@ mod tests {
         assert_eq!(reader.stage_checkpoint().unwrap(), Some(old));
         assert!(reader.get_block(&actual_hash).unwrap().is_none());
         assert!(reader.get_block_undo(&actual_hash).unwrap().is_none());
+        assert_eq!(reader.exex_journal_tip().unwrap().unwrap().sequence, 1);
+        assert!(reader.exex_journal_entry(2).unwrap().is_none());
         assert!(reader.get_tx_block_index(&txid).unwrap().is_none());
         assert!(reader.script_history(&script, 10).unwrap().is_empty());
         assert_eq!(node.db.coin_count().unwrap(), 1);

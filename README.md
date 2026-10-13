@@ -318,7 +318,7 @@ btc-network      → P2P codec, handshake, DNS seeds, peer manager, compact bloc
 btc-mempool      → Fee-sorted pool, RBF (BIP125), cluster mempool, fee estimation
 btc-stages       → Actual block preparation: Headers → Bodies → Validation → TxIndex → AddressIndex
 btc-rpc          → JSON-RPC 2.0 server with Bitcoin Core-compatible methods
-btc-exex         → Execution Extensions plugin system (ordinals indexer included)
+btc-exex         → Durable execution extensions and live observation examples
 btc-electrum     → Opt-in local validated Bitcoin Electrum 1.4 service
 btc-test         → In-process regtest harness for BIP development
 btc-node         → CLI, NodeBuilder, sync manager, Esplora REST, Prometheus, ZMQ
@@ -392,9 +392,11 @@ Built-in example plugins:
 - **ZMQ notifications** — hashblock, hashtx, rawblock, rawtx, sequence via ExEx
 
 ### Execution Extensions (ExEx)
-The shared validated backend emits committed block/UTXO data, reversions and reorg summaries after successful persistence. ZMQ consumes this live feed. The current 1,024-event broadcast channel has no durable replay or acknowledged cursor; lagging consumers can lose events. Manager registration tracks names but does not spawn or supervise extensions. Durable recovery remains required work in [the build plan](docs/BUILD_PLAN.md).
+The production node records actual canonical connects and disconnects in the same transaction as validated chain state. Typed `durable::DurableManager` registration starts and supervises real extensions; each application state and acknowledged cursor commit together. Replay survives dropped live notifications, restart and winning reorgs. The default `ValidatedMetrics` consumer maintains durable transaction and spendable-coin totals, reversing actual disconnects. Query `getexexinfo` and bounded `getexexjournal` for real progress; see [journal, recovery and limits](docs/EXEX.md).
 
-Manually started extensions can subscribe to future chain events:
+The [offline example](examples/exex_plugin.rs) replays an existing stopped node database. Name-only legacy registration now errors explicitly. Complete Ordinals/Runes indexes, large-index storage, retention and public-chain/load qualification remain required work in [the build plan](docs/BUILD_PLAN.md).
+
+Legacy manually started extensions and ZMQ can subscribe to future events through the 1,024-event live broadcast channel. This API still has no durable external-delivery acknowledgement:
 
 ```rust
 use btc_exex::{ExEx, ExExContext, ExExNotification};
@@ -419,6 +421,8 @@ impl ExEx for MyPlugin {
 ```
 
 Example extensions:
+
+- **ValidatedMetrics** — the default supervised durable chain consumer.
 - **OrdinalsExEx / RunesExEx** — candidate detection and observation counters; no durable protocol index or reorg undo.
 - **MetricsExEx** — in-memory counters; transaction/coin totals are not restored on reverts or dropped events.
 - **LoggingExEx** — live structured event logging.

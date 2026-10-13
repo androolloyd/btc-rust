@@ -16,7 +16,8 @@ ordinary startup verification; a damaged partial history is not silently reset.
 An orphan coin set without a committed tip, or coins attached to genesis, fails
 startup. The option conflicts with loading an AssumeUTXO snapshot.
 
-One redb transaction renames all ten known active tables to
+One redb transaction renames all fourteen known active tables, including
+script-history and ExEx tables, to
 `LegacyCheckpointV1.<original name>`, creates empty replacement tables, installs
 the actual network genesis header/index/tip, and records the recovery genesis in
 `LegacyCheckpointResyncV1`. Renaming retains the original raw bytes, including
