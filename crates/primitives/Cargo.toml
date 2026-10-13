@@ -12,14 +12,15 @@ readme = "README.md"
 [features]
 default = ["bip32", "bip39", "bip21", "psbt", "descriptor", "silent-payments", "serde"]
 bip32 = []              # HD key derivation (BIP32)
-bip39 = []              # Mnemonic seed phrases (BIP39)
+bip39 = ["dep:unicode-normalization"]              # Mnemonic seed phrases (BIP39)
 bip21 = []              # Bitcoin URI parsing (BIP21)
-psbt = []               # Partially Signed Bitcoin Transactions
-descriptor = []         # Output descriptors (BIP380-387)
+psbt = ["bip32"]        # Partially Signed Bitcoin Transactions with BIP32 key validation
+descriptor = ["bip32"]  # Bounded output descriptor expansion (BIP380-387 subset)
 silent-payments = []    # Silent payments (BIP352)
 serde = ["dep:serde"]   # Optional serde support
 
 [dependencies]
+unicode-normalization = { version = "0.1", optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 sha2 = { workspace = true }

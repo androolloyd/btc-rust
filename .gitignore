@@ -2,8 +2,15 @@
 /fuzz/target
 /fuzz/corpus
 /fuzz/artifacts
-Cargo.lock
+*.profraw
+tarpaulin-report.json
 *.swp
 *.swo
 .DS_Store
 .env
+
+# Python interoperability tools
+__pycache__/
+# Per-start local RPC authentication material.
+.cookie
+.cookie.tmp-*

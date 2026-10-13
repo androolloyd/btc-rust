@@ -20,6 +20,10 @@ pub const ADDRESS_INDEX: StageId = StageId("AddressIndex");
 
 #[derive(Debug, Error)]
 pub enum StageError {
+    #[error("actual downloaded data/validated stage provider unavailable")]
+    ProviderUnavailable,
+    #[error("backend failure ({code}): {message}")]
+    Backend { code: i32, message: String },
     #[error("stage {0} failed: {1}")]
     StageFailed(StageId, String),
     #[error("database error: {0}")]
@@ -30,6 +34,26 @@ pub enum StageError {
     Consensus(String),
     #[error("pipeline aborted")]
     Aborted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StageCheckpoint {
+    pub height: u64,
+    pub hash: btc_primitives::BlockHash,
+}
+
+/// One actual downloaded batch. Implementations prepare against isolated state,
+/// then commit every stage, coins, undo, indices and tip atomically. `abort` must
+/// discard only uncommitted work; it must never erase prior validated progress.
+pub trait StageBackend {
+    fn execute(
+        &mut self,
+        stage: StageId,
+        target: u64,
+        limit: u64,
+    ) -> Result<ExecOutput, StageError>;
+    fn commit(&mut self) -> Result<StageCheckpoint, StageError>;
+    fn abort(&mut self);
 }
 
 /// Output from a stage execution
@@ -48,18 +72,27 @@ pub struct UnwindOutput {
     pub checkpoint: u64,
 }
 
-/// Reth-style Stage trait — each stage processes blocks in a specific way
-///
-/// Stages are executed serially in the pipeline. On error, stages can be
-/// unwound to revert their changes.
+/// Stages prepare an actual input batch serially. The backend owns atomic
+/// publication and validated fork undo. Unbound execution/manual unwind fail.
 pub trait Stage: Send + Sync {
     /// Unique identifier for this stage
     fn id(&self) -> StageId;
 
     /// Execute the stage, processing blocks from the current checkpoint
     /// up to the target block number.
-    fn execute(&mut self, target: u64) -> Result<ExecOutput, StageError>;
+    fn execute(&mut self, _target: u64) -> Result<ExecOutput, StageError> {
+        Err(StageError::ProviderUnavailable)
+    }
+    fn execute_with(
+        &mut self,
+        _backend: &mut dyn StageBackend,
+        _target: u64,
+    ) -> Result<ExecOutput, StageError> {
+        Err(StageError::ProviderUnavailable)
+    }
 
     /// Unwind the stage, reverting changes back to the given block number.
-    fn unwind(&mut self, target: u64) -> Result<UnwindOutput, StageError>;
+    fn unwind(&mut self, _target: u64) -> Result<UnwindOutput, StageError> {
+        Err(StageError::ProviderUnavailable)
+    }
 }

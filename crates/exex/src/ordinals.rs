@@ -71,12 +71,7 @@ fn find_envelope_start(data: &[u8]) -> Option<usize> {
     if data.len() < 2 {
         return None;
     }
-    for i in 0..data.len() - 1 {
-        if data[i] == OP_FALSE && data[i + 1] == OP_IF {
-            return Some(i);
-        }
-    }
-    None
+    (0..data.len() - 1).find(|&i| data[i] == OP_FALSE && data[i + 1] == OP_IF)
 }
 
 /// Read a push-data item starting at `pos` in `data`.
@@ -205,9 +200,7 @@ pub fn scan_transaction_for_inscriptions(tx: &Transaction) -> Vec<InscriptionDat
 
     for (input_idx, witness) in tx.witness.iter().enumerate() {
         for item in witness.iter() {
-            if let Some(inscription) =
-                parse_inscription_from_witness_item(item, txid, input_idx)
-            {
+            if let Some(inscription) = parse_inscription_from_witness_item(item, txid, input_idx) {
                 inscriptions.push(inscription);
             }
         }
@@ -309,7 +302,10 @@ impl ExEx for OrdinalsExEx {
                     }
                 },
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    warn!(skipped, "OrdinalsExEx: lagged behind, skipped notifications");
+                    warn!(
+                        skipped,
+                        "OrdinalsExEx: lagged behind, skipped notifications"
+                    );
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     info!("OrdinalsExEx: channel closed, shutting down");
@@ -486,11 +482,7 @@ mod tests {
         data.extend_from_slice(b"xyz"); // not "ord"
         data.push(OP_ENDIF);
 
-        let result = parse_inscription_from_witness_item(
-            &data,
-            TxHash::from_bytes([0xaa; 32]),
-            0,
-        );
+        let result = parse_inscription_from_witness_item(&data, TxHash::from_bytes([0xaa; 32]), 0);
         assert!(result.is_none());
     }
 
@@ -671,8 +663,7 @@ mod tests {
         data.extend_from_slice(b"test");
         data.push(OP_ENDIF);
 
-        let result =
-            parse_envelope(&data, TxHash::from_bytes([0x11; 32]), 0).unwrap();
+        let result = parse_envelope(&data, TxHash::from_bytes([0x11; 32]), 0).unwrap();
         assert_eq!(result.content_type, "text/plain");
         assert_eq!(result.content_body, b"test");
     }
@@ -690,8 +681,7 @@ mod tests {
         // Invalid push data (OP_RETURN is not a valid push)
         data.push(0x6a);
 
-        let result =
-            parse_envelope(&data, TxHash::from_bytes([0x22; 32]), 0);
+        let result = parse_envelope(&data, TxHash::from_bytes([0x22; 32]), 0);
         // Should still return Some with defaults (empty content_type, empty body)
         assert!(result.is_some());
         let insc = result.unwrap();
@@ -713,8 +703,7 @@ mod tests {
         data.extend_from_slice(b"hello");
         data.push(OP_ENDIF);
 
-        let result =
-            parse_envelope(&data, TxHash::from_bytes([0x33; 32]), 0).unwrap();
+        let result = parse_envelope(&data, TxHash::from_bytes([0x33; 32]), 0).unwrap();
         assert_eq!(result.content_type, ""); // default empty
         assert_eq!(result.content_body, b"hello");
     }
@@ -740,8 +729,7 @@ mod tests {
         data.extend_from_slice(b" World");
         data.push(OP_ENDIF);
 
-        let result =
-            parse_envelope(&data, TxHash::from_bytes([0x44; 32]), 0).unwrap();
+        let result = parse_envelope(&data, TxHash::from_bytes([0x44; 32]), 0).unwrap();
         assert_eq!(result.content_type, "text/plain");
         assert_eq!(result.content_body, b"Hello World");
     }
@@ -753,11 +741,7 @@ mod tests {
     #[test]
     fn test_parse_inscription_from_witness_item_too_short() {
         let data = [0x00]; // single byte, too short
-        let result = parse_inscription_from_witness_item(
-            &data,
-            TxHash::from_bytes([0; 32]),
-            0,
-        );
+        let result = parse_inscription_from_witness_item(&data, TxHash::from_bytes([0; 32]), 0);
         assert!(result.is_none());
     }
 
@@ -765,11 +749,7 @@ mod tests {
     fn test_parse_inscription_from_witness_item_no_envelope() {
         // Data without OP_FALSE OP_IF
         let data = [0x01, 0x02, 0x03, 0x04, 0x05];
-        let result = parse_inscription_from_witness_item(
-            &data,
-            TxHash::from_bytes([0; 32]),
-            0,
-        );
+        let result = parse_inscription_from_witness_item(&data, TxHash::from_bytes([0; 32]), 0);
         assert!(result.is_none());
     }
 
@@ -942,11 +922,7 @@ mod tests {
         data.extend_from_slice(b"test");
         data.push(OP_ENDIF);
 
-        let result = parse_inscription_from_witness_item(
-            &data,
-            TxHash::from_bytes([0x55; 32]),
-            0,
-        );
+        let result = parse_inscription_from_witness_item(&data, TxHash::from_bytes([0x55; 32]), 0);
         assert!(result.is_some());
         let insc = result.unwrap();
         assert_eq!(insc.content_type, "text/plain");

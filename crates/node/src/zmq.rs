@@ -182,12 +182,8 @@ impl ZmqMessage {
         if pos + 4 > data.len() {
             return None;
         }
-        let body_len = u32::from_le_bytes([
-            data[pos],
-            data[pos + 1],
-            data[pos + 2],
-            data[pos + 3],
-        ]) as usize;
+        let body_len =
+            u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
         pos += 4;
 
         if pos + body_len > data.len() {
@@ -200,12 +196,7 @@ impl ZmqMessage {
         if pos + 4 > data.len() {
             return None;
         }
-        let sequence = u32::from_le_bytes([
-            data[pos],
-            data[pos + 1],
-            data[pos + 2],
-            data[pos + 3],
-        ]);
+        let sequence = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
 
         Some(Self {
             topic,
@@ -313,9 +304,7 @@ impl ZmqPublisher {
         let mut messages = Vec::new();
 
         match notification {
-            ExExNotification::BlockCommitted {
-                hash, block, ..
-            } => {
+            ExExNotification::BlockCommitted { hash, block, .. } => {
                 // hashblock: 32-byte block hash
                 if topics.contains(TOPIC_HASHBLOCK) {
                     messages.push(ZmqMessage {
@@ -464,11 +453,8 @@ impl ZmqPublisher {
         loop {
             match ctx.notifications.recv().await {
                 Ok(notification) => {
-                    let messages = Self::notification_to_messages(
-                        &notification,
-                        &topics,
-                        &counters,
-                    );
+                    let messages =
+                        Self::notification_to_messages(&notification, &topics, &counters);
                     for msg in messages {
                         debug!(
                             topic = %msg.topic,
@@ -496,10 +482,7 @@ impl ZmqPublisher {
 ///
 /// Reads messages from the internal broadcast channel and writes them to the
 /// TCP stream. Exits when the stream errors or the broadcast channel closes.
-async fn handle_subscriber(
-    mut stream: TcpStream,
-    mut rx: broadcast::Receiver<ZmqMessage>,
-) {
+async fn handle_subscriber(mut stream: TcpStream, mut rx: broadcast::Receiver<ZmqMessage>) {
     loop {
         match rx.recv().await {
             Ok(msg) => {
@@ -520,7 +503,10 @@ async fn handle_subscriber(
                 }
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
-                warn!(skipped = n, "ZMQ subscriber lagged, some notifications dropped");
+                warn!(
+                    skipped = n,
+                    "ZMQ subscriber lagged, some notifications dropped"
+                );
             }
             Err(broadcast::error::RecvError::Closed) => {
                 debug!("ZMQ subscriber: broadcast channel closed");
@@ -639,21 +625,13 @@ impl NotificationHub {
     }
 
     /// Notify that a block has been disconnected.
-    pub fn notify_block_disconnected(
-        &self,
-        hash: btc_primitives::BlockHash,
-        height: u64,
-    ) {
+    pub fn notify_block_disconnected(&self, hash: btc_primitives::BlockHash, height: u64) {
         let notification = NodeNotification::BlockDisconnected { hash, height };
         let _ = self.sender.send(notification);
     }
 
     /// Notify that a transaction has been accepted into the mempool.
-    pub fn notify_tx_accepted(
-        &self,
-        txid: btc_primitives::TxHash,
-        raw_tx: Vec<u8>,
-    ) {
+    pub fn notify_tx_accepted(&self, txid: btc_primitives::TxHash, raw_tx: Vec<u8>) {
         let notification = NodeNotification::TxAccepted { txid, raw_tx };
         let _ = self.sender.send(notification);
     }
@@ -667,9 +645,7 @@ impl NotificationHub {
 
         match notification {
             NodeNotification::BlockConnected {
-                hash,
-                raw_block,
-                ..
+                hash, raw_block, ..
             } => {
                 if self.topics.contains(TOPIC_HASHBLOCK) {
                     messages.push(ZmqMessage {
@@ -892,8 +868,7 @@ mod tests {
             utxo_changes: make_utxo_update(),
         };
 
-        let messages =
-            ZmqPublisher::notification_to_messages(&notification, &topics, &counters);
+        let messages = ZmqPublisher::notification_to_messages(&notification, &topics, &counters);
 
         // Should only produce hashblock, not rawblock/hashtx/rawtx/sequence.
         assert_eq!(messages.len(), 1);
@@ -915,8 +890,7 @@ mod tests {
             utxo_changes: make_utxo_update(),
         };
 
-        let messages =
-            ZmqPublisher::notification_to_messages(&notification, &topics, &counters);
+        let messages = ZmqPublisher::notification_to_messages(&notification, &topics, &counters);
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].topic, TOPIC_SEQUENCE);
@@ -943,8 +917,7 @@ mod tests {
             utxo_changes: make_utxo_update(),
         };
 
-        let messages =
-            ZmqPublisher::notification_to_messages(&notification, &topics, &counters);
+        let messages = ZmqPublisher::notification_to_messages(&notification, &topics, &counters);
 
         // 1 hashblock + 1 rawblock + 1 hashtx (1 tx) + 1 rawtx (1 tx) + 1 sequence = 5
         assert_eq!(messages.len(), 5);
@@ -986,8 +959,7 @@ mod tests {
         let hash = BlockHash::from_bytes([0xab; 32]);
         let notification = ExExNotification::BlockReverted { height: 100, hash };
 
-        let messages =
-            ZmqPublisher::notification_to_messages(&notification, &topics, &counters);
+        let messages = ZmqPublisher::notification_to_messages(&notification, &topics, &counters);
 
         // BlockReverted only produces a sequence disconnect notification.
         assert_eq!(messages.len(), 1);
@@ -1019,8 +991,7 @@ mod tests {
             committed: vec![(51, committed_hash)],
         };
 
-        let messages =
-            ZmqPublisher::notification_to_messages(&notification, &topics, &counters);
+        let messages = ZmqPublisher::notification_to_messages(&notification, &topics, &counters);
 
         // 1 disconnect + 1 connect = 2 sequence messages
         assert_eq!(messages.len(), 2);
@@ -1055,22 +1026,32 @@ mod tests {
         };
 
         // First batch
-        let messages1 =
-            ZmqPublisher::notification_to_messages(&notification, &topics, &counters);
+        let messages1 = ZmqPublisher::notification_to_messages(&notification, &topics, &counters);
 
         // Second batch — sequence numbers should be higher
-        let messages2 =
-            ZmqPublisher::notification_to_messages(&notification, &topics, &counters);
+        let messages2 = ZmqPublisher::notification_to_messages(&notification, &topics, &counters);
 
         // hashblock: first was 0, second should be 1
-        let hb1 = messages1.iter().find(|m| m.topic == TOPIC_HASHBLOCK).unwrap();
-        let hb2 = messages2.iter().find(|m| m.topic == TOPIC_HASHBLOCK).unwrap();
+        let hb1 = messages1
+            .iter()
+            .find(|m| m.topic == TOPIC_HASHBLOCK)
+            .unwrap();
+        let hb2 = messages2
+            .iter()
+            .find(|m| m.topic == TOPIC_HASHBLOCK)
+            .unwrap();
         assert_eq!(hb1.sequence, 0);
         assert_eq!(hb2.sequence, 1);
 
         // rawblock: first was 0, second should be 1
-        let rb1 = messages1.iter().find(|m| m.topic == TOPIC_RAWBLOCK).unwrap();
-        let rb2 = messages2.iter().find(|m| m.topic == TOPIC_RAWBLOCK).unwrap();
+        let rb1 = messages1
+            .iter()
+            .find(|m| m.topic == TOPIC_RAWBLOCK)
+            .unwrap();
+        let rb2 = messages2
+            .iter()
+            .find(|m| m.topic == TOPIC_RAWBLOCK)
+            .unwrap();
         assert_eq!(rb1.sequence, 0);
         assert_eq!(rb2.sequence, 1);
     }
@@ -1207,7 +1188,7 @@ mod tests {
     #[test]
     fn test_zmq_config_debug() {
         let config = ZmqConfig::default();
-        let debug = format!("{:?}", config);
+        let debug = format!("{config:?}");
         assert!(debug.contains("ZmqConfig"));
     }
 
@@ -1229,7 +1210,7 @@ mod tests {
             body: vec![0x01],
             sequence: 0,
         };
-        let debug = format!("{:?}", msg);
+        let debug = format!("{msg:?}");
         assert!(debug.contains("ZmqMessage"));
     }
 
@@ -1307,10 +1288,7 @@ mod tests {
         let config = ZmqConfig {
             enabled: true,
             port: 28332,
-            topics: vec![
-                "hashblock".to_string(),
-                "fakeTopic".to_string(),
-            ],
+            topics: vec!["hashblock".to_string(), "fakeTopic".to_string()],
         };
         let effective = config.effective_topics();
         assert_eq!(effective.len(), 1);
@@ -1376,18 +1354,26 @@ mod tests {
             utxo_changes: make_utxo_update(),
         };
 
-        let messages =
-            ZmqPublisher::notification_to_messages(&notification, &topics, &counters);
+        let messages = ZmqPublisher::notification_to_messages(&notification, &topics, &counters);
 
         // 1 hashblock + 1 rawblock + 2 hashtx + 2 rawtx + 1 sequence = 7
         assert_eq!(messages.len(), 7);
 
         // Count per topic
-        let hashblock_count = messages.iter().filter(|m| m.topic == TOPIC_HASHBLOCK).count();
-        let rawblock_count = messages.iter().filter(|m| m.topic == TOPIC_RAWBLOCK).count();
+        let hashblock_count = messages
+            .iter()
+            .filter(|m| m.topic == TOPIC_HASHBLOCK)
+            .count();
+        let rawblock_count = messages
+            .iter()
+            .filter(|m| m.topic == TOPIC_RAWBLOCK)
+            .count();
         let hashtx_count = messages.iter().filter(|m| m.topic == TOPIC_HASHTX).count();
         let rawtx_count = messages.iter().filter(|m| m.topic == TOPIC_RAWTX).count();
-        let sequence_count = messages.iter().filter(|m| m.topic == TOPIC_SEQUENCE).count();
+        let sequence_count = messages
+            .iter()
+            .filter(|m| m.topic == TOPIC_SEQUENCE)
+            .count();
 
         assert_eq!(hashblock_count, 1);
         assert_eq!(rawblock_count, 1);
@@ -1460,10 +1446,7 @@ mod tests {
 
         let notification = rx.try_recv().unwrap();
         match notification {
-            NodeNotification::BlockDisconnected {
-                hash: h,
-                height,
-            } => {
+            NodeNotification::BlockDisconnected { hash: h, height } => {
                 assert_eq!(h, hash);
                 assert_eq!(height, 100);
             }
@@ -1546,10 +1529,7 @@ mod tests {
         let hub = NotificationHub::new(128);
 
         let hash = BlockHash::from_bytes([0xab; 32]);
-        let notification = NodeNotification::BlockDisconnected {
-            hash,
-            height: 42,
-        };
+        let notification = NodeNotification::BlockDisconnected { hash, height: 42 };
 
         let messages = hub.to_zmq_messages(&notification);
 
@@ -1614,8 +1594,14 @@ mod tests {
         let messages2 = hub.to_zmq_messages(&notification);
 
         // hashblock sequence should increment: 0, then 1
-        let hb1 = messages1.iter().find(|m| m.topic == TOPIC_HASHBLOCK).unwrap();
-        let hb2 = messages2.iter().find(|m| m.topic == TOPIC_HASHBLOCK).unwrap();
+        let hb1 = messages1
+            .iter()
+            .find(|m| m.topic == TOPIC_HASHBLOCK)
+            .unwrap();
+        let hb2 = messages2
+            .iter()
+            .find(|m| m.topic == TOPIC_HASHBLOCK)
+            .unwrap();
         assert_eq!(hb1.sequence, 0);
         assert_eq!(hb2.sequence, 1);
     }

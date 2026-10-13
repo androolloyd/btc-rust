@@ -100,11 +100,16 @@ unsafe impl Sync for QmdbDatabase {}
 impl QmdbDatabase {
     /// Create or open a QMDB database at the given path
     pub fn new(path: &Path) -> Result<Self, StorageError> {
-        let dir = path.to_str().ok_or_else(|| {
-            StorageError::Database("path is not valid UTF-8".into())
-        })?;
+        let dir = path
+            .to_str()
+            .ok_or_else(|| StorageError::Database("path is not valid UTF-8".into()))?;
 
-        let config = Config::from_dir(dir);
+        let mut config = Config::from_dir(dir);
+        // Upstream's 512-thread benchmark default exhausts ordinary hosts and
+        // parallel test runners. Bound prefetch work to available CPU capacity.
+        config.prefetcher_thread_count = std::thread::available_parallelism()
+            .map(|count| count.get().min(8))
+            .unwrap_or(1);
         // init_dir is now idempotent (patched in androolloyd/qmdb) —
         // it skips initialization if the data directory already exists.
         AdsCore::init_dir(&config);
@@ -115,9 +120,9 @@ impl QmdbDatabase {
         let current_height = {
             let _shared = ads.get_shared();
             // Try reading heights 1, 10, 100, 1000... to find the highest committed block
-            let h = 1i64;
+
             // QMDB tracks its own block height internally
-            h
+            1i64
         };
 
         Ok(QmdbDatabase {
@@ -168,8 +173,8 @@ impl DbTx for QmdbTx {
         let key = make_key(NS_BLOCK_HEADER, hash.as_bytes());
         match self.read_value(&key) {
             Some(bytes) => {
-                let header: BlockHeader = encode::decode(&bytes)
-                    .map_err(|e| StorageError::Corruption(e.to_string()))?;
+                let header: BlockHeader =
+                    encode::decode(&bytes).map_err(|e| StorageError::Corruption(e.to_string()))?;
                 Ok(Some(header))
             }
             None => Ok(None),
@@ -189,8 +194,8 @@ impl DbTx for QmdbTx {
         let key = make_key(NS_TRANSACTION, txid.as_bytes());
         match self.read_value(&key) {
             Some(bytes) => {
-                let tx: Transaction = encode::decode(&bytes)
-                    .map_err(|e| StorageError::Corruption(e.to_string()))?;
+                let tx: Transaction =
+                    encode::decode(&bytes).map_err(|e| StorageError::Corruption(e.to_string()))?;
                 Ok(Some(tx))
             }
             None => Ok(None),
@@ -201,8 +206,8 @@ impl DbTx for QmdbTx {
         let key = outpoint_key(outpoint);
         match self.read_value(&key) {
             Some(bytes) => {
-                let txout: TxOut = encode::decode(&bytes)
-                    .map_err(|e| StorageError::Corruption(e.to_string()))?;
+                let txout: TxOut =
+                    encode::decode(&bytes).map_err(|e| StorageError::Corruption(e.to_string()))?;
                 Ok(Some(txout))
             }
             None => Ok(None),
@@ -211,9 +216,7 @@ impl DbTx for QmdbTx {
 
     fn get_best_block_height(&self) -> Result<u64, StorageError> {
         match self.read_value(META_BEST_HEIGHT) {
-            Some(bytes) if bytes.len() == 8 => {
-                Ok(u64::from_be_bytes(bytes.try_into().unwrap()))
-            }
+            Some(bytes) if bytes.len() == 8 => Ok(u64::from_be_bytes(bytes.try_into().unwrap())),
             None => Ok(0),
             _ => Err(StorageError::Corruption("invalid best height".into())),
         }
@@ -234,14 +237,22 @@ impl DbTx for QmdbTx {
                 let block_hash = BlockHash::from_slice(&bytes[..32]);
                 let mut pos_buf = [0u8; 4];
                 pos_buf.copy_from_slice(&bytes[32..36]);
-                Ok(Some(TxBlockLocation { block_hash, tx_position: u32::from_le_bytes(pos_buf) }))
+                Ok(Some(TxBlockLocation {
+                    block_hash,
+                    tx_position: u32::from_le_bytes(pos_buf),
+                }))
             }
-            Some(_) => Err(StorageError::Corruption("invalid tx_block_index length".into())),
+            Some(_) => Err(StorageError::Corruption(
+                "invalid tx_block_index length".into(),
+            )),
             None => Ok(None),
         }
     }
 
-    fn get_address_txs(&self, _script_hash: &[u8; 32]) -> Result<Vec<AddressIndexValue>, StorageError> {
+    fn get_address_txs(
+        &self,
+        _script_hash: &[u8; 32],
+    ) -> Result<Vec<AddressIndexValue>, StorageError> {
         // QMDB does not support range scans natively; return empty for now.
         // A full implementation would use a separate index or iterate.
         Ok(Vec::new())
@@ -302,11 +313,19 @@ impl QmdbTxMut {
         };
         let created_in_batch = self.created_keys.lock().unwrap().contains(&key);
 
-        let op_type = if exists || created_in_batch { OP_WRITE } else { OP_CREATE };
+        let op_type = if exists || created_in_batch {
+            OP_WRITE
+        } else {
+            OP_CREATE
+        };
         if op_type == OP_CREATE {
             self.created_keys.lock().unwrap().insert(key.clone());
         }
-        self.ops.lock().unwrap().push(WriteOp { op_type, key, value });
+        self.ops.lock().unwrap().push(WriteOp {
+            op_type,
+            key,
+            value,
+        });
     }
 
     fn buffer_delete(&self, key: Vec<u8>, value: Vec<u8>) {
@@ -322,7 +341,9 @@ impl DbTx for QmdbTxMut {
     fn get_block_header(&self, hash: &BlockHash) -> Result<Option<BlockHeader>, StorageError> {
         let key = make_key(NS_BLOCK_HEADER, hash.as_bytes());
         match self.read_value(&key) {
-            Some(bytes) => Ok(Some(encode::decode(&bytes).map_err(|e| StorageError::Corruption(e.to_string()))?)),
+            Some(bytes) => Ok(Some(
+                encode::decode(&bytes).map_err(|e| StorageError::Corruption(e.to_string()))?,
+            )),
             None => Ok(None),
         }
     }
@@ -339,7 +360,9 @@ impl DbTx for QmdbTxMut {
     fn get_transaction(&self, txid: &TxHash) -> Result<Option<Transaction>, StorageError> {
         let key = make_key(NS_TRANSACTION, txid.as_bytes());
         match self.read_value(&key) {
-            Some(bytes) => Ok(Some(encode::decode(&bytes).map_err(|e| StorageError::Corruption(e.to_string()))?)),
+            Some(bytes) => Ok(Some(
+                encode::decode(&bytes).map_err(|e| StorageError::Corruption(e.to_string()))?,
+            )),
             None => Ok(None),
         }
     }
@@ -347,7 +370,9 @@ impl DbTx for QmdbTxMut {
     fn get_utxo(&self, outpoint: &OutPoint) -> Result<Option<TxOut>, StorageError> {
         let key = outpoint_key(outpoint);
         match self.read_value(&key) {
-            Some(bytes) => Ok(Some(encode::decode(&bytes).map_err(|e| StorageError::Corruption(e.to_string()))?)),
+            Some(bytes) => Ok(Some(
+                encode::decode(&bytes).map_err(|e| StorageError::Corruption(e.to_string()))?,
+            )),
             None => Ok(None),
         }
     }
@@ -375,14 +400,22 @@ impl DbTx for QmdbTxMut {
                 let block_hash = BlockHash::from_slice(&bytes[..32]);
                 let mut pos_buf = [0u8; 4];
                 pos_buf.copy_from_slice(&bytes[32..36]);
-                Ok(Some(TxBlockLocation { block_hash, tx_position: u32::from_le_bytes(pos_buf) }))
+                Ok(Some(TxBlockLocation {
+                    block_hash,
+                    tx_position: u32::from_le_bytes(pos_buf),
+                }))
             }
-            Some(_) => Err(StorageError::Corruption("invalid tx_block_index length".into())),
+            Some(_) => Err(StorageError::Corruption(
+                "invalid tx_block_index length".into(),
+            )),
             None => Ok(None),
         }
     }
 
-    fn get_address_txs(&self, _script_hash: &[u8; 32]) -> Result<Vec<AddressIndexValue>, StorageError> {
+    fn get_address_txs(
+        &self,
+        _script_hash: &[u8; 32],
+    ) -> Result<Vec<AddressIndexValue>, StorageError> {
         // QMDB does not support range scans natively; return empty for now.
         Ok(Vec::new())
     }
@@ -390,7 +423,10 @@ impl DbTx for QmdbTxMut {
 
 impl DbTxMut for QmdbTxMut {
     fn put_block_header(&self, hash: &BlockHash, header: &BlockHeader) -> Result<(), StorageError> {
-        self.buffer_upsert(make_key(NS_BLOCK_HEADER, hash.as_bytes()), encode::encode(header));
+        self.buffer_upsert(
+            make_key(NS_BLOCK_HEADER, hash.as_bytes()),
+            encode::encode(header),
+        );
         Ok(())
     }
 
@@ -400,7 +436,10 @@ impl DbTxMut for QmdbTxMut {
     }
 
     fn put_transaction(&self, txid: &TxHash, tx: &Transaction) -> Result<(), StorageError> {
-        self.buffer_upsert(make_key(NS_TRANSACTION, txid.as_bytes()), encode::encode(tx));
+        self.buffer_upsert(
+            make_key(NS_TRANSACTION, txid.as_bytes()),
+            encode::encode(tx),
+        );
         Ok(())
     }
 
@@ -484,12 +523,9 @@ impl DbTxMut for QmdbTxMut {
 
         let task = SimpleTask::new(vec![cset]);
         let task_list = vec![RwLock::new(Some(task))];
-        let last_task_id = (height << IN_BLOCK_IDX_BITS) | 0;
+        let last_task_id = height << IN_BLOCK_IDX_BITS;
 
-        ads.start_block(
-            height,
-            Arc::new(TasksManager::new(task_list, last_task_id)),
-        );
+        ads.start_block(height, Arc::new(TasksManager::new(task_list, last_task_id)));
 
         let shared = ads.get_shared();
         shared.insert_extra_data(height, String::new());
@@ -544,7 +580,9 @@ mod tests {
     fn test_qmdb_missing_key_returns_none() {
         let (_dir, db) = temp_db();
         let tx = db.tx().unwrap();
-        let result = tx.get_block_header(&BlockHash::from_bytes([0xff; 32])).unwrap();
+        let result = tx
+            .get_block_header(&BlockHash::from_bytes([0xff; 32]))
+            .unwrap();
         assert_eq!(result, None);
     }
 
@@ -645,9 +683,7 @@ mod tests {
     fn test_qmdb_transaction_missing() {
         let (_dir, db) = temp_db();
         let tx = db.tx().unwrap();
-        let result = tx
-            .get_transaction(&TxHash::from_bytes([0xff; 32]))
-            .unwrap();
+        let result = tx.get_transaction(&TxHash::from_bytes([0xff; 32])).unwrap();
         assert_eq!(result, None);
     }
 
@@ -685,10 +721,7 @@ mod tests {
         let key = outpoint_key(&outpoint);
         assert!(key.starts_with(NS_UTXO));
         assert_eq!(&key[NS_UTXO.len()..NS_UTXO.len() + 32], &[0xab; 32]);
-        assert_eq!(
-            &key[NS_UTXO.len() + 32..],
-            &42u32.to_le_bytes()
-        );
+        assert_eq!(&key[NS_UTXO.len() + 32..], &42u32.to_le_bytes());
     }
 
     // -----------------------------------------------------------------------
@@ -892,9 +925,7 @@ mod tests {
         assert_eq!(got, Some(transaction));
 
         // Missing.
-        let missing = tx
-            .get_transaction(&TxHash::from_bytes([0xff; 32]))
-            .unwrap();
+        let missing = tx.get_transaction(&TxHash::from_bytes([0xff; 32])).unwrap();
         assert_eq!(missing, None);
 
         tx.commit().unwrap();

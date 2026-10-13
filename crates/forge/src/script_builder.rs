@@ -78,9 +78,7 @@ impl ForgeScript {
 
     /// Standard P2WPKH: `OP_0 <pubkey_hash>`
     pub fn p2wpkh(pubkey_hash: &[u8; 20]) -> Self {
-        ForgeScript::new()
-            .op(Opcode::OP_0)
-            .push_bytes(pubkey_hash)
+        ForgeScript::new().op(Opcode::OP_0).push_bytes(pubkey_hash)
     }
 
     /// Standard P2SH: `OP_HASH160 <script_hash> OP_EQUAL`
@@ -130,10 +128,7 @@ impl ForgeScript {
             threshold >= 1 && (threshold as usize) <= pubkeys.len(),
             "threshold must be between 1 and the number of pubkeys"
         );
-        assert!(
-            pubkeys.len() <= 16,
-            "multisig supports at most 16 pubkeys"
-        );
+        assert!(pubkeys.len() <= 16, "multisig supports at most 16 pubkeys");
 
         let mut s = ForgeScript::new().push_num(threshold as i64);
         for pk in pubkeys {
@@ -196,7 +191,7 @@ fn encode_script_num(n: i64) -> Vec<u8> {
         abs >>= 8;
     }
 
-    if result.last().map_or(false, |b| b & 0x80 != 0) {
+    if result.last().is_some_and(|b| b & 0x80 != 0) {
         result.push(if negative { 0x80 } else { 0x00 });
     } else if negative {
         let last = result.last_mut().unwrap();

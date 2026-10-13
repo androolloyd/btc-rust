@@ -3,12 +3,12 @@
 use libfuzzer_sys::fuzz_target;
 use std::panic;
 
+use btc_consensus::block_template::{build_block_template, CandidateTx};
 use btc_primitives::amount::Amount;
 use btc_primitives::compact::CompactTarget;
 use btc_primitives::hash::{BlockHash, TxHash};
 use btc_primitives::script::ScriptBuf;
 use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
-use btc_consensus::block_template::{build_block_template, CandidateTx};
 
 fuzz_target!(|data: &[u8]| {
     // Build random candidate transactions from the fuzz input.

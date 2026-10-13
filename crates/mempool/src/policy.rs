@@ -1,4 +1,4 @@
-use btc_primitives::{Amount, Transaction, Encodable};
+use btc_primitives::{Amount, Encodable, Transaction};
 use thiserror::Error;
 
 /// Default maximum OP_RETURN data size in bytes.
@@ -31,7 +31,11 @@ pub enum PolicyError {
     TooManyDescendants { count: usize, max: usize },
 
     #[error("OP_RETURN output {index} has {size} bytes of data, exceeding limit of {max} bytes")]
-    OpReturnTooLarge { index: usize, size: usize, max: usize },
+    OpReturnTooLarge {
+        index: usize,
+        size: usize,
+        max: usize,
+    },
 }
 
 /// Configurable limits for transaction acceptance into the mempool.
@@ -261,10 +265,7 @@ mod tests {
         let result = validate_tx_policy(&tx, Amount::from_sat(5_000), 30, 0, &policy);
         assert_eq!(
             result,
-            Err(PolicyError::TooManyAncestors {
-                count: 30,
-                max: 25,
-            })
+            Err(PolicyError::TooManyAncestors { count: 30, max: 25 })
         );
     }
 
@@ -275,10 +276,7 @@ mod tests {
         let result = validate_tx_policy(&tx, Amount::from_sat(5_000), 0, 30, &policy);
         assert_eq!(
             result,
-            Err(PolicyError::TooManyDescendants {
-                count: 30,
-                max: 25,
-            })
+            Err(PolicyError::TooManyDescendants { count: 30, max: 25 })
         );
     }
 
@@ -422,7 +420,10 @@ mod tests {
         let tx = make_tx(&[100, 50_000], 25); // First output is dust
         let policy = TxValidationPolicy::default();
         let result = validate_tx_policy(&tx, Amount::from_sat(5_000), 0, 0, &policy);
-        assert!(matches!(result, Err(PolicyError::DustOutput { index: 0, .. })));
+        assert!(matches!(
+            result,
+            Err(PolicyError::DustOutput { index: 0, .. })
+        ));
     }
 
     #[test]
@@ -430,7 +431,10 @@ mod tests {
         let tx = make_tx(&[50_000, 100], 25); // Second output is dust
         let policy = TxValidationPolicy::default();
         let result = validate_tx_policy(&tx, Amount::from_sat(5_000), 0, 0, &policy);
-        assert!(matches!(result, Err(PolicyError::DustOutput { index: 1, .. })));
+        assert!(matches!(
+            result,
+            Err(PolicyError::DustOutput { index: 1, .. })
+        ));
     }
 
     #[test]
@@ -447,7 +451,7 @@ mod tests {
             size: 200_000,
             max: 100_000,
         };
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(msg.contains("200000"));
         assert!(msg.contains("100000"));
     }
@@ -458,7 +462,7 @@ mod tests {
             fee: 500,
             min_fee: 1000,
         };
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(msg.contains("500"));
         assert!(msg.contains("1000"));
     }
@@ -470,29 +474,23 @@ mod tests {
             value: 100,
             dust_limit: 546,
         };
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(msg.contains("100"));
         assert!(msg.contains("546"));
     }
 
     #[test]
     fn test_policy_error_display_ancestors() {
-        let err = PolicyError::TooManyAncestors {
-            count: 30,
-            max: 25,
-        };
-        let msg = format!("{}", err);
+        let err = PolicyError::TooManyAncestors { count: 30, max: 25 };
+        let msg = format!("{err}");
         assert!(msg.contains("30"));
         assert!(msg.contains("25"));
     }
 
     #[test]
     fn test_policy_error_display_descendants() {
-        let err = PolicyError::TooManyDescendants {
-            count: 30,
-            max: 25,
-        };
-        let msg = format!("{}", err);
+        let err = PolicyError::TooManyDescendants { count: 30, max: 25 };
+        let msg = format!("{err}");
         assert!(msg.contains("30"));
         assert!(msg.contains("25"));
     }
@@ -538,7 +536,7 @@ mod tests {
     #[test]
     fn test_policy_debug() {
         let policy = TxValidationPolicy::default();
-        let debug = format!("{:?}", policy);
+        let debug = format!("{policy:?}");
         assert!(debug.contains("TxValidationPolicy"));
     }
 
@@ -549,7 +547,7 @@ mod tests {
             value: 100,
             dust_limit: 546,
         };
-        let debug = format!("{:?}", err);
+        let debug = format!("{err:?}");
         assert!(debug.contains("DustOutput"));
     }
 
@@ -585,7 +583,7 @@ mod tests {
     fn test_op_return_within_default_limit() {
         // OP_RETURN with 80 bytes of data (old limit) should pass
         let mut script_bytes = vec![0x6a]; // OP_RETURN
-        script_bytes.extend_from_slice(&vec![0xab; 80]);
+        script_bytes.extend_from_slice(&[0xab; 80]);
         let tx = Transaction {
             version: 2,
             inputs: vec![TxIn {
@@ -642,7 +640,7 @@ mod tests {
     fn test_op_return_exceeds_custom_limit() {
         // Set a custom limit of 80 bytes, then exceed it
         let mut script_bytes = vec![0x6a]; // OP_RETURN
-        script_bytes.extend_from_slice(&vec![0xab; 100]); // 100 bytes data > 80 limit
+        script_bytes.extend_from_slice(&[0xab; 100]); // 100 bytes data > 80 limit
         let tx = Transaction {
             version: 2,
             inputs: vec![TxIn {
@@ -665,7 +663,11 @@ mod tests {
         let result = validate_tx_policy(&tx, Amount::from_sat(5_000), 0, 0, &policy);
         assert!(matches!(
             result,
-            Err(PolicyError::OpReturnTooLarge { index: 0, size: 100, max: 80 })
+            Err(PolicyError::OpReturnTooLarge {
+                index: 0,
+                size: 100,
+                max: 80
+            })
         ));
     }
 
@@ -709,7 +711,7 @@ mod tests {
     fn test_op_return_exactly_at_limit() {
         // OP_RETURN data exactly at the limit should pass
         let mut script_bytes = vec![0x6a]; // OP_RETURN
-        script_bytes.extend_from_slice(&vec![0xab; 80]); // exactly 80 bytes data
+        script_bytes.extend_from_slice(&[0xab; 80]); // exactly 80 bytes data
         let tx = Transaction {
             version: 2,
             inputs: vec![TxIn {
@@ -736,7 +738,7 @@ mod tests {
     #[test]
     fn test_op_return_one_over_limit() {
         let mut script_bytes = vec![0x6a]; // OP_RETURN
-        script_bytes.extend_from_slice(&vec![0xab; 81]); // 81 bytes data > 80 limit
+        script_bytes.extend_from_slice(&[0xab; 81]); // 81 bytes data > 80 limit
         let tx = Transaction {
             version: 2,
             inputs: vec![TxIn {
@@ -759,7 +761,11 @@ mod tests {
         let result = validate_tx_policy(&tx, Amount::from_sat(5_000), 0, 0, &policy);
         assert!(matches!(
             result,
-            Err(PolicyError::OpReturnTooLarge { index: 0, size: 81, max: 80 })
+            Err(PolicyError::OpReturnTooLarge {
+                index: 0,
+                size: 81,
+                max: 80
+            })
         ));
     }
 
@@ -770,7 +776,7 @@ mod tests {
             size: 200,
             max: 100,
         };
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(msg.contains("200"));
         assert!(msg.contains("100"));
         assert!(msg.contains("OP_RETURN"));

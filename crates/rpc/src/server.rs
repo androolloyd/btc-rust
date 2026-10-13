@@ -1,20 +1,32 @@
 use std::sync::Arc;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use std::time::Duration;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
+use tokio::task::JoinSet;
 use tracing::{error, info};
 
 use crate::handler::RpcHandler;
+pub use crate::http::HttpAuth;
 
-/// JSON-RPC server -- provides a Bitcoin Core-compatible RPC interface over
-/// newline-delimited JSON on a raw TCP socket.
+/// Loopback JSON-RPC with authenticated HTTP and legacy newline JSON transport.
 pub struct RpcServer {
     port: u16,
+    http_auth: Option<HttpAuth>,
 }
 
 impl RpcServer {
     pub fn new(port: u16) -> Self {
-        RpcServer { port }
+        RpcServer {
+            port,
+            http_auth: None,
+        }
+    }
+
+    /// HTTP is unavailable without credentials; legacy local TCP is retained.
+    pub fn with_http_auth(mut self, auth: HttpAuth) -> Self {
+        self.http_auth = Some(auth);
+        self
     }
 
     pub fn port(&self) -> u16 {
@@ -29,71 +41,135 @@ impl Default for RpcServer {
 }
 
 impl RpcServer {
-
-    /// Start listening for RPC connections.
-    ///
-    /// This drives the server to completion; it only returns when the
-    /// handler's shutdown flag is set (via a `stop` RPC call) or when the
-    /// listener encounters a fatal error.
-    ///
-    /// If the port is already in use (e.g. from a previous run), the error
-    /// is logged and the method returns `Ok(())` -- this keeps the RPC
-    /// failure non-fatal so the rest of the node can still operate.
+    /// Bind failures are fatal to RPC startup and are returned to the caller.
     pub async fn run(self, handler: Arc<RpcHandler>) -> eyre::Result<()> {
-        let addr = format!("127.0.0.1:{}", self.port);
-        let listener = match TcpListener::bind(&addr).await {
-            Ok(l) => l,
-            Err(e) => {
-                error!(
-                    addr = %addr,
-                    error = %e,
-                    "failed to bind RPC server (port may already be in use) -- RPC disabled"
-                );
-                return Ok(());
-            }
-        };
-        info!(addr = %addr, "rpc server listening");
+        let listener = TcpListener::bind(("127.0.0.1", self.port)).await?;
+        self.run_listener(listener, handler).await
+    }
 
+    /// Serve an already-bound listener (also used by real transport tests).
+    pub async fn run_listener(
+        self,
+        listener: TcpListener,
+        handler: Arc<RpcHandler>,
+    ) -> eyre::Result<()> {
+        info!(addr = %listener.local_addr()?, "rpc server listening");
+        let mut clients = JoinSet::new();
+        let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
         loop {
-            if handler.should_shutdown() {
-                info!("rpc server shutting down");
-                break;
+            tokio::select! {
+                biased;
+                _ = handler.wait_for_shutdown() => break,
+                result = clients.join_next(), if !clients.is_empty() => {
+                    if let Some(Err(error)) = result { error!(%error, "RPC connection task failed"); }
+                }
+                accepted = listener.accept() => {
+                    let (stream, _) = accepted?;
+                    let Ok(permit) = permits.clone().try_acquire_owned() else { drop(stream); continue; };
+                    let handler = Arc::clone(&handler);
+                    let auth = self.http_auth.clone();
+                    clients.spawn(async move {
+                        let _permit = permit;
+                        if let Err(error) = serve_connection(stream, handler, auth).await {
+                            error!(%error, "RPC connection failed");
+                        }
+                    });
+                }
             }
-
-            let (stream, peer) = match listener.accept().await {
-                Ok(conn) => conn,
-                Err(e) => {
-                    error!(error = %e, "accept failed");
-                    continue;
-                }
-            };
-
-            info!(peer = %peer, "rpc connection accepted");
-
-            let handler = Arc::clone(&handler);
-            tokio::spawn(async move {
-                let (reader, mut writer) = stream.into_split();
-                let mut lines = BufReader::new(reader).lines();
-
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let line = line.trim().to_string();
-                    if line.is_empty() {
-                        continue;
-                    }
-
-                    let response = handler.handle_raw(&line);
-                    let mut out = response.into_bytes();
-                    out.push(b'\n');
-
-                    if let Err(e) = writer.write_all(&out).await {
-                        error!(error = %e, "write failed");
-                        break;
-                    }
-                }
-            });
         }
-
+        // Let the connection handling stop RPC finish writing its response.
+        if tokio::time::timeout(Duration::from_secs(1), async {
+            while clients.join_next().await.is_some() {}
+        })
+        .await
+        .is_err()
+        {
+            clients.abort_all();
+            while clients.join_next().await.is_some() {}
+        }
         Ok(())
+    }
+}
+
+/// A 4 MW block fits as hex, including its request envelope.
+pub const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024 + 4096;
+pub const MAX_CONNECTIONS: usize = 64;
+pub(crate) const IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+async fn read_request<R: AsyncBufRead + Unpin>(reader: &mut R) -> std::io::Result<Option<Vec<u8>>> {
+    read_line_limited(reader, MAX_REQUEST_BYTES).await
+}
+
+pub(crate) async fn read_line_limited<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    limit: usize,
+) -> std::io::Result<Option<Vec<u8>>> {
+    let mut line = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return if line.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(line))
+            };
+        }
+        let newline = available.iter().position(|b| *b == b'\n');
+        let consumed = newline.map(|n| n + 1).unwrap_or(available.len());
+        if consumed > limit.saturating_sub(line.len()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "RPC request exceeds size limit",
+            ));
+        }
+        line.extend_from_slice(&available[..consumed]);
+        reader.consume(consumed);
+        if newline.is_some() {
+            return Ok(Some(line));
+        }
+    }
+}
+
+async fn serve_connection(
+    stream: tokio::net::TcpStream,
+    handler: Arc<RpcHandler>,
+    auth: Option<HttpAuth>,
+) -> eyre::Result<()> {
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    // The mode is selected once. A rejected HTTP body can never be reparsed as
+    // a legacy request, nor can an HTTP keepalive switch to raw TCP dispatch.
+    let first = tokio::select! {
+        biased;
+        _ = handler.wait_for_shutdown() => return Ok(()),
+        result = tokio::time::timeout(IO_TIMEOUT, reader.fill_buf()) => result??.first().copied(),
+    };
+    if first.is_some_and(|byte| byte.is_ascii_alphabetic()) {
+        return crate::http::serve(&mut reader, &mut writer, handler, auth).await;
+    }
+    loop {
+        let line = tokio::select! {
+            biased;
+            _ = handler.wait_for_shutdown() => return Ok(()),
+            result = tokio::time::timeout(Duration::from_secs(30), read_request(&mut reader)) => result??,
+        };
+        let Some(line) = line else {
+            return Ok(());
+        };
+        let line = std::str::from_utf8(&line)?.trim().to_string();
+        if line.is_empty() {
+            continue;
+        }
+        let worker = Arc::clone(&handler);
+        let response = tokio::task::spawn_blocking(move || worker.handle_raw(&line)).await?;
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            writer.write_all(format!("{response}\n").as_bytes()),
+        )
+        .await??;
+        if handler.should_shutdown() {
+            return Ok(());
+        }
     }
 }
 
@@ -112,6 +188,52 @@ mod tests {
     fn test_server_default() {
         let server = RpcServer::default();
         assert_eq!(server.port(), 8332);
+    }
+
+    #[tokio::test]
+    async fn real_server_stop_wakes_listener_and_returns_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handler = Arc::new(RpcHandler::new());
+        let task = tokio::spawn(RpcServer::new(address.port()).run_listener(listener, handler));
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader).lines();
+        writer.write_all(b"\n{\"jsonrpc\":\"2.0\",\"method\":\"getblockcount\",\"params\":[],\"id\":1}\n{\"jsonrpc\":\"2.0\",\"method\":\"stop\",\"params\":[],\"id\":2}\n").await.unwrap();
+        let first: serde_json::Value =
+            serde_json::from_str(&reader.next_line().await.unwrap().unwrap()).unwrap();
+        let second: serde_json::Value =
+            serde_json::from_str(&reader.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(first["result"], 0);
+        assert_eq!(second["id"], 2);
+        assert_eq!(second["result"], "Bitcoin server stopping");
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(tokio::net::TcpStream::connect(address).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn bind_failure_is_reported() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let error = RpcServer::new(listener.local_addr().unwrap().port())
+            .run(Arc::new(RpcHandler::new()))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().to_lowercase().contains("address"));
+    }
+
+    #[tokio::test]
+    async fn oversized_unterminated_request_is_bounded() {
+        let (mut writer, reader) = tokio::io::duplex(8192);
+        let task = tokio::spawn(async move {
+            let _ = writer.write_all(&vec![b'x'; MAX_REQUEST_BYTES + 1]).await;
+        });
+        let error = read_request(&mut BufReader::new(reader)).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        task.abort();
     }
 
     #[tokio::test]
@@ -144,16 +266,15 @@ mod tests {
         });
 
         // Connect as a client
-        let mut client =
-            tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
-                .await
-                .unwrap();
+        let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
         let (reader, mut writer) = client.split();
 
         // Send a valid RPC request
         let req = r#"{"jsonrpc":"2.0","method":"getblockcount","params":[],"id":1}"#;
         writer
-            .write_all(format!("{}\n", req).as_bytes())
+            .write_all(format!("{req}\n").as_bytes())
             .await
             .unwrap();
 
@@ -195,17 +316,16 @@ mod tests {
             }
         });
 
-        let mut client =
-            tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
-                .await
-                .unwrap();
+        let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
         let (reader, mut writer) = client.split();
 
         // Send empty lines followed by a valid request
         writer.write_all(b"\n\n\n").await.unwrap();
         let req = r#"{"jsonrpc":"2.0","method":"getblockcount","params":[],"id":99}"#;
         writer
-            .write_all(format!("{}\n", req).as_bytes())
+            .write_all(format!("{req}\n").as_bytes())
             .await
             .unwrap();
 
@@ -246,10 +366,9 @@ mod tests {
             }
         });
 
-        let mut client =
-            tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
-                .await
-                .unwrap();
+        let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
         let (reader, mut writer) = client.split();
 
         // Send invalid JSON
@@ -292,20 +411,17 @@ mod tests {
             }
         });
 
-        let mut client =
-            tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
-                .await
-                .unwrap();
+        let mut client = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
         let (reader, mut writer) = client.split();
 
         // Send multiple requests on same connection
         for i in 1..=3 {
-            let req = format!(
-                r#"{{"jsonrpc":"2.0","method":"getblockcount","params":[],"id":{}}}"#,
-                i
-            );
+            let req =
+                format!(r#"{{"jsonrpc":"2.0","method":"getblockcount","params":[],"id":{i}}}"#);
             writer
-                .write_all(format!("{}\n", req).as_bytes())
+                .write_all(format!("{req}\n").as_bytes())
                 .await
                 .unwrap();
         }

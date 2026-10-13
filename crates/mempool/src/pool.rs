@@ -356,7 +356,8 @@ mod tests {
     fn test_add_duplicate_tx() {
         let mut pool = Mempool::new(10_000_000, 1000);
         let tx = make_test_tx(0x01, 50_000, 25);
-        pool.add_tx(tx.clone(), Amount::from_sat(5_000), 1000).unwrap();
+        pool.add_tx(tx.clone(), Amount::from_sat(5_000), 1000)
+            .unwrap();
 
         let result = pool.add_tx(tx, Amount::from_sat(5_000), 1001);
         assert!(matches!(result, Err(MempoolError::AlreadyExists(_))));
@@ -570,7 +571,9 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(MempoolError::PolicyViolation(PolicyError::DustOutput { .. }))
+            Err(MempoolError::PolicyViolation(
+                PolicyError::DustOutput { .. }
+            ))
         ));
         assert_eq!(pool.size(), 0);
     }
@@ -583,7 +586,9 @@ mod tests {
         let result = pool.add_tx(tx, Amount::from_sat(100), 100); // below min relay fee
         assert!(matches!(
             result,
-            Err(MempoolError::PolicyViolation(PolicyError::InsufficientFee { .. }))
+            Err(MempoolError::PolicyViolation(
+                PolicyError::InsufficientFee { .. }
+            ))
         ));
     }
 
@@ -840,7 +845,7 @@ mod tests {
     #[test]
     fn test_error_display_already_exists() {
         let err = MempoolError::AlreadyExists("deadbeef".to_string());
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(msg.contains("deadbeef"));
         assert!(msg.contains("already in mempool"));
     }
@@ -852,7 +857,7 @@ mod tests {
             min_fee: 1000,
         };
         let err = MempoolError::PolicyViolation(policy_err);
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(msg.contains("policy violation"));
     }
 
@@ -921,7 +926,8 @@ mod tests {
         let tx = make_test_tx(0x01, 50_000, 25);
         let txid = tx.txid();
 
-        pool.add_tx(tx.clone(), Amount::from_sat(5_000), 100).unwrap();
+        pool.add_tx(tx.clone(), Amount::from_sat(5_000), 100)
+            .unwrap();
         pool.remove_tx(&txid);
         assert!(!pool.contains(&txid));
 
@@ -1006,7 +1012,7 @@ mod tests {
             ancestors: 0,
             descendants: 0,
         };
-        let debug = format!("{:?}", entry);
+        let debug = format!("{entry:?}");
         assert!(debug.contains("MempoolEntry"));
     }
 }

@@ -5,9 +5,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use tracing::info;
 
-use btc_primitives::block::Block;
-use btc_primitives::encode::Decodable;
-
 use crate::methods::*;
 
 // ---------------------------------------------------------------------------
@@ -77,6 +74,49 @@ impl RpcResponse {
     }
 }
 
+/// Backend operations return actual validated chain data or an RPC error.
+pub trait ChainBackend: Send + Sync {
+    fn call(&self, method: &str, params: Value) -> Result<Value, RpcError>;
+}
+
+pub const CHAIN_METHODS: &[&str] = &[
+    METHOD_GETBLOCKCHAININFO,
+    METHOD_GETBLOCK,
+    METHOD_GETBLOCKHASH,
+    METHOD_GETBLOCKHEADER,
+    METHOD_GETBLOCKCOUNT,
+    METHOD_GETBESTBLOCKHASH,
+    METHOD_GETRAWTRANSACTION,
+    "gettxout",
+    METHOD_GETBLOCKTEMPLATE,
+    METHOD_SUBMITBLOCK,
+    METHOD_GETMININGINFO,
+    METHOD_GETNETWORKHASHPS,
+    METHOD_ESTIMATEFEE,
+    "estimatesmartfee",
+    "getmempoolfees",
+    "getstageinfo",
+    "getexexinfo",
+    "getexexjournal",
+    METHOD_PRIORITISETRANSACTION,
+    METHOD_GENERATETOADDRESS,
+    "sendrawtransaction",
+    "testmempoolaccept",
+    "getrawmempool",
+    "getmempoolentry",
+    "getmempoolinfo",
+];
+
+impl RpcError {
+    pub fn new(code: i32, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            data: None,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Method handler function type
 // ---------------------------------------------------------------------------
@@ -91,6 +131,7 @@ type MethodFn = Box<dyn Fn(Value) -> RpcResponse + Send + Sync>;
 pub struct RpcHandler {
     methods: HashMap<String, MethodFn>,
     shutdown_flag: Arc<AtomicBool>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
     // Shared state
     chain_height: Arc<AtomicU64>,
     best_hash: Arc<RwLock<String>>,
@@ -98,8 +139,6 @@ pub struct RpcHandler {
     peer_count: Arc<AtomicU64>,
     mempool_size: Arc<AtomicU64>,
     mempool_bytes: Arc<AtomicU64>,
-    /// Fee deltas for prioritised transactions (txid hex -> satoshi delta).
-    priority_deltas: Arc<RwLock<HashMap<String, i64>>>,
 }
 
 impl RpcHandler {
@@ -136,94 +175,18 @@ impl RpcHandler {
         mempool_bytes: Arc<AtomicU64>,
     ) -> Self {
         let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let mut handler = RpcHandler {
             methods: HashMap::new(),
             shutdown_flag: shutdown_flag.clone(),
+            shutdown_tx: shutdown_tx.clone(),
             chain_height,
             best_hash,
             network,
             peer_count,
             mempool_size,
             mempool_bytes,
-            priority_deltas: Arc::new(RwLock::new(HashMap::new())),
         };
-
-        // --- getblockchaininfo ---
-        {
-            let height = handler.chain_height.clone();
-            let hash = handler.best_hash.clone();
-            let net = handler.network.clone();
-            handler.register(METHOD_GETBLOCKCHAININFO, move |_params| {
-                let h = height.load(Ordering::SeqCst);
-                let bh = hash.read().unwrap().clone();
-                let progress = if h == 0 { 0.0 } else { 1.0 };
-                serde_json::json!({
-                    "chain": net,
-                    "blocks": h,
-                    "headers": h,
-                    "bestblockhash": bh,
-                    "difficulty": 1.0,
-                    "mediantime": 1231006505_u64,
-                    "verificationprogress": progress,
-                    "initialblockdownload": h == 0,
-                    "chainwork": "0000000000000000000000000000000000000000000000000000000100010001",
-                    "pruned": false,
-                    "warnings": ""
-                })
-            });
-        }
-
-        // --- getblockhash ---
-        {
-            let height = handler.chain_height.clone();
-            handler.register(METHOD_GETBLOCKHASH, move |params| {
-                let requested = match params.get(0).and_then(|v| v.as_u64()) {
-                    Some(h) => h,
-                    None => {
-                        return serde_json::json!(null);
-                    }
-                };
-                let current = height.load(Ordering::SeqCst);
-                if requested > current {
-                    return serde_json::json!(null);
-                }
-                if requested == 0 {
-                    serde_json::json!(
-                        "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
-                    )
-                } else {
-                    // For heights we know about but don't have stored, return a zeroed hash.
-                    serde_json::json!(
-                        "0000000000000000000000000000000000000000000000000000000000000000"
-                    )
-                }
-            });
-        }
-
-        // --- getblockheader ---
-        handler.register(METHOD_GETBLOCKHEADER, |params| {
-            let _hash = params
-                .get(0)
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            serde_json::json!({
-                "hash": _hash,
-                "confirmations": 1,
-                "height": 0,
-                "version": 1,
-                "versionHex": "00000001",
-                "merkleroot": "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b",
-                "time": 1231006505_u64,
-                "mediantime": 1231006505_u64,
-                "nonce": 2083236893_u64,
-                "bits": "1d00ffff",
-                "difficulty": 1.0,
-                "chainwork": "0000000000000000000000000000000000000000000000000000000100010001",
-                "nTx": 1,
-                "previousblockhash": serde_json::Value::Null,
-                "nextblockhash": serde_json::Value::Null,
-            })
-        });
 
         // --- getblockcount ---
         {
@@ -258,26 +221,6 @@ impl RpcHandler {
             });
         }
 
-        // --- getmempoolinfo ---
-        {
-            let mp_size = handler.mempool_size.clone();
-            let mp_bytes = handler.mempool_bytes.clone();
-            handler.register(METHOD_GETMEMPOOLINFO, move |_params| {
-                let size = mp_size.load(Ordering::SeqCst);
-                let bytes = mp_bytes.load(Ordering::SeqCst);
-                serde_json::json!({
-                    "loaded": true,
-                    "size": size,
-                    "bytes": bytes,
-                    "usage": bytes,
-                    "maxmempool": 300000000_u64,
-                    "mempoolminfee": 0.00001,
-                    "minrelaytxfee": 0.00001,
-                    "unbroadcastcount": 0
-                })
-            });
-        }
-
         // --- getbestblockhash ---
         {
             let hash = handler.best_hash.clone();
@@ -286,13 +229,6 @@ impl RpcHandler {
                 serde_json::json!(bh)
             });
         }
-
-        // --- estimatefee ---
-        handler.register(METHOD_ESTIMATEFEE, |params| {
-            let _nblocks = params.get(0).and_then(|v| v.as_u64()).unwrap_or(6);
-            // Return a default fee estimate of 0.00001 BTC/kB (1 sat/vbyte)
-            serde_json::json!(0.00001)
-        });
 
         // --- getnetworkinfo ---
         {
@@ -330,6 +266,7 @@ impl RpcHandler {
             let stop_flag = shutdown_flag;
             handler.register(METHOD_STOP, move |_params| {
                 stop_flag.store(true, Ordering::SeqCst);
+                shutdown_tx.send_replace(true);
                 serde_json::json!("Bitcoin server stopping")
             });
         }
@@ -338,160 +275,66 @@ impl RpcHandler {
         // Mining RPCs
         // ---------------------------------------------------------------
 
-        // --- getblocktemplate ---
-        {
-            let height = handler.chain_height.clone();
-            let hash = handler.best_hash.clone();
-            handler.register(METHOD_GETBLOCKTEMPLATE, move |_params| {
-                let h = height.load(Ordering::SeqCst);
-                let bh = hash.read().unwrap().clone();
-                // Difficulty-1 target in compact form
-                let bits: u32 = 0x1d00ffff;
-                // Expand bits to 256-bit target hex
-                let target_hex = compact_bits_to_target_hex(bits);
-                let curtime = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0) as u64;
-                // Coinbase value: subsidy for next block height (no fees from empty tx list)
-                let subsidy = block_subsidy_sats(h + 1);
-
-                serde_json::json!({
-                    "version": 536870912_u32,
-                    "previousblockhash": bh,
-                    "transactions": [],
-                    "coinbasevalue": subsidy,
-                    "target": target_hex,
-                    "mintime": curtime.saturating_sub(600),
-                    "curtime": curtime,
-                    "height": h + 1,
-                    "bits": format!("{:08x}", bits)
-                })
-            });
-        }
-
-        // --- submitblock ---
-        handler.register(METHOD_SUBMITBLOCK, |params| {
-            let block_hex = match params.get(0).and_then(|v| v.as_str()) {
-                Some(h) => h,
-                None => {
-                    return serde_json::json!("invalid parameter: expected hex string");
-                }
-            };
-
-            let raw = match hex::decode(block_hex) {
-                Ok(b) => b,
-                Err(e) => {
-                    return serde_json::json!(format!("invalid hex: {}", e));
-                }
-            };
-
-            let mut cursor = std::io::Cursor::new(&raw[..]);
-            match Block::decode(&mut cursor) {
-                Ok(block) => {
-                    // Basic structural validation
-                    if block.transactions.is_empty() {
-                        return serde_json::json!("block must have at least one transaction");
-                    }
-                    if !block.transactions[0].is_coinbase() {
-                        return serde_json::json!("first transaction must be coinbase");
-                    }
-                    // Structural validation passed; full chain validation is not yet wired up.
-                    serde_json::json!(null)
-                }
-                Err(e) => {
-                    serde_json::json!(format!("decode error: {}", e))
-                }
+        // Chain operations require a backend; never fabricate successful data.
+        for method in CHAIN_METHODS {
+            if matches!(*method, METHOD_GETBLOCKCOUNT | METHOD_GETBESTBLOCKHASH) {
+                continue;
             }
-        });
-
-        // --- getmininginfo ---
-        {
-            let height = handler.chain_height.clone();
-            let net = handler.network.clone();
-            handler.register(METHOD_GETMININGINFO, move |_params| {
-                let h = height.load(Ordering::SeqCst);
-                let bits: u32 = 0x1d00ffff;
-                let difficulty = compact_bits_to_difficulty(bits);
-                // Simple estimate: difficulty * 2^32 / 600
-                let hashps = difficulty * 4_294_967_296.0 / 600.0;
-                serde_json::json!({
-                    "blocks": h,
-                    "difficulty": difficulty,
-                    "networkhashps": hashps,
-                    "chain": net
-                })
-            });
-        }
-
-        // --- getnetworkhashps ---
-        handler.register(METHOD_GETNETWORKHASHPS, |params| {
-            let _nblocks = params.get(0).and_then(|v| v.as_i64()).unwrap_or(120);
-            let _height = params.get(1).and_then(|v| v.as_i64()).unwrap_or(-1);
-            let bits: u32 = 0x1d00ffff;
-            let difficulty = compact_bits_to_difficulty(bits);
-            // Simple formula: difficulty * 2^32 / target_spacing(600s)
-            let hashps = difficulty * 4_294_967_296.0 / 600.0;
-            serde_json::json!(hashps)
-        });
-
-        // --- prioritisetransaction ---
-        {
-            let deltas = handler.priority_deltas.clone();
-            handler.register(METHOD_PRIORITISETRANSACTION, move |params| {
-                let txid = match params.get(0).and_then(|v| v.as_str()) {
-                    Some(t) => t.to_string(),
-                    None => {
-                        return serde_json::json!(false);
-                    }
-                };
-                // params[1] is the dummy value (ignored, for Bitcoin Core compat)
-                let fee_delta = match params.get(2).and_then(|v| v.as_i64())
-                    .or_else(|| params.get(1).and_then(|v| v.as_i64()))
-                {
-                    Some(d) => d,
-                    None => {
-                        return serde_json::json!(false);
-                    }
-                };
-                let mut guard = deltas.write().unwrap();
-                let entry = guard.entry(txid).or_insert(0);
-                *entry += fee_delta;
-                serde_json::json!(true)
-            });
-        }
-
-        // --- generatetoaddress ---
-        {
-            let net = handler.network.clone();
-            handler.register(METHOD_GENERATETOADDRESS, move |params| {
-                if net != "regtest" {
-                    return serde_json::json!({
-                        "error": "generatetoaddress is only available in regtest mode"
-                    });
-                }
-                let nblocks = match params.get(0).and_then(|v| v.as_u64()) {
-                    Some(n) => n,
-                    None => {
-                        return serde_json::json!(null);
-                    }
-                };
-                let _address = match params.get(1).and_then(|v| v.as_str()) {
-                    Some(a) => a.to_string(),
-                    None => {
-                        return serde_json::json!(null);
-                    }
-                };
-                // In regtest, generate nblocks placeholder hashes.
-                // Real block generation requires full chain integration.
-                let hashes: Vec<String> = (0..nblocks)
-                    .map(|i| format!("{:064x}", i + 1))
-                    .collect();
-                serde_json::json!(hashes)
+            handler.register_fallible(method, |_| {
+                Err(RpcError::new(
+                    INTERNAL_ERROR,
+                    "validated chain backend unavailable",
+                ))
             });
         }
 
         handler
+    }
+
+    /// Install the node's authoritative chain backend for all chain RPCs.
+    pub fn with_chain_backend(mut self, backend: Arc<dyn ChainBackend>) -> Self {
+        for method in CHAIN_METHODS {
+            let backend = Arc::clone(&backend);
+            let method = *method;
+            self.register_fallible(method, move |params| backend.call(method, params));
+        }
+        self
+    }
+
+    /// Register a method that can return a protocol error.
+    pub fn register_fallible<F>(&mut self, method: &str, f: F)
+    where
+        F: Fn(Value) -> Result<Value, RpcError> + Send + Sync + 'static,
+    {
+        self.methods.insert(
+            method.to_string(),
+            Box::new(move |params| match f(params) {
+                Ok(value) => RpcResponse::success(Value::Null, value),
+                Err(error) => RpcResponse {
+                    jsonrpc: "2.0".into(),
+                    result: None,
+                    error: Some(error),
+                    id: Value::Null,
+                },
+            }),
+        );
+    }
+
+    pub async fn wait_for_shutdown(&self) {
+        let mut receiver = self.shutdown_tx.subscribe();
+        loop {
+            if *receiver.borrow_and_update() {
+                return;
+            }
+            if receiver.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    pub fn request_shutdown(&self) {
+        self.shutdown_flag.store(true, Ordering::SeqCst);
+        self.shutdown_tx.send_replace(true);
     }
 
     // -----------------------------------------------------------------
@@ -578,12 +421,6 @@ impl RpcHandler {
     pub fn should_shutdown(&self) -> bool {
         self.shutdown_flag.load(Ordering::SeqCst)
     }
-
-    /// Get the priority delta for a transaction (for testing/introspection).
-    pub fn get_priority_delta(&self, txid: &str) -> Option<i64> {
-        let guard = self.priority_deltas.read().unwrap();
-        guard.get(txid).copied()
-    }
 }
 
 impl Default for RpcHandler {
@@ -597,17 +434,18 @@ impl Default for RpcHandler {
 // ---------------------------------------------------------------------------
 
 /// Compute block subsidy in satoshis for a given height.
+#[cfg(test)]
 fn block_subsidy_sats(height: u64) -> u64 {
     let halvings = height / 210_000;
     if halvings >= 64 {
         return 0;
     }
-    50 * 100_000_000u64 >> halvings
+    (50 * 100_000_000u64) >> halvings
 }
 
 /// Convert compact bits to floating-point difficulty.
-fn compact_bits_to_difficulty(bits: u32) -> f64 {
-    let exponent = (bits >> 24) as u32;
+pub fn compact_bits_to_difficulty(bits: u32) -> f64 {
+    let exponent = bits >> 24;
     let mantissa = (bits & 0x00ff_ffff) as f64;
     if mantissa == 0.0 {
         return 0.0;
@@ -619,7 +457,7 @@ fn compact_bits_to_difficulty(bits: u32) -> f64 {
 }
 
 /// Expand compact bits to a 64-hex-char target string (big-endian).
-fn compact_bits_to_target_hex(bits: u32) -> String {
+pub fn compact_bits_to_target_hex(bits: u32) -> String {
     let mut target = [0u8; 32];
     let exponent = (bits >> 24) as usize;
     let mantissa = bits & 0x00ff_ffff;
@@ -705,53 +543,12 @@ mod tests {
     // -- Method dispatch --
 
     #[test]
-    fn test_dispatch_getblockchaininfo() {
-        let handler = RpcHandler::new();
-        let req = make_request(METHOD_GETBLOCKCHAININFO, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let result = resp.result.unwrap();
-        assert_eq!(result["chain"], "main");
-        assert_eq!(result["blocks"], 0);
-    }
-
-    #[test]
     fn test_dispatch_getblockcount() {
         let handler = RpcHandler::new();
         let req = make_request(METHOD_GETBLOCKCOUNT, serde_json::json!([]));
         let resp = handler.handle(&req);
         assert!(resp.error.is_none());
         assert_eq!(resp.result.unwrap(), serde_json::json!(0));
-    }
-
-    #[test]
-    fn test_dispatch_getblockhash_genesis() {
-        let handler = RpcHandler::new();
-        let req = make_request(METHOD_GETBLOCKHASH, serde_json::json!([0]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let hash = resp.result.unwrap();
-        assert_eq!(
-            hash,
-            serde_json::json!(
-                "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
-            )
-        );
-    }
-
-    #[test]
-    fn test_dispatch_getblockheader() {
-        let handler = RpcHandler::new();
-        let req = make_request(
-            METHOD_GETBLOCKHEADER,
-            serde_json::json!([
-                "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
-            ]),
-        );
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let result = resp.result.unwrap();
-        assert_eq!(result["height"], 0);
     }
 
     #[test]
@@ -764,14 +561,11 @@ mod tests {
     }
 
     #[test]
-    fn test_dispatch_getmempoolinfo() {
+    fn test_dispatch_getmempoolinfo_requires_backend() {
         let handler = RpcHandler::new();
-        let req = make_request(METHOD_GETMEMPOOLINFO, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let result = resp.result.unwrap();
-        assert_eq!(result["size"], 0);
-        assert_eq!(result["loaded"], true);
+        let resp = handler.handle(&make_request(METHOD_GETMEMPOOLINFO, serde_json::json!([])));
+        assert!(resp.result.is_none());
+        assert_eq!(resp.error.unwrap().code, INTERNAL_ERROR);
     }
 
     #[test]
@@ -843,58 +637,6 @@ mod tests {
     // -- Tests for state-aware methods --
 
     #[test]
-    fn test_new_with_state_custom_values() {
-        let handler = RpcHandler::new_with_state(
-            Arc::new(AtomicU64::new(100)),
-            Arc::new(RwLock::new("aabbccdd".to_string())),
-            "regtest".to_string(),
-            Arc::new(AtomicU64::new(5)),
-            Arc::new(AtomicU64::new(42)),
-            Arc::new(AtomicU64::new(9999)),
-        );
-
-        // getblockcount should return 100
-        let req = make_request(METHOD_GETBLOCKCOUNT, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        assert_eq!(resp.result.unwrap(), serde_json::json!(100));
-
-        // getblockchaininfo should reflect state
-        let req = make_request(METHOD_GETBLOCKCHAININFO, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        let result = resp.result.unwrap();
-        assert_eq!(result["chain"], "regtest");
-        assert_eq!(result["blocks"], 100);
-        assert_eq!(result["bestblockhash"], "aabbccdd");
-        assert_eq!(result["initialblockdownload"], false);
-        assert_eq!(result["verificationprogress"], 1.0);
-    }
-
-    #[test]
-    fn test_update_chain_state() {
-        let handler = RpcHandler::new();
-
-        // Initially at height 0
-        let req = make_request(METHOD_GETBLOCKCOUNT, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        assert_eq!(resp.result.unwrap(), serde_json::json!(0));
-
-        // Update chain state
-        handler.update_chain_state(500, "00000000000000000001deadbeef");
-
-        // Should reflect updated height
-        let req = make_request(METHOD_GETBLOCKCOUNT, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        assert_eq!(resp.result.unwrap(), serde_json::json!(500));
-
-        // getblockchaininfo should also reflect
-        let req = make_request(METHOD_GETBLOCKCHAININFO, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        let result = resp.result.unwrap();
-        assert_eq!(result["blocks"], 500);
-        assert_eq!(result["bestblockhash"], "00000000000000000001deadbeef");
-    }
-
-    #[test]
     fn test_update_peer_count() {
         let handler = RpcHandler::new();
 
@@ -922,15 +664,14 @@ mod tests {
     #[test]
     fn test_update_mempool_stats() {
         let handler = RpcHandler::new();
-
-        // Update mempool
         handler.update_mempool_stats(10, 5000);
-
-        let req = make_request(METHOD_GETMEMPOOLINFO, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        let result = resp.result.unwrap();
-        assert_eq!(result["size"], 10);
-        assert_eq!(result["bytes"], 5000);
+        assert_eq!(handler.mempool_size.load(Ordering::SeqCst), 10);
+        assert_eq!(handler.mempool_bytes.load(Ordering::SeqCst), 5000);
+        let resp = handler.handle(&make_request(METHOD_GETMEMPOOLINFO, serde_json::json!([])));
+        assert!(
+            resp.result.is_none(),
+            "metrics do not establish a loaded mempool backend"
+        );
     }
 
     #[test]
@@ -941,9 +682,7 @@ mod tests {
         assert!(resp.error.is_none());
         assert_eq!(
             resp.result.unwrap(),
-            serde_json::json!(
-                "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
-            )
+            serde_json::json!("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
         );
 
         // After update
@@ -961,9 +700,8 @@ mod tests {
         let handler = RpcHandler::new();
         let req = make_request(METHOD_ESTIMATEFEE, serde_json::json!([6]));
         let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let fee = resp.result.unwrap().as_f64().unwrap();
-        assert!(fee > 0.0);
+        assert!(resp.result.is_none());
+        assert_eq!(resp.error.unwrap().code, INTERNAL_ERROR);
     }
 
     #[test]
@@ -979,181 +717,19 @@ mod tests {
         assert_eq!(result["connections"], 0);
     }
 
-    #[test]
-    fn test_getblockhash_beyond_height_returns_null() {
-        let handler = RpcHandler::new();
-        // Height 0 is current. Requesting height 1 should return null.
-        let req = make_request(METHOD_GETBLOCKHASH, serde_json::json!([1]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        assert_eq!(resp.result.unwrap(), serde_json::json!(null));
-    }
-
-    #[test]
-    fn test_getblockhash_within_range_after_update() {
-        let handler = RpcHandler::new();
-        handler.update_chain_state(10, "00000000001111");
-        // Height 5 is within range
-        let req = make_request(METHOD_GETBLOCKHASH, serde_json::json!([5]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        // Non-genesis returns zeroed hash placeholder
-        assert_eq!(
-            resp.result.unwrap(),
-            serde_json::json!(
-                "0000000000000000000000000000000000000000000000000000000000000000"
-            )
-        );
-    }
-
     // -- Mining RPC tests --
 
     #[test]
-    fn test_getblocktemplate_returns_valid_json() {
-        let handler = RpcHandler::new();
-        handler.update_chain_state(810000, "0000000000000000000000000000000000000000000000000000000000abcdef");
-        let req = make_request(METHOD_GETBLOCKTEMPLATE, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let result = resp.result.unwrap();
-
-        // Required GBT fields
-        assert_eq!(result["version"], 536870912);
-        assert_eq!(
-            result["previousblockhash"],
-            "0000000000000000000000000000000000000000000000000000000000abcdef"
-        );
-        assert!(result["transactions"].is_array());
-        assert!(result["coinbasevalue"].is_number());
-        assert!(result["target"].is_string());
-        assert!(result["mintime"].is_number());
-        assert!(result["curtime"].is_number());
-        assert_eq!(result["height"], 810001);
-        assert!(result["bits"].is_string());
-        // bits should be 8 hex chars
-        assert_eq!(result["bits"].as_str().unwrap().len(), 8);
-    }
-
-    #[test]
-    fn test_submitblock_invalid_hex() {
-        let handler = RpcHandler::new();
-        let req = make_request(METHOD_SUBMITBLOCK, serde_json::json!(["zzzz_not_hex"]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none()); // returns a result, not an RPC-level error
-        let result = resp.result.unwrap();
-        let msg = result.as_str().unwrap();
-        assert!(msg.contains("invalid hex"), "expected hex error, got: {}", msg);
-    }
-
-    #[test]
-    fn test_submitblock_truncated_data() {
-        let handler = RpcHandler::new();
-        // Valid hex but not a valid block (too short)
-        let req = make_request(METHOD_SUBMITBLOCK, serde_json::json!(["aabbccdd"]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let result = resp.result.unwrap();
-        let msg = result.as_str().unwrap();
-        assert!(msg.contains("decode error"), "expected decode error, got: {}", msg);
-    }
-
-    #[test]
-    fn test_getmininginfo_returns_required_fields() {
-        let handler = RpcHandler::new();
-        handler.update_chain_state(810000, "00000000000000000000");
-        let req = make_request(METHOD_GETMININGINFO, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let result = resp.result.unwrap();
-
-        assert_eq!(result["blocks"], 810000);
-        assert!(result["difficulty"].is_number());
-        assert!(result["difficulty"].as_f64().unwrap() > 0.0);
-        assert!(result["networkhashps"].is_number());
-        assert_eq!(result["chain"], "main");
-    }
-
-    #[test]
-    fn test_getnetworkhashps_returns_number() {
-        let handler = RpcHandler::new();
-        let req = make_request(METHOD_GETNETWORKHASHPS, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let result = resp.result.unwrap();
-        assert!(result.is_number());
-        assert!(result.as_f64().unwrap() > 0.0);
-    }
-
-    #[test]
-    fn test_prioritisetransaction_stores_delta() {
+    fn test_prioritisetransaction_cannot_claim_success_without_a_backend() {
         let handler = RpcHandler::new();
         let txid = "aaaa000000000000000000000000000000000000000000000000000000000001";
-
-        // Should return true
-        let req = make_request(
-            METHOD_PRIORITISETRANSACTION,
-            serde_json::json!([txid, 0, 5000]),
-        );
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        assert_eq!(resp.result.unwrap(), serde_json::json!(true));
-
-        // Verify stored delta
-        assert_eq!(handler.get_priority_delta(txid), Some(5000));
-
-        // Apply another delta -- should accumulate
-        let req = make_request(
-            METHOD_PRIORITISETRANSACTION,
-            serde_json::json!([txid, 0, -2000]),
-        );
-        let resp = handler.handle(&req);
-        assert_eq!(resp.result.unwrap(), serde_json::json!(true));
-        assert_eq!(handler.get_priority_delta(txid), Some(3000));
-    }
-
-    #[test]
-    fn test_generatetoaddress_non_regtest_returns_error() {
-        // Default handler is "main" network
-        let handler = RpcHandler::new();
-        let req = make_request(
-            METHOD_GENERATETOADDRESS,
-            serde_json::json!([1, "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"]),
-        );
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let result = resp.result.unwrap();
-        // Should contain an error message, not an array of hashes
-        assert!(result["error"].is_string());
-        assert!(
-            result["error"]
-                .as_str()
-                .unwrap()
-                .contains("regtest"),
-        );
-    }
-
-    #[test]
-    fn test_generatetoaddress_regtest_returns_hashes() {
-        let handler = RpcHandler::new_with_state(
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(RwLock::new("00".repeat(32))),
-            "regtest".to_string(),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-        );
-        let req = make_request(
-            METHOD_GENERATETOADDRESS,
-            serde_json::json!([3, "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"]),
-        );
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let result = resp.result.unwrap();
-        let arr = result.as_array().unwrap();
-        assert_eq!(arr.len(), 3);
-        // Each entry should be a 64-char hex hash
-        for hash in arr {
-            assert_eq!(hash.as_str().unwrap().len(), 64);
+        for delta in [5000, -2000, i64::MAX] {
+            let response = handler.handle(&make_request(
+                METHOD_PRIORITISETRANSACTION,
+                serde_json::json!([txid, 0, delta]),
+            ));
+            assert!(response.result.is_none());
+            assert_eq!(response.error.unwrap().code, INTERNAL_ERROR);
         }
     }
 
@@ -1171,43 +747,12 @@ mod tests {
     }
 
     #[test]
-    fn test_getblockhash_no_params() {
-        let handler = RpcHandler::new();
-        let req = make_request(METHOD_GETBLOCKHASH, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        // No height param => null
-        assert_eq!(resp.result.unwrap(), serde_json::json!(null));
-    }
-
-    #[test]
-    fn test_getblockhash_null_param() {
-        let handler = RpcHandler::new();
-        let req = make_request(METHOD_GETBLOCKHASH, serde_json::json!([null]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        assert_eq!(resp.result.unwrap(), serde_json::json!(null));
-    }
-
-    #[test]
-    fn test_getblockheader_no_param() {
-        let handler = RpcHandler::new();
-        let req = make_request(METHOD_GETBLOCKHEADER, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let result = resp.result.unwrap();
-        // hash should be empty string (default)
-        assert_eq!(result["hash"], "");
-    }
-
-    #[test]
     fn test_estimatefee_no_param() {
         let handler = RpcHandler::new();
         let req = make_request(METHOD_ESTIMATEFEE, serde_json::json!([]));
         let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let fee = resp.result.unwrap().as_f64().unwrap();
-        assert!(fee > 0.0);
+        assert!(resp.result.is_none());
+        assert_eq!(resp.error.unwrap().code, INTERNAL_ERROR);
     }
 
     #[test]
@@ -1215,49 +760,8 @@ mod tests {
         let handler = RpcHandler::new();
         let req = make_request(METHOD_ESTIMATEFEE, serde_json::json!([null]));
         let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let fee = resp.result.unwrap().as_f64().unwrap();
-        assert_eq!(fee, 0.00001);
-    }
-
-    #[test]
-    fn test_getnetworkhashps_with_params() {
-        let handler = RpcHandler::new();
-        let req = make_request(METHOD_GETNETWORKHASHPS, serde_json::json!([240, 100]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let hashps = resp.result.unwrap().as_f64().unwrap();
-        assert!(hashps > 0.0);
-    }
-
-    #[test]
-    fn test_getnetworkhashps_no_params() {
-        let handler = RpcHandler::new();
-        let req = make_request(METHOD_GETNETWORKHASHPS, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let hashps = resp.result.unwrap().as_f64().unwrap();
-        assert!(hashps > 0.0);
-    }
-
-    #[test]
-    fn test_submitblock_no_param() {
-        let handler = RpcHandler::new();
-        let req = make_request(METHOD_SUBMITBLOCK, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let msg = resp.result.unwrap();
-        assert!(msg.as_str().unwrap().contains("invalid parameter"));
-    }
-
-    #[test]
-    fn test_submitblock_null_param() {
-        let handler = RpcHandler::new();
-        let req = make_request(METHOD_SUBMITBLOCK, serde_json::json!([null]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let msg = resp.result.unwrap();
-        assert!(msg.as_str().unwrap().contains("invalid parameter"));
+        assert!(resp.result.is_none());
+        assert_eq!(resp.error.unwrap().code, INTERNAL_ERROR);
     }
 
     #[test]
@@ -1265,26 +769,22 @@ mod tests {
         let handler = RpcHandler::new();
         let req = make_request(METHOD_PRIORITISETRANSACTION, serde_json::json!([]));
         let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        assert_eq!(resp.result.unwrap(), serde_json::json!(false));
+        assert!(resp.result.is_none());
+        assert_eq!(resp.error.unwrap().code, INTERNAL_ERROR);
     }
 
     #[test]
     fn test_prioritisetransaction_no_fee_delta() {
         let handler = RpcHandler::new();
         let txid = "aaaa000000000000000000000000000000000000000000000000000000000001";
-        let req = make_request(
-            METHOD_PRIORITISETRANSACTION,
-            serde_json::json!([txid]),
-        );
+        let req = make_request(METHOD_PRIORITISETRANSACTION, serde_json::json!([txid]));
         let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        assert_eq!(resp.result.unwrap(), serde_json::json!(false));
+        assert!(resp.result.is_none());
+        assert_eq!(resp.error.unwrap().code, INTERNAL_ERROR);
     }
 
     #[test]
     fn test_prioritisetransaction_two_param_form() {
-        // When only 2 params: txid and fee_delta (no dummy in between)
         let handler = RpcHandler::new();
         let txid = "bbbb000000000000000000000000000000000000000000000000000000000002";
         let req = make_request(
@@ -1292,67 +792,33 @@ mod tests {
             serde_json::json!([txid, 7000]),
         );
         let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        assert_eq!(resp.result.unwrap(), serde_json::json!(true));
-        assert_eq!(handler.get_priority_delta(txid), Some(7000));
+        assert!(resp.result.is_none());
+        assert_eq!(resp.error.unwrap().code, INTERNAL_ERROR);
     }
 
     #[test]
-    fn test_get_priority_delta_nonexistent() {
-        let handler = RpcHandler::new();
-        assert_eq!(handler.get_priority_delta("doesnotexist"), None);
-    }
-
-    #[test]
-    fn test_generatetoaddress_no_nblocks() {
-        let handler = RpcHandler::new_with_state(
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(RwLock::new("00".repeat(32))),
-            "regtest".to_string(),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
+    fn fee_operations_delegate_to_the_actual_backend_without_shadow_state() {
+        struct Backend(std::sync::Mutex<Vec<(String, Value)>>);
+        impl ChainBackend for Backend {
+            fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+                self.0.lock().unwrap().push((method.into(), params));
+                Err(RpcError::new(METHOD_NOT_FOUND, "fee backend unavailable"))
+            }
+        }
+        let backend = Arc::new(Backend(std::sync::Mutex::new(Vec::new())));
+        let handler = RpcHandler::new().with_chain_backend(backend.clone());
+        for method in [METHOD_ESTIMATEFEE, METHOD_PRIORITISETRANSACTION] {
+            let response = handler.handle(&make_request(method, serde_json::json!([1])));
+            assert!(response.result.is_none());
+            assert_eq!(response.error.unwrap().code, METHOD_NOT_FOUND);
+        }
+        assert_eq!(
+            *backend.0.lock().unwrap(),
+            vec![
+                (METHOD_ESTIMATEFEE.into(), serde_json::json!([1])),
+                (METHOD_PRIORITISETRANSACTION.into(), serde_json::json!([1]))
+            ]
         );
-        let req = make_request(METHOD_GENERATETOADDRESS, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        assert_eq!(resp.result.unwrap(), serde_json::json!(null));
-    }
-
-    #[test]
-    fn test_generatetoaddress_no_address() {
-        let handler = RpcHandler::new_with_state(
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(RwLock::new("00".repeat(32))),
-            "regtest".to_string(),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-        );
-        let req = make_request(METHOD_GENERATETOADDRESS, serde_json::json!([5]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        assert_eq!(resp.result.unwrap(), serde_json::json!(null));
-    }
-
-    #[test]
-    fn test_generatetoaddress_zero_blocks() {
-        let handler = RpcHandler::new_with_state(
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(RwLock::new("00".repeat(32))),
-            "regtest".to_string(),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-        );
-        let req = make_request(
-            METHOD_GENERATETOADDRESS,
-            serde_json::json!([0, "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080"]),
-        );
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let result = resp.result.unwrap();
-        assert_eq!(result.as_array().unwrap().len(), 0);
     }
 
     // -- Mining helper function tests --
@@ -1499,28 +965,6 @@ mod tests {
     }
 
     #[test]
-    fn test_getblockchaininfo_zero_height_progress() {
-        let handler = RpcHandler::new();
-        let req = make_request(METHOD_GETBLOCKCHAININFO, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        let result = resp.result.unwrap();
-        // At height 0, progress should be 0.0 and initialblockdownload = true
-        assert_eq!(result["verificationprogress"], 0.0);
-        assert_eq!(result["initialblockdownload"], true);
-    }
-
-    #[test]
-    fn test_getblockchaininfo_nonzero_height_progress() {
-        let handler = RpcHandler::new();
-        handler.update_chain_state(1, "aabb");
-        let req = make_request(METHOD_GETBLOCKCHAININFO, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        let result = resp.result.unwrap();
-        assert_eq!(result["verificationprogress"], 1.0);
-        assert_eq!(result["initialblockdownload"], false);
-    }
-
-    #[test]
     fn test_getpeerinfo_with_multiple_peers() {
         let handler = RpcHandler::new();
         handler.update_peer_count(5);
@@ -1537,20 +981,20 @@ mod tests {
     }
 
     #[test]
-    fn test_getmempoolinfo_all_fields() {
+    fn mempool_methods_require_backend_even_with_nonzero_metrics() {
         let handler = RpcHandler::new();
         handler.update_mempool_stats(42, 123456);
-        let req = make_request(METHOD_GETMEMPOOLINFO, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        let result = resp.result.unwrap();
-        assert_eq!(result["loaded"], true);
-        assert_eq!(result["size"], 42);
-        assert_eq!(result["bytes"], 123456);
-        assert_eq!(result["usage"], 123456);
-        assert_eq!(result["maxmempool"], 300000000_u64);
-        assert!(result["mempoolminfee"].as_f64().unwrap() > 0.0);
-        assert!(result["minrelaytxfee"].as_f64().unwrap() > 0.0);
-        assert_eq!(result["unbroadcastcount"], 0);
+        for method in [
+            "getmempoolinfo",
+            "getrawmempool",
+            "getmempoolentry",
+            "sendrawtransaction",
+            "testmempoolaccept",
+        ] {
+            let resp = handler.handle(&make_request(method, serde_json::json!([])));
+            assert!(resp.result.is_none());
+            assert_eq!(resp.error.unwrap().code, INTERNAL_ERROR);
+        }
     }
 
     #[test]
@@ -1565,40 +1009,6 @@ mod tests {
             serde_json::json!("Bitcoin server stopping")
         );
         assert!(handler.should_shutdown());
-    }
-
-    #[test]
-    fn test_getblocktemplate_coinbase_value() {
-        let handler = RpcHandler::new();
-        // At height 0, next block is height 1 -> 50 BTC subsidy
-        let req = make_request(METHOD_GETBLOCKTEMPLATE, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        let result = resp.result.unwrap();
-        assert_eq!(result["coinbasevalue"], 50 * 100_000_000u64);
-        assert_eq!(result["height"], 1);
-    }
-
-    #[test]
-    fn test_getblocktemplate_after_halving() {
-        let handler = RpcHandler::new();
-        handler.update_chain_state(209_999, "aabb");
-        let req = make_request(METHOD_GETBLOCKTEMPLATE, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        let result = resp.result.unwrap();
-        // Next block is 210000 (first halving) -> 25 BTC subsidy
-        assert_eq!(result["coinbasevalue"], 25 * 100_000_000u64);
-    }
-
-    #[test]
-    fn test_getmininginfo_all_fields() {
-        let handler = RpcHandler::new();
-        let req = make_request(METHOD_GETMININGINFO, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        let result = resp.result.unwrap();
-        assert_eq!(result["blocks"], 0);
-        assert!(result["difficulty"].as_f64().unwrap() > 0.0);
-        assert!(result["networkhashps"].as_f64().unwrap() > 0.0);
-        assert_eq!(result["chain"], "main");
     }
 
     #[test]
@@ -1660,30 +1070,6 @@ mod tests {
     }
 
     #[test]
-    fn test_getblockheader_returns_all_fields() {
-        let handler = RpcHandler::new();
-        let req = make_request(
-            METHOD_GETBLOCKHEADER,
-            serde_json::json!(["000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"]),
-        );
-        let resp = handler.handle(&req);
-        let result = resp.result.unwrap();
-        assert_eq!(result["confirmations"], 1);
-        assert_eq!(result["version"], 1);
-        assert_eq!(result["versionHex"], "00000001");
-        assert!(result["merkleroot"].is_string());
-        assert_eq!(result["time"], 1231006505_u64);
-        assert_eq!(result["mediantime"], 1231006505_u64);
-        assert_eq!(result["nonce"], 2083236893_u64);
-        assert_eq!(result["bits"], "1d00ffff");
-        assert_eq!(result["difficulty"], 1.0);
-        assert!(result["chainwork"].is_string());
-        assert_eq!(result["nTx"], 1);
-        assert!(result["previousblockhash"].is_null());
-        assert!(result["nextblockhash"].is_null());
-    }
-
-    #[test]
     fn test_response_null_id() {
         let handler = RpcHandler::new();
         let req = RpcRequest {
@@ -1707,161 +1093,25 @@ mod tests {
     }
 
     #[test]
-    fn test_getblockchaininfo_fields_comprehensive() {
+    fn chain_operations_require_a_validated_backend() {
         let handler = RpcHandler::new();
-        let req = make_request(METHOD_GETBLOCKCHAININFO, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        let result = resp.result.unwrap();
-        assert!(result["mediantime"].is_number());
-        assert!(result["chainwork"].is_string());
-        assert_eq!(result["pruned"], false);
-        assert_eq!(result["warnings"], "");
+        for method in CHAIN_METHODS {
+            if matches!(*method, METHOD_GETBLOCKCOUNT | METHOD_GETBESTBLOCKHASH) {
+                continue;
+            }
+            let response = handler.handle(&make_request(method, serde_json::json!([])));
+            assert_eq!(response.error.unwrap().code, INTERNAL_ERROR);
+            assert!(response.result.is_none());
+        }
     }
 
     #[test]
-    fn test_getblocktemplate_target_is_64_hex() {
-        let handler = RpcHandler::new();
-        let req = make_request(METHOD_GETBLOCKTEMPLATE, serde_json::json!([]));
-        let resp = handler.handle(&req);
-        let result = resp.result.unwrap();
-        let target = result["target"].as_str().unwrap();
-        assert_eq!(target.len(), 64);
-        // target should be valid hex
-        assert!(hex::decode(target).is_ok());
-    }
-
-    #[test]
-    fn test_submitblock_valid_block_with_coinbase() {
-        use btc_primitives::block::{Block, BlockHeader};
-        use btc_primitives::compact::CompactTarget;
-        use btc_primitives::encode::Encodable;
-        use btc_primitives::hash::{BlockHash, TxHash};
-        use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
-        use btc_primitives::script::ScriptBuf;
-        use btc_primitives::amount::Amount;
-
-        let handler = RpcHandler::new();
-
-        // Build a coinbase transaction (prev_output is all-zeros txid with vout=0xffffffff)
-        let coinbase_tx = Transaction {
-            version: 1,
-            inputs: vec![TxIn {
-                previous_output: OutPoint::new(TxHash::ZERO, 0xffffffff),
-                script_sig: ScriptBuf::from_bytes(vec![0x04, 0xff, 0xff, 0x00, 0x1d]),
-                sequence: 0xffffffff,
-            }],
-            outputs: vec![TxOut {
-                value: Amount::from_sat(5_000_000_000),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x76, 0xa9, 0x14]),
-            }],
-            witness: Vec::new(),
-            lock_time: 0,
-        };
-
-        let block = Block {
-            header: BlockHeader {
-                version: 1,
-                prev_blockhash: BlockHash::ZERO,
-                merkle_root: TxHash::ZERO,
-                time: 1231006505,
-                bits: CompactTarget::from_u32(0x1d00ffff),
-                nonce: 0,
-            },
-            transactions: vec![coinbase_tx],
-        };
-
-        // Encode the block to hex
-        let mut buf = Vec::new();
-        block.encode(&mut buf).unwrap();
-        let block_hex = hex::encode(&buf);
-
-        let req = make_request(METHOD_SUBMITBLOCK, serde_json::json!([block_hex]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        // Successful submission returns null
-        assert_eq!(resp.result.unwrap(), serde_json::json!(null));
-    }
-
-    #[test]
-    fn test_submitblock_block_with_no_transactions() {
-        use btc_primitives::block::{Block, BlockHeader};
-        use btc_primitives::compact::CompactTarget;
-        use btc_primitives::encode::Encodable;
-        use btc_primitives::hash::{BlockHash, TxHash};
-
-        let handler = RpcHandler::new();
-
-        let block = Block {
-            header: BlockHeader {
-                version: 1,
-                prev_blockhash: BlockHash::ZERO,
-                merkle_root: TxHash::ZERO,
-                time: 1231006505,
-                bits: CompactTarget::from_u32(0x1d00ffff),
-                nonce: 0,
-            },
-            transactions: vec![],
-        };
-
-        let mut buf = Vec::new();
-        block.encode(&mut buf).unwrap();
-        let block_hex = hex::encode(&buf);
-
-        let req = make_request(METHOD_SUBMITBLOCK, serde_json::json!([block_hex]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let msg = resp.result.unwrap();
-        assert_eq!(msg.as_str().unwrap(), "block must have at least one transaction");
-    }
-
-    #[test]
-    fn test_submitblock_non_coinbase_first_tx() {
-        use btc_primitives::block::{Block, BlockHeader};
-        use btc_primitives::compact::CompactTarget;
-        use btc_primitives::encode::Encodable;
-        use btc_primitives::hash::{BlockHash, TxHash};
-        use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
-        use btc_primitives::script::ScriptBuf;
-        use btc_primitives::amount::Amount;
-
-        let handler = RpcHandler::new();
-
-        // Build a NON-coinbase transaction (normal outpoint, not all-zeros/0xffffffff)
-        let non_coinbase_tx = Transaction {
-            version: 1,
-            inputs: vec![TxIn {
-                previous_output: OutPoint::new(TxHash::from_bytes([0xaa; 32]), 0),
-                script_sig: ScriptBuf::from_bytes(vec![0x00; 10]),
-                sequence: 0xffffffff,
-            }],
-            outputs: vec![TxOut {
-                value: Amount::from_sat(50_000),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x76, 0xa9, 0x14]),
-            }],
-            witness: Vec::new(),
-            lock_time: 0,
-        };
-
-        let block = Block {
-            header: BlockHeader {
-                version: 1,
-                prev_blockhash: BlockHash::ZERO,
-                merkle_root: TxHash::ZERO,
-                time: 1231006505,
-                bits: CompactTarget::from_u32(0x1d00ffff),
-                nonce: 0,
-            },
-            transactions: vec![non_coinbase_tx],
-        };
-
-        let mut buf = Vec::new();
-        block.encode(&mut buf).unwrap();
-        let block_hex = hex::encode(&buf);
-
-        let req = make_request(METHOD_SUBMITBLOCK, serde_json::json!([block_hex]));
-        let resp = handler.handle(&req);
-        assert!(resp.error.is_none());
-        let msg = resp.result.unwrap();
-        assert_eq!(msg.as_str().unwrap(), "first transaction must be coinbase");
+    fn fallible_method_preserves_error_and_request_id() {
+        let mut handler = RpcHandler::new();
+        handler.register_fallible("failure", |_| Err(RpcError::new(-8, "invalid height")));
+        let response = handler.handle(&make_request("failure", serde_json::json!([])));
+        assert_eq!(response.id, serde_json::json!(1));
+        assert_eq!(response.error.unwrap().code, -8);
+        assert!(response.result.is_none());
     }
 }

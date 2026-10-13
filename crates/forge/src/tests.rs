@@ -537,7 +537,11 @@ fn test_script_env_verify_with_witness() {
     let script_pubkey = ForgeScript::new().build(); // empty
 
     let result = env
-        .verify_script_with_witness(&witness_items, witness_script.as_script(), script_pubkey.as_script())
+        .verify_script_with_witness(
+            &witness_items,
+            witness_script.as_script(),
+            script_pubkey.as_script(),
+        )
         .unwrap();
     assert!(result.success);
 }
@@ -572,7 +576,11 @@ fn test_debugger_step() {
 
 #[test]
 fn test_debugger_set_breakpoint() {
-    let script = ForgeScript::new().push_num(1).push_num(2).op(Opcode::OP_ADD).build();
+    let script = ForgeScript::new()
+        .push_num(1)
+        .push_num(2)
+        .op(Opcode::OP_ADD)
+        .build();
     let mut debugger = ScriptDebugger::new(script.as_script());
     debugger.set_breakpoint(0);
     debugger.set_breakpoint(0); // duplicate should not add
@@ -850,10 +858,7 @@ fn test_miniscript_safety_thresh_edge_cases() {
     // k=1, 1 no-sig sub: unsafe (no_sig_count=1 >= k=1)
     let ms2 = Miniscript::Thresh(
         1,
-        vec![
-            Miniscript::Pk(vec![0xaa; 33]),
-            Miniscript::After(100),
-        ],
+        vec![Miniscript::Pk(vec![0xaa; 33]), Miniscript::After(100)],
     );
     assert!(!ms2.is_safe());
 }
@@ -979,11 +984,11 @@ fn test_script_analysis_op0_push() {
 fn test_forge_error_display() {
     use crate::script_env::ForgeError;
     let e1 = ForgeError::ScriptExecution("exec fail".into());
-    assert!(format!("{}", e1).contains("exec fail"));
+    assert!(format!("{e1}").contains("exec fail"));
     let e2 = ForgeError::MissingUtxo("missing".into());
-    assert!(format!("{}", e2).contains("missing"));
+    assert!(format!("{e2}").contains("missing"));
     let e3 = ForgeError::InvalidArgument("bad arg".into());
-    assert!(format!("{}", e3).contains("bad arg"));
+    assert!(format!("{e3}").contains("bad arg"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1039,7 +1044,7 @@ fn test_debugger_invalid_script_breaks() {
 fn test_debugger_print_trace_empty_stack_items() {
     // Ensure print_trace handles empty stack items (the "[]" branch)
     let script = ForgeScript::new()
-        .op(Opcode::OP_0)  // pushes empty bytes onto stack
+        .op(Opcode::OP_0) // pushes empty bytes onto stack
         .op(Opcode::OP_DROP)
         .build();
 
@@ -1177,28 +1182,28 @@ fn test_policy_parse_and_missing_close_paren() {
 fn test_miniscript_error_display() {
     use crate::miniscript::MiniscriptError;
     let e1 = MiniscriptError::UnexpectedEof;
-    assert!(format!("{}", e1).contains("unexpected end"));
+    assert!(format!("{e1}").contains("unexpected end"));
 
     let e2 = MiniscriptError::Expected("(".into(), "foo".into());
-    assert!(format!("{}", e2).contains("expected"));
+    assert!(format!("{e2}").contains("expected"));
 
     let e3 = MiniscriptError::InvalidHex("bad hex".into());
-    assert!(format!("{}", e3).contains("invalid hex"));
+    assert!(format!("{e3}").contains("invalid hex"));
 
     let e4 = MiniscriptError::InvalidNumber("nan".into());
-    assert!(format!("{}", e4).contains("invalid number"));
+    assert!(format!("{e4}").contains("invalid number"));
 
     let e5 = MiniscriptError::UnknownPolicy("foo".into());
-    assert!(format!("{}", e5).contains("unknown policy"));
+    assert!(format!("{e5}").contains("unknown policy"));
 
     let e6 = MiniscriptError::InvalidThreshold;
-    assert!(format!("{}", e6).contains("thresh"));
+    assert!(format!("{e6}").contains("thresh"));
 
     let e7 = MiniscriptError::EmptyThresh;
-    assert!(format!("{}", e7).contains("thresh"));
+    assert!(format!("{e7}").contains("thresh"));
 
     let e8 = MiniscriptError::TrailingInput("extra".into());
-    assert!(format!("{}", e8).contains("trailing"));
+    assert!(format!("{e8}").contains("trailing"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1488,7 +1493,10 @@ fn test_miniscript_script_size_various() {
     // Thresh
     let ms6 = Miniscript::Thresh(
         1,
-        vec![Miniscript::Pk(vec![0xaa; 33]), Miniscript::Pk(vec![0xbb; 33])],
+        vec![
+            Miniscript::Pk(vec![0xaa; 33]),
+            Miniscript::Pk(vec![0xbb; 33]),
+        ],
     );
     assert_eq!(ms6.script_size(), ms6.compile().len());
 
@@ -1564,7 +1572,7 @@ fn test_policy_parse_sha256_with_nested_parens_in_hash() {
     // Let's test a read_until_close where depth goes up then down
     // The 'pk' argument is simple but 'sha256' goes through read_until_close
     let valid_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let result = Policy::parse(&format!("sha256({})", valid_hash));
+    let result = Policy::parse(&format!("sha256({valid_hash})"));
     assert!(result.is_ok());
 }
 
@@ -1581,12 +1589,12 @@ fn test_debugger_very_large_pushdata() {
     let mut bytes = Vec::new();
     bytes.push(0x4e); // OP_PUSHDATA4
     bytes.extend_from_slice(&data_len.to_le_bytes());
-    bytes.extend(std::iter::repeat(0x42).take(data_len as usize));
+    bytes.extend(std::iter::repeat_n(0x42, data_len as usize));
     bytes.push(Opcode::OP_DROP as u8);
 
     let script = ScriptBuf::from_bytes(bytes);
     let mut debugger = ScriptDebugger::new(script.as_script());
     let trace = debugger.run();
     // Should have parsed the pushdata instruction (pos += 5 + len) and the OP_DROP
-    assert!(trace.len() >= 1);
+    assert!(!trace.is_empty());
 }

@@ -10,10 +10,9 @@ use std::panic::catch_unwind;
 use std::slice;
 
 use btc_primitives::encode;
-use btc_primitives::script::Script;
 use btc_primitives::transaction::Transaction;
 
-use crate::script_engine::{ScriptEngine, ScriptFlags};
+use crate::script_engine::ScriptFlags;
 use crate::sig_verify::Secp256k1Verifier;
 use crate::sighash::{sighash_legacy, SighashType};
 
@@ -59,6 +58,7 @@ fn flags_from_u32(flags: u32) -> ScriptFlags {
         verify_checklocktimeverify: flags & BTC_SCRIPT_FLAGS_VERIFY_CHECKLOCKTIMEVERIFY != 0,
         verify_checksequenceverify: flags & BTC_SCRIPT_FLAGS_VERIFY_CHECKSEQUENCEVERIFY != 0,
         verify_taproot: false,
+        ..ScriptFlags::default()
     }
 }
 
@@ -66,7 +66,7 @@ fn flags_from_u32(flags: u32) -> ScriptFlags {
 ///
 /// Returns `None` when the pointer is null **or** the length would overflow
 /// the address space.
-unsafe fn slice_from_raw(ptr: *const u8, len: u32) -> Option<&'static [u8]> {
+unsafe fn slice_from_raw<'a>(ptr: *const u8, len: u32) -> Option<&'a [u8]> {
     if ptr.is_null() {
         return None;
     }
@@ -94,8 +94,11 @@ unsafe fn slice_from_raw(ptr: *const u8, len: u32) -> Option<&'static [u8]> {
 /// # Returns
 /// `1` on success, `0` on any failure (bad pointers, decode error, script
 /// failure, etc.).
+/// # Safety
+/// Non-null pointers must reference readable buffers of the supplied lengths
+/// for the duration of this call.
 #[no_mangle]
-pub extern "C" fn btc_verify_script(
+pub unsafe extern "C" fn btc_verify_script(
     script_pubkey: *const u8,
     script_pubkey_len: u32,
     tx_data: *const u8,
@@ -128,24 +131,25 @@ pub extern "C" fn btc_verify_script(
             return 0;
         }
 
-        // --- build the script engine and run ---
-        let verifier = Secp256k1Verifier;
-        let script_flags = flags_from_u32(flags);
-        let mut engine = ScriptEngine::new(&verifier, script_flags, Some(&tx), idx, 0);
-
-        // Execute the scriptSig first, then the scriptPubKey.
-        let script_sig = &tx.inputs[idx].script_sig;
-        let pubkey_script = Script::from_bytes(spk);
-
-        if engine.execute(Script::from_bytes(script_sig.as_bytes())).is_err() {
+        let prev_output = btc_primitives::transaction::TxOut {
+            value: btc_primitives::amount::Amount::ZERO,
+            script_pubkey: btc_primitives::script::ScriptBuf::from_bytes(spk.to_vec()),
+        };
+        // This legacy ABI has no input amount. SegWit v0 signatures require
+        // the amount; expose that in a separate API rather than guessing.
+        if prev_output.script_pubkey.is_witness_program()
+            && flags & BTC_SCRIPT_FLAGS_VERIFY_WITNESS != 0
+        {
             return 0;
         }
-        if engine.execute(pubkey_script).is_err() {
-            return 0;
-        }
-
-        // After executing both scripts, the top of the stack must be truthy.
-        if engine.success() { 1 } else { 0 }
+        crate::witness::verify_input(
+            &tx,
+            idx,
+            &prev_output,
+            &Secp256k1Verifier,
+            &flags_from_u32(flags),
+        )
+        .is_ok() as i32
     });
 
     result.unwrap_or(0)
@@ -166,8 +170,11 @@ pub extern "C" fn btc_consensus_version() -> u32 {
 ///
 /// # Returns
 /// `1` on success, `0` on failure.
+/// # Safety
+/// Input pointers must reference readable buffers of the supplied lengths;
+/// output must reference 32 writable bytes, without aliasing the inputs.
 #[no_mangle]
-pub extern "C" fn btc_sighash(
+pub unsafe extern "C" fn btc_sighash(
     tx_data: *const u8,
     tx_data_len: u32,
     script_code: *const u8,
@@ -224,11 +231,11 @@ pub extern "C" fn btc_sighash(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use btc_primitives::encode;
-    use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint};
-    use btc_primitives::script::ScriptBuf;
     use btc_primitives::amount::Amount;
+    use btc_primitives::encode;
     use btc_primitives::hash::TxHash;
+    use btc_primitives::script::ScriptBuf;
+    use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
 
     /// Build a minimal valid transaction for testing.
     fn make_test_tx() -> (Transaction, Vec<u8>) {
@@ -260,7 +267,7 @@ mod tests {
     fn test_verify_script_null_pointers() {
         // Null scriptPubKey pointer should return 0, not crash.
         assert_eq!(
-            btc_verify_script(std::ptr::null(), 0, std::ptr::null(), 0, 0, 0),
+            unsafe { btc_verify_script(std::ptr::null(), 0, std::ptr::null(), 0, 0, 0) },
             0
         );
     }
@@ -269,7 +276,7 @@ mod tests {
     fn test_verify_script_empty_tx() {
         let spk: &[u8] = &[0x51]; // OP_TRUE
         assert_eq!(
-            btc_verify_script(spk.as_ptr(), spk.len() as u32, std::ptr::null(), 0, 0, 0),
+            unsafe { btc_verify_script(spk.as_ptr(), spk.len() as u32, std::ptr::null(), 0, 0, 0) },
             0
         );
     }
@@ -278,16 +285,18 @@ mod tests {
     fn test_verify_script_input_out_of_range() {
         let (_tx, raw) = make_test_tx();
         let spk: &[u8] = &[0x51]; // OP_TRUE
-        // input_index = 99 is out of range
+                                  // input_index = 99 is out of range
         assert_eq!(
-            btc_verify_script(
-                spk.as_ptr(),
-                spk.len() as u32,
-                raw.as_ptr(),
-                raw.len() as u32,
-                99,
-                0
-            ),
+            unsafe {
+                btc_verify_script(
+                    spk.as_ptr(),
+                    spk.len() as u32,
+                    raw.as_ptr(),
+                    raw.len() as u32,
+                    99,
+                    0,
+                )
+            },
             0
         );
     }
@@ -297,14 +306,16 @@ mod tests {
         let (_tx, raw) = make_test_tx();
         // scriptPubKey = OP_TRUE (0x51): always passes
         let spk: &[u8] = &[0x51];
-        let result = btc_verify_script(
-            spk.as_ptr(),
-            spk.len() as u32,
-            raw.as_ptr(),
-            raw.len() as u32,
-            0,
-            0,
-        );
+        let result = unsafe {
+            btc_verify_script(
+                spk.as_ptr(),
+                spk.len() as u32,
+                raw.as_ptr(),
+                raw.len() as u32,
+                0,
+                0,
+            )
+        };
         assert_eq!(result, 1);
     }
 
@@ -313,14 +324,16 @@ mod tests {
         let (_tx, raw) = make_test_tx();
         // scriptPubKey = OP_FALSE (0x00) followed by nothing -- should fail
         let spk: &[u8] = &[0x00];
-        let result = btc_verify_script(
-            spk.as_ptr(),
-            spk.len() as u32,
-            raw.as_ptr(),
-            raw.len() as u32,
-            0,
-            0,
-        );
+        let result = unsafe {
+            btc_verify_script(
+                spk.as_ptr(),
+                spk.len() as u32,
+                raw.as_ptr(),
+                raw.len() as u32,
+                0,
+                0,
+            )
+        };
         assert_eq!(result, 0);
     }
 
@@ -329,15 +342,17 @@ mod tests {
         let (_tx, raw) = make_test_tx();
         let sc: &[u8] = &[0x51];
         assert_eq!(
-            btc_sighash(
-                raw.as_ptr(),
-                raw.len() as u32,
-                sc.as_ptr(),
-                sc.len() as u32,
-                0,
-                1,
-                std::ptr::null_mut(),
-            ),
+            unsafe {
+                btc_sighash(
+                    raw.as_ptr(),
+                    raw.len() as u32,
+                    sc.as_ptr(),
+                    sc.len() as u32,
+                    0,
+                    1,
+                    std::ptr::null_mut(),
+                )
+            },
             0
         );
     }
@@ -347,15 +362,17 @@ mod tests {
         let sc: &[u8] = &[0x51];
         let mut out = [0u8; 32];
         assert_eq!(
-            btc_sighash(
-                std::ptr::null(),
-                0,
-                sc.as_ptr(),
-                sc.len() as u32,
-                0,
-                1,
-                out.as_mut_ptr(),
-            ),
+            unsafe {
+                btc_sighash(
+                    std::ptr::null(),
+                    0,
+                    sc.as_ptr(),
+                    sc.len() as u32,
+                    0,
+                    1,
+                    out.as_mut_ptr(),
+                )
+            },
             0
         );
     }
@@ -366,28 +383,32 @@ mod tests {
         let sc: &[u8] = &[0x51]; // OP_TRUE as script code
         let mut out = [0u8; 32];
 
-        let result = btc_sighash(
-            raw.as_ptr(),
-            raw.len() as u32,
-            sc.as_ptr(),
-            sc.len() as u32,
-            0,
-            0x01, // SIGHASH_ALL
-            out.as_mut_ptr(),
-        );
+        let result = unsafe {
+            btc_sighash(
+                raw.as_ptr(),
+                raw.len() as u32,
+                sc.as_ptr(),
+                sc.len() as u32,
+                0,
+                0x01, // SIGHASH_ALL
+                out.as_mut_ptr(),
+            )
+        };
         assert_eq!(result, 1);
 
         // The hash should be deterministic -- call again and compare.
         let mut out2 = [0u8; 32];
-        let result2 = btc_sighash(
-            raw.as_ptr(),
-            raw.len() as u32,
-            sc.as_ptr(),
-            sc.len() as u32,
-            0,
-            0x01,
-            out2.as_mut_ptr(),
-        );
+        let result2 = unsafe {
+            btc_sighash(
+                raw.as_ptr(),
+                raw.len() as u32,
+                sc.as_ptr(),
+                sc.len() as u32,
+                0,
+                0x01,
+                out2.as_mut_ptr(),
+            )
+        };
         assert_eq!(result2, 1);
         assert_eq!(out, out2, "sighash must be deterministic");
     }
@@ -400,26 +421,33 @@ mod tests {
         let mut out_all = [0u8; 32];
         let mut out_none = [0u8; 32];
 
-        btc_sighash(
-            raw.as_ptr(),
-            raw.len() as u32,
-            sc.as_ptr(),
-            sc.len() as u32,
-            0,
-            0x01, // SIGHASH_ALL
-            out_all.as_mut_ptr(),
-        );
-        btc_sighash(
-            raw.as_ptr(),
-            raw.len() as u32,
-            sc.as_ptr(),
-            sc.len() as u32,
-            0,
-            0x02, // SIGHASH_NONE
-            out_none.as_mut_ptr(),
-        );
+        unsafe {
+            btc_sighash(
+                raw.as_ptr(),
+                raw.len() as u32,
+                sc.as_ptr(),
+                sc.len() as u32,
+                0,
+                0x01, // SIGHASH_ALL
+                out_all.as_mut_ptr(),
+            )
+        };
+        unsafe {
+            btc_sighash(
+                raw.as_ptr(),
+                raw.len() as u32,
+                sc.as_ptr(),
+                sc.len() as u32,
+                0,
+                0x02, // SIGHASH_NONE
+                out_none.as_mut_ptr(),
+            )
+        };
 
-        assert_ne!(out_all, out_none, "different hash types must produce different sighashes");
+        assert_ne!(
+            out_all, out_none,
+            "different hash types must produce different sighashes"
+        );
     }
 
     #[test]
@@ -428,15 +456,17 @@ mod tests {
         let sc: &[u8] = &[0x51];
         let mut out = [0u8; 32];
 
-        let result = btc_sighash(
-            raw.as_ptr(),
-            raw.len() as u32,
-            sc.as_ptr(),
-            sc.len() as u32,
-            99, // out of range
-            0x01,
-            out.as_mut_ptr(),
-        );
+        let result = unsafe {
+            btc_sighash(
+                raw.as_ptr(),
+                raw.len() as u32,
+                sc.as_ptr(),
+                sc.len() as u32,
+                99, // out of range
+                0x01,
+                out.as_mut_ptr(),
+            )
+        };
         assert_eq!(result, 0);
     }
 
@@ -444,14 +474,16 @@ mod tests {
     fn test_verify_script_garbage_tx_data() {
         let spk: &[u8] = &[0x51];
         let garbage: &[u8] = &[0xde, 0xad, 0xbe, 0xef];
-        let result = btc_verify_script(
-            spk.as_ptr(),
-            spk.len() as u32,
-            garbage.as_ptr(),
-            garbage.len() as u32,
-            0,
-            0,
-        );
+        let result = unsafe {
+            btc_verify_script(
+                spk.as_ptr(),
+                spk.len() as u32,
+                garbage.as_ptr(),
+                garbage.len() as u32,
+                0,
+                0,
+            )
+        };
         assert_eq!(result, 0);
     }
 }

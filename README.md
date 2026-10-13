@@ -2,6 +2,8 @@
 
 A modular Rust Bitcoin full node and development platform. Built from scratch with no dependency on `rust-bitcoin` — we own our encoding, hashing, serialization, and consensus implementation.
 
+Development status: several runtime backends remain experimental. See [the review](docs/REVIEW.md), [remaining build work](docs/BUILD_PLAN.md), and [BIP roadmap](docs/BIP_ROADMAP.md) for verified capabilities and acceptance gaps.
+
 Inspired by [reth](https://github.com/paradigmxyz/reth)'s architecture: pipeline/stages sync, trait-based database abstraction, type-state node builder, and execution extensions (ExEx) plugin system.
 
 ## Quick Start
@@ -22,6 +24,14 @@ cargo build --release
 # Interactive mode (for humans)
 ./target/release/btc-node run --interactive
 ```
+
+Old tip-only databases can preserve their data and rebuild from genesis using
+`run --resync-legacy-checkpoint`. See [checkpoint recovery](docs/CHECKPOINT_RECOVERY.md)
+for the supported layout and verified recovery behavior.
+
+Core’s `bitcoin-cli` can use the node’s authenticated HTTP RPC with the data
+directory’s private `.cookie`. See [HTTP RPC](docs/RPC_HTTP.md) for client setup
+and supported protocol behavior.
 
 ## Script Development Quickstart
 
@@ -298,7 +308,7 @@ btc-node decode-tx <invalid> --json; echo "exit: $?"
 
 ## Architecture
 
-11 crates in a Cargo workspace, each independently importable:
+12 crates in a Cargo workspace, each independently importable:
 
 ```
 btc-primitives   → Hash, encode, script, transaction, block, address, bech32, PSBT
@@ -306,12 +316,13 @@ btc-consensus    → Script engine, sighash, segwit, taproot, UTXO, chain state,
 btc-storage      → Database traits, QMDB backend, redb fallback, UTXO persistence, pruning
 btc-network      → P2P codec, handshake, DNS seeds, peer manager, compact blocks, tx relay
 btc-mempool      → Fee-sorted pool, RBF (BIP125), cluster mempool, fee estimation
-btc-stages       → Pipeline: Headers → Bodies → Execution → Indexing → AddressIndex
+btc-stages       → Actual block preparation: Headers → Bodies → Validation → TxIndex → AddressIndex
 btc-rpc          → JSON-RPC 2.0 server with Bitcoin Core-compatible methods
-btc-exex         → Execution Extensions plugin system (ordinals indexer included)
-btc-electrum     → Embedded Electrum protocol server (14 methods)
+btc-exex         → Durable execution extensions and live observation examples
+btc-electrum     → Opt-in local validated Bitcoin Electrum 1.4 service
 btc-test         → In-process regtest harness for BIP development
 btc-node         → CLI, NodeBuilder, sync manager, Esplora REST, Prometheus, ZMQ
+btc-forge        → Script builders, debugger, transaction tooling, Miniscript
 ```
 
 ## Features
@@ -373,14 +384,19 @@ Built-in example plugins:
 - BIP331 package relay for Lightning safety
 
 ### APIs
-- **JSON-RPC** — 9 Bitcoin Core-compatible methods wired to real chain state
-- **Electrum protocol** — 14 methods, embedded server, no separate Electrs needed
-- **Esplora REST** — 9 endpoints matching Blockstream's API format
+- **JSON-RPC** — validated chain, transaction, mining and pool queries over authenticated HTTP and local newline RPC
+- **Experimental local Electrum 1.4** — opt-in loopback chain/transaction queries, verified admission, transaction IDs by active-block position, transaction and header checkpoint proofs, and header notifications; validated history/balance/unspent/pool queries and connection-owned script-status notifications are available; the released Bitcoin 1.4 method catalog and connection-owned negotiation are implemented; public/TLS/load qualification remains open. See [supported methods and setup](docs/ELECTRUM.md).
+- **Fee providers** — actual relay policy and pool histograms, plus bounded empirical confirmation estimates with explicit insufficient-data results. See [fee scope](docs/FEES.md).
+- **Esplora REST** — experimental endpoint scaffolding; validated fee/pool providers are not installed on that separate service
 - **Prometheus** — `/metrics` endpoint with 7 gauges (chain height, peers, mempool, sync progress, etc.)
 - **ZMQ notifications** — hashblock, hashtx, rawblock, rawtx, sequence via ExEx
 
 ### Execution Extensions (ExEx)
-Subscribe to chain events without forking the node:
+The production node records actual canonical connects and disconnects in the same transaction as validated chain state. Typed `durable::DurableManager` registration starts and supervises real extensions; each application state and acknowledged cursor commit together. Replay survives dropped live notifications, restart and winning reorgs. The default `ValidatedMetrics` consumer maintains durable transaction and spendable-coin totals, reversing actual disconnects. Query `getexexinfo` and bounded `getexexjournal` for real progress; see [journal, recovery and limits](docs/EXEX.md).
+
+The [offline example](examples/exex_plugin.rs) replays an existing stopped node database. Name-only legacy registration now errors explicitly. Complete Ordinals/Runes indexes, large-index storage, retention and public-chain/load qualification remain required work in [the build plan](docs/BUILD_PLAN.md).
+
+Legacy manually started extensions and ZMQ can subscribe to future events through the 1,024-event live broadcast channel. This API still has no durable external-delivery acknowledgement:
 
 ```rust
 use btc_exex::{ExEx, ExExContext, ExExNotification};
@@ -404,10 +420,14 @@ impl ExEx for MyPlugin {
 }
 ```
 
-Built-in ExEx plugins:
-- **OrdinalsExEx** — inscription detection and indexing
-- **MetricsExEx** — chain height, tx count, UTXO set tracking
-- **LoggingExEx** — structured event logging
+Example extensions:
+
+- **ValidatedMetrics** — the default supervised durable chain consumer.
+- **OrdinalsExEx / RunesExEx** — candidate detection and observation counters; no durable protocol index or reorg undo.
+- **MetricsExEx** — in-memory counters; transaction/coin totals are not restored on reverts or dropped events.
+- **LoggingExEx** — live structured event logging.
+
+The real stage backend prepares downloaded bodies and commits actual indexes and a hash-bound checkpoint with chain state. Query `getstageinfo` for all five validated phases; see [stage semantics and migration](docs/STAGES.md).
 
 ### Test Harness
 In-process regtest for BIP development — `cargo add btc-test --dev`:
@@ -433,6 +453,8 @@ node.mine_block(vec![my_tx]);
 
 ## CLI
 
+For a private regtest peer, run `btc-node --network regtest --port 19444 --rpc-port 19450 --connect 127.0.0.1:18444 run`. The node negotiates v2 with v1 fallback, validates downloaded blocks against the shared chain backend, relays committed blocks and retries disconnected outbound sessions. Validated side branches can replace the active chain by accumulated work using durable undo. Signed transactions enter a persistent, dependency-aware mempool through RPC/P2P; relay, RBF, mining and reorg revalidation are wired. Full consensus/policy parity, package admission and dynamic fee estimation/eviction remain unfinished.
+
 ```
 btc-node run          Start syncing
 btc-node status       Show node status
@@ -445,6 +467,11 @@ btc-node rpc METHOD   Send RPC command
 btc-node decode-tx    Decode raw transaction hex
 btc-node decode-script  Decode raw script hex
 btc-node decode-header  Decode raw block header hex
+btc-node decode-psbt    Inspect PSBT v0/v2 hex
+btc-node convert-psbt   Convert PSBT hex with --version 0 or 2
+btc-node extract-psbt   Extract externally finalized PSBT fields
+btc-node verify-psbt    Verify supported finalized spends against supplied prevouts
+                       --partial checks signatures before finalization
 btc-node watch ADDR   Watch address for transactions
 btc-node simulate-tx  Simulate transaction (dry run)
 btc-node compile      Compile miniscript policy to script
@@ -454,6 +481,7 @@ btc-node playground   Interactive script playground (no JSON mode)
 Flags:
   --network signet|testnet|mainnet|regtest
   --datadir PATH
+  --connect IP:port      (repeat for alternatives; disables DNS seeds)
   --output json|text     (auto-detects: JSON when piped)
   --json                 (shorthand for --output json)
   --interactive          (human-friendly mode)
@@ -468,11 +496,16 @@ Run flags:
   --datacarrier-size BYTES    (custom OP_RETURN data limit)
 ```
 
+PSBT CLI tools use hexadecimal input and support BIP174 v0 and BIP370 v2.
+See [PSBT tools and verification scope](docs/PSBT.md) for usage, resource limits
+and the distinction between extraction and signature verification.
+
 ## Testing
 
 ```bash
-cargo test                    # 909 tests, 0 failures
-cargo test -p btc-consensus   # Consensus tests (267 tests)
+./scripts/check.sh            # Full workspace, feature, lint and release gate
+cargo test                    # Default workspace tests
+cargo test -p btc-consensus   # Consensus tests
 cargo test -p btc-primitives  # Primitives + Core test vectors
 cargo test -p btc-network     # P2P codec + discovery
 cargo test -p btc-test        # Test harness

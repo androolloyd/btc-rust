@@ -5,14 +5,14 @@
 //! ordinals/runes, block template building, BIP9 version bits, chain reorgs,
 //! and universal address type support.
 
-use btc_test::{TestNode, TestKeyPair};
 use btc_consensus::utxo::UtxoSet;
 use btc_primitives::amount::Amount;
 use btc_primitives::block::{Block, BlockHeader};
 use btc_primitives::compact::CompactTarget;
-use btc_primitives::hash::{sha256, hash160, BlockHash, TxHash};
+use btc_primitives::hash::{hash160, sha256, BlockHash, TxHash};
 use btc_primitives::script::{Opcode, ScriptBuf};
 use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut, Witness};
+use btc_test::{TestKeyPair, TestNode};
 
 // ============================================================================
 // 1. Pluggable CTV Covenant
@@ -27,8 +27,7 @@ fn showcase_pluggable_ctv_covenant() {
     // btc-rust's pluggable opcode architecture allows BIP119 OP_CTV
     // to be tested without recompiling the node.
     use btc_consensus::opcode_plugin::{
-        OpCheckTemplateVerify, OpcodeRegistry,
-        default_check_template_verify_hash,
+        default_check_template_verify_hash, OpCheckTemplateVerify, OpcodeRegistry,
     };
     use btc_consensus::script_engine::{ScriptEngine, ScriptFlags};
     use btc_consensus::sig_verify::Secp256k1Verifier;
@@ -84,7 +83,10 @@ fn showcase_pluggable_ctv_covenant() {
         Some(&registry),
     );
     engine.execute(locking_script.as_script()).unwrap();
-    assert!(engine.success(), "CTV covenant should succeed for the committed template");
+    assert!(
+        engine.success(),
+        "CTV covenant should succeed for the committed template"
+    );
 
     // Now try with a WRONG template (different outputs) -- must fail.
     let wrong_tx = Transaction {
@@ -111,7 +113,10 @@ fn showcase_pluggable_ctv_covenant() {
         Some(&registry),
     );
     let result = engine2.execute(locking_script.as_script());
-    assert!(result.is_err(), "CTV should reject a spending tx that doesn't match the template");
+    assert!(
+        result.is_err(),
+        "CTV should reject a spending tx that doesn't match the template"
+    );
 }
 
 // ============================================================================
@@ -158,7 +163,10 @@ fn showcase_op_cat_script() {
         Some(&registry),
     );
     engine.execute(script.as_script()).unwrap();
-    assert!(engine.success(), "OP_CAT concatenation and hash verification should succeed");
+    assert!(
+        engine.success(),
+        "OP_CAT concatenation and hash verification should succeed"
+    );
 }
 
 // ============================================================================
@@ -305,7 +313,11 @@ fn showcase_parallel_verification() {
     });
 
     let result = validator.validate_block_scripts(&block, &utxo_set, 1, &params);
-    assert!(result.is_ok(), "50-tx block should pass parallel validation: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "50-tx block should pass parallel validation: {:?}",
+        result.err()
+    );
 }
 
 // ============================================================================
@@ -327,7 +339,7 @@ fn showcase_exex_ordinals_detection() {
     // OP_FALSE OP_IF
     witness_item.push(0x00); // OP_FALSE
     witness_item.push(0x63); // OP_IF
-    // Push "ord"
+                             // Push "ord"
     witness_item.push(3u8);
     witness_item.extend_from_slice(b"ord");
     // OP_1 <content type>
@@ -362,7 +374,11 @@ fn showcase_exex_ordinals_detection() {
     };
 
     let inscriptions = scan_transaction_for_inscriptions(&tx);
-    assert_eq!(inscriptions.len(), 1, "should detect exactly one inscription");
+    assert_eq!(
+        inscriptions.len(),
+        1,
+        "should detect exactly one inscription"
+    );
     let insc = &inscriptions[0];
     assert_eq!(insc.content_type, content_type);
     assert_eq!(insc.content_body, content);
@@ -383,8 +399,8 @@ fn showcase_exex_runes_etch() {
     // Create a transaction with a rune etch, run the runes parser,
     // verify the rune was detected.
     use btc_exex::runes::{
-        build_etch_payload, build_runestone_script, encode_rune_name,
-        parse_runestone, RuneOperation,
+        build_etch_payload, build_runestone_script, encode_rune_name, parse_runestone,
+        RuneOperation,
     };
 
     let rune_name = "BTCRUST";
@@ -418,10 +434,16 @@ fn showcase_exex_runes_etch() {
     let ops = parse_runestone(&tx).expect("should find a runestone");
     assert!(!ops.is_empty(), "should have at least one rune operation");
 
-    let etch = ops.iter().find(|op| matches!(op, RuneOperation::Etch { .. }));
+    let etch = ops
+        .iter()
+        .find(|op| matches!(op, RuneOperation::Etch { .. }));
     assert!(etch.is_some(), "should find an Etch operation");
     match etch.unwrap() {
-        RuneOperation::Etch { name, symbol: sym, supply: sup } => {
+        RuneOperation::Etch {
+            name,
+            symbol: sym,
+            supply: sup,
+        } => {
             assert_eq!(name, rune_name);
             assert_eq!(*sym, symbol);
             assert_eq!(*sup, supply);
@@ -470,11 +492,11 @@ fn showcase_block_template_building() {
 
     // Create candidates with varying fee rates.
     let mut candidates = vec![
-        make_candidate(1, 1_000, 500),   // 2.0 sat/wu
-        make_candidate(2, 10_000, 500),  // 20.0 sat/wu  (highest)
-        make_candidate(3, 5_000, 1000),  // 5.0 sat/wu
-        make_candidate(4, 500, 200),     // 2.5 sat/wu
-        make_candidate(5, 8_000, 400),   // 20.0 sat/wu  (tied highest)
+        make_candidate(1, 1_000, 500),  // 2.0 sat/wu
+        make_candidate(2, 10_000, 500), // 20.0 sat/wu  (highest)
+        make_candidate(3, 5_000, 1000), // 5.0 sat/wu
+        make_candidate(4, 500, 200),    // 2.5 sat/wu
+        make_candidate(5, 8_000, 400),  // 20.0 sat/wu  (tied highest)
     ];
 
     let height = 100;
@@ -517,8 +539,7 @@ fn showcase_bip9_version_bits() {
     // Demonstrate soft fork signaling: create headers with version bits and
     // track deployment state through DEFINED -> STARTED -> LOCKED_IN -> ACTIVE.
     use btc_consensus::versionbits::{
-        Deployment, DeploymentState, VersionBitsManager,
-        check_version_bit, get_block_version,
+        check_version_bit, get_block_version, Deployment, DeploymentState, VersionBitsManager,
     };
 
     // Create a custom deployment: bit 7, low threshold for testing.
@@ -624,16 +645,19 @@ fn showcase_address_types() {
 
     let key = TestKeyPair::generate();
     let pubkey_hash = key.pubkey_hash();
-    let script_hash = hash160(&key.p2pkh_script().as_bytes());
-    let witness_script_hash = sha256(&key.p2wpkh_script().as_bytes());
+    let script_hash = hash160(key.p2pkh_script().as_bytes());
+    let witness_script_hash = sha256(key.p2wpkh_script().as_bytes());
 
     // P2PKH
     let p2pkh = Address::P2pkh {
         hash: pubkey_hash,
         network: Network::Mainnet,
     };
-    let p2pkh_str = format!("{}", p2pkh);
-    assert!(p2pkh_str.starts_with('1'), "P2PKH mainnet should start with 1");
+    let p2pkh_str = format!("{p2pkh}");
+    assert!(
+        p2pkh_str.starts_with('1'),
+        "P2PKH mainnet should start with 1"
+    );
     let decoded = Address::from_base58(&p2pkh_str, Network::Mainnet).unwrap();
     assert_eq!(decoded, p2pkh);
 
@@ -642,8 +666,11 @@ fn showcase_address_types() {
         hash: script_hash,
         network: Network::Mainnet,
     };
-    let p2sh_str = format!("{}", p2sh);
-    assert!(p2sh_str.starts_with('3'), "P2SH mainnet should start with 3");
+    let p2sh_str = format!("{p2sh}");
+    assert!(
+        p2sh_str.starts_with('3'),
+        "P2SH mainnet should start with 3"
+    );
     let decoded = Address::from_base58(&p2sh_str, Network::Mainnet).unwrap();
     assert_eq!(decoded, p2sh);
 
@@ -652,11 +679,10 @@ fn showcase_address_types() {
         hash: pubkey_hash,
         network: Network::Mainnet,
     };
-    let p2wpkh_str = format!("{}", p2wpkh);
+    let p2wpkh_str = format!("{p2wpkh}");
     assert!(
         p2wpkh_str.starts_with("bc1q"),
-        "P2WPKH mainnet should start with bc1q, got: {}",
-        p2wpkh_str
+        "P2WPKH mainnet should start with bc1q, got: {p2wpkh_str}"
     );
     let decoded = Address::from_bech32(&p2wpkh_str, Network::Mainnet).unwrap();
     assert_eq!(decoded, p2wpkh);
@@ -666,11 +692,10 @@ fn showcase_address_types() {
         hash: witness_script_hash,
         network: Network::Mainnet,
     };
-    let p2wsh_str = format!("{}", p2wsh);
+    let p2wsh_str = format!("{p2wsh}");
     assert!(
         p2wsh_str.starts_with("bc1q"),
-        "P2WSH mainnet should start with bc1q, got: {}",
-        p2wsh_str
+        "P2WSH mainnet should start with bc1q, got: {p2wsh_str}"
     );
     let decoded = Address::from_bech32(&p2wsh_str, Network::Mainnet).unwrap();
     assert_eq!(decoded, p2wsh);
@@ -680,11 +705,10 @@ fn showcase_address_types() {
         output_key: [0xab; 32],
         network: Network::Mainnet,
     };
-    let p2tr_str = format!("{}", p2tr);
+    let p2tr_str = format!("{p2tr}");
     assert!(
         p2tr_str.starts_with("bc1p"),
-        "P2TR mainnet should start with bc1p, got: {}",
-        p2tr_str
+        "P2TR mainnet should start with bc1p, got: {p2tr_str}"
     );
     let decoded = Address::from_bech32(&p2tr_str, Network::Mainnet).unwrap();
     assert_eq!(decoded, p2tr);

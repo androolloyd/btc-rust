@@ -8,14 +8,16 @@
 //! [`DbTx::get_utxo`] and transparently inserted into the cache so that
 //! subsequent lookups for the same outpoint are fast.
 
-use std::cell::UnsafeCell;
-use std::collections::HashMap;
+use parking_lot::Mutex;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use btc_consensus::utxo::{UtxoEntry, UtxoSet, UtxoSetUpdate};
 use btc_primitives::amount::Amount;
+use btc_primitives::block::Block;
+use btc_primitives::hash::BlockHash;
 use btc_primitives::script::ScriptBuf;
-use btc_primitives::transaction::{OutPoint, TxOut};
+use btc_primitives::transaction::{OutPoint, Transaction, TxOut};
 
 use crate::traits::{Database, DbTx, DbTxMut, StorageError};
 
@@ -38,39 +40,39 @@ const DEFAULT_CACHE_SIZE_LIMIT: usize = 100_000;
 ///   always be reloaded on the next cache miss.
 pub struct PersistentUtxoSet<DB: Database> {
     db: Arc<DB>,
-    /// Read-through cache for hot UTXOs.
-    ///
-    /// # Safety
-    ///
-    /// Wrapped in `UnsafeCell` to allow interior mutation during `get_utxo`
-    /// (`&self`).  This is sound because:
-    ///
-    /// 1. During `&self` borrows (reads), entries are only *added* to the map —
-    ///    never removed — so outstanding `&UtxoEntry` references remain valid.
-    /// 2. Methods that remove entries (`apply_update`, `flush_cache`) require
-    ///    `&mut self`, which the borrow checker guarantees is exclusive (no
-    ///    `&self` borrows can coexist).
-    /// 3. `PersistentUtxoSet` is `!Sync` (due to `UnsafeCell`) so no concurrent
-    ///    `&self` access can occur across threads.
-    cache: UnsafeCell<HashMap<OutPoint, UtxoEntry>>,
+    /// Owned entries behind a mutex; callers receive clones, so cache growth
+    /// cannot invalidate entries returned by earlier reads.
+    cache: Mutex<HashMap<OutPoint, UtxoEntry>>,
+    /// Unflushed creations must never be evicted.
+    dirty: HashSet<OutPoint>,
     cache_size_limit: usize,
     /// Outpoints that were spent via `apply_update_cached` and need to be
     /// deleted from the DB on the next `flush_cache()`.
-    pending_deletes: Vec<OutPoint>,
+    pending_deletes: HashSet<OutPoint>,
 }
 
-// PersistentUtxoSet is Send if DB is Send (UnsafeCell is Send when inner is Send).
-// It is intentionally !Sync due to UnsafeCell, which is correct for our use case.
-unsafe impl<DB: Database> Send for PersistentUtxoSet<DB> {}
+/// One atomic active-chain transition, including undo and the revalidated pool.
+pub struct ChainTransition<'a> {
+    pub incoming: &'a Block,
+    pub height: u64,
+    pub undo: &'a UtxoSetUpdate,
+    pub detached: &'a [(u64, Block)],
+    pub attached: &'a [(u64, Block)],
+    pub coins: &'a HashMap<OutPoint, Option<UtxoEntry>>,
+    pub tip: Option<(u64, BlockHash)>,
+    pub old_height: u64,
+    pub mempool: &'a [Transaction],
+}
 
 impl<DB: Database> PersistentUtxoSet<DB> {
     /// Create a new `PersistentUtxoSet` wrapping the given database.
     pub fn new(db: Arc<DB>) -> Self {
         Self {
             db,
-            cache: UnsafeCell::new(HashMap::new()),
+            cache: Mutex::new(HashMap::new()),
+            dirty: HashSet::new(),
             cache_size_limit: DEFAULT_CACHE_SIZE_LIMIT,
-            pending_deletes: Vec::new(),
+            pending_deletes: HashSet::new(),
         }
     }
 
@@ -78,9 +80,10 @@ impl<DB: Database> PersistentUtxoSet<DB> {
     pub fn with_cache_limit(db: Arc<DB>, cache_size_limit: usize) -> Self {
         Self {
             db,
-            cache: UnsafeCell::new(HashMap::new()),
+            cache: Mutex::new(HashMap::new()),
+            dirty: HashSet::new(),
             cache_size_limit,
-            pending_deletes: Vec::new(),
+            pending_deletes: HashSet::new(),
         }
     }
 
@@ -89,25 +92,244 @@ impl<DB: Database> PersistentUtxoSet<DB> {
     /// This writes through to the database in a single transaction and updates
     /// the in-memory cache accordingly.
     pub fn apply_update(&mut self, update: &UtxoSetUpdate) -> Result<(), StorageError> {
+        self.apply_update_inner(update, None)
+    }
+
+    /// Commit a validated block's body, header, indices, UTXOs and tip atomically.
+    /// Cache changes become visible only after the database commit succeeds.
+    pub fn apply_block_update(
+        &mut self,
+        block: &Block,
+        height: u64,
+        update: &UtxoSetUpdate,
+    ) -> Result<(), StorageError> {
+        self.apply_update_inner(update, Some((block, height)))
+    }
+
+    /// Side-branch data stays durable without changing active coins. A winning
+    /// branch commits coin undo/reconnect, indices, pool and tip in one transaction.
+    pub fn commit_chain_transition(
+        &mut self,
+        change: ChainTransition<'_>,
+    ) -> Result<(), StorageError> {
+        self.commit_chain_transition_with_fees(change, None)
+    }
+    /// Optional bounded fee observations publish with the actual active tip/pool.
+    pub fn commit_chain_transition_with_fees(
+        &mut self,
+        change: ChainTransition<'_>,
+        fees: Option<&[u8]>,
+    ) -> Result<(), StorageError> {
+        self.commit_chain_transition_with_stage_plan(change, fees, None)
+    }
+    pub fn commit_chain_transition_with_stage_plan(
+        &mut self,
+        change: ChainTransition<'_>,
+        fees: Option<&[u8]>,
+        plan: Option<&crate::index_plan::BlockIndexPlan>,
+    ) -> Result<(), StorageError> {
+        if plan.is_some_and(|plan| !plan.matches(change.height, change.incoming, change.undo)) {
+            return Err(StorageError::Corruption(
+                "prepared stage indices do not match input".into(),
+            ));
+        }
+        self.flush_cache()?;
         let tx = self.db.tx_mut()?;
+        let indexed = tx.script_index_tip()?;
+        let old_hash = tx.get_best_block_hash()?;
+        if indexed.is_some_and(|tip| tip != (change.old_height, old_hash)) {
+            return Err(StorageError::Corruption(
+                "script index/chain transition tip mismatch".into(),
+            ));
+        }
+        if let Some(tip) = tx.stage_checkpoint()? {
+            if tip != (change.old_height, old_hash) {
+                return Err(StorageError::Corruption(
+                    "stage checkpoint/chain transition mismatch".into(),
+                ));
+            }
+            if change.tip.is_some() && plan.is_none() {
+                return Err(StorageError::Database(
+                    "active stage-enabled transition requires prepared indices".into(),
+                ));
+            }
+        }
+        let journal = tx.exex_journal_tip()?;
+        if let Some(tip) = journal {
+            if (tip.height, tip.hash) != (change.old_height, old_hash) {
+                return Err(StorageError::Corruption(
+                    "ExEx journal/chain transition mismatch".into(),
+                ));
+            }
+        } else if plan.is_some() {
+            return Err(StorageError::Database(
+                "validated stages require durable ExEx journal".into(),
+            ));
+        }
+        let hash = change.incoming.block_hash();
+        tx.put_block_header(&hash, &change.incoming.header)?;
+        tx.put_block(&hash, change.incoming)?;
+        tx.put_block_undo(&hash, &crate::undo::encode_undo(hash, change.undo))?;
+        for transaction in &change.incoming.transactions {
+            tx.put_transaction(&transaction.txid(), transaction)?;
+        }
+        for (_, block) in change.detached {
+            for transaction in &block.transactions {
+                let txid = transaction.txid();
+                if tx
+                    .get_tx_block_index(&txid)?
+                    .is_some_and(|loc| loc.block_hash == block.block_hash())
+                {
+                    tx.delete_tx_block_index(&txid)?;
+                }
+            }
+        }
+        for (height, block) in change.attached {
+            tx.put_block_hash_by_height(*height, &block.block_hash())?;
+            if let Some(plan) = plan.filter(|_| block.block_hash() == hash) {
+                for (id, location) in plan.transactions() {
+                    tx.put_tx_block_index(id, &location.block_hash, location.tx_position)?;
+                }
+            } else {
+                for (position, transaction) in block.transactions.iter().enumerate() {
+                    tx.put_tx_block_index(
+                        &transaction.txid(),
+                        &block.block_hash(),
+                        position as u32,
+                    )?;
+                }
+            }
+        }
+        for (outpoint, value) in change.coins {
+            if let Some(entry) = value {
+                tx.put_utxo(outpoint, &entry.txout)?;
+                self.put_utxo_meta(&tx, outpoint, entry)?;
+            } else if tx.get_utxo(outpoint)?.is_some() {
+                tx.delete_utxo(outpoint)?;
+                self.delete_utxo_meta(&tx, outpoint)?;
+            }
+        }
+        if indexed.is_some() && change.tip.is_some() {
+            for (height, block) in change.detached {
+                let hash = block.block_hash();
+                let raw = tx.get_block_undo(&hash)?.ok_or_else(|| {
+                    StorageError::Corruption("missing detached script-index undo".into())
+                })?;
+                tx.index_script_block(
+                    *height,
+                    block,
+                    &crate::undo::decode_undo(hash, &raw)?,
+                    true,
+                )?;
+            }
+            for (height, block) in change.attached {
+                let hash = block.block_hash();
+                let raw = tx.get_block_undo(&hash)?.ok_or_else(|| {
+                    StorageError::Corruption("missing attached script-index undo".into())
+                })?;
+                let decoded = crate::undo::decode_undo(hash, &raw)?;
+                if let Some(plan) = plan.filter(|plan| plan.matches(*height, block, &decoded)) {
+                    tx.index_script_plan(plan, false)?;
+                } else {
+                    tx.index_script_block(*height, block, &decoded, false)?;
+                }
+            }
+        }
+        if let Some((height, tip)) = change.tip {
+            if let Some(bytes) = fees {
+                tx.set_fee_observations(bytes)?;
+            }
+            if indexed.is_some() {
+                tx.set_script_index_tip(height, &tip)?;
+            }
+            for h in height + 1..=change.old_height {
+                tx.delete_block_hash_by_height(h)?;
+            }
+            tx.set_best_block(height, &tip)?;
+            if plan.is_some() {
+                tx.set_stage_checkpoint(height, &tip)?;
+            }
+            tx.replace_mempool(change.mempool)?;
+            if journal.is_some() {
+                for (height, block) in change.detached {
+                    tx.append_exex_event(false, *height, block)?;
+                }
+                for (height, block) in change.attached {
+                    tx.append_exex_event(true, *height, block)?;
+                }
+                if tx.exex_journal_tip()?.map(|tip| (tip.height, tip.hash)) != Some((height, tip)) {
+                    return Err(StorageError::Corruption(
+                        "ExEx journal did not reach actual committed tip".into(),
+                    ));
+                }
+            }
+        }
+        tx.commit()?;
+        self.cache.get_mut().clear();
+        Ok(())
+    }
+
+    fn apply_update_inner(
+        &mut self,
+        update: &UtxoSetUpdate,
+        block: Option<(&Block, u64)>,
+    ) -> Result<(), StorageError> {
+        self.flush_cache()?;
+        let tx = self.db.tx_mut()?;
+        let spent: HashSet<_> = update.spent.iter().map(|(op, _)| *op).collect();
 
         // Remove spent UTXOs from DB and cache.
         for (outpoint, _entry) in &update.spent {
-            tx.delete_utxo(outpoint)?;
-            self.delete_utxo_meta(&tx, outpoint)?;
-            self.cache.get_mut().remove(outpoint);
+            if tx.get_utxo(outpoint)?.is_some() {
+                tx.delete_utxo(outpoint)?;
+                self.delete_utxo_meta(&tx, outpoint)?;
+            }
         }
 
         // Insert created UTXOs into DB and cache.
         for (outpoint, entry) in &update.created {
+            if spent.contains(outpoint) {
+                continue;
+            }
             tx.put_utxo(outpoint, &entry.txout)?;
             // We also need to persist height + is_coinbase metadata.
             // Encode as: height(8 LE) || is_coinbase(1)
             self.put_utxo_meta(&tx, outpoint, entry)?;
-            self.cache.get_mut().insert(*outpoint, entry.clone());
         }
 
+        if let Some((block, height)) = block {
+            let hash = block.block_hash();
+            if let Some((old_height, old_hash)) = tx.script_index_tip()? {
+                if old_height.checked_add(1) != Some(height)
+                    || old_hash != block.header.prev_blockhash
+                {
+                    return Err(StorageError::Corruption(
+                        "script index extension mismatch".into(),
+                    ));
+                }
+                tx.index_script_block(height, block, update, false)?;
+                tx.set_script_index_tip(height, &hash)?;
+            }
+            tx.put_block_header(&hash, &block.header)?;
+            tx.put_block_hash_by_height(height, &hash)?;
+            tx.put_block(&hash, block)?;
+            tx.put_block_undo(&hash, &crate::undo::encode_undo(hash, update))?;
+            for (position, transaction) in block.transactions.iter().enumerate() {
+                let txid = transaction.txid();
+                tx.put_transaction(&txid, transaction)?;
+                tx.put_tx_block_index(&txid, &hash, position as u32)?;
+            }
+            tx.set_best_block(height, &hash)?;
+        }
         tx.commit()?;
+        for (outpoint, _) in &update.spent {
+            self.cache.get_mut().remove(outpoint);
+        }
+        for (outpoint, entry) in &update.created {
+            if !spent.contains(outpoint) {
+                self.cache.get_mut().insert(*outpoint, entry.clone());
+            }
+        }
 
         // Evict if cache is over the limit.
         self.evict_cache();
@@ -120,20 +342,48 @@ impl<DB: Database> PersistentUtxoSet<DB> {
     /// Tracks spent outpoints in `pending_deletes` so `flush_cache()`
     /// can delete them from the DB.
     pub fn apply_update_cached(&mut self, update: &UtxoSetUpdate) {
+        let spent: HashSet<_> = update.spent.iter().map(|(op, _)| *op).collect();
         for (outpoint, _) in &update.spent {
             self.cache.get_mut().remove(outpoint);
-            self.pending_deletes.push(*outpoint);
+            self.dirty.remove(outpoint);
+            self.pending_deletes.insert(*outpoint);
         }
         for (outpoint, entry) in &update.created {
+            if spent.contains(outpoint) {
+                continue;
+            }
+            self.pending_deletes.remove(outpoint);
             self.cache.get_mut().insert(*outpoint, entry.clone());
+            self.dirty.insert(*outpoint);
         }
         self.evict_cache();
     }
 
     /// Write all cached entries to the database, delete spent UTXOs, and clear.
     pub fn flush_cache(&mut self) -> Result<(), StorageError> {
+        self.flush_cache_at(None)
+    }
+    /// Commit the validated tip in the same transaction as its UTXO delta.
+    pub fn flush_cache_with_tip(
+        &mut self,
+        height: u64,
+        hash: BlockHash,
+    ) -> Result<(), StorageError> {
+        self.flush_cache_at(Some((height, hash)))
+    }
+    pub fn validated_tip(&self) -> Result<Option<(u64, BlockHash)>, StorageError> {
+        let tx = self.db.tx()?;
+        let hash = tx.get_best_block_hash()?;
+        if hash == BlockHash::ZERO {
+            Ok(None)
+        } else {
+            Ok(Some((tx.get_best_block_height()?, hash)))
+        }
+    }
+    fn flush_cache_at(&mut self, tip: Option<(u64, BlockHash)>) -> Result<(), StorageError> {
         let cache = self.cache.get_mut();
-        if cache.is_empty() && self.pending_deletes.is_empty() {
+        if self.dirty.is_empty() && self.pending_deletes.is_empty() && tip.is_none() {
+            cache.clear();
             return Ok(());
         }
 
@@ -154,7 +404,8 @@ impl<DB: Database> PersistentUtxoSet<DB> {
         }
 
         // Write created/cached UTXOs to DB
-        for (outpoint, entry) in cache.iter() {
+        for outpoint in &self.dirty {
+            let entry = &cache[outpoint];
             tx.put_utxo(outpoint, &entry.txout)?;
             let meta_outpoint = OutPoint::new(outpoint.txid, outpoint.vout | 0x8000_0000);
             let meta_txout = TxOut {
@@ -163,17 +414,21 @@ impl<DB: Database> PersistentUtxoSet<DB> {
             };
             tx.put_utxo(&meta_outpoint, &meta_txout)?;
         }
+        if let Some((height, hash)) = tip {
+            tx.set_best_block(height, &hash)?;
+        }
         tx.commit()?;
 
         cache.clear();
+        self.dirty.clear();
         self.pending_deletes.clear();
+        self.evict_cache();
         Ok(())
     }
 
     /// Return the number of entries currently in the cache.
     pub fn cache_len(&self) -> usize {
-        // SAFETY: only reading the length, no mutation.
-        unsafe { (*self.cache.get()).len() }
+        self.cache.lock().len()
     }
 
     // -----------------------------------------------------------------------
@@ -260,7 +515,12 @@ impl<DB: Database> PersistentUtxoSet<DB> {
             return;
         }
         let to_remove = cache.len() - self.cache_size_limit;
-        let keys_to_remove: Vec<OutPoint> = cache.keys().take(to_remove).copied().collect();
+        let keys_to_remove: Vec<OutPoint> = cache
+            .keys()
+            .filter(|op| !self.dirty.contains(op))
+            .take(to_remove)
+            .copied()
+            .collect();
         for key in keys_to_remove {
             cache.remove(&key);
         }
@@ -268,29 +528,25 @@ impl<DB: Database> PersistentUtxoSet<DB> {
 }
 
 impl<DB: Database> UtxoSet for PersistentUtxoSet<DB> {
-    fn get_utxo(&self, outpoint: &OutPoint) -> Option<&UtxoEntry> {
-        let cache_ptr = self.cache.get();
-
-        // SAFETY: We only read from the map here.  If we find the entry, we
-        // return a reference whose lifetime is tied to `&self`.  The entry will
-        // not be removed until `&mut self` is taken (apply_update / flush_cache),
-        // which cannot happen while `&self` is borrowed.
-        if let Some(entry) = unsafe { (*cache_ptr).get(outpoint) } {
+    fn get_utxo(&self, outpoint: &OutPoint) -> Option<UtxoEntry> {
+        // The upper vout bit is reserved for local metadata. No valid block
+        // can contain 2^31 outputs, and metadata must never appear as a coin.
+        if outpoint.vout & 0x8000_0000 != 0 {
+            return None;
+        }
+        if self.pending_deletes.contains(outpoint) {
+            return None;
+        }
+        if let Some(entry) = self.cache.lock().get(outpoint).cloned() {
             return Some(entry);
         }
-
-        // Cache miss — load from DB and promote into cache.
         let entry = self.load_from_db(outpoint)?;
-
-        // SAFETY: No outstanding references into the map exist (the `get` above
-        // returned `None`).  We insert a new entry and immediately obtain a
-        // reference to it.  The reference is valid for `&self`'s lifetime because
-        // entries are never removed while `&self` is borrowed (removal requires
-        // `&mut self`).
-        unsafe {
-            (*cache_ptr).insert(*outpoint, entry);
-            (*cache_ptr).get(outpoint)
+        // Bound clean read-through entries without evicting dirty creations.
+        let mut cache = self.cache.lock();
+        if cache.len() < self.cache_size_limit {
+            cache.insert(*outpoint, entry.clone());
         }
+        Some(entry)
     }
 }
 
@@ -306,7 +562,494 @@ mod tests {
     use btc_primitives::amount::Amount;
     use btc_primitives::hash::TxHash;
     use btc_primitives::script::ScriptBuf;
-    use btc_primitives::transaction::{OutPoint, TxOut};
+    use btc_primitives::transaction::{OutPoint, Transaction, TxOut};
+
+    struct FailCommitDb {
+        inner: Arc<RedbDatabase>,
+        fail: Arc<std::sync::atomic::AtomicBool>,
+    }
+    struct FailCommitTx {
+        inner: crate::redb_backend::RedbTxMut,
+        fail: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl Database for FailCommitDb {
+        type TX = crate::redb_backend::RedbTx;
+        type TXMut = FailCommitTx;
+        fn tx(&self) -> Result<Self::TX, StorageError> {
+            self.inner.tx()
+        }
+        fn tx_mut(&self) -> Result<Self::TXMut, StorageError> {
+            Ok(FailCommitTx {
+                inner: self.inner.tx_mut()?,
+                fail: self.fail.clone(),
+            })
+        }
+    }
+    impl DbTx for FailCommitTx {
+        fn exex_state(
+            &self,
+            name: &str,
+        ) -> Result<Option<crate::exex::ExtensionState>, StorageError> {
+            self.inner.exex_state(name)
+        }
+        fn exex_journal_tip(&self) -> Result<Option<crate::exex::JournalTip>, StorageError> {
+            self.inner.exex_journal_tip()
+        }
+        fn exex_journal_entry(
+            &self,
+            sequence: u64,
+        ) -> Result<Option<crate::exex::JournalEntry>, StorageError> {
+            self.inner.exex_journal_entry(sequence)
+        }
+        fn stage_checkpoint(&self) -> Result<Option<(u64, BlockHash)>, StorageError> {
+            self.inner.stage_checkpoint()
+        }
+        fn script_index_tip(&self) -> Result<Option<(u64, BlockHash)>, StorageError> {
+            self.inner.script_index_tip()
+        }
+        fn get_block_undo(&self, hash: &BlockHash) -> Result<Option<Vec<u8>>, StorageError> {
+            self.inner.get_block_undo(hash)
+        }
+        fn get_block(&self, hash: &BlockHash) -> Result<Option<Block>, StorageError> {
+            self.inner.get_block(hash)
+        }
+        fn get_block_header(
+            &self,
+            hash: &BlockHash,
+        ) -> Result<Option<btc_primitives::block::BlockHeader>, StorageError> {
+            self.inner.get_block_header(hash)
+        }
+        fn get_block_hash_by_height(&self, height: u64) -> Result<Option<BlockHash>, StorageError> {
+            self.inner.get_block_hash_by_height(height)
+        }
+        fn get_transaction(
+            &self,
+            txid: &btc_primitives::hash::TxHash,
+        ) -> Result<Option<btc_primitives::transaction::Transaction>, StorageError> {
+            self.inner.get_transaction(txid)
+        }
+        fn get_utxo(&self, outpoint: &OutPoint) -> Result<Option<TxOut>, StorageError> {
+            self.inner.get_utxo(outpoint)
+        }
+        fn get_best_block_height(&self) -> Result<u64, StorageError> {
+            self.inner.get_best_block_height()
+        }
+        fn get_best_block_hash(&self) -> Result<BlockHash, StorageError> {
+            self.inner.get_best_block_hash()
+        }
+        fn get_tx_block_index(
+            &self,
+            txid: &btc_primitives::hash::TxHash,
+        ) -> Result<Option<crate::traits::TxBlockLocation>, StorageError> {
+            self.inner.get_tx_block_index(txid)
+        }
+        fn get_address_txs(
+            &self,
+            script_hash: &[u8; 32],
+        ) -> Result<Vec<crate::traits::AddressIndexValue>, StorageError> {
+            self.inner.get_address_txs(script_hash)
+        }
+    }
+    impl DbTxMut for FailCommitTx {
+        fn set_exex_state(
+            &self,
+            name: &str,
+            state: &crate::exex::ExtensionState,
+        ) -> Result<(), StorageError> {
+            self.inner.set_exex_state(name, state)
+        }
+        fn append_exex_event(
+            &self,
+            connected: bool,
+            height: u64,
+            block: &Block,
+        ) -> Result<(), StorageError> {
+            self.inner.append_exex_event(connected, height, block)
+        }
+        fn set_stage_checkpoint(&self, height: u64, hash: &BlockHash) -> Result<(), StorageError> {
+            self.inner.set_stage_checkpoint(height, hash)
+        }
+        fn set_script_index_tip(&self, height: u64, hash: &BlockHash) -> Result<(), StorageError> {
+            self.inner.set_script_index_tip(height, hash)
+        }
+        fn index_script_plan(
+            &self,
+            plan: &crate::index_plan::BlockIndexPlan,
+            remove: bool,
+        ) -> Result<(), StorageError> {
+            self.inner.index_script_plan(plan, remove)
+        }
+        fn put_block_undo(&self, hash: &BlockHash, bytes: &[u8]) -> Result<(), StorageError> {
+            self.inner.put_block_undo(hash, bytes)
+        }
+        fn delete_block_hash_by_height(&self, height: u64) -> Result<(), StorageError> {
+            self.inner.delete_block_hash_by_height(height)
+        }
+        fn delete_tx_block_index(&self, txid: &btc_primitives::TxHash) -> Result<(), StorageError> {
+            self.inner.delete_tx_block_index(txid)
+        }
+        fn replace_mempool(&self, transactions: &[Transaction]) -> Result<(), StorageError> {
+            self.inner.replace_mempool(transactions)
+        }
+        fn put_block(&self, hash: &BlockHash, block: &Block) -> Result<(), StorageError> {
+            self.inner.put_block(hash, block)
+        }
+        fn put_block_header(
+            &self,
+            hash: &BlockHash,
+            header: &btc_primitives::block::BlockHeader,
+        ) -> Result<(), StorageError> {
+            self.inner.put_block_header(hash, header)
+        }
+        fn put_block_hash_by_height(
+            &self,
+            height: u64,
+            hash: &BlockHash,
+        ) -> Result<(), StorageError> {
+            self.inner.put_block_hash_by_height(height, hash)
+        }
+        fn put_transaction(
+            &self,
+            txid: &btc_primitives::hash::TxHash,
+            transaction: &btc_primitives::transaction::Transaction,
+        ) -> Result<(), StorageError> {
+            self.inner.put_transaction(txid, transaction)
+        }
+        fn put_utxo(&self, outpoint: &OutPoint, output: &TxOut) -> Result<(), StorageError> {
+            self.inner.put_utxo(outpoint, output)
+        }
+        fn delete_utxo(&self, outpoint: &OutPoint) -> Result<(), StorageError> {
+            self.inner.delete_utxo(outpoint)
+        }
+        fn set_best_block(&self, height: u64, hash: &BlockHash) -> Result<(), StorageError> {
+            self.inner.set_best_block(height, hash)
+        }
+        fn put_tx_block_index(
+            &self,
+            txid: &btc_primitives::hash::TxHash,
+            hash: &BlockHash,
+            position: u32,
+        ) -> Result<(), StorageError> {
+            self.inner.put_tx_block_index(txid, hash, position)
+        }
+        fn put_address_tx(
+            &self,
+            script_hash: &[u8; 32],
+            entry: &crate::traits::AddressIndexValue,
+        ) -> Result<(), StorageError> {
+            self.inner.put_address_tx(script_hash, entry)
+        }
+        fn commit(self) -> Result<(), StorageError> {
+            if self.fail.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                Err(StorageError::Database("injected commit failure".into()))
+            } else {
+                self.inner.commit()
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_stage_commit_failure_rolls_back_receipt_and_actual_indices_with_coins() {
+        let (db, _dir) = temp_db();
+        let genesis =
+            btc_consensus::chain::genesis_block(&btc_consensus::validation::ChainParams::regtest());
+        let old = genesis.block_hash();
+        let write = db.tx_mut().unwrap();
+        write.set_best_block(0, &old).unwrap();
+        write.set_script_index_tip(0, &old).unwrap();
+        write.set_stage_checkpoint(0, &old).unwrap();
+        write.initialize_exex_journal(old).unwrap();
+        write.commit().unwrap();
+        // Actual serialized body/txid/script rows, used to exercise the storage transaction.
+        let mut block = genesis.clone();
+        block.header.prev_blockhash = old;
+        block.header.time += 1;
+        block.transactions[0].inputs[0].script_sig = ScriptBuf::from_bytes(vec![0x51, 0x00]);
+        block.header.merkle_root = block.compute_merkle_root();
+        while !block.header.check_proof_of_work() {
+            block.header.nonce += 1;
+        }
+        let hash = block.block_hash();
+        let id = block.transactions[0].txid();
+        let op = OutPoint::new(id, 0);
+        let entry = UtxoEntry {
+            txout: block.transactions[0].outputs[0].clone(),
+            height: 1,
+            is_coinbase: true,
+        };
+        let undo = UtxoSetUpdate {
+            spent: vec![],
+            created: vec![(op, entry.clone())],
+        };
+        let plan = crate::index_plan::BlockIndexPlan::new(
+            1,
+            &block,
+            &undo,
+            crate::index_plan::BlockIndexPlan::transaction_rows(&block).unwrap(),
+        )
+        .unwrap();
+        let changes = HashMap::from([(op, Some(entry.clone()))]);
+        let attached = vec![(1, block.clone())];
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let fault_db = Arc::new(FailCommitDb {
+            inner: db.clone(),
+            fail: fail.clone(),
+        });
+        let mut coins = PersistentUtxoSet::new(fault_db.clone());
+        let transition = || ChainTransition {
+            incoming: &block,
+            height: 1,
+            undo: &undo,
+            detached: &[],
+            attached: &attached,
+            coins: &changes,
+            tip: Some((1, hash)),
+            old_height: 0,
+            mempool: &[],
+        };
+        assert!(coins
+            .commit_chain_transition_with_stage_plan(transition(), None, Some(&plan))
+            .is_err());
+        assert!(!coins.contains(&op));
+        let read = db.tx().unwrap();
+        assert_eq!(read.stage_checkpoint().unwrap(), Some((0, old)));
+        assert_eq!(read.exex_journal_tip().unwrap().unwrap().sequence, 0);
+        assert!(read.exex_journal_entry(1).unwrap().is_none());
+        assert_eq!(read.script_index_tip().unwrap(), Some((0, old)));
+        assert_eq!(read.get_best_block_hash().unwrap(), old);
+        assert!(read.get_block(&hash).unwrap().is_none());
+        assert!(read.get_block_undo(&hash).unwrap().is_none());
+        assert!(read.get_tx_block_index(&id).unwrap().is_none());
+        let script = btc_primitives::hash::sha256(entry.txout.script_pubkey.as_bytes());
+        assert!(read.script_history(&script, 10).unwrap().is_empty());
+        drop(read);
+        assert!(coins.commit_chain_transition(transition()).is_err()); // no legacy shortcut after stages are enabled
+        coins
+            .commit_chain_transition_with_stage_plan(transition(), None, Some(&plan))
+            .unwrap();
+        let read = db.tx().unwrap();
+        assert_eq!(read.stage_checkpoint().unwrap(), Some((1, hash)));
+        assert_eq!(read.exex_journal_tip().unwrap().unwrap().sequence, 1);
+        assert_eq!(read.exex_journal_entry(1).unwrap().unwrap().hash, hash);
+        assert_eq!(read.script_index_tip().unwrap(), Some((1, hash)));
+        assert_eq!(
+            read.get_tx_block_index(&id).unwrap().unwrap().block_hash,
+            hash
+        );
+        assert_eq!(read.script_history(&script, 10).unwrap()[0].txid, id);
+        assert_eq!(coins.get_utxo(&op), Some(entry));
+        let checkpoint = crate::exex::ExtensionState {
+            cursor: read.exex_journal_tip().unwrap().unwrap(),
+            state: vec![1, 2, 3],
+        };
+        drop(read);
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let write = fault_db.tx_mut().unwrap();
+        write.set_exex_state("atomic-v1", &checkpoint).unwrap();
+        assert!(write.commit().is_err());
+        assert!(db.tx().unwrap().exex_state("atomic-v1").unwrap().is_none());
+        assert_eq!(
+            db.tx().unwrap().exex_journal_tip().unwrap().unwrap(),
+            checkpoint.cursor
+        );
+        let write = fault_db.tx_mut().unwrap();
+        write.set_exex_state("atomic-v1", &checkpoint).unwrap();
+        write.commit().unwrap();
+        assert_eq!(
+            db.tx().unwrap().exex_state("atomic-v1").unwrap(),
+            Some(checkpoint)
+        );
+    }
+
+    #[test]
+    fn block_commit_failure_preserves_tip_body_and_coins_until_retry() {
+        let (db, _dir) = temp_db();
+        let mut initial = PersistentUtxoSet::new(db.clone());
+        let old_coin = make_outpoint(0x41, 0);
+        let old_entry = make_entry(500, 1, false);
+        initial.apply_update_cached(&UtxoSetUpdate {
+            spent: vec![],
+            created: vec![(old_coin, old_entry.clone())],
+        });
+        let old_tip = BlockHash::from_bytes([0x42; 32]);
+        initial.flush_cache_with_tip(1, old_tip).unwrap();
+        let block = Block {
+            header: btc_primitives::block::BlockHeader {
+                version: 4,
+                prev_blockhash: old_tip,
+                merkle_root: btc_primitives::hash::TxHash::ZERO,
+                time: 2,
+                bits: btc_primitives::compact::CompactTarget(0x207fffff),
+                nonce: 0,
+            },
+            transactions: vec![],
+        };
+        let new_coin = make_outpoint(0x43, 0);
+        let update = UtxoSetUpdate {
+            spent: vec![(old_coin, old_entry.clone())],
+            created: vec![(new_coin, make_entry(400, 2, false))],
+        };
+        let mut set = PersistentUtxoSet::new(Arc::new(FailCommitDb {
+            inner: db.clone(),
+            fail: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }));
+        assert_eq!(set.get_utxo(&old_coin), Some(old_entry.clone()));
+        assert!(set.apply_block_update(&block, 2, &update).is_err());
+        assert_eq!(set.get_utxo(&old_coin), Some(old_entry));
+        assert!(!set.contains(&new_coin));
+        let reader = PersistentUtxoSet::new(db.clone());
+        assert_eq!(reader.validated_tip().unwrap(), Some((1, old_tip)));
+        assert!(reader.contains(&old_coin));
+        assert!(!reader.contains(&new_coin));
+        assert!(db
+            .tx()
+            .unwrap()
+            .get_block(&block.block_hash())
+            .unwrap()
+            .is_none());
+        set.apply_block_update(&block, 2, &update).unwrap();
+        let reader = PersistentUtxoSet::new(db.clone());
+        assert_eq!(
+            reader.validated_tip().unwrap(),
+            Some((2, block.block_hash()))
+        );
+        assert!(!reader.contains(&old_coin));
+        assert!(reader.contains(&new_coin));
+        assert!(!reader.contains(&OutPoint::new(new_coin.txid, new_coin.vout | 0x8000_0000)));
+        assert_eq!(
+            db.tx().unwrap().get_block(&block.block_hash()).unwrap(),
+            Some(block)
+        );
+    }
+
+    #[test]
+    fn reorg_commit_failure_leaves_coins_indices_undo_tip_and_pool_unchanged() {
+        let (db, _dir) = temp_db();
+        let mut initial = PersistentUtxoSet::new(db.clone());
+        let old_coin = make_outpoint(0x51, 0);
+        let new_coin = make_outpoint(0x52, 0);
+        let old_entry = make_entry(500, 1, false);
+        initial
+            .apply_update(&UtxoSetUpdate {
+                spent: vec![],
+                created: vec![(old_coin, old_entry.clone())],
+            })
+            .unwrap();
+        let old = Block {
+            header: btc_primitives::block::BlockHeader {
+                version: 4,
+                prev_blockhash: BlockHash::ZERO,
+                merkle_root: TxHash::ZERO,
+                time: 1,
+                bits: btc_primitives::compact::CompactTarget(0x207fffff),
+                nonce: 0,
+            },
+            transactions: vec![],
+        };
+        let mut next = old.clone();
+        next.header.nonce = 1;
+        let write = db.tx_mut().unwrap();
+        write.put_block(&old.block_hash(), &old).unwrap();
+        write
+            .put_block_hash_by_height(1, &old.block_hash())
+            .unwrap();
+        write
+            .put_tx_block_index(&old_coin.txid, &old.block_hash(), 0)
+            .unwrap();
+        write.set_best_block(1, &old.block_hash()).unwrap();
+        write.commit().unwrap();
+        let update = UtxoSetUpdate {
+            spent: vec![(old_coin, old_entry.clone())],
+            created: vec![(new_coin, make_entry(400, 1, false))],
+        };
+        let coins = HashMap::from([
+            (old_coin, None),
+            (new_coin, Some(make_entry(400, 1, false))),
+        ]);
+        let mut set = PersistentUtxoSet::new(Arc::new(FailCommitDb {
+            inner: db.clone(),
+            fail: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }));
+        let detached = vec![(1, old.clone())];
+        let attached = vec![(1, next.clone())];
+        let transition = || ChainTransition {
+            incoming: &next,
+            height: 1,
+            undo: &update,
+            detached: &detached,
+            attached: &attached,
+            coins: &coins,
+            tip: Some((1, next.block_hash())),
+            old_height: 1,
+            mempool: &[],
+        };
+        assert!(set.commit_chain_transition(transition()).is_err());
+        assert_eq!(set.get_utxo(&old_coin), Some(old_entry));
+        assert!(!set.contains(&new_coin));
+        let reader = db.tx().unwrap();
+        assert_eq!(reader.get_best_block_hash().unwrap(), old.block_hash());
+        assert_eq!(
+            reader.get_block_hash_by_height(1).unwrap(),
+            Some(old.block_hash())
+        );
+        assert!(reader.get_block_undo(&next.block_hash()).unwrap().is_none());
+        assert!(reader.get_block(&next.block_hash()).unwrap().is_none());
+        assert_eq!(
+            reader
+                .get_tx_block_index(&old_coin.txid)
+                .unwrap()
+                .unwrap()
+                .block_hash,
+            old.block_hash()
+        );
+        drop(reader);
+        set.commit_chain_transition(transition()).unwrap();
+        let fresh = PersistentUtxoSet::new(db.clone());
+        assert_eq!(fresh.validated_tip().unwrap(), Some((1, next.block_hash())));
+        assert!(!fresh.contains(&old_coin));
+        assert!(fresh.contains(&new_coin));
+        let raw = db
+            .tx()
+            .unwrap()
+            .get_block_undo(&next.block_hash())
+            .unwrap()
+            .unwrap();
+        let decoded = crate::undo::decode_undo(next.block_hash(), &raw).unwrap();
+        assert_eq!(decoded.spent, update.spent);
+        assert_eq!(decoded.created, update.created);
+    }
+
+    #[test]
+    fn validated_tip_is_committed_with_utxo_changes() {
+        let (db, _dir) = temp_db();
+        let mut set = PersistentUtxoSet::new(Arc::clone(&db));
+        let op = make_outpoint(0xe0, 0);
+        let hash = BlockHash::from_bytes([0xaa; 32]);
+        set.apply_update_cached(&UtxoSetUpdate {
+            spent: vec![],
+            created: vec![(op, make_entry(42, 1, false))],
+        });
+        let old = PersistentUtxoSet::new(Arc::clone(&db));
+        assert_eq!(old.validated_tip().unwrap(), None);
+        assert!(!old.contains(&op));
+        set.flush_cache_with_tip(1, hash).unwrap();
+        let committed = PersistentUtxoSet::new(Arc::clone(&db));
+        assert_eq!(committed.validated_tip().unwrap(), Some((1, hash)));
+        assert!(committed.contains(&op));
+        let entry = set.get_utxo(&op).unwrap();
+        set.apply_update_cached(&UtxoSetUpdate {
+            spent: vec![(op, entry)],
+            created: vec![],
+        });
+        let old = PersistentUtxoSet::new(Arc::clone(&db));
+        assert_eq!(old.validated_tip().unwrap(), Some((1, hash)));
+        assert!(old.contains(&op));
+        let next = BlockHash::from_bytes([0xbb; 32]);
+        set.flush_cache_with_tip(2, next).unwrap();
+        let committed = PersistentUtxoSet::new(db);
+        assert_eq!(committed.validated_tip().unwrap(), Some((2, next)));
+        assert!(!committed.contains(&op));
+    }
 
     /// Helper: create a temporary RedbDatabase.
     fn temp_db() -> (Arc<RedbDatabase>, tempfile::TempDir) {
@@ -505,7 +1248,12 @@ mod tests {
 
         // Insert 10 UTXOs — cache should be capped at 5 after eviction.
         let entries: Vec<(OutPoint, UtxoEntry)> = (0u8..10)
-            .map(|i| (make_outpoint(i, 0), make_entry(1_000 * i as u64, i as u64, false)))
+            .map(|i| {
+                (
+                    make_outpoint(i, 0),
+                    make_entry(1_000 * i as u64, i as u64, false),
+                )
+            })
             .collect();
 
         let update = UtxoSetUpdate {
@@ -633,8 +1381,14 @@ mod tests {
             .unwrap();
 
         assert!(utxo_set.get_utxo(&op1).is_none());
-        assert_eq!(utxo_set.get_utxo(&op2).unwrap().txout.value.as_sat(), 20_000);
-        assert_eq!(utxo_set.get_utxo(&op3).unwrap().txout.value.as_sat(), 30_000);
+        assert_eq!(
+            utxo_set.get_utxo(&op2).unwrap().txout.value.as_sat(),
+            20_000
+        );
+        assert_eq!(
+            utxo_set.get_utxo(&op3).unwrap().txout.value.as_sat(),
+            30_000
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -713,10 +1467,9 @@ mod tests {
             created: vec![],
         });
 
-        // The cache no longer has it, but get_utxo falls through to DB
-        // and re-loads it. This is expected behavior — the cached spend
-        // only takes full effect after flush.
-        // Verify a fresh instance still sees it in DB.
+        // The live view must hide the spent output immediately, even though
+        // a separate reader still sees the last committed database snapshot.
+        assert!(utxo_set.get_utxo(&op).is_none());
         {
             let fresh = PersistentUtxoSet::new(Arc::clone(&db));
             assert!(fresh.get_utxo(&op).is_some());
@@ -790,9 +1543,14 @@ mod tests {
         let (db, _dir) = temp_db();
         let mut utxo_set = PersistentUtxoSet::with_cache_limit(Arc::clone(&db), 3);
 
-        // Insert 5 UTXOs through cached path — cache should be capped at 3.
+        // Dirty entries must survive the cache limit until they are flushed.
         let entries: Vec<(OutPoint, UtxoEntry)> = (0u8..5)
-            .map(|i| (make_outpoint(0x70 + i, 0), make_entry(i as u64 * 100, i as u64, false)))
+            .map(|i| {
+                (
+                    make_outpoint(0x70 + i, 0),
+                    make_entry(i as u64 * 100, i as u64, false),
+                )
+            })
             .collect();
 
         utxo_set.apply_update_cached(&UtxoSetUpdate {
@@ -800,7 +1558,15 @@ mod tests {
             created: entries.clone(),
         });
 
+        for (op, entry) in &entries {
+            assert_eq!(utxo_set.get_utxo(op).as_ref(), Some(entry));
+        }
+        utxo_set.flush_cache().unwrap();
         assert!(utxo_set.cache_len() <= 3);
+        let fresh = PersistentUtxoSet::new(db);
+        for (op, entry) in &entries {
+            assert_eq!(fresh.get_utxo(op).as_ref(), Some(entry));
+        }
     }
 
     // -----------------------------------------------------------------------

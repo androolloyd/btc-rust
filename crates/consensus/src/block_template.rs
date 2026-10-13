@@ -3,13 +3,13 @@
 //! Assembles a candidate block from the mempool, selecting transactions
 //! by fee rate to maximize miner revenue while respecting consensus limits.
 
+use crate::validation::block_subsidy;
 use btc_primitives::amount::Amount;
 use btc_primitives::block::{Block, BlockHeader};
 use btc_primitives::compact::CompactTarget;
 use btc_primitives::hash::{BlockHash, TxHash};
 use btc_primitives::script::ScriptBuf;
 use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut, Witness};
-use crate::validation::block_subsidy;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -106,8 +106,27 @@ pub fn build_block_template(
 
     // Build coinbase transaction
     let coinbase_value = subsidy + total_fees;
-    let coinbase = build_coinbase(height, coinbase_script, coinbase_output_script, coinbase_value);
+    let mut coinbase = build_coinbase(
+        height,
+        coinbase_script,
+        coinbase_output_script,
+        coinbase_value,
+    );
 
+    if selected_txs.iter().any(Transaction::is_segwit) {
+        let mut leaves = vec![[0; 32]];
+        leaves.extend(selected_txs.iter().map(|t| t.wtxid().to_bytes()));
+        let mut preimage = btc_primitives::block::merkle_root(&leaves).to_vec();
+        preimage.extend_from_slice(&[0; 32]);
+        let commitment = btc_primitives::hash::sha256d(&preimage);
+        let mut script = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+        script.extend_from_slice(&commitment);
+        coinbase.outputs.push(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(script),
+        });
+        coinbase.witness = vec![Witness::from_items(vec![vec![0; 32]])];
+    }
     // Build header (nonce will be set by the miner)
     let mut all_txs = Vec::with_capacity(1 + selected_txs.len());
     all_txs.push(coinbase.clone());
@@ -142,19 +161,11 @@ fn build_coinbase(
     output_script: ScriptBuf,
     value: Amount,
 ) -> Transaction {
-    // BIP34: height must be in coinbase scriptSig
-    let mut script_sig_bytes = Vec::new();
-    // Encode height as minimal push
-    if height == 0 {
-        script_sig_bytes.push(0x00);
-    } else {
-        let height_bytes = height.to_le_bytes();
-        let len = 8 - height_bytes.iter().rev().take_while(|&&b| b == 0).count();
-        let len = len.max(1);
-        script_sig_bytes.push(len as u8);
-        script_sig_bytes.extend_from_slice(&height_bytes[..len]);
-    }
+    let mut script_sig_bytes = crate::validation::encode_bip34_height(height);
     script_sig_bytes.extend_from_slice(extra_data);
+    if script_sig_bytes.len() < 2 {
+        script_sig_bytes.push(0x00);
+    }
 
     Transaction {
         version: 2,
@@ -163,13 +174,11 @@ fn build_coinbase(
             script_sig: ScriptBuf::from_bytes(script_sig_bytes),
             sequence: 0xffffffff,
         }],
-        outputs: vec![
-            TxOut {
-                value,
-                script_pubkey: output_script,
-            },
-        ],
-        witness: vec![Witness::from_items(vec![vec![0u8; 32]])], // witness commitment placeholder
+        outputs: vec![TxOut {
+            value,
+            script_pubkey: output_script,
+        }],
+        witness: vec![],
         lock_time: 0,
     }
 }
@@ -195,7 +204,12 @@ mod tests {
     #[test]
     fn test_build_coinbase() {
         let output_script = ScriptBuf::from_bytes(vec![0x76, 0xa9, 0x14]);
-        let cb = build_coinbase(100, b"btc-rust", output_script, Amount::from_sat(5_000_000_000));
+        let cb = build_coinbase(
+            100,
+            b"btc-rust",
+            output_script,
+            Amount::from_sat(5_000_000_000),
+        );
 
         assert!(cb.is_coinbase());
         assert_eq!(cb.outputs[0].value.as_sat(), 5_000_000_000);
@@ -240,14 +254,12 @@ mod tests {
             lock_time: 0,
         };
 
-        let mut candidates = vec![
-            CandidateTx {
-                txid: tx1.txid(),
-                tx: tx1.clone(),
-                fee: Amount::from_sat(10_000),
-                weight: 400,
-            },
-        ];
+        let mut candidates = vec![CandidateTx {
+            txid: tx1.txid(),
+            tx: tx1.clone(),
+            fee: Amount::from_sat(10_000),
+            weight: 400,
+        }];
 
         let template = build_block_template(
             BlockHash::ZERO,
@@ -290,7 +302,7 @@ mod tests {
             CandidateTx {
                 txid: tx_low.txid(),
                 tx: tx_low,
-                fee: Amount::from_sat(100),  // low fee rate
+                fee: Amount::from_sat(100), // low fee rate
                 weight: 1000,
             },
             CandidateTx {
@@ -375,7 +387,12 @@ mod tests {
     #[test]
     fn test_build_coinbase_height_zero() {
         let output_script = ScriptBuf::from_bytes(vec![0x76, 0xa9]);
-        let cb = build_coinbase(0, b"btc-rust", output_script, Amount::from_sat(5_000_000_000));
+        let cb = build_coinbase(
+            0,
+            b"btc-rust",
+            output_script,
+            Amount::from_sat(5_000_000_000),
+        );
         assert!(cb.is_coinbase());
         let sig = cb.inputs[0].script_sig.as_bytes();
         assert_eq!(sig[0], 0x00); // OP_0 for height 0
@@ -449,14 +466,12 @@ mod tests {
             lock_time: 0,
         };
 
-        let mut candidates = vec![
-            CandidateTx {
-                txid: tx.txid(),
-                tx: tx.clone(),
-                fee: Amount::from_sat(10_000),
-                weight: 3_999_000, // exceeds available_weight (4M - 4K = 3,996,000)
-            },
-        ];
+        let mut candidates = vec![CandidateTx {
+            txid: tx.txid(),
+            tx: tx.clone(),
+            fee: Amount::from_sat(10_000),
+            weight: 3_999_000, // exceeds available_weight (4M - 4K = 3,996,000)
+        }];
 
         let template = build_block_template(
             BlockHash::ZERO,

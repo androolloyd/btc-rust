@@ -2,7 +2,7 @@
 //!
 //! Usage: cargo run --example forge_htlc
 
-use btc_forge::{ForgeScript, ScriptDebugger, ScriptEnv, analyze_script};
+use btc_forge::{analyze_script, ForgeScript, ScriptDebugger, ScriptEnv};
 use btc_primitives::hash::sha256;
 
 fn main() {
@@ -34,7 +34,12 @@ fn main() {
     println!("  Max stack depth: {}", analysis.max_stack_depth);
     println!("  Branches: {}", analysis.branches.len());
     for (i, branch) in analysis.branches.iter().enumerate() {
-        println!("    Branch {}: {} ({} ops)", i, branch.condition, branch.ops.len());
+        println!(
+            "    Branch {}: {} ({} ops)",
+            i,
+            branch.condition,
+            branch.ops.len()
+        );
     }
     println!("  Hex: {}", hex::encode(htlc.as_bytes()));
 

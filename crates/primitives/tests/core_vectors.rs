@@ -1,15 +1,14 @@
 /// Integration tests against Bitcoin Core test vectors
 /// These are the authoritative consensus compatibility tests.
-
 use btc_primitives::encode;
 use btc_primitives::transaction::Transaction;
 
 const TESTDATA_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata");
 
 fn load_test_vectors(filename: &str) -> serde_json::Value {
-    let path = format!("{}/{}", TESTDATA_DIR, filename);
-    let data = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {}", path, e));
+    let path = format!("{TESTDATA_DIR}/{filename}");
+    let data =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("failed to read {path}: {e}"));
     serde_json::from_str(&data).unwrap()
 }
 
@@ -45,22 +44,23 @@ mod base58 {
             let encoded = base58_encode(&bytes);
             assert_eq!(
                 encoded, expected_base58,
-                "base58 encode mismatch for hex: {}",
-                hex_str
+                "base58 encode mismatch for hex: {hex_str}"
             );
 
             let decoded = base58_decode(expected_base58).unwrap();
             assert_eq!(
                 decoded, bytes,
-                "base58 decode mismatch for: {}",
-                expected_base58
+                "base58 decode mismatch for: {expected_base58}"
             );
 
             tested += 1;
         }
 
-        assert!(tested > 10, "expected at least 10 base58 test vectors, got {}", tested);
-        eprintln!("passed {} base58 encode/decode test vectors", tested);
+        assert!(
+            tested > 10,
+            "expected at least 10 base58 test vectors, got {tested}"
+        );
+        eprintln!("passed {tested} base58 encode/decode test vectors");
     }
 
     // Re-implement base58 encode/decode here for testing (mirrors address.rs internals)
@@ -105,8 +105,7 @@ mod base58 {
             let val = BASE58_ALPHABET
                 .iter()
                 .position(|&c| c == ch as u8)
-                .ok_or_else(|| format!("invalid base58 char: {}", ch))?
-                as u32;
+                .ok_or_else(|| format!("invalid base58 char: {ch}"))? as u32;
             let mut carry = val;
             for byte in bytes.iter_mut() {
                 carry += (*byte as u32) * 58;
@@ -175,8 +174,8 @@ mod transactions {
             match encode::decode::<Transaction>(&tx_bytes) {
                 Ok(tx) => {
                     // Verify basic structural properties
-                    assert!(!tx.inputs.is_empty(), "tx should have inputs: {}", tx_hex);
-                    assert!(!tx.outputs.is_empty(), "tx should have outputs: {}", tx_hex);
+                    assert!(!tx.inputs.is_empty(), "tx should have inputs: {tx_hex}");
+                    assert!(!tx.outputs.is_empty(), "tx should have outputs: {tx_hex}");
 
                     // Re-encode and verify roundtrip
                     let re_encoded = encode::encode(&tx);
@@ -185,8 +184,7 @@ mod transactions {
                     if !tx.is_segwit() {
                         assert_eq!(
                             re_encoded, tx_bytes,
-                            "legacy tx roundtrip failed for: {}",
-                            tx_hex
+                            "legacy tx roundtrip failed for: {tx_hex}"
                         );
                     }
 
@@ -194,19 +192,19 @@ mod transactions {
                 }
                 Err(e) => {
                     skipped += 1;
-                    eprintln!("warning: failed to decode valid tx ({}): {}", &tx_hex[..20.min(tx_hex.len())], e);
+                    eprintln!(
+                        "warning: failed to decode valid tx ({}): {}",
+                        &tx_hex[..20.min(tx_hex.len())],
+                        e
+                    );
                 }
             }
         }
 
-        eprintln!(
-            "tx_valid: {} decoded successfully, {} skipped",
-            tested, skipped
-        );
+        eprintln!("tx_valid: {tested} decoded successfully, {skipped} skipped");
         assert!(
             tested > 50,
-            "expected at least 50 valid tx vectors to decode, got {}",
-            tested
+            "expected at least 50 valid tx vectors to decode, got {tested}"
         );
     }
 
@@ -257,8 +255,7 @@ mod transactions {
         }
 
         eprintln!(
-            "tx_invalid: {} tested ({} decoded structurally, {} failed decode)",
-            tested, decode_ok, decode_err
+            "tx_invalid: {tested} tested ({decode_ok} decoded structurally, {decode_err} failed decode)"
         );
         assert!(tested > 10, "expected at least 10 invalid tx vectors");
     }
@@ -321,11 +318,10 @@ mod sighash {
             }
         }
 
-        eprintln!("sighash: {} transactions deserialized", tested);
+        eprintln!("sighash: {tested} transactions deserialized");
         assert!(
             tested > 100,
-            "expected at least 100 sighash test vectors, got {}",
-            tested
+            "expected at least 100 sighash test vectors, got {tested}"
         );
     }
 }
@@ -359,7 +355,10 @@ mod key_io {
             let _script_hex = arr[1].as_str().unwrap();
             let meta = arr[2].as_object().unwrap();
 
-            let is_privkey = meta.get("isPrivkey").and_then(|v| v.as_bool()).unwrap_or(false);
+            let is_privkey = meta
+                .get("isPrivkey")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
 
             // Skip private key entries for now
             if is_privkey {
@@ -367,8 +366,10 @@ mod key_io {
             }
 
             // For base58 addresses (not bech32), test decode
-            if address_str.starts_with('1') || address_str.starts_with('3')
-                || address_str.starts_with('m') || address_str.starts_with('n')
+            if address_str.starts_with('1')
+                || address_str.starts_with('3')
+                || address_str.starts_with('m')
+                || address_str.starts_with('n')
                 || address_str.starts_with('2')
             {
                 // These are base58check addresses — verify they decode without error
@@ -382,24 +383,18 @@ mod key_io {
                     Ok(addr) => {
                         // Verify the address re-encodes to the same string
                         let re_encoded = addr.to_base58().unwrap();
-                        assert_eq!(
-                            re_encoded, address_str,
-                            "base58 address roundtrip failed"
-                        );
+                        assert_eq!(re_encoded, address_str, "base58 address roundtrip failed");
                         tested_base58 += 1;
                     }
                     Err(e) => {
                         // Some testnet addresses might have version mismatches
-                        eprintln!("warning: could not decode address {}: {}", address_str, e);
+                        eprintln!("warning: could not decode address {address_str}: {e}");
                     }
                 }
             }
         }
 
-        eprintln!(
-            "key_io_valid: {} base58 addresses tested",
-            tested_base58
-        );
+        eprintln!("key_io_valid: {tested_base58} base58 addresses tested");
         assert!(
             tested_base58 > 5,
             "expected at least 5 valid base58 addresses"
@@ -434,10 +429,14 @@ mod key_io {
 
             // These should all fail to decode as valid addresses
             // Try both networks
-            let result_main =
-                btc_primitives::address::Address::from_base58(invalid_str, btc_primitives::network::Network::Mainnet);
-            let result_test =
-                btc_primitives::address::Address::from_base58(invalid_str, btc_primitives::network::Network::Testnet);
+            let result_main = btc_primitives::address::Address::from_base58(
+                invalid_str,
+                btc_primitives::network::Network::Mainnet,
+            );
+            let result_test = btc_primitives::address::Address::from_base58(
+                invalid_str,
+                btc_primitives::network::Network::Testnet,
+            );
 
             // At least one should fail (bech32 addresses will fail base58 decode)
             if result_main.is_ok() && result_test.is_ok() {
@@ -448,7 +447,7 @@ mod key_io {
             tested += 1;
         }
 
-        eprintln!("key_io_invalid: {} entries tested", tested);
+        eprintln!("key_io_invalid: {tested} entries tested");
         assert!(tested > 10, "expected at least 10 invalid key_io entries");
     }
 }

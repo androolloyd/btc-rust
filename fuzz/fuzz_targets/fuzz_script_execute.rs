@@ -3,9 +3,13 @@
 use libfuzzer_sys::fuzz_target;
 use std::panic;
 
-use btc_primitives::script::ScriptBuf;
 use btc_consensus::script_engine::{ScriptEngine, ScriptFlags};
 use btc_consensus::sig_verify::Secp256k1Verifier;
+use btc_consensus::witness::verify_input_with_prevouts;
+use btc_primitives::amount::Amount;
+use btc_primitives::hash::{hash160, sha256, TxHash};
+use btc_primitives::script::ScriptBuf;
+use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut, Witness};
 
 fuzz_target!(|data: &[u8]| {
     // Cap script size to Bitcoin's consensus limit (10 000 bytes) to keep
@@ -16,6 +20,9 @@ fuzz_target!(|data: &[u8]| {
     }
 
     let script = ScriptBuf::from_bytes(data.to_vec());
+    for accurate in [false, true] {
+        let _ = btc_consensus::sigops::script_sigops(script.as_script(), accurate);
+    }
 
     // --- Instruction iterator must not panic ---
     for _instr in script.as_script().instructions() {
@@ -39,6 +46,130 @@ fuzz_target!(|data: &[u8]| {
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         let mut engine = ScriptEngine::new_without_tx(&verifier, flags);
         let _ = engine.execute(script.as_script());
+        // Also exercise the production P2SH dispatcher. The raw engine alone
+        // cannot detect missing script phases or stack-restoration panics.
+        if data.len() >= 3 {
+            let mask = data[0];
+            let payload = &data[3..];
+            let split = usize::from(u16::from_le_bytes([data[1], data[2]])).min(payload.len());
+            let (arguments, redeem) = payload.split_at(split);
+            let mut script_sig = ScriptBuf::from_bytes(arguments.to_vec());
+            script_sig.push_slice(redeem);
+            let previous = TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::p2sh(&hash160(redeem)),
+            };
+            let tx = Transaction {
+                version: 1,
+                inputs: vec![TxIn {
+                    previous_output: OutPoint::new(TxHash::from_bytes([1; 32]), 0),
+                    script_sig,
+                    sequence: u32::MAX,
+                }],
+                outputs: vec![TxOut {
+                    value: Amount::from_sat(49_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+                witness: if mask & 4 != 0 {
+                    vec![Witness::from_items(vec![arguments.to_vec()])]
+                } else {
+                    vec![]
+                },
+                lock_time: 0,
+            };
+            let witness_flags = if mask & 128 != 0 {
+                ScriptFlags::all()
+            } else {
+                ScriptFlags::consensus()
+            };
+            let mut flags = witness_flags;
+            flags.verify_p2sh = mask & 1 != 0;
+            flags.verify_witness = mask & 2 != 0;
+            flags.verify_cleanstack = mask & 8 != 0;
+            flags.verify_const_scriptcode = mask & 64 != 0;
+            let _ = btc_consensus::sigops::p2sh_sigops(
+                tx.inputs[0].script_sig.as_script(),
+                previous.script_pubkey.as_script(),
+            );
+            let _ = btc_consensus::sigops::transaction_sigop_cost(
+                &tx,
+                std::slice::from_ref(&previous),
+                &flags,
+            );
+            let _ = verify_input_with_prevouts(&tx, 0, &[previous], &verifier, &flags);
+
+            // Exercise native witness initialization/completion and the
+            // tapscript OP_SUCCESS pre-scan through actual committed outputs.
+            let items = if mask & 16 != 0 {
+                arguments.chunks(1).map(<[u8]>::to_vec).collect::<Vec<_>>()
+            } else {
+                vec![arguments.to_vec()]
+            };
+            let mut witness_tx = tx.clone();
+            witness_tx.inputs[0].script_sig = ScriptBuf::new();
+            witness_tx.witness = vec![Witness::from_items(
+                [items.clone(), vec![redeem.to_vec()]].concat(),
+            )];
+            let previous = TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::p2wsh(&sha256(redeem)),
+            };
+            let _ =
+                verify_input_with_prevouts(&witness_tx, 0, &[previous], &verifier, &witness_flags);
+            use btc_consensus::taproot::{
+                compute_taprootoutput_key, tap_branch_hash, tap_leaf_hash,
+            };
+            let internal = [
+                0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce, 0x87,
+                0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81, 0x5b,
+                0x16, 0xf8, 0x17, 0x98,
+            ];
+            if let Ok((output, parity)) =
+                compute_taprootoutput_key(&internal, Some(&tap_leaf_hash(0xc0, redeem)))
+            {
+                let control = [vec![0xc0 | parity], internal.to_vec()].concat();
+                witness_tx.witness = vec![Witness::from_items(
+                    [items, vec![redeem.to_vec(), control]].concat(),
+                )];
+                let previous = TxOut {
+                    value: Amount::from_sat(50_000),
+                    script_pubkey: ScriptBuf::p2tr(&output),
+                };
+                let _ = verify_input_with_prevouts(
+                    &witness_tx,
+                    0,
+                    &[previous],
+                    &verifier,
+                    &witness_flags,
+                );
+            }
+            // Treat the prefix as an arbitrary control proof and derive its
+            // real output point. This reaches control-depth/shape checks on
+            // the production path rather than only using depth-zero proofs.
+            if mask & 32 != 0 && arguments.len() >= 33 {
+                let internal: [u8; 32] = arguments[1..33].try_into().unwrap();
+                let mut root = tap_leaf_hash(arguments[0] & 0xfe, redeem);
+                for node in arguments[33..].chunks_exact(32) {
+                    root = tap_branch_hash(&root, &node.try_into().unwrap());
+                }
+                if let Ok((output, parity)) = compute_taprootoutput_key(&internal, Some(&root)) {
+                    let mut control = arguments.to_vec();
+                    control[0] = (control[0] & 0xfe) | parity;
+                    witness_tx.witness = vec![Witness::from_items(vec![redeem.to_vec(), control])];
+                    let previous = TxOut {
+                        value: Amount::from_sat(50_000),
+                        script_pubkey: ScriptBuf::p2tr(&output),
+                    };
+                    let _ = verify_input_with_prevouts(
+                        &witness_tx,
+                        0,
+                        &[previous],
+                        &verifier,
+                        &witness_flags,
+                    );
+                }
+            }
+        }
     }));
 
     // A panic in the script engine is a real bug -- re-panic so the fuzzer

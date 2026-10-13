@@ -36,6 +36,8 @@ pub enum ChainError {
     BadDifficultyBits { expected: u32, got: u32 },
     #[error("duplicate header {0}")]
     DuplicateHeader(BlockHash),
+    #[error("header persistence failed: {0}")]
+    CommitFailed(String),
     #[error("checkpoint mismatch at height {height}: expected {expected}, got {got}")]
     CheckpointMismatch {
         height: u64,
@@ -63,6 +65,7 @@ pub struct HeaderEntry {
 // ---------------------------------------------------------------------------
 
 /// Tracks the header chain, selecting the best tip by cumulative work.
+#[derive(Clone)]
 pub struct ChainState {
     /// Hash of the best (most-work) known header.
     best_header: BlockHash,
@@ -122,6 +125,11 @@ impl ChainState {
 
     /// Validate and accept a new block header, returning its hash on success.
     pub fn accept_header(&mut self, header: BlockHeader) -> Result<BlockHash, ChainError> {
+        self.accept_header_with_commit(header, || Ok(()))
+    }
+
+    /// Check a candidate against its actual ancestry without publishing it.
+    pub fn validate_header(&self, header: BlockHeader) -> Result<HeaderEntry, ChainError> {
         let hash = header.block_hash();
 
         // Reject duplicates.
@@ -192,23 +200,53 @@ impl ChainState {
         let header_work = calculate_header_work(&header);
         let cumulative_work = add_u256(&prev_entry.cumulative_work, &header_work);
 
-        let entry = HeaderEntry {
+        Ok(HeaderEntry {
             header,
             height: new_height,
             cumulative_work,
-        };
+        })
+    }
 
+    /// Validate first, persist through `commit`, then publish the new header.
+    /// A failed commit leaves the header chain unchanged.
+    pub fn accept_header_with_commit<F>(
+        &mut self,
+        header: BlockHeader,
+        commit: F,
+    ) -> Result<BlockHash, ChainError>
+    where
+        F: FnOnce() -> Result<(), String>,
+    {
+        let entry = self.validate_header(header)?;
+        let hash = header.block_hash();
+        let new_height = entry.height;
+        let cumulative_work = entry.cumulative_work;
+        commit().map_err(ChainError::CommitFailed)?;
         self.headers.insert(hash, entry);
 
         // Update best tip if more cumulative work.
         if compare_u256(&cumulative_work, &self.best_entry().cumulative_work)
             == std::cmp::Ordering::Greater
         {
+            let old_height = self.best_height;
             self.best_header = hash;
             self.best_height = new_height;
-            // Incrementally update the height index instead of rebuilding from scratch.
-            // This avoids O(chain_height) HashMap insertions per new header.
-            self.height_index.insert(new_height, hash);
+            // Replace the fork's height mappings as well as its tip.
+            let mut current = hash;
+            loop {
+                let entry = &self.headers[&current];
+                if self.height_index.get(&entry.height) == Some(&current) {
+                    break;
+                }
+                self.height_index.insert(entry.height, current);
+                if entry.height == 0 {
+                    break;
+                }
+                current = entry.header.prev_blockhash;
+            }
+            if new_height < old_height {
+                self.height_index.retain(|height, _| *height <= new_height);
+            }
         }
 
         Ok(hash)
@@ -217,6 +255,28 @@ impl ChainState {
     // ------------------------------------------------------------------
     // Accessors
     // ------------------------------------------------------------------
+
+    /// Select an already validated branch for contextual validation or durable
+    /// restoration. Callers must commit its matching coins before publishing it.
+    pub fn select_tip(&mut self, hash: BlockHash) -> Result<(), ChainError> {
+        let entry = self
+            .headers
+            .get(&hash)
+            .ok_or(ChainError::PrevBlockNotFound(hash))?;
+        self.best_height = entry.height;
+        self.best_header = hash;
+        self.height_index.clear();
+        let mut current = hash;
+        loop {
+            let entry = &self.headers[&current];
+            self.height_index.insert(entry.height, current);
+            if entry.height == 0 {
+                break;
+            }
+            current = entry.header.prev_blockhash;
+        }
+        Ok(())
+    }
 
     /// Look up a header entry by block hash.
     pub fn get_header(&self, hash: &BlockHash) -> Option<&HeaderEntry> {
@@ -232,7 +292,9 @@ impl ChainState {
 
     /// Return the best (most-work) header entry.
     pub fn best_header(&self) -> &HeaderEntry {
-        self.headers.get(&self.best_header).expect("best header must exist")
+        self.headers
+            .get(&self.best_header)
+            .expect("best header must exist")
     }
 
     /// Height of the best chain tip.
@@ -248,6 +310,31 @@ impl ChainState {
     /// Access the chain parameters.
     pub fn params(&self) -> &ChainParams {
         &self.params
+    }
+
+    /// Difficulty required for a block extending the current tip at `time`.
+    pub fn next_work_required(&self, time: u32) -> CompactTarget {
+        let prev = self.best_header();
+        let mut candidate = prev.header.clone();
+        candidate.prev_blockhash = prev.header.block_hash();
+        candidate.time = time;
+        self.get_next_work_required(prev.height + 1, &candidate, prev)
+    }
+
+    /// MTP including a validated candidate header without cloning/inserting a
+    /// complete chain merely to evaluate next-block mempool lock points.
+    pub fn median_time_past_with_header(&self, header: &BlockHeader) -> Option<u32> {
+        let mut times = vec![header.time];
+        let mut current = self.get_header(&header.prev_blockhash)?;
+        for _ in 1..MEDIAN_TIME_SPAN {
+            times.push(current.header.time);
+            if current.height == 0 {
+                break;
+            }
+            current = self.get_header(&current.header.prev_blockhash)?;
+        }
+        times.sort_unstable();
+        Some(times[times.len() / 2])
     }
 
     /// Build a set of block locator hashes for the `getheaders` P2P message.
@@ -288,7 +375,7 @@ impl ChainState {
     }
 
     /// Compute the median time of the previous `MEDIAN_TIME_SPAN` blocks.
-    fn median_time_past(&self, tip: &HeaderEntry) -> u32 {
+    pub fn median_time_past(&self, tip: &HeaderEntry) -> u32 {
         let mut times = Vec::with_capacity(MEDIAN_TIME_SPAN);
         let mut current = tip.clone();
         for _ in 0..MEDIAN_TIME_SPAN {
@@ -343,7 +430,11 @@ impl ChainState {
     }
 
     /// Walk backwards from `entry` to the ancestor at `target_height`.
-    fn get_ancestor<'a>(&'a self, entry: &'a HeaderEntry, target_height: u64) -> Option<&'a HeaderEntry> {
+    fn get_ancestor<'a>(
+        &'a self,
+        entry: &'a HeaderEntry,
+        target_height: u64,
+    ) -> Option<&'a HeaderEntry> {
         if entry.height < target_height {
             return None;
         }
@@ -353,7 +444,6 @@ impl ChainState {
         }
         Some(current)
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -492,13 +582,55 @@ pub fn genesis_header(params: &ChainParams) -> BlockHeader {
             version: 1,
             prev_blockhash: BlockHash::ZERO,
             merkle_root: TxHash::from_hex(
-                "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b",
+                "7aa0a7ae1e223414cb807e40cd57e667b718e42aaf9306db9102fe28912b7b4e",
             )
             .unwrap(),
             time: 1714777860,
             bits: CompactTarget::from_u32(0x1d00ffff),
             nonce: 393743547,
         },
+    }
+}
+
+/// Canonical complete genesis body from Core v29 kernel/chainparams.cpp.
+/// Reading this body does not connect its outputs to the spendable coin set.
+pub fn genesis_block(params: &ChainParams) -> btc_primitives::Block {
+    use btc_primitives::{Amount, OutPoint, ScriptBuf, Transaction, TxHash, TxIn, TxOut};
+    let testnet4 = params.network == btc_primitives::Network::Testnet4;
+    let message: &[u8] = if testnet4 {
+        b"03/May/2024 000000000000000000001ebd58c244970b3aa9d783bb001011fbe8ea8e98e00e"
+    } else {
+        b"The Times 03/Jan/2009 Chancellor on brink of second bailout for banks"
+    };
+    // Core intentionally pushes the serialized CScriptNum(4), not OP_4.
+    let mut script_sig = ScriptBuf::from_bytes(vec![4, 0xff, 0xff, 0, 0x1d, 1, 4]);
+    script_sig.push_slice(message);
+    let key = if testnet4 {
+        // The published Testnet4 genesis contains 33 zero bytes here. This is
+        // its actual unspendable historical script, not a synthesized curve key.
+        vec![0; 33]
+    } else {
+        hex::decode("04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f").expect("constant genesis key")
+    };
+    let mut script_pubkey = ScriptBuf::new();
+    script_pubkey.push_slice(&key);
+    script_pubkey.push_opcode(btc_primitives::Opcode::OP_CHECKSIG);
+    btc_primitives::Block {
+        header: genesis_header(params),
+        transactions: vec![Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::ZERO, u32::MAX),
+                script_sig,
+                sequence: u32::MAX,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                script_pubkey,
+            }],
+            witness: vec![],
+            lock_time: 0,
+        }],
     }
 }
 
@@ -716,6 +848,40 @@ mod tests {
     use super::*;
     use btc_primitives::hash::TxHash;
 
+    #[test]
+    fn all_published_network_genesis_bodies_bind_exact_header_identity() {
+        for network in [
+            btc_primitives::Network::Mainnet,
+            btc_primitives::Network::Testnet,
+            btc_primitives::Network::Testnet4,
+            btc_primitives::Network::Signet,
+            btc_primitives::Network::Regtest,
+        ] {
+            let params = ChainParams::from_network(network);
+            let block = genesis_block(&params);
+            assert!(block.header.check_proof_of_work());
+            assert!(
+                block.check_merkle_root(),
+                "{network:?}: {}",
+                block.transactions[0].txid()
+            );
+            assert_eq!(block.block_hash(), params.genesis_hash);
+            assert_eq!(ChainState::new(params).best_header().header, block.header);
+            // Core's published Testnet4 transaction commits to its distinct
+            // timestamp and 33-zero-byte output, rather than the 2009 coinbase.
+            if network == btc_primitives::Network::Testnet4 {
+                assert_eq!(
+                    block.transactions[0].txid().to_string(),
+                    "7aa0a7ae1e223414cb807e40cd57e667b718e42aaf9306db9102fe28912b7b4e"
+                );
+                assert_eq!(
+                    block.block_hash().to_string(),
+                    "00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043"
+                );
+            }
+        }
+    }
+
     /// Helper: build a regtest ChainState (easiest PoW target).
     fn regtest_chain() -> ChainState {
         ChainState::new(ChainParams::regtest())
@@ -767,6 +933,53 @@ mod tests {
         assert_eq!(chain.best_height(), 1);
         assert_eq!(chain.best_header().header.block_hash(), hash);
         assert!(chain.get_header(&hash).is_some());
+    }
+
+    #[test]
+    fn failed_persistence_does_not_publish_a_header() {
+        let mut chain = regtest_chain();
+        let genesis = chain.best_header().header.block_hash();
+        let header = mine_header(chain.best_header(), chain.params.pow_limit);
+        let hash = header.block_hash();
+        let error = chain
+            .accept_header_with_commit(header, || Err("injected commit failure".into()))
+            .unwrap_err();
+        assert!(matches!(error, ChainError::CommitFailed(_)));
+        assert_eq!(chain.best_height(), 0);
+        assert_eq!(chain.best_header().header.block_hash(), genesis);
+        assert!(chain.get_header(&hash).is_none());
+        chain.accept_header(header).unwrap();
+        assert_eq!(chain.best_height(), 1);
+    }
+
+    #[test]
+    fn heavier_fork_replaces_every_affected_height_mapping() {
+        let mut chain = regtest_chain();
+        let genesis = chain.best_header().clone();
+        let bits = chain.params.pow_limit;
+        let first = mine_header(&genesis, bits);
+        chain.accept_header(first).unwrap();
+        let second = mine_header(chain.best_header(), bits);
+        chain.accept_header(second).unwrap();
+        let mut fork_first = mine_header(&genesis, bits);
+        fork_first.merkle_root = TxHash::from_bytes([42; 32]);
+        while !fork_first.check_proof_of_work() {
+            fork_first.nonce += 1;
+        }
+        let first_hash = chain.accept_header(fork_first).unwrap();
+        let fork_second = mine_header(chain.get_header(&first_hash).unwrap(), bits);
+        let second_hash = chain.accept_header(fork_second).unwrap();
+        let fork_third = mine_header(chain.get_header(&second_hash).unwrap(), bits);
+        chain.accept_header(fork_third).unwrap();
+        assert_eq!(
+            chain.get_header_by_height(1).unwrap().header.block_hash(),
+            first_hash
+        );
+        assert_eq!(
+            chain.get_header_by_height(2).unwrap().header.block_hash(),
+            second_hash
+        );
+        assert_eq!(chain.best_height(), 3);
     }
 
     // ---- Test: reject header with unknown prev_blockhash ----
@@ -857,7 +1070,10 @@ mod tests {
         // First entry must be the tip.
         assert_eq!(locators[0], chain.best_header().header.block_hash());
         // Last entry must be genesis.
-        assert_eq!(*locators.last().unwrap(), ChainParams::regtest().genesis_hash);
+        assert_eq!(
+            *locators.last().unwrap(),
+            ChainParams::regtest().genesis_hash
+        );
         // With 20 blocks we should get more than 10 locators but fewer than 20
         // because of exponential backoff.
         assert!(locators.len() > 10);
@@ -928,17 +1144,14 @@ mod tests {
 
         // The tip should have more cumulative work than genesis.
         let genesis = chain.get_header_by_height(0).unwrap();
-        assert!(
-            compare_u256(&tip_work, &genesis.cumulative_work) == std::cmp::Ordering::Greater
-        );
+        assert!(compare_u256(&tip_work, &genesis.cumulative_work) == std::cmp::Ordering::Greater);
 
         // Each subsequent block should have more cumulative work.
         for h in 0..3 {
             let a = chain.get_header_by_height(h).unwrap();
             let b = chain.get_header_by_height(h + 1).unwrap();
             assert!(
-                compare_u256(&b.cumulative_work, &a.cumulative_work)
-                    == std::cmp::Ordering::Greater,
+                compare_u256(&b.cumulative_work, &a.cumulative_work) == std::cmp::Ordering::Greater,
                 "block at height {} should have more work than height {}",
                 h + 1,
                 h
@@ -1005,7 +1218,11 @@ mod tests {
         // on actual vs expected timespan — this is correct signet behavior.
         let expected_at_retarget = chain.get_next_work_required(2016, &dummy_header, &genesis);
         // Just verify it returns something valid (non-zero)
-        assert_ne!(expected_at_retarget.to_u32(), 0, "retarget should produce valid difficulty");
+        assert_ne!(
+            expected_at_retarget.to_u32(),
+            0,
+            "retarget should produce valid difficulty"
+        );
     }
 
     // ---- Test: duplicate header rejection ----
@@ -1135,7 +1352,10 @@ mod tests {
     fn test_chain_accessors() {
         let chain = regtest_chain();
         // Test params() and checkpoints()
-        assert_eq!(chain.params().network, btc_primitives::network::Network::Regtest);
+        assert_eq!(
+            chain.params().network,
+            btc_primitives::network::Network::Regtest
+        );
         let _cp = chain.checkpoints();
     }
 
@@ -1243,7 +1463,12 @@ mod tests {
     fn test_difficulty_clamped_to_pow_limit() {
         let params = ChainParams::mainnet();
         // Use MAX_TARGET as old target and very long timespan => result clamped
-        let new_target = calculate_next_target(0, params.pow_target_timespan * 4, CompactTarget::MAX_TARGET, &params);
+        let new_target = calculate_next_target(
+            0,
+            params.pow_target_timespan * 4,
+            CompactTarget::MAX_TARGET,
+            &params,
+        );
         // Should be clamped to pow_limit
         assert!(new_target.to_u32() <= CompactTarget::MAX_TARGET.to_u32());
     }

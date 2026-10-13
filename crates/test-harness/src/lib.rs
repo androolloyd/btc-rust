@@ -7,7 +7,9 @@
 use std::collections::HashMap;
 
 use btc_consensus::utxo::{connect_block, InMemoryUtxoSet, UtxoSet, UtxoSetUpdate};
-use btc_consensus::validation::{block_subsidy, ChainParams};
+#[cfg(test)]
+use btc_consensus::validation::block_subsidy;
+use btc_consensus::validation::{block_subsidy_with_params, encode_bip34_height, ChainParams};
 use btc_mempool::pool::Mempool;
 use btc_primitives::amount::Amount;
 use btc_primitives::block::{Block, BlockHeader};
@@ -87,12 +89,13 @@ impl TestNode {
     /// next-block height.
     pub fn create_coinbase(&self, output_script: ScriptBuf) -> Transaction {
         let next_height = self.height + 1;
-        let subsidy = block_subsidy(next_height);
+        let subsidy = block_subsidy_with_params(next_height, &self.params);
 
         // Coinbase script_sig must include the block height (BIP 34).
-        let height_bytes = (next_height as u32).to_le_bytes();
-        let mut sig = vec![height_bytes.len() as u8];
-        sig.extend_from_slice(&height_bytes);
+        let mut sig = encode_bip34_height(next_height);
+        if sig.len() < 2 {
+            sig.push(0);
+        }
 
         Transaction {
             version: 2,
@@ -141,22 +144,20 @@ impl TestNode {
                     input_sum = input_sum + entry.txout.value;
                 }
             }
-            let output_sum: Amount = tx
-                .outputs
-                .iter()
-                .fold(Amount::ZERO, |acc, o| acc + o.value);
+            let output_sum: Amount = tx.outputs.iter().fold(Amount::ZERO, |acc, o| acc + o.value);
             if input_sum.as_sat() > output_sum.as_sat() {
                 total_fees = total_fees + (input_sum - output_sum);
             }
         }
 
         // Build coinbase claiming subsidy + fees.
-        let subsidy = block_subsidy(next_height);
+        let subsidy = block_subsidy_with_params(next_height, &self.params);
         let reward = subsidy + total_fees;
 
-        let height_bytes = (next_height as u32).to_le_bytes();
-        let mut sig = vec![height_bytes.len() as u8];
-        sig.extend_from_slice(&height_bytes);
+        let mut sig = encode_bip34_height(next_height);
+        if sig.len() < 2 {
+            sig.push(0);
+        }
 
         let coinbase_tx = Transaction {
             version: 2,
@@ -255,17 +256,11 @@ impl TestNode {
                 .utxo_set
                 .get_utxo(&inp.previous_output)
                 .ok_or_else(|| {
-                    format!(
-                        "input references unknown UTXO {:?}",
-                        inp.previous_output
-                    )
+                    format!("input references unknown UTXO {:?}", inp.previous_output)
                 })?;
             input_sum = input_sum + entry.txout.value;
         }
-        let output_sum: Amount = tx
-            .outputs
-            .iter()
-            .fold(Amount::ZERO, |acc, o| acc + o.value);
+        let output_sum: Amount = tx.outputs.iter().fold(Amount::ZERO, |acc, o| acc + o.value);
 
         if output_sum.as_sat() > input_sum.as_sat() {
             return Err(format!(
@@ -278,9 +273,7 @@ impl TestNode {
         let fee = input_sum - output_sum;
         let now = self.height; // use height as a cheap timestamp stand-in
 
-        self.mempool
-            .add_tx(tx, fee, now)
-            .map_err(|e| e.to_string())
+        self.mempool.add_tx(tx, fee, now).map_err(|e| e.to_string())
     }
 
     // ------------------------------------------------------------------
@@ -398,12 +391,7 @@ impl TestKeyPair {
     ///
     /// Returns the DER-encoded signature with the sighash byte appended,
     /// ready for use in `script_sig`.
-    pub fn sign_input(
-        &self,
-        tx: &Transaction,
-        input_index: usize,
-        prev_output: &TxOut,
-    ) -> Vec<u8> {
+    pub fn sign_input(&self, tx: &Transaction, input_index: usize, prev_output: &TxOut) -> Vec<u8> {
         use btc_consensus::sighash::{sighash_legacy, SighashType};
 
         let hash = sighash_legacy(
@@ -585,7 +573,7 @@ fn encode_script_num(n: i64) -> Vec<u8> {
 
     // If the most significant byte has the sign bit set, add an extra byte
     // to disambiguate from a negative number.
-    if result.last().map_or(false, |b| b & 0x80 != 0) {
+    if result.last().is_some_and(|b| b & 0x80 != 0) {
         result.push(if negative { 0x80 } else { 0x00 });
     } else if negative {
         let last = result.last_mut().unwrap();

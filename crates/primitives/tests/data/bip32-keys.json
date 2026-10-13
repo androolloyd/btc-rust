@@ -1,0 +1,457 @@
+{
+  "source": "https://raw.githubusercontent.com/bitcoin/bips/master/bip-0032.mediawiki",
+  "source_sha256": "e5e00a8289db2f681052cf24a745320afc225e66b25d1e489a7c884d2fc7f11f",
+  "license": "BSD-2-Clause",
+  "psbt_source": "https://raw.githubusercontent.com/bitcoin/bips/master/bip-0174.mediawiki",
+  "psbt_source_sha256": "f2a8e1a9c9e31cc7f607b3c7e2419c63eeccc4bd5b725968cde54ab8cfa1d410",
+  "scope": "All 17 valid public/private key pairs from BIP32 vectors 1-4 and all 16 invalid extended keys from vector 5. PSBT wrappers are independently serialized test-only unsigned metadata envelopes; invalid published BIP174 key cases are retained verbatim. Core decodepsbt only partially checks global xpub semantics, distinguished by core_parse_reject.",
+  "valid_keys": [
+    {
+      "vector": 1,
+      "seed_hex": "000102030405060708090a0b0c0d0e0f",
+      "path": "m",
+      "xpub": "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8",
+      "xprv": "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi",
+      "serialized_xpub": "0488b21e000000000000000000873dff81c02f525623fd1fe5167eac3a55a049de3d314bb42ee227ffed37d5080339a36013301597daef41fbe593a02cc513d0b55527ec2df1050e2e8ff49c85c2",
+      "master_fingerprint": "3442193e",
+      "child_indices": []
+    },
+    {
+      "vector": 1,
+      "seed_hex": "000102030405060708090a0b0c0d0e0f",
+      "path": "m/0'",
+      "xpub": "xpub68Gmy5EdvgibQVfPdqkBBCHxA5htiqg55crXYuXoQRKfDBFA1WEjWgP6LHhwBZeNK1VTsfTFUHCdrfp1bgwQ9xv5ski8PX9rL2dZXvgGDnw",
+      "xprv": "xprv9uHRZZhk6KAJC1avXpDAp4MDc3sQKNxDiPvvkX8Br5ngLNv1TxvUxt4cV1rGL5hj6KCesnDYUhd7oWgT11eZG7XnxHrnYeSvkzY7d2bhkJ7",
+      "serialized_xpub": "0488b21e013442193e8000000047fdacbd0f1097043b78c63c20c34ef4ed9a111d980047ad16282c7ae6236141035a784662a4a20a65bf6aab9ae98a6c068a81c52e4b032c0fb5400c706cfccc56",
+      "master_fingerprint": "3442193e",
+      "child_indices": [
+        2147483648
+      ]
+    },
+    {
+      "vector": 1,
+      "seed_hex": "000102030405060708090a0b0c0d0e0f",
+      "path": "m/0'/1",
+      "xpub": "xpub6ASuArnXKPbfEwhqN6e3mwBcDTgzisQN1wXN9BJcM47sSikHjJf3UFHKkNAWbWMiGj7Wf5uMash7SyYq527Hqck2AxYysAA7xmALppuCkwQ",
+      "xprv": "xprv9wTYmMFdV23N2TdNG573QoEsfRrWKQgWeibmLntzniatZvR9BmLnvSxqu53Kw1UmYPxLgboyZQaXwTCg8MSY3H2EU4pWcQDnRnrVA1xe8fs",
+      "serialized_xpub": "0488b21e025c1bd648000000012a7857631386ba23dacac34180dd1983734e444fdbf774041578e9b6adb37c1903501e454bf00751f24b1b489aa925215d66af2234e3891c3b21a52bedb3cd711c",
+      "master_fingerprint": "3442193e",
+      "child_indices": [
+        2147483648,
+        1
+      ]
+    },
+    {
+      "vector": 1,
+      "seed_hex": "000102030405060708090a0b0c0d0e0f",
+      "path": "m/0'/1/2'",
+      "xpub": "xpub6D4BDPcP2GT577Vvch3R8wDkScZWzQzMMUm3PWbmWvVJrZwQY4VUNgqFJPMM3No2dFDFGTsxxpG5uJh7n7epu4trkrX7x7DogT5Uv6fcLW5",
+      "xprv": "xprv9z4pot5VBttmtdRTWfWQmoH1taj2axGVzFqSb8C9xaxKymcFzXBDptWmT7FwuEzG3ryjH4ktypQSAewRiNMjANTtpgP4mLTj34bhnZX7UiM",
+      "serialized_xpub": "0488b21e03bef5a2f98000000204466b9cc8e161e966409ca52986c584f07e9dc81f735db683c3ff6ec7b1503f0357bfe1e341d01c69fe5654309956cbea516822fba8a601743a012a7896ee8dc2",
+      "master_fingerprint": "3442193e",
+      "child_indices": [
+        2147483648,
+        1,
+        2147483650
+      ]
+    },
+    {
+      "vector": 1,
+      "seed_hex": "000102030405060708090a0b0c0d0e0f",
+      "path": "m/0'/1/2'/2",
+      "xpub": "xpub6FHa3pjLCk84BayeJxFW2SP4XRrFd1JYnxeLeU8EqN3vDfZmbqBqaGJAyiLjTAwm6ZLRQUMv1ZACTj37sR62cfN7fe5JnJ7dh8zL4fiyLHV",
+      "xprv": "xprvA2JDeKCSNNZky6uBCviVfJSKyQ1mDYahRjijr5idH2WwLsEd4Hsb2Tyh8RfQMuPh7f7RtyzTtdrbdqqsunu5Mm3wDvUAKRHSC34sJ7in334",
+      "serialized_xpub": "0488b21e04ee7ab90c00000002cfb71883f01676f587d023cc53a35bc7f88f724b1f8c2892ac1275ac822a3edd02e8445082a72f29b75ca48748a914df60622a609cacfce8ed0e35804560741d29",
+      "master_fingerprint": "3442193e",
+      "child_indices": [
+        2147483648,
+        1,
+        2147483650,
+        2
+      ]
+    },
+    {
+      "vector": 1,
+      "seed_hex": "000102030405060708090a0b0c0d0e0f",
+      "path": "m/0'/1/2'/2/1000000000",
+      "xpub": "xpub6H1LXWLaKsWFhvm6RVpEL9P4KfRZSW7abD2ttkWP3SSQvnyA8FSVqNTEcYFgJS2UaFcxupHiYkro49S8yGasTvXEYBVPamhGW6cFJodrTHy",
+      "xprv": "xprvA41z7zogVVwxVSgdKUHDy1SKmdb533PjDz7J6N6mV6uS3ze1ai8FHa8kmHScGpWmj4WggLyQjgPie1rFSruoUihUZREPSL39UNdE3BBDu76",
+      "serialized_xpub": "0488b21e05d880d7d83b9aca00c783e67b921d2beb8f6b389cc646d7263b4145701dadd2161548a8b078e65e9e022a471424da5e657499d1ff51cb43c47481a03b1e77f951fe64cec9f5a48f7011",
+      "master_fingerprint": "3442193e",
+      "child_indices": [
+        2147483648,
+        1,
+        2147483650,
+        2,
+        1000000000
+      ]
+    },
+    {
+      "vector": 2,
+      "seed_hex": "fffcf9f6f3f0edeae7e4e1dedbd8d5d2cfccc9c6c3c0bdbab7b4b1aeaba8a5a29f9c999693908d8a8784817e7b7875726f6c696663605d5a5754514e4b484542",
+      "path": "m",
+      "xpub": "xpub661MyMwAqRbcFW31YEwpkMuc5THy2PSt5bDMsktWQcFF8syAmRUapSCGu8ED9W6oDMSgv6Zz8idoc4a6mr8BDzTJY47LJhkJ8UB7WEGuduB",
+      "xprv": "xprv9s21ZrQH143K31xYSDQpPDxsXRTUcvj2iNHm5NUtrGiGG5e2DtALGdso3pGz6ssrdK4PFmM8NSpSBHNqPqm55Qn3LqFtT2emdEXVYsCzC2U",
+      "serialized_xpub": "0488b21e00000000000000000060499f801b896d83179a4374aeb7822aaeaceaa0db1f85ee3e904c4defbd968903cbcaa9c98c877a26977d00825c956a238e8dddfbd322cce4f74b0b5bd6ace4a7",
+      "master_fingerprint": "bd16bee5",
+      "child_indices": []
+    },
+    {
+      "vector": 2,
+      "seed_hex": "fffcf9f6f3f0edeae7e4e1dedbd8d5d2cfccc9c6c3c0bdbab7b4b1aeaba8a5a29f9c999693908d8a8784817e7b7875726f6c696663605d5a5754514e4b484542",
+      "path": "m/0",
+      "xpub": "xpub69H7F5d8KSRgmmdJg2KhpAK8SR3DjMwAdkxj3ZuxV27CprR9LgpeyGmXUbC6wb7ERfvrnKZjXoUmmDznezpbZb7ap6r1D3tgFxHmwMkQTPH",
+      "xprv": "xprv9vHkqa6EV4sPZHYqZznhT2NPtPCjKuDKGY38FBWLvgaDx45zo9WQRUT3dKYnjwih2yJD9mkrocEZXo1ex8G81dwSM1fwqWpWkeS3v86pgKt",
+      "serialized_xpub": "0488b21e01bd16bee500000000f0909affaa7ee7abe5dd4e100598d4dc53cd709d5a5c2cac40e7412f232f7c9c02fc9e5af0ac8d9b3cecfe2a888e2117ba3d089d8585886c9c826b6b22a98d12ea",
+      "master_fingerprint": "bd16bee5",
+      "child_indices": [
+        0
+      ]
+    },
+    {
+      "vector": 2,
+      "seed_hex": "fffcf9f6f3f0edeae7e4e1dedbd8d5d2cfccc9c6c3c0bdbab7b4b1aeaba8a5a29f9c999693908d8a8784817e7b7875726f6c696663605d5a5754514e4b484542",
+      "path": "m/0/2147483647'",
+      "xpub": "xpub6ASAVgeehLbnwdqV6UKMHVzgqAG8Gr6riv3Fxxpj8ksbH9ebxaEyBLZ85ySDhKiLDBrQSARLq1uNRts8RuJiHjaDMBU4Zn9h8LZNnBC5y4a",
+      "xprv": "xprv9wSp6B7kry3Vj9m1zSnLvN3xH8RdsPP1Mh7fAaR7aRLcQMKTR2vidYEeEg2mUCTAwCd6vnxVrcjfy2kRgVsFawNzmjuHc2YmYRmagcEPdU9",
+      "serialized_xpub": "0488b21e025a61ff8effffffffbe17a268474a6bb9c61e1d720cf6215e2a88c5406c4aee7b38547f585c9a37d903c01e7425647bdefa82b12d9bad5e3e6865bee0502694b94ca58b666abc0a5c3b",
+      "master_fingerprint": "bd16bee5",
+      "child_indices": [
+        0,
+        4294967295
+      ]
+    },
+    {
+      "vector": 2,
+      "seed_hex": "fffcf9f6f3f0edeae7e4e1dedbd8d5d2cfccc9c6c3c0bdbab7b4b1aeaba8a5a29f9c999693908d8a8784817e7b7875726f6c696663605d5a5754514e4b484542",
+      "path": "m/0/2147483647'/1",
+      "xpub": "xpub6DF8uhdarytz3FWdA8TvFSvvAh8dP3283MY7p2V4SeE2wyWmG5mg5EwVvmdMVCQcoNJxGoWaU9DCWh89LojfZ537wTfunKau47EL2dhHKon",
+      "xprv": "xprv9zFnWC6h2cLgpmSA46vutJzBcfJ8yaJGg8cX1e5StJh45BBciYTRXSd25UEPVuesF9yog62tGAQtHjXajPPdbRCHuWS6T8XA2ECKADdw4Ef",
+      "serialized_xpub": "0488b21e03d8ab493700000001f366f48f1ea9f2d1d3fe958c95ca84ea18e4c4ddb9366c336c927eb246fb38cb03a7d1d856deb74c508e05031f9895dab54626251b3806e16b4bd12e781a7df5b9",
+      "master_fingerprint": "bd16bee5",
+      "child_indices": [
+        0,
+        4294967295,
+        1
+      ]
+    },
+    {
+      "vector": 2,
+      "seed_hex": "fffcf9f6f3f0edeae7e4e1dedbd8d5d2cfccc9c6c3c0bdbab7b4b1aeaba8a5a29f9c999693908d8a8784817e7b7875726f6c696663605d5a5754514e4b484542",
+      "path": "m/0/2147483647'/1/2147483646'",
+      "xpub": "xpub6ERApfZwUNrhLCkDtcHTcxd75RbzS1ed54G1LkBUHQVHQKqhMkhgbmJbZRkrgZw4koxb5JaHWkY4ALHY2grBGRjaDMzQLcgJvLJuZZvRcEL",
+      "xprv": "xprvA1RpRA33e1JQ7ifknakTFpgNXPmW2YvmhqLQYMmrj4xJXXWYpDPS3xz7iAxn8L39njGVyuoseXzU6rcxFLJ8HFsTjSyQbLYnMpCqE2VbFWc",
+      "serialized_xpub": "0488b21e0478412e3afffffffe637807030d55d01f9a0cb3a7839515d796bd07706386a6eddf06cc29a65a0e2902d2b36900396c9282fa14628566582f206a5dd0bcc8d5e892611806cafb0301f0",
+      "master_fingerprint": "bd16bee5",
+      "child_indices": [
+        0,
+        4294967295,
+        1,
+        4294967294
+      ]
+    },
+    {
+      "vector": 2,
+      "seed_hex": "fffcf9f6f3f0edeae7e4e1dedbd8d5d2cfccc9c6c3c0bdbab7b4b1aeaba8a5a29f9c999693908d8a8784817e7b7875726f6c696663605d5a5754514e4b484542",
+      "path": "m/0/2147483647'/1/2147483646'/2",
+      "xpub": "xpub6FnCn6nSzZAw5Tw7cgR9bi15UV96gLZhjDstkXXxvCLsUXBGXPdSnLFbdpq8p9HmGsApME5hQTZ3emM2rnY5agb9rXpVGyy3bdW6EEgAtqt",
+      "xprv": "xprvA2nrNbFZABcdryreWet9Ea4LvTJcGsqrMzxHx98MMrotbir7yrKCEXw7nadnHM8Dq38EGfSh6dqA9QWTyefMLEcBYJUuekgW4BYPJcr9E7j",
+      "serialized_xpub": "0488b21e0531a507b8000000029452b549be8cea3ecb7a84bec10dcfd94afe4d129ebfd3b3cb58eedf394ed271024d902e1a2fc7a8755ab5b694c575fce742c48d9ff192e63df5193e4c7afe1f9c",
+      "master_fingerprint": "bd16bee5",
+      "child_indices": [
+        0,
+        4294967295,
+        1,
+        4294967294,
+        2
+      ]
+    },
+    {
+      "vector": 3,
+      "seed_hex": "4b381541583be4423346c643850da4b320e46a87ae3d2a4e6da11eba819cd4acba45d239319ac14f863b8d5ab5a0d0c64d2e8a1e7d1457df2e5a3c51c73235be",
+      "path": "m",
+      "xpub": "xpub661MyMwAqRbcEZVB4dScxMAdx6d4nFc9nvyvH3v4gJL378CSRZiYmhRoP7mBy6gSPSCYk6SzXPTf3ND1cZAceL7SfJ1Z3GC8vBgp2epUt13",
+      "xprv": "xprv9s21ZrQH143K25QhxbucbDDuQ4naNntJRi4KUfWT7xo4EKsHt2QJDu7KXp1A3u7Bi1j8ph3EGsZ9Xvz9dGuVrtHHs7pXeTzjuxBrCmmhgC6",
+      "serialized_xpub": "0488b21e00000000000000000001d28a3e53cffa419ec122c968b3259e16b65076495494d97cae10bbfec3c36f03683af1ba5743bdfc798cf814efeeab2735ec52d95eced528e692b8e34c4e5669",
+      "master_fingerprint": "41d63b50",
+      "child_indices": []
+    },
+    {
+      "vector": 3,
+      "seed_hex": "4b381541583be4423346c643850da4b320e46a87ae3d2a4e6da11eba819cd4acba45d239319ac14f863b8d5ab5a0d0c64d2e8a1e7d1457df2e5a3c51c73235be",
+      "path": "m/0'",
+      "xpub": "xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y",
+      "xprv": "xprv9uPDJpEQgRQfDcW7BkF7eTya6RPxXeJCqCJGHuCJ4GiRVLzkTXBAJMu2qaMWPrS7AANYqdq6vcBcBUdJCVVFceUvJFjaPdGZ2y9WACViL4L",
+      "serialized_xpub": "0488b21e0141d63b5080000000e5fea12a97b927fc9dc3d2cb0d1ea1cf50aa5a1fdc1f933e8906bb38df3377bd026557fdda1d5d43d79611f784780471f086d58e8126b8c40acb82272a7712e7f2",
+      "master_fingerprint": "41d63b50",
+      "child_indices": [
+        2147483648
+      ]
+    },
+    {
+      "vector": 4,
+      "seed_hex": "3ddd5602285899a946114506157c7997e5444528f3003f6134712147db19b678",
+      "path": "m",
+      "xpub": "xpub661MyMwAqRbcGczjuMoRm6dXaLDEhW1u34gKenbeYqAix21mdUKJyuyu5F1rzYGVxyL6tmgBUAEPrEz92mBXjByMRiJdba9wpnN37RLLAXa",
+      "xprv": "xprv9s21ZrQH143K48vGoLGRPxgo2JNkJ3J3fqkirQC2zVdk5Dgd5w14S7fRDyHH4dWNHUgkvsvNDCkvAwcSHNAQwhwgNMgZhLtQC63zxwhQmRv",
+      "serialized_xpub": "0488b21e000000000000000000d0c8a1f6edf2500798c3e0b54f1b56e45f6d03e6076abd36e5e2f54101e44ce6026f6fedc9240f61daa9c7144b682a430a3a1366576f840bf2d070101fcbc9a02d",
+      "master_fingerprint": "ad85d955",
+      "child_indices": []
+    },
+    {
+      "vector": 4,
+      "seed_hex": "3ddd5602285899a946114506157c7997e5444528f3003f6134712147db19b678",
+      "path": "m/0'",
+      "xpub": "xpub69AUMk3qDBi3uW1sXgjCmVjJ2G6WQoYSnNHyzkmdCHEhSZ4tBok37xfFEqHd2AddP56Tqp4o56AePAgCjYdvpW2PU2jbUPFKsav5ut6Ch1m",
+      "xprv": "xprv9vB7xEWwNp9kh1wQRfCCQMnZUEG21LpbR9NPCNN1dwhiZkjjeGRnaALmPXCX7SgjFTiCTT6bXes17boXtjq3xLpcDjzEuGLQBM5ohqkao9G",
+      "serialized_xpub": "0488b21e01ad85d95580000000cdc0f06456a14876c898790e0b3b1a41c531170aec69da44ff7b7265bfe7743b039382d2b6003446792d2917f7ac4b3edf079a1a94dd4eb010dc25109dda680a9d",
+      "master_fingerprint": "ad85d955",
+      "child_indices": [
+        2147483648
+      ]
+    },
+    {
+      "vector": 4,
+      "seed_hex": "3ddd5602285899a946114506157c7997e5444528f3003f6134712147db19b678",
+      "path": "m/0'/1'",
+      "xpub": "xpub6BJA1jSqiukeaesWfxe6sNK9CCGaujFFSJLomWHprUL9DePQ4JDkM5d88n49sMGJxrhpjazuXYWdMf17C9T5XnxkopaeS7jGk1GyyVziaMt",
+      "xprv": "xprv9xJocDuwtYCMNAo3Zw76WENQeAS6WGXQ55RCy7tDJ8oALr4FWkuVoHJeHVAcAqiZLE7Je3vZJHxspZdFHfnBEjHqU5hG1Jaj32dVoS6XLT1",
+      "serialized_xpub": "0488b21e02cfa6128180000001a48ee6674c5264a237703fd383bccd9fad4d9378ac98ab05e6e7029b06360c0d032edaf9e591ee27f3c69c36221e3c54c38088ef34e93fbb9bb2d4d9b92364cbbd",
+      "master_fingerprint": "ad85d955",
+      "child_indices": [
+        2147483648,
+        2147483649
+      ]
+    }
+  ],
+  "invalid_keys": [
+    {
+      "key": "xpub661MyMwAqRbcEYS8w7XLSVeEsBXy79zSzH1J8vCdxAZningWLdN3zgtU6LBpB85b3D2yc8sfvZU521AAwdZafEz7mnzBBsz4wKY5fTtTQBm",
+      "case": "pubkey version / prvkey mismatch"
+    },
+    {
+      "key": "xprv9s21ZrQH143K24Mfq5zL5MhWK9hUhhGbd45hLXo2Pq2oqzMMo63oStZzFGTQQD3dC4H2D5GBj7vWvSQaaBv5cxi9gafk7NF3pnBju6dwKvH",
+      "case": "prvkey version / pubkey mismatch"
+    },
+    {
+      "key": "xpub661MyMwAqRbcEYS8w7XLSVeEsBXy79zSzH1J8vCdxAZningWLdN3zgtU6Txnt3siSujt9RCVYsx4qHZGc62TG4McvMGcAUjeuwZdduYEvFn",
+      "case": "invalid pubkey prefix 04"
+    },
+    {
+      "key": "xprv9s21ZrQH143K24Mfq5zL5MhWK9hUhhGbd45hLXo2Pq2oqzMMo63oStZzFGpWnsj83BHtEy5Zt8CcDr1UiRXuWCmTQLxEK9vbz5gPstX92JQ",
+      "case": "invalid prvkey prefix 04"
+    },
+    {
+      "key": "xpub661MyMwAqRbcEYS8w7XLSVeEsBXy79zSzH1J8vCdxAZningWLdN3zgtU6N8ZMMXctdiCjxTNq964yKkwrkBJJwpzZS4HS2fxvyYUA4q2Xe4",
+      "case": "invalid pubkey prefix 01"
+    },
+    {
+      "key": "xprv9s21ZrQH143K24Mfq5zL5MhWK9hUhhGbd45hLXo2Pq2oqzMMo63oStZzFAzHGBP2UuGCqWLTAPLcMtD9y5gkZ6Eq3Rjuahrv17fEQ3Qen6J",
+      "case": "invalid prvkey prefix 01"
+    },
+    {
+      "key": "xprv9s2SPatNQ9Vc6GTbVMFPFo7jsaZySyzk7L8n2uqKXJen3KUmvQNTuLh3fhZMBoG3G4ZW1N2kZuHEPY53qmbZzCHshoQnNf4GvELZfqTUrcv",
+      "case": "zero depth with non-zero parent fingerprint"
+    },
+    {
+      "key": "xpub661no6RGEX3uJkY4bNnPcw4URcQTrSibUZ4NqJEw5eBkv7ovTwgiT91XX27VbEXGENhYRCf7hyEbWrR3FewATdCEebj6znwMfQkhRYHRLpJ",
+      "case": "zero depth with non-zero parent fingerprint"
+    },
+    {
+      "key": "xprv9s21ZrQH4r4TsiLvyLXqM9P7k1K3EYhA1kkD6xuquB5i39AU8KF42acDyL3qsDbU9NmZn6MsGSUYZEsuoePmjzsB3eFKSUEh3Gu1N3cqVUN",
+      "case": "zero depth with non-zero index"
+    },
+    {
+      "key": "xpub661MyMwAuDcm6CRQ5N4qiHKrJ39Xe1R1NyfouMKTTWcguwVcfrZJaNvhpebzGerh7gucBvzEQWRugZDuDXjNDRmXzSZe4c7mnTK97pTvGS8",
+      "case": "zero depth with non-zero index"
+    },
+    {
+      "key": "DMwo58pR1QLEFihHiXPVykYB6fJmsTeHvyTp7hRThAtCX8CvYzgPcn8XnmdfHGMQzT7ayAmfo4z3gY5KfbrZWZ6St24UVf2Qgo6oujFktLHdHY4",
+      "case": "unknown extended key version"
+    },
+    {
+      "key": "DMwo58pR1QLEFihHiXPVykYB6fJmsTeHvyTp7hRThAtCX8CvYzgPcn8XnmdfHPmHJiEDXkTiJTVV9rHEBUem2mwVbbNfvT2MTcAqj3nesx8uBf9",
+      "case": "unknown extended key version"
+    },
+    {
+      "key": "xprv9s21ZrQH143K24Mfq5zL5MhWK9hUhhGbd45hLXo2Pq2oqzMMo63oStZzF93Y5wvzdUayhgkkFoicQZcP3y52uPPxFnfoLZB21Teqt1VvEHx",
+      "case": "private key 0 not in 1..n-1"
+    },
+    {
+      "key": "xprv9s21ZrQH143K24Mfq5zL5MhWK9hUhhGbd45hLXo2Pq2oqzMMo63oStZzFAzHGBP2UuGCqWLTAPLcMtD5SDKr24z3aiUvKr9bJpdrcLg1y3G",
+      "case": "private key n not in 1..n-1"
+    },
+    {
+      "key": "xpub661MyMwAqRbcEYS8w7XLSVeEsBXy79zSzH1J8vCdxAZningWLdN3zgtU6Q5JXayek4PRsn35jii4veMimro1xefsM58PgBMrvdYre8QyULY",
+      "case": "invalid pubkey 020000000000000000000000000000000000000000000000000000000000000007"
+    },
+    {
+      "key": "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHL",
+      "case": "invalid checksum"
+    }
+  ],
+  "psbt_vectors": [
+    {
+      "case": "BIP32 vector 1 m",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000004f010488b21e000000000000000000873dff81c02f525623fd1fe5167eac3a55a049de3d314bb42ee227ffed37d5080339a36013301597daef41fbe593a02cc513d0b55527ec2df1050e2e8ff49c85c2043442193e0022060339a36013301597daef41fbe593a02cc513d0b55527ec2df1050e2e8ff49c85c2043442193e0022020339a36013301597daef41fbe593a02cc513d0b55527ec2df1050e2e8ff49c85c2043442193e00",
+      "valid_key_index": 0
+    },
+    {
+      "case": "BIP32 vector 1 m/0'",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000004f010488b21e013442193e8000000047fdacbd0f1097043b78c63c20c34ef4ed9a111d980047ad16282c7ae6236141035a784662a4a20a65bf6aab9ae98a6c068a81c52e4b032c0fb5400c706cfccc56083442193e00000080002206035a784662a4a20a65bf6aab9ae98a6c068a81c52e4b032c0fb5400c706cfccc56083442193e00000080002202035a784662a4a20a65bf6aab9ae98a6c068a81c52e4b032c0fb5400c706cfccc56083442193e0000008000",
+      "valid_key_index": 1
+    },
+    {
+      "case": "BIP32 vector 1 m/0'/1",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000004f010488b21e025c1bd648000000012a7857631386ba23dacac34180dd1983734e444fdbf774041578e9b6adb37c1903501e454bf00751f24b1b489aa925215d66af2234e3891c3b21a52bedb3cd711c0c3442193e000000800100000000220603501e454bf00751f24b1b489aa925215d66af2234e3891c3b21a52bedb3cd711c0c3442193e000000800100000000220203501e454bf00751f24b1b489aa925215d66af2234e3891c3b21a52bedb3cd711c0c3442193e000000800100000000",
+      "valid_key_index": 2
+    },
+    {
+      "case": "BIP32 vector 1 m/0'/1/2'",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000004f010488b21e03bef5a2f98000000204466b9cc8e161e966409ca52986c584f07e9dc81f735db683c3ff6ec7b1503f0357bfe1e341d01c69fe5654309956cbea516822fba8a601743a012a7896ee8dc2103442193e0000008001000000020000800022060357bfe1e341d01c69fe5654309956cbea516822fba8a601743a012a7896ee8dc2103442193e0000008001000000020000800022020357bfe1e341d01c69fe5654309956cbea516822fba8a601743a012a7896ee8dc2103442193e00000080010000000200008000",
+      "valid_key_index": 3
+    },
+    {
+      "case": "BIP32 vector 1 m/0'/1/2'/2",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000004f010488b21e04ee7ab90c00000002cfb71883f01676f587d023cc53a35bc7f88f724b1f8c2892ac1275ac822a3edd02e8445082a72f29b75ca48748a914df60622a609cacfce8ed0e35804560741d29143442193e0000008001000000020000800200000000220602e8445082a72f29b75ca48748a914df60622a609cacfce8ed0e35804560741d29143442193e0000008001000000020000800200000000220202e8445082a72f29b75ca48748a914df60622a609cacfce8ed0e35804560741d29143442193e0000008001000000020000800200000000",
+      "valid_key_index": 4
+    },
+    {
+      "case": "BIP32 vector 1 m/0'/1/2'/2/1000000000",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000004f010488b21e05d880d7d83b9aca00c783e67b921d2beb8f6b389cc646d7263b4145701dadd2161548a8b078e65e9e022a471424da5e657499d1ff51cb43c47481a03b1e77f951fe64cec9f5a48f7011183442193e0000008001000000020000800200000000ca9a3b002206022a471424da5e657499d1ff51cb43c47481a03b1e77f951fe64cec9f5a48f7011183442193e0000008001000000020000800200000000ca9a3b002202022a471424da5e657499d1ff51cb43c47481a03b1e77f951fe64cec9f5a48f7011183442193e0000008001000000020000800200000000ca9a3b00",
+      "valid_key_index": 5
+    },
+    {
+      "case": "BIP32 vector 2 m",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000004f010488b21e00000000000000000060499f801b896d83179a4374aeb7822aaeaceaa0db1f85ee3e904c4defbd968903cbcaa9c98c877a26977d00825c956a238e8dddfbd322cce4f74b0b5bd6ace4a704bd16bee500220603cbcaa9c98c877a26977d00825c956a238e8dddfbd322cce4f74b0b5bd6ace4a704bd16bee500220203cbcaa9c98c877a26977d00825c956a238e8dddfbd322cce4f74b0b5bd6ace4a704bd16bee500",
+      "valid_key_index": 6
+    },
+    {
+      "case": "BIP32 vector 2 m/0",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000004f010488b21e01bd16bee500000000f0909affaa7ee7abe5dd4e100598d4dc53cd709d5a5c2cac40e7412f232f7c9c02fc9e5af0ac8d9b3cecfe2a888e2117ba3d089d8585886c9c826b6b22a98d12ea08bd16bee50000000000220602fc9e5af0ac8d9b3cecfe2a888e2117ba3d089d8585886c9c826b6b22a98d12ea08bd16bee50000000000220202fc9e5af0ac8d9b3cecfe2a888e2117ba3d089d8585886c9c826b6b22a98d12ea08bd16bee50000000000",
+      "valid_key_index": 7
+    },
+    {
+      "case": "BIP32 vector 2 m/0/2147483647'",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000004f010488b21e025a61ff8effffffffbe17a268474a6bb9c61e1d720cf6215e2a88c5406c4aee7b38547f585c9a37d903c01e7425647bdefa82b12d9bad5e3e6865bee0502694b94ca58b666abc0a5c3b0cbd16bee500000000ffffffff00220603c01e7425647bdefa82b12d9bad5e3e6865bee0502694b94ca58b666abc0a5c3b0cbd16bee500000000ffffffff00220203c01e7425647bdefa82b12d9bad5e3e6865bee0502694b94ca58b666abc0a5c3b0cbd16bee500000000ffffffff00",
+      "valid_key_index": 8
+    },
+    {
+      "case": "BIP32 vector 2 m/0/2147483647'/1",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000004f010488b21e03d8ab493700000001f366f48f1ea9f2d1d3fe958c95ca84ea18e4c4ddb9366c336c927eb246fb38cb03a7d1d856deb74c508e05031f9895dab54626251b3806e16b4bd12e781a7df5b910bd16bee500000000ffffffff0100000000220603a7d1d856deb74c508e05031f9895dab54626251b3806e16b4bd12e781a7df5b910bd16bee500000000ffffffff0100000000220203a7d1d856deb74c508e05031f9895dab54626251b3806e16b4bd12e781a7df5b910bd16bee500000000ffffffff0100000000",
+      "valid_key_index": 9
+    },
+    {
+      "case": "BIP32 vector 2 m/0/2147483647'/1/2147483646'",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000004f010488b21e0478412e3afffffffe637807030d55d01f9a0cb3a7839515d796bd07706386a6eddf06cc29a65a0e2902d2b36900396c9282fa14628566582f206a5dd0bcc8d5e892611806cafb0301f014bd16bee500000000ffffffff01000000feffffff00220602d2b36900396c9282fa14628566582f206a5dd0bcc8d5e892611806cafb0301f014bd16bee500000000ffffffff01000000feffffff00220202d2b36900396c9282fa14628566582f206a5dd0bcc8d5e892611806cafb0301f014bd16bee500000000ffffffff01000000feffffff00",
+      "valid_key_index": 10
+    },
+    {
+      "case": "BIP32 vector 2 m/0/2147483647'/1/2147483646'/2",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000004f010488b21e0531a507b8000000029452b549be8cea3ecb7a84bec10dcfd94afe4d129ebfd3b3cb58eedf394ed271024d902e1a2fc7a8755ab5b694c575fce742c48d9ff192e63df5193e4c7afe1f9c18bd16bee500000000ffffffff01000000feffffff02000000002206024d902e1a2fc7a8755ab5b694c575fce742c48d9ff192e63df5193e4c7afe1f9c18bd16bee500000000ffffffff01000000feffffff02000000002202024d902e1a2fc7a8755ab5b694c575fce742c48d9ff192e63df5193e4c7afe1f9c18bd16bee500000000ffffffff01000000feffffff0200000000",
+      "valid_key_index": 11
+    },
+    {
+      "case": "BIP32 vector 3 m",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000004f010488b21e00000000000000000001d28a3e53cffa419ec122c968b3259e16b65076495494d97cae10bbfec3c36f03683af1ba5743bdfc798cf814efeeab2735ec52d95eced528e692b8e34c4e56690441d63b5000220603683af1ba5743bdfc798cf814efeeab2735ec52d95eced528e692b8e34c4e56690441d63b5000220203683af1ba5743bdfc798cf814efeeab2735ec52d95eced528e692b8e34c4e56690441d63b5000",
+      "valid_key_index": 12
+    },
+    {
+      "case": "BIP32 vector 3 m/0'",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000004f010488b21e0141d63b5080000000e5fea12a97b927fc9dc3d2cb0d1ea1cf50aa5a1fdc1f933e8906bb38df3377bd026557fdda1d5d43d79611f784780471f086d58e8126b8c40acb82272a7712e7f20841d63b5000000080002206026557fdda1d5d43d79611f784780471f086d58e8126b8c40acb82272a7712e7f20841d63b5000000080002202026557fdda1d5d43d79611f784780471f086d58e8126b8c40acb82272a7712e7f20841d63b500000008000",
+      "valid_key_index": 13
+    },
+    {
+      "case": "BIP32 vector 4 m",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000004f010488b21e000000000000000000d0c8a1f6edf2500798c3e0b54f1b56e45f6d03e6076abd36e5e2f54101e44ce6026f6fedc9240f61daa9c7144b682a430a3a1366576f840bf2d070101fcbc9a02d04ad85d955002206026f6fedc9240f61daa9c7144b682a430a3a1366576f840bf2d070101fcbc9a02d04ad85d955002202026f6fedc9240f61daa9c7144b682a430a3a1366576f840bf2d070101fcbc9a02d04ad85d95500",
+      "valid_key_index": 14
+    },
+    {
+      "case": "BIP32 vector 4 m/0'",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000004f010488b21e01ad85d95580000000cdc0f06456a14876c898790e0b3b1a41c531170aec69da44ff7b7265bfe7743b039382d2b6003446792d2917f7ac4b3edf079a1a94dd4eb010dc25109dda680a9d08ad85d95500000080002206039382d2b6003446792d2917f7ac4b3edf079a1a94dd4eb010dc25109dda680a9d08ad85d95500000080002202039382d2b6003446792d2917f7ac4b3edf079a1a94dd4eb010dc25109dda680a9d08ad85d9550000008000",
+      "valid_key_index": 15
+    },
+    {
+      "case": "BIP32 vector 4 m/0'/1'",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000004f010488b21e02cfa6128180000001a48ee6674c5264a237703fd383bccd9fad4d9378ac98ab05e6e7029b06360c0d032edaf9e591ee27f3c69c36221e3c54c38088ef34e93fbb9bb2d4d9b92364cbbd0cad85d9550000008001000080002206032edaf9e591ee27f3c69c36221e3c54c38088ef34e93fbb9bb2d4d9b92364cbbd0cad85d9550000008001000080002202032edaf9e591ee27f3c69c36221e3c54c38088ef34e93fbb9bb2d4d9b92364cbbd0cad85d955000000800100008000",
+      "valid_key_index": 16
+    },
+    {
+      "case": "BIP32 invalid global xpub: pubkey version / prvkey mismatch",
+      "status": "invalid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000004f010488b21e000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c04c8be0718000000",
+      "core_parse_reject": true
+    },
+    {
+      "case": "BIP32 invalid global xpub: invalid pubkey prefix 04",
+      "status": "invalid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000004f010488b21e000000000000000000000000000000000000000000000000000000000000000000000000000000000004000000000000000000000000000000000000000000000000000000000000000c04972f2f75000000",
+      "core_parse_reject": true
+    },
+    {
+      "case": "BIP32 invalid global xpub: invalid pubkey prefix 01",
+      "status": "invalid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000004f010488b21e000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000000000000000000000000000000000000000000000000000000000000c04c7f378c6000000",
+      "core_parse_reject": true
+    },
+    {
+      "case": "BIP32 invalid global xpub: zero depth with non-zero parent fingerprint",
+      "status": "invalid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000004f010488b21e000101010100000000000000000000000000000000000000000000000000000000000000000000000003d01115d548e7561b15c38f004d734633687cf4419620095bc5b0f47070afe85a04dd100be700220603d01115d548e7561b15c38f004d734633687cf4419620095bc5b0f47070afe85a04dd100be700220203d01115d548e7561b15c38f004d734633687cf4419620095bc5b0f47070afe85a04dd100be700",
+      "core_parse_reject": true
+    },
+    {
+      "case": "BIP32 invalid global xpub: zero depth with non-zero index",
+      "status": "invalid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000004f010488b21e000000000001010101000000000000000000000000000000000000000000000000000000000000000003d01115d548e7561b15c38f004d734633687cf4419620095bc5b0f47070afe85a04dd100be700220603d01115d548e7561b15c38f004d734633687cf4419620095bc5b0f47070afe85a04dd100be700220203d01115d548e7561b15c38f004d734633687cf4419620095bc5b0f47070afe85a04dd100be700",
+      "core_parse_reject": true
+    },
+    {
+      "case": "BIP32 invalid global xpub: unknown extended key version",
+      "status": "invalid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000004f0101010101000000000000000000000000000000000000000000000000000000000000000000000000000000000003d01115d548e7561b15c38f004d734633687cf4419620095bc5b0f47070afe85a04dd100be700220603d01115d548e7561b15c38f004d734633687cf4419620095bc5b0f47070afe85a04dd100be700220203d01115d548e7561b15c38f004d734633687cf4419620095bc5b0f47070afe85a04dd100be700",
+      "core_parse_reject": false
+    },
+    {
+      "case": "BIP32 invalid global xpub: invalid pubkey 020000000000000000000000000000000000000000000000000000000000000007",
+      "status": "invalid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000004f010488b21e0000000000000000000000000000000000000000000000000000000000000000000000000000000000020000000000000000000000000000000000000000000000000000000000000007041a7340da002206020000000000000000000000000000000000000000000000000000000000000007041a7340da002202020000000000000000000000000000000000000000000000000000000000000007041a7340da00",
+      "core_parse_reject": true
+    },
+    {
+      "case": "PSBT with invalid pubkey length for input partial signature typed key",
+      "status": "invalid",
+      "hex": "70736274ff0100550200000001279a2323a5dfb51fc45f220fa58b0fc13e1e3342792a85d7e36cd6333b5cbc390000000000ffffffff01a05aea0b000000001976a914ffe9c0061097cc3b636f2cb0460fa4fc427d2b4588ac0000000000010120955eea0b0000000017a9146345200f68d189e1adc0df1c4d16ea8f14c0dbeb87210203b1341ccba7683b6af4f1238cd6e97e7167d569fac47f1e48d47541844355bd46304302200424b58effaaa694e1559ea5c93bbfd4a89064224055cdf070b6771469442d07021f5c8eb0fea6516d60b8acb33ad64ede60e8785bfb3aa94b99bdf86151db9a9a010104220020771fd18ad459666dd49f3d564e3dbc42f4c84774e360ada16816a8ed488d5681010547522103b1341ccba7683b6af4f1238cd6e97e7167d569fac47f1e48d47541844355bd462103de55d1e1dac805e3f8a58c1fbf9b94c02f3dbaafe127fefca4995f26f82083bd52ae220603b1341ccba7683b6af4f1238cd6e97e7167d569fac47f1e48d47541844355bd4610b4a6ba67000000800000008004000080220603de55d1e1dac805e3f8a58c1fbf9b94c02f3dbaafe127fefca4995f26f82083bd10b4a6ba670000008000000080050000800000",
+      "core_parse_reject": true
+    },
+    {
+      "case": "PSBT with invalid pubkey in input BIP 32 derivation paths typed key",
+      "status": "invalid",
+      "hex": "70736274ff0100550200000001279a2323a5dfb51fc45f220fa58b0fc13e1e3342792a85d7e36cd6333b5cbc390000000000ffffffff01a05aea0b000000001976a914ffe9c0061097cc3b636f2cb0460fa4fc427d2b4588ac0000000000010120955eea0b0000000017a9146345200f68d189e1adc0df1c4d16ea8f14c0dbeb87220203b1341ccba7683b6af4f1238cd6e97e7167d569fac47f1e48d47541844355bd4646304302200424b58effaaa694e1559ea5c93bbfd4a89064224055cdf070b6771469442d07021f5c8eb0fea6516d60b8acb33ad64ede60e8785bfb3aa94b99bdf86151db9a9a010104220020771fd18ad459666dd49f3d564e3dbc42f4c84774e360ada16816a8ed488d5681010547522103b1341ccba7683b6af4f1238cd6e97e7167d569fac47f1e48d47541844355bd462103de55d1e1dac805e3f8a58c1fbf9b94c02f3dbaafe127fefca4995f26f82083bd52ae210603b1341ccba7683b6af4f1238cd6e97e7167d569fac47f1e48d47541844355bd10b4a6ba67000000800000008004000080220603de55d1e1dac805e3f8a58c1fbf9b94c02f3dbaafe127fefca4995f26f82083bd10b4a6ba670000008000000080050000800000",
+      "core_parse_reject": true
+    },
+    {
+      "case": "PSBT with invalid pubkey in output BIP 32 derivation paths typed key",
+      "status": "invalid",
+      "hex": "70736274ff01009a020000000258e87a21b56daf0c23be8e7070456c336f7cbaa5c8757924f545887bb2abdd750000000000ffffffff838d0427d0ec650a68aa46bb0b098aea4422c071b2ca78352a077959d07cea1d0100000000ffffffff0270aaf00800000000160014d85c2b71d0060b09c9886aeb815e50991dda124d00e1f5050000000016001400aea9a2e5f0f876a588df5546e8742d1d87008f00000000000100bb0200000001aad73931018bd25f84ae400b68848be09db706eac2ac18298babee71ab656f8b0000000048473044022058f6fc7c6a33e1b31548d481c826c015bd30135aad42cd67790dab66d2ad243b02204a1ced2604c6735b6393e5b41691dd78b00f0c5942fb9f751856faa938157dba01feffffff0280f0fa020000000017a9140fb9463421696b82c833af241c78c17ddbde493487d0f20a270100000017a91429ca74f8a08f81999428185c97b5d852e4063f6187650000000107da00473044022074018ad4180097b873323c0015720b3684cc8123891048e7dbcd9b55ad679c99022073d369b740e3eb53dcefa33823c8070514ca55a7dd9544f157c167913261118c01483045022100f61038b308dc1da865a34852746f015772934208c6d24454393cd99bdf2217770220056e675a675a6d0a02b85b14e5e29074d8a25a9b5760bea2816f661910a006ea01475221029583bf39ae0a609747ad199addd634fa6108559d6c5cd39b4c2183f1ab96e07f2102dab61ff49a14db6a7d02b0cd1fbb78fc4b18312b5b4e54dae4dba2fbfef536d752ae0001012000c2eb0b0000000017a914b7f5faf40e3d40a5a459b1db3535f2b72fa921e8870107232200208c2353173743b595dfb4a07b72ba8e42e3797da74e87fe7d9d7497e3b20289030108da0400473044022062eb7a556107a7c73f45ac4ab5a1dddf6f7075fb1275969a7f383efff784bcb202200c05dbb7470dbf2f08557dd356c7325c1ed30913e996cd3840945db12228da5f01473044022065f45ba5998b59a27ffe1a7bed016af1f1f90d54b3aa8f7450aa5f56a25103bd02207f724703ad1edb96680b284b56d4ffcb88f7fb759eabbe08aa30f29b851383d20147522103089dc10c7ac6db54f91329af617333db388cead0c231f723379d1b99030b02dc21023add904f3d6dcf59ddb906b0dee23529b7ffb9ed50e5e86151926860221f0e7352ae00210203a9a4c37f5996d3aa25dbac6b570af0650394492942460b354753ed9eeca58710d90c6a4f000000800000008004000080002202027f6399757d2eff55a136ad02c684b1838b6556e5f1b6b34282a94b6b5005109610d90c6a4f00000080000000800500008000",
+      "core_parse_reject": true
+    }
+  ]
+}

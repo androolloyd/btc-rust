@@ -7,9 +7,10 @@
 mod bip39_wordlist;
 pub use bip39_wordlist::ENGLISH_WORDLIST;
 
-use sha2::{Sha256, Sha512, Digest};
 use pbkdf2::pbkdf2_hmac;
+use sha2::{Digest, Sha256, Sha512};
 use thiserror::Error;
+use unicode_normalization::UnicodeNormalization;
 
 /// Errors from BIP39 mnemonic operations.
 #[derive(Debug, Error)]
@@ -147,16 +148,11 @@ impl Mnemonic {
 
     /// Derive a 64-byte seed from the mnemonic using PBKDF2-HMAC-SHA512.
     pub fn to_seed(&self, passphrase: &str) -> [u8; 64] {
-        let mnemonic_str = self.words.join(" ");
-        let salt = format!("mnemonic{}", passphrase);
+        let mnemonic_str: String = self.words.join(" ").nfkd().collect();
+        let salt: String = format!("mnemonic{passphrase}").nfkd().collect();
 
         let mut seed = [0u8; 64];
-        pbkdf2_hmac::<Sha512>(
-            mnemonic_str.as_bytes(),
-            salt.as_bytes(),
-            2048,
-            &mut seed,
-        );
+        pbkdf2_hmac::<Sha512>(mnemonic_str.as_bytes(), salt.as_bytes(), 2048, &mut seed);
         seed
     }
 
@@ -256,18 +252,39 @@ mod tests {
 
     #[test]
     fn test_invalid_checksum() {
-        // Take a valid mnemonic and change the last word
-        let m = Mnemonic::generate(12).unwrap();
-        let mut words: Vec<String> = m.words().to_vec();
-        // Change last word to something that breaks checksum
-        words[11] = if words[11] == "abandon" { "zoo".into() } else { "abandon".into() };
-        let phrase = words.join(" ");
-        assert!(Mnemonic::from_phrase(&phrase).is_err());
+        // BIP39's last word includes entropy AND checksum. Replacing it
+        // arbitrarily can yield another valid mnemonic. Flip only checksum
+        // bits, preserving entropy, to guarantee rejection without randomness.
+        for size in [16, 20, 24, 28, 32] {
+            for entropy in [vec![0; size], vec![0xff; size], (0..size as u8).collect()] {
+                let valid = Mnemonic::from_entropy(&entropy).unwrap();
+                let words = valid.words();
+                let last = words.len() - 1;
+                let index = ENGLISH_WORDLIST
+                    .iter()
+                    .position(|word| *word == words[last])
+                    .unwrap();
+                let checksum_bits = size / 4;
+                for bit in 0..checksum_bits {
+                    let mut corrupted = words.to_vec();
+                    corrupted[last] = ENGLISH_WORDLIST[index ^ (1 << bit)].to_string();
+                    assert!(
+                        matches!(
+                            Mnemonic::from_phrase(&corrupted.join(" ")),
+                            Err(Bip39Error::InvalidChecksum)
+                        ),
+                        "size {size}, checksum bit {bit}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
     fn test_unknown_word() {
-        let result = Mnemonic::from_phrase("abandon ability able about above absent absorb abstract absurd abuse access notaword");
+        let result = Mnemonic::from_phrase(
+            "abandon ability able about above absent absorb abstract absurd abuse access notaword",
+        );
         assert!(matches!(result, Err(Bip39Error::UnknownWord(_))));
     }
 
@@ -275,6 +292,13 @@ mod tests {
     fn test_wrong_word_count_phrase() {
         let result = Mnemonic::from_phrase("abandon ability able");
         assert!(matches!(result, Err(Bip39Error::InvalidWordCount(3))));
+    }
+
+    #[test]
+    fn seed_passphrase_uses_nfkd() {
+        let m = Mnemonic::from_entropy(&[0; 16]).unwrap();
+        assert_eq!(m.to_seed("\u{00e9}"), m.to_seed("e\u{0301}"));
+        assert_eq!(m.to_seed("\u{ff21}"), m.to_seed("A"));
     }
 
     #[test]
@@ -297,7 +321,7 @@ mod tests {
     #[test]
     fn test_display_and_from_str() {
         let m1 = Mnemonic::generate(12).unwrap();
-        let display = format!("{}", m1);
+        let display = format!("{m1}");
         let m2: Mnemonic = display.parse().unwrap();
         assert_eq!(m1, m2);
     }
@@ -307,14 +331,9 @@ mod tests {
     fn test_vector_all_zeros_128() {
         let entropy = vec![0u8; 16];
         let m = Mnemonic::from_entropy(&entropy).unwrap();
-        // Known result for all-zeros entropy
-        assert_eq!(m.words()[0], "abandon");
-        assert_eq!(m.word_count(), 12);
-
-        // Verify seed with empty passphrase matches known vector
-        let seed = m.to_seed("TREZOR");
-        // The seed should be deterministic and non-zero
-        assert_ne!(seed, [0u8; 64]);
+        assert_eq!(m.phrase(), "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
+        assert_eq!(hex::encode(m.to_seed("TREZOR")),
+            "c55257c360c07c72029aebc1b53c05ed0362ada38ead3e3e9efa3708e53495531f09a6987599d18264c1e1c92f2cf141630c7a3c4ab7c81b2f001698e7463b04");
     }
 
     // BIP39 test vector: all-ones (0xff) 256-bit entropy
@@ -322,10 +341,59 @@ mod tests {
     fn test_vector_all_ff_256() {
         let entropy = vec![0xff; 32];
         let m = Mnemonic::from_entropy(&entropy).unwrap();
-        assert_eq!(m.word_count(), 24);
-        // All 0xff bits = index 2047 for each 11-bit chunk = "zoo" repeated
-        assert_eq!(m.words()[0], "zoo");
-        assert_eq!(m.words()[1], "zoo");
+        assert_eq!(m.phrase(), "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo vote");
+        assert_eq!(hex::encode(m.to_seed("TREZOR")),
+            "dd48c104698c30cfe2b6142103248622fb7bb0ff692eebb00089b32d22484e1613912f0a5b694407be899ffd31ed3992c456cdf60f5d4564b8ba3f05a69890ad");
+    }
+
+    #[test]
+    fn published_english_mnemonic_seed_and_master_key_vectors() {
+        // The independent reference vectors are linked directly from BIP39.
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/data/bip39-english.json")).unwrap();
+        let vectors = fixture["english"].as_array().unwrap();
+        assert_eq!(vectors.len(), 24);
+        for (i, vector) in vectors.iter().enumerate() {
+            let entropy = hex::decode(vector[0].as_str().unwrap()).unwrap();
+            let phrase = vector[1].as_str().unwrap();
+            let generated = Mnemonic::from_entropy(&entropy).unwrap();
+            assert_eq!(generated.phrase(), phrase, "vector {i} mnemonic");
+            let restored = Mnemonic::from_phrase(phrase).unwrap();
+            assert_eq!(restored.to_entropy(), entropy, "vector {i} entropy");
+            let seed = restored.to_seed(fixture["passphrase"].as_str().unwrap());
+            assert_eq!(
+                hex::encode(seed),
+                vector[2].as_str().unwrap(),
+                "vector {i} seed"
+            );
+            #[cfg(feature = "bip32")]
+            {
+                let key = crate::bip32::ExtendedPrivKey::from_seed(&seed, crate::Network::Mainnet)
+                    .unwrap();
+                assert_eq!(
+                    key.to_base58(),
+                    vector[3].as_str().unwrap(),
+                    "vector {i} master key"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn final_word_replacement_can_be_another_valid_mnemonic() {
+        // Explicit deterministic witness for the old CI test's false assumption:
+        // each phrase has a different last seven entropy bits and valid checksum.
+        let original = Mnemonic::from_phrase("blade abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon add").unwrap();
+        let replacement = Mnemonic::from_phrase("blade abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon").unwrap();
+        assert_eq!(
+            hex::encode(original.to_entropy()),
+            "17000000000000000000000000000001"
+        );
+        assert_eq!(
+            hex::encode(replacement.to_entropy()),
+            "17000000000000000000000000000000"
+        );
+        assert_ne!(original.to_entropy(), replacement.to_entropy());
     }
 
     #[test]

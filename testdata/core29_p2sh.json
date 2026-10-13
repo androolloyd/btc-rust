@@ -1,0 +1,144 @@
+{
+  "source": "https://github.com/bitcoin/bitcoin/blob/v29.0/src/test/data/script_tests.json",
+  "source_sha256": "195d1ae4c1701ffa4e4b0ac14ba2b451da0e73fb22292656cd0f2196a78010db",
+  "license": "MIT",
+  "scope": "All plain, non-WITNESS P2SH-flagged rows whose scriptPubKey is exactly the BIP16 template. Zero-based source row numbers are preserved; checks use the runtime dispatcher, not the differential mirror.",
+  "vectors": [
+    {
+      "core_row": 456,
+      "script_sig": "0 0x01 1",
+      "script_pubkey": "HASH160 0x14 0xda1745e9b549bd0bfa1a569971c77eba30cd5a4b EQUAL",
+      "flags": "P2SH,STRICTENC",
+      "expected": "OK",
+      "comment": "Very basic P2SH"
+    },
+    {
+      "core_row": 457,
+      "script_sig": "0x4c 0 0x01 1",
+      "script_pubkey": "HASH160 0x14 0xda1745e9b549bd0bfa1a569971c77eba30cd5a4b EQUAL",
+      "flags": "P2SH,STRICTENC",
+      "expected": "OK",
+      "comment": ""
+    },
+    {
+      "core_row": 745,
+      "script_sig": "1 0x01 0xb9",
+      "script_pubkey": "HASH160 0x14 0x15727299b05b45fdaf9ac9ecf7565cfe27c3e567 EQUAL",
+      "flags": "P2SH,DISCOURAGE_UPGRADABLE_NOPS",
+      "expected": "DISCOURAGE_UPGRADABLE_NOPS",
+      "comment": "Discouraged NOP10 in redeemScript"
+    },
+    {
+      "core_row": 914,
+      "script_sig": "NOP 0x01 1",
+      "script_pubkey": "HASH160 0x14 0xda1745e9b549bd0bfa1a569971c77eba30cd5a4b EQUAL",
+      "flags": "P2SH,STRICTENC",
+      "expected": "SIG_PUSHONLY",
+      "comment": "Tests for Script.IsPushOnly()"
+    },
+    {
+      "core_row": 915,
+      "script_sig": "NOP1 0x01 1",
+      "script_pubkey": "HASH160 0x14 0xda1745e9b549bd0bfa1a569971c77eba30cd5a4b EQUAL",
+      "flags": "P2SH,STRICTENC",
+      "expected": "SIG_PUSHONLY",
+      "comment": ""
+    },
+    {
+      "core_row": 916,
+      "script_sig": "0 0x01 0x50",
+      "script_pubkey": "HASH160 0x14 0xece424a6bb6ddf4db592c0faed60685047a361b1 EQUAL",
+      "flags": "P2SH,STRICTENC",
+      "expected": "BAD_OPCODE",
+      "comment": "OP_RESERVED in P2SH should fail"
+    },
+    {
+      "core_row": 917,
+      "script_sig": "0 0x01 VER",
+      "script_pubkey": "HASH160 0x14 0x0f4d7845db968f2a81b530b6f3c1d6246d4c7e01 EQUAL",
+      "flags": "P2SH,STRICTENC",
+      "expected": "BAD_OPCODE",
+      "comment": "OP_VER in P2SH should fail"
+    },
+    {
+      "core_row": 1028,
+      "script_sig": "0x47 0x3044022003fef42ed6c7be8917441218f525a60e2431be978e28b7aca4d7a532cc413ae8022067a1f82c74e8d69291b90d148778405c6257bbcfc2353cc38a3e1f22bf44254601 0x23 0x210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ac",
+      "script_pubkey": "HASH160 0x14 0x23b0ad3477f2178bc0b3eed26e4e6316f4e83aa1 EQUAL",
+      "flags": "P2SH",
+      "expected": "OK",
+      "comment": "P2SH(P2PK)"
+    },
+    {
+      "core_row": 1029,
+      "script_sig": "0x47 0x3044022003fef42ed6c7be8917441218f525a60e2431be978e28b7aca4d7a532cc413ae8022067a1f82c74e8d69291b90d148778405c6257bbcfc2353cc38a3e1f22bf44254601 0x23 0x210279be667ef9dcbbac54a06295ce870b07029bfcdb2dce28d959f2815b16f81798ac",
+      "script_pubkey": "HASH160 0x14 0x23b0ad3477f2178bc0b3eed26e4e6316f4e83aa1 EQUAL",
+      "flags": "P2SH",
+      "expected": "EVAL_FALSE",
+      "comment": "P2SH(P2PK), bad redeemscript"
+    },
+    {
+      "core_row": 1030,
+      "script_sig": "0x47 0x30440220781ba4f59a7b207a10db87628bc2168df4d59b844b397d2dbc9a5835fb2f2b7602206ed8fbcc1072fe2dfc5bb25909269e5dc42ffcae7ec2bc81d59692210ff30c2b01 0x41 0x0479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8 0x19 0x76a91491b24bf9f5288532960ac687abb035127b1d28a588ac",
+      "script_pubkey": "HASH160 0x14 0x7f67f0521934a57d3039f77f9f32cf313f3ac74b EQUAL",
+      "flags": "P2SH",
+      "expected": "OK",
+      "comment": "P2SH(P2PKH)"
+    },
+    {
+      "core_row": 1032,
+      "script_sig": "0x47 0x304402204e2eb034be7b089534ac9e798cf6a2c79f38bcb34d1b179efd6f2de0841735db022071461beb056b5a7be1819da6a3e3ce3662831ecc298419ca101eb6887b5dd6a401 0x19 0x76a9147cf9c846cd4882efec4bf07e44ebdad495c94f4b88ac",
+      "script_pubkey": "HASH160 0x14 0x2df519943d5acc0ef5222091f9dfe3543f489a82 EQUAL",
+      "flags": "P2SH",
+      "expected": "EQUALVERIFY",
+      "comment": "P2SH(P2PKH), bad sig"
+    },
+    {
+      "core_row": 1035,
+      "script_sig": "0 0x47 0x304402205b7d2c2f177ae76cfbbf14d589c113b0b35db753d305d5562dd0b61cbf366cfb02202e56f93c4f08a27f986cd424ffc48a462c3202c4902104d4d0ff98ed28f4bf8001 0x47 0x30440220563e5b3b1fc11662a84bc5ea2a32cc3819703254060ba30d639a1aaf2d5068ad0220601c1f47ddc76d93284dd9ed68f7c9974c4a0ea7cbe8a247d6bc3878567a5fca01 0x4c69 0x52210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179821038282263212c609d9ea2a6e3e172de238d8c39cabd5ac1ca10646e23fd5f515082103363d90d447b00c9c99ceac05b6262ee053441c7e55552ffe526bad8f83ff464053ae",
+      "script_pubkey": "HASH160 0x14 0xc9e4a896d149702d0d1695434feddd52e24ad78d EQUAL",
+      "flags": "P2SH",
+      "expected": "OK",
+      "comment": "P2SH(2-of-3)"
+    },
+    {
+      "core_row": 1036,
+      "script_sig": "0 0x47 0x304402205b7d2c2f177ae76cfbbf14d589c113b0b35db753d305d5562dd0b61cbf366cfb02202e56f93c4f08a27f986cd424ffc48a462c3202c4902104d4d0ff98ed28f4bf8001 0 0x4c69 0x52210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179821038282263212c609d9ea2a6e3e172de238d8c39cabd5ac1ca10646e23fd5f515082103363d90d447b00c9c99ceac05b6262ee053441c7e55552ffe526bad8f83ff464053ae",
+      "script_pubkey": "HASH160 0x14 0xc9e4a896d149702d0d1695434feddd52e24ad78d EQUAL",
+      "flags": "P2SH",
+      "expected": "EVAL_FALSE",
+      "comment": "P2SH(2-of-3), 1 sig"
+    },
+    {
+      "core_row": 1099,
+      "script_sig": "0x47 0x3044022018a2a81a93add5cb5f5da76305718e4ea66045ec4888b28d84cb22fae7f4645b02201e6daa5ed5d2e4b2b2027cf7ffd43d8d9844dd49f74ef86899ec8e669dfd39aa01 NOP8 0x23 0x2103363d90d447b00c9c99ceac05b6262ee053441c7e55552ffe526bad8f83ff4640ac",
+      "script_pubkey": "HASH160 0x14 0x215640c2f72f0d16b4eced26762035a42ffed39a EQUAL",
+      "flags": "P2SH",
+      "expected": "SIG_PUSHONLY",
+      "comment": "P2SH(P2PK) with non-push scriptSig but no SIGPUSHONLY"
+    },
+    {
+      "core_row": 1104,
+      "script_sig": "11 0x47 0x304402202f7505132be14872581f35d74b759212d9da40482653f1ffa3116c3294a4a51702206adbf347a2240ca41c66522b1a22a41693610b76a8e7770645dc721d1635854f01 0x43 0x410479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8ac",
+      "script_pubkey": "HASH160 0x14 0x31edc23bdafda4639e669f89ad6b2318dd79d032 EQUAL",
+      "flags": "P2SH",
+      "expected": "OK",
+      "comment": "P2SH with unnecessary input but no CLEANSTACK"
+    },
+    {
+      "core_row": 1105,
+      "script_sig": "11 0x47 0x304402202f7505132be14872581f35d74b759212d9da40482653f1ffa3116c3294a4a51702206adbf347a2240ca41c66522b1a22a41693610b76a8e7770645dc721d1635854f01 0x43 0x410479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8ac",
+      "script_pubkey": "HASH160 0x14 0x31edc23bdafda4639e669f89ad6b2318dd79d032 EQUAL",
+      "flags": "CLEANSTACK,P2SH",
+      "expected": "CLEANSTACK",
+      "comment": "P2SH with unnecessary input"
+    },
+    {
+      "core_row": 1106,
+      "script_sig": "0x47 0x304402202f7505132be14872581f35d74b759212d9da40482653f1ffa3116c3294a4a51702206adbf347a2240ca41c66522b1a22a41693610b76a8e7770645dc721d1635854f01 0x43 0x410479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8ac",
+      "script_pubkey": "HASH160 0x14 0x31edc23bdafda4639e669f89ad6b2318dd79d032 EQUAL",
+      "flags": "CLEANSTACK,P2SH",
+      "expected": "OK",
+      "comment": "P2SH with CLEANSTACK"
+    }
+  ]
+}

@@ -79,6 +79,12 @@ pub struct VersionBitsManager {
     states: HashMap<String, DeploymentState>,
 }
 
+impl Default for VersionBitsManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl VersionBitsManager {
     /// Create a new manager initialised with the well-known historical
     /// mainnet deployments (CSV, SegWit, Taproot).
@@ -88,8 +94,8 @@ impl VersionBitsManager {
             Deployment {
                 name: "csv",
                 bit: 0,
-                start_time: 1462060800,  // 2016-05-01
-                timeout: 1493596800,     // 2017-05-01
+                start_time: 1462060800, // 2016-05-01
+                timeout: 1493596800,    // 2017-05-01
                 min_activation_height: 0,
                 threshold: DEFAULT_THRESHOLD,
                 period: DEFAULT_PERIOD,
@@ -98,8 +104,8 @@ impl VersionBitsManager {
             Deployment {
                 name: "segwit",
                 bit: 1,
-                start_time: 1479168000,  // 2016-11-15
-                timeout: 1510704000,     // 2017-11-15
+                start_time: 1479168000, // 2016-11-15
+                timeout: 1510704000,    // 2017-11-15
                 min_activation_height: 0,
                 threshold: DEFAULT_THRESHOLD,
                 period: DEFAULT_PERIOD,
@@ -108,8 +114,8 @@ impl VersionBitsManager {
             Deployment {
                 name: "taproot",
                 bit: 2,
-                start_time: 1619222400,  // 2021-04-24
-                timeout: 1628640000,     // 2021-08-11
+                start_time: 1619222400, // 2021-04-24
+                timeout: 1628640000,    // 2021-08-11
                 min_activation_height: 709632,
                 threshold: 1815,
                 period: DEFAULT_PERIOD,
@@ -254,8 +260,7 @@ impl VersionBitsManager {
         for deployment in &deployments {
             let new_state =
                 self.compute_state(deployment, height, median_time_past, period_headers);
-            self.states
-                .insert(deployment.name.to_string(), new_state);
+            self.states.insert(deployment.name.to_string(), new_state);
         }
     }
 }
@@ -296,10 +301,7 @@ pub fn get_block_version(active_bits: &[u8]) -> i32 {
 
 /// Count the number of blocks in a slice that signal for the given bit.
 pub fn count_signaling_blocks(headers: &[BlockHeader], bit: u8) -> u32 {
-    headers
-        .iter()
-        .filter(|h| check_version_bit(h, bit))
-        .count() as u32
+    headers.iter().filter(|h| check_version_bit(h, bit)).count() as u32
 }
 
 /// Returns `true` if the version field indicates BIP9 signaling (top 3 bits
@@ -446,13 +448,7 @@ mod tests {
         let non_signaling = header_with_version(0x20000000);
         let old_version = header_with_version(1);
 
-        let headers = vec![
-            signaling,
-            non_signaling,
-            signaling,
-            old_version,
-            signaling,
-        ];
+        let headers = vec![signaling, non_signaling, signaling, old_version, signaling];
 
         assert_eq!(count_signaling_blocks(&headers, 5), 3);
         assert_eq!(count_signaling_blocks(&headers, 0), 0);
@@ -507,8 +503,7 @@ mod tests {
             non_signaling,
         ];
 
-        let state =
-            manager.update_state("testdeploy", 15, 1_500_000, &period_headers);
+        let state = manager.update_state("testdeploy", 15, 1_500_000, &period_headers);
         assert_eq!(state, DeploymentState::LockedIn);
     }
 
@@ -581,8 +576,7 @@ mod tests {
         // MTP reaches timeout without enough signaling => FAILED.
         let non_signaling = header_with_version(0x20000000);
         let period_headers = vec![non_signaling; 5];
-        let state =
-            manager.update_state("testdeploy", 10, 2_000_000, &period_headers);
+        let state = manager.update_state("testdeploy", 10, 2_000_000, &period_headers);
         assert_eq!(state, DeploymentState::Failed);
     }
 
@@ -599,8 +593,7 @@ mod tests {
         // Even with valid signaling, it should stay FAILED.
         let signaling = header_with_version(0x20000000 | (1 << 5));
         let period_headers = vec![signaling; 5];
-        let state =
-            manager.update_state("testdeploy", 10, 1_500_000, &period_headers);
+        let state = manager.update_state("testdeploy", 10, 1_500_000, &period_headers);
         assert_eq!(state, DeploymentState::Failed);
     }
 
@@ -665,8 +658,7 @@ mod tests {
         // STARTED -> LOCKED_IN (enough signaling)
         let signaling = header_with_version(0x20000000 | (1 << 3));
         let period_headers = vec![signaling; 5];
-        let state =
-            manager.update_state("speedytrial", 10, 1_200_000, &period_headers);
+        let state = manager.update_state("speedytrial", 10, 1_200_000, &period_headers);
         assert_eq!(state, DeploymentState::LockedIn);
 
         // LOCKED_IN but below min_activation_height => stays LOCKED_IN
@@ -766,8 +758,7 @@ mod tests {
             signaling,
         ];
 
-        let state =
-            manager.update_state("testdeploy", 10, 1_500_000, &period_headers);
+        let state = manager.update_state("testdeploy", 10, 1_500_000, &period_headers);
         assert_eq!(state, DeploymentState::LockedIn);
     }
 
@@ -790,8 +781,7 @@ mod tests {
             non_signaling,
         ];
 
-        let state =
-            manager.update_state("testdeploy", 10, 1_500_000, &period_headers);
+        let state = manager.update_state("testdeploy", 10, 1_500_000, &period_headers);
         assert_eq!(state, DeploymentState::Started);
     }
 
@@ -836,10 +826,7 @@ mod tests {
     #[test]
     fn test_get_state_unknown_deployment() {
         let manager = VersionBitsManager::new();
-        assert_eq!(
-            manager.get_state("nonexistent"),
-            DeploymentState::Defined
-        );
+        assert_eq!(manager.get_state("nonexistent"), DeploymentState::Defined);
     }
 
     #[test]

@@ -12,14 +12,12 @@ const CHARSET: &[u8; 32] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
 
 /// Reverse lookup table: ASCII byte -> 5-bit value (-1 = invalid).
 const CHARSET_REV: [i8; 128] = [
-    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-    15, -1, 10, 17, 21, 20, 26, 30,  7,  5, -1, -1, -1, -1, -1, -1,
-    -1, 29, -1, 24, 13, 25,  9,  8, 23, -1, 18, 22, 31, 27, 19, -1,
-     1,  0,  3, 16, 11, 28, 12, 14,  6,  4,  2, -1, -1, -1, -1, -1,
-    -1, 29, -1, 24, 13, 25,  9,  8, 23, -1, 18, 22, 31, 27, 19, -1,
-     1,  0,  3, 16, 11, 28, 12, 14,  6,  4,  2, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    15, -1, 10, 17, 21, 20, 26, 30, 7, 5, -1, -1, -1, -1, -1, -1, -1, 29, -1, 24, 13, 25, 9, 8, 23,
+    -1, 18, 22, 31, 27, 19, -1, 1, 0, 3, 16, 11, 28, 12, 14, 6, 4, 2, -1, -1, -1, -1, -1, -1, 29,
+    -1, 24, 13, 25, 9, 8, 23, -1, 18, 22, 31, 27, 19, -1, 1, 0, 3, 16, 11, 28, 12, 14, 6, 4, 2, -1,
+    -1, -1, -1, -1,
 ];
 
 /// Bech32 variant: original (BIP173) or modified (BIP350).
@@ -77,7 +75,9 @@ pub enum Bech32Error {
     InvalidProgramLength(usize),
     #[error("invalid program length {0} for witness v0 (expected 20 or 32)")]
     InvalidV0ProgramLength(usize),
-    #[error("wrong encoding variant for witness version {version}: expected {expected}, got {got}")]
+    #[error(
+        "wrong encoding variant for witness version {version}: expected {expected}, got {got}"
+    )]
     WrongVariant {
         version: u8,
         expected: Bech32Variant,
@@ -99,11 +99,21 @@ fn bech32_polymod(values: &[u8]) -> u32 {
     for &v in values {
         let b = chk >> 25;
         chk = ((chk & 0x01ff_ffff) << 5) ^ (v as u32);
-        if b & 1 != 0 { chk ^= 0x3b6a_57b2; }
-        if b & 2 != 0 { chk ^= 0x2650_8e6d; }
-        if b & 4 != 0 { chk ^= 0x1ea1_19fa; }
-        if b & 8 != 0 { chk ^= 0x3d42_33dd; }
-        if b & 16 != 0 { chk ^= 0x2a14_62b3; }
+        if b & 1 != 0 {
+            chk ^= 0x3b6a_57b2;
+        }
+        if b & 2 != 0 {
+            chk ^= 0x2650_8e6d;
+        }
+        if b & 4 != 0 {
+            chk ^= 0x1ea1_19fa;
+        }
+        if b & 8 != 0 {
+            chk ^= 0x3d42_33dd;
+        }
+        if b & 16 != 0 {
+            chk ^= 0x2a14_62b3;
+        }
     }
     chk
 }
@@ -127,7 +137,9 @@ fn bech32_create_checksum(hrp: &str, data: &[u8], variant: Bech32Variant) -> Vec
     values.extend_from_slice(data);
     values.extend_from_slice(&[0u8; 6]);
     let polymod = bech32_polymod(&values) ^ variant.constant();
-    (0..6).map(|i| ((polymod >> (5 * (5 - i))) & 31) as u8).collect()
+    (0..6)
+        .map(|i| ((polymod >> (5 * (5 - i))) & 31) as u8)
+        .collect()
 }
 
 /// Verify that the bech32 checksum is valid. Returns the variant if valid.
@@ -152,7 +164,11 @@ fn bech32_verify_checksum(hrp: &str, data: &[u8]) -> Option<Bech32Variant> {
 ///
 /// `hrp` is the human-readable part (e.g. "bc"), `data` is already in 5-bit
 /// groups, and `variant` selects Bech32 vs Bech32m checksum.
-pub fn bech32_encode(hrp: &str, data: &[u8], variant: Bech32Variant) -> Result<String, Bech32Error> {
+pub fn bech32_encode(
+    hrp: &str,
+    data: &[u8],
+    variant: Bech32Variant,
+) -> Result<String, Bech32Error> {
     // Validate HRP
     if hrp.is_empty() {
         return Err(Bech32Error::EmptyHrp);
@@ -161,7 +177,7 @@ pub fn bech32_encode(hrp: &str, data: &[u8], variant: Bech32Variant) -> Result<S
         return Err(Bech32Error::HrpTooLong);
     }
     for b in hrp.bytes() {
-        if b < 33 || b > 126 {
+        if !(33..=126).contains(&b) {
             return Err(Bech32Error::InvalidHrpChar);
         }
     }
@@ -216,7 +232,7 @@ pub fn bech32_decode(s: &str) -> Result<(String, Vec<u8>, Bech32Variant), Bech32
 
     // Validate HRP characters
     for b in hrp.bytes() {
-        if b < 33 || b > 126 {
+        if !(33..=126).contains(&b) {
             return Err(Bech32Error::InvalidHrpChar);
         }
     }
@@ -236,8 +252,7 @@ pub fn bech32_decode(s: &str) -> Result<(String, Vec<u8>, Bech32Variant), Bech32
     }
 
     // Verify checksum
-    let variant = bech32_verify_checksum(hrp, &data)
-        .ok_or(Bech32Error::InvalidChecksum)?;
+    let variant = bech32_verify_checksum(hrp, &data).ok_or(Bech32Error::InvalidChecksum)?;
 
     // Strip the 6 checksum values
     let data_len = data.len() - 6;
@@ -254,7 +269,11 @@ pub fn bech32_decode(s: &str) -> Result<(String, Vec<u8>, Bech32Variant), Bech32
 ///
 /// This is needed for protocols like BIP352 (Silent Payments) whose addresses
 /// are longer than 90 characters.
-pub fn bech32_encode_long(hrp: &str, data: &[u8], variant: Bech32Variant) -> Result<String, Bech32Error> {
+pub fn bech32_encode_long(
+    hrp: &str,
+    data: &[u8],
+    variant: Bech32Variant,
+) -> Result<String, Bech32Error> {
     if hrp.is_empty() {
         return Err(Bech32Error::EmptyHrp);
     }
@@ -262,7 +281,7 @@ pub fn bech32_encode_long(hrp: &str, data: &[u8], variant: Bech32Variant) -> Res
         return Err(Bech32Error::HrpTooLong);
     }
     for b in hrp.bytes() {
-        if b < 33 || b > 126 {
+        if !(33..=126).contains(&b) {
             return Err(Bech32Error::InvalidHrpChar);
         }
     }
@@ -309,7 +328,7 @@ pub fn bech32_decode_long(s: &str) -> Result<(String, Vec<u8>, Bech32Variant), B
     }
 
     for b in hrp.bytes() {
-        if b < 33 || b > 126 {
+        if !(33..=126).contains(&b) {
             return Err(Bech32Error::InvalidHrpChar);
         }
     }
@@ -327,8 +346,7 @@ pub fn bech32_decode_long(s: &str) -> Result<(String, Vec<u8>, Bech32Variant), B
         data.push(val as u8);
     }
 
-    let variant = bech32_verify_checksum(hrp, &data)
-        .ok_or(Bech32Error::InvalidChecksum)?;
+    let variant = bech32_verify_checksum(hrp, &data).ok_or(Bech32Error::InvalidChecksum)?;
 
     let data_len = data.len() - 6;
     data.truncate(data_len);
@@ -344,7 +362,12 @@ pub fn bech32_decode_long(s: &str) -> Result<(String, Vec<u8>, Bech32Variant), B
 ///
 /// `from_bits` and `to_bits` specify the source and target bit widths.
 /// If `pad` is true, any remaining bits are zero-padded to fill the last group.
-pub fn convert_bits(data: &[u8], from_bits: u32, to_bits: u32, pad: bool) -> Result<Vec<u8>, Bech32Error> {
+pub fn convert_bits(
+    data: &[u8],
+    from_bits: u32,
+    to_bits: u32,
+    pad: bool,
+) -> Result<Vec<u8>, Bech32Error> {
     let mut acc: u32 = 0;
     let mut bits: u32 = 0;
     let mut ret: Vec<u8> = Vec::new();
@@ -424,10 +447,7 @@ pub fn encode_witness_address(
 ///
 /// Returns `(witness_version, witness_program)` on success.
 /// `expected_hrp` is the network HRP to validate against (e.g. "bc").
-pub fn decode_witness_address(
-    s: &str,
-    expected_hrp: &str,
-) -> Result<(u8, Vec<u8>), Bech32Error> {
+pub fn decode_witness_address(s: &str, expected_hrp: &str) -> Result<(u8, Vec<u8>), Bech32Error> {
     // BIP173: witness addresses are limited to 90 characters
     if s.len() > 90 {
         return Err(Bech32Error::StringTooLong);
@@ -515,9 +535,9 @@ mod tests {
     #[test]
     fn test_bip173_valid_p2wsh_testnet() {
         // P2WSH testnet: encode a 32-byte program and roundtrip
-        let program = hex::decode(
-            "1863143c14c5166804bd19203356da136c985678cd4d27a1b8c6329604903262",
-        ).unwrap();
+        let program =
+            hex::decode("1863143c14c5166804bd19203356da136c985678cd4d27a1b8c6329604903262")
+                .unwrap();
         let encoded = encode_witness_address("tb", 0, &program).unwrap();
         let (ver, prog) = decode_witness_address(&encoded, "tb").unwrap();
         assert_eq!(ver, 0);
@@ -642,8 +662,10 @@ mod tests {
 
     #[test]
     fn test_convert_bits_roundtrip() {
-        let original = vec![0x75, 0x1e, 0x76, 0xe8, 0x19, 0x91, 0x96, 0xd4, 0x54, 0x94,
-                            0x1c, 0x45, 0xd1, 0xb3, 0xa3, 0x23, 0xf1, 0x43, 0x3b, 0xd6];
+        let original = vec![
+            0x75, 0x1e, 0x76, 0xe8, 0x19, 0x91, 0x96, 0xd4, 0x54, 0x94, 0x1c, 0x45, 0xd1, 0xb3,
+            0xa3, 0x23, 0xf1, 0x43, 0x3b, 0xd6,
+        ];
         let five_bit = convert_bits(&original, 8, 5, true).unwrap();
         let back = convert_bits(&five_bit, 5, 8, false).unwrap();
         assert_eq!(back, original);
@@ -690,7 +712,7 @@ mod tests {
             },
         ];
         for e in errors {
-            let s = format!("{}", e);
+            let s = format!("{e}");
             assert!(!s.is_empty());
         }
     }
@@ -722,9 +744,10 @@ mod tests {
 
     #[test]
     fn test_bech32_encode_decode_full_roundtrip() {
-        let data5 = vec![0u8, 14, 20, 15, 7, 13, 26, 0, 25, 18, 6, 11, 13, 8, 21,
-                         4, 20, 3, 17, 2, 29, 3, 12, 29, 3, 4, 15, 24, 20, 6, 14,
-                         30, 22];
+        let data5 = vec![
+            0u8, 14, 20, 15, 7, 13, 26, 0, 25, 18, 6, 11, 13, 8, 21, 4, 20, 3, 17, 2, 29, 3, 12,
+            29, 3, 4, 15, 24, 20, 6, 14, 30, 22,
+        ];
         let encoded = bech32_encode("bc", &data5, Bech32Variant::Bech32).unwrap();
         let (hrp, decoded, variant) = bech32_decode(&encoded).unwrap();
         assert_eq!(hrp, "bc");
@@ -734,10 +757,10 @@ mod tests {
 
     #[test]
     fn test_bech32m_encode_decode_full_roundtrip() {
-        let data5 = vec![1u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                         0, 0, 0];
+        let data5 = vec![
+            1u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
         let encoded = bech32_encode("bc", &data5, Bech32Variant::Bech32m).unwrap();
         let (hrp, decoded, variant) = bech32_decode(&encoded).unwrap();
         assert_eq!(hrp, "bc");
@@ -814,7 +837,7 @@ mod tests {
 
     #[test]
     fn test_bech32_decode_long_invalid_char() {
-        let result = bech32_decode_long("bc1qb");  // 'b' is invalid
+        let result = bech32_decode_long("bc1qb"); // 'b' is invalid
         assert!(result.is_err());
     }
 
@@ -896,8 +919,10 @@ mod tests {
 
     #[test]
     fn test_bech32m_encode_decode_roundtrip() {
-        let data: Vec<u8> = vec![0, 14, 20, 15, 7, 13, 26, 0, 25, 18, 6, 11, 13, 8, 21, 4, 20,
-                                  3, 17, 2, 29, 3, 12, 29, 3, 4, 15, 24, 20, 6, 14, 30, 22];
+        let data: Vec<u8> = vec![
+            0, 14, 20, 15, 7, 13, 26, 0, 25, 18, 6, 11, 13, 8, 21, 4, 20, 3, 17, 2, 29, 3, 12, 29,
+            3, 4, 15, 24, 20, 6, 14, 30, 22,
+        ];
         let encoded = bech32_encode("bc", &data, Bech32Variant::Bech32m).unwrap();
         let (hrp, decoded, variant) = bech32_decode(&encoded).unwrap();
         assert_eq!(hrp, "bc");
@@ -918,9 +943,9 @@ mod tests {
 
     #[test]
     fn test_roundtrip_p2wsh() {
-        let program = hex::decode(
-            "1863143c14c5166804bd19203356da136c985678cd4d27a1b8c6329604903262",
-        ).unwrap();
+        let program =
+            hex::decode("1863143c14c5166804bd19203356da136c985678cd4d27a1b8c6329604903262")
+                .unwrap();
         let encoded = encode_witness_address("tb", 0, &program).unwrap();
         let (ver, decoded_prog) = decode_witness_address(&encoded, "tb").unwrap();
         assert_eq!(ver, 0);
@@ -929,9 +954,9 @@ mod tests {
 
     #[test]
     fn test_roundtrip_p2tr() {
-        let program = hex::decode(
-            "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
-        ).unwrap();
+        let program =
+            hex::decode("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+                .unwrap();
         let encoded = encode_witness_address("bc", 1, &program).unwrap();
         let (ver, decoded_prog) = decode_witness_address(&encoded, "bc").unwrap();
         assert_eq!(ver, 1);
@@ -977,8 +1002,16 @@ mod tests {
     #[test]
     fn test_bip350_valid_address_vectors() {
         let valid = vec![
-            ("tb1pqqqqp399et2xygdj5xreqhjjvcmzhxw4aywxecjdzew6hylgvsesf3hn0c", "tb", 1),
-            ("bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0", "bc", 1),
+            (
+                "tb1pqqqqp399et2xygdj5xreqhjjvcmzhxw4aywxecjdzew6hylgvsesf3hn0c",
+                "tb",
+                1,
+            ),
+            (
+                "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0",
+                "bc",
+                1,
+            ),
         ];
 
         for (addr, hrp, expected_ver) in valid {
@@ -990,8 +1023,8 @@ mod tests {
                 result.err()
             );
             let (ver, prog) = result.unwrap();
-            assert_eq!(ver, expected_ver, "Wrong version for {}", addr);
-            assert_eq!(prog.len(), 32, "Wrong program length for {}", addr);
+            assert_eq!(ver, expected_ver, "Wrong version for {addr}");
+            assert_eq!(prog.len(), 32, "Wrong program length for {addr}");
 
             // Roundtrip
             let reencoded = encode_witness_address(hrp, ver, &prog).unwrap();
@@ -1130,8 +1163,7 @@ mod tests {
             assert_eq!(
                 variant,
                 Bech32Variant::Bech32,
-                "Expected Bech32 variant for: {}",
-                s
+                "Expected Bech32 variant for: {s}"
             );
         }
     }
@@ -1159,12 +1191,7 @@ mod tests {
                 result.err()
             );
             let (_, _, variant) = result.unwrap();
-            assert_eq!(
-                variant,
-                Bech32Variant::Bech32m,
-                "Expected Bech32m for: {}",
-                s
-            );
+            assert_eq!(variant, Bech32Variant::Bech32m, "Expected Bech32m for: {s}");
         }
     }
 
@@ -1193,11 +1220,7 @@ mod tests {
 
         for s in invalid {
             let result = bech32_decode(s);
-            assert!(
-                result.is_err(),
-                "Should have rejected invalid bech32: {}",
-                s
-            );
+            assert!(result.is_err(), "Should have rejected invalid bech32: {s}");
         }
     }
 
@@ -1232,11 +1255,8 @@ mod tests {
             let result = bech32_decode(s);
             // Some may decode as Bech32 (not Bech32m). We check they
             // do not decode as valid Bech32m.
-            match &result {
-                Ok((_, _, Bech32Variant::Bech32m)) => {
-                    panic!("Should have rejected invalid bech32m: {}", s);
-                }
-                _ => {}
+            if let Ok((_, _, Bech32Variant::Bech32m)) = &result {
+                panic!("Should have rejected invalid bech32m: {s}");
             }
         }
     }

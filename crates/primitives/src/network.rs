@@ -1,6 +1,7 @@
 /// Bitcoin network type — compile-time selectable via NodeTypes pattern (reth-style)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Network {
+    #[default]
     Mainnet,
     Testnet,
     /// Testnet4 (BIP94) — replacement for testnet3 with proper difficulty adjustment.
@@ -83,12 +84,6 @@ impl Network {
             Network::Mainnet => [0x04, 0x88, 0xB2, 0x1E],
             _ => [0x04, 0x35, 0x87, 0xCF],
         }
-    }
-}
-
-impl Default for Network {
-    fn default() -> Self {
-        Network::Mainnet
     }
 }
 

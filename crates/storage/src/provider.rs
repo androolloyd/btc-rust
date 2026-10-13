@@ -1,7 +1,7 @@
+use crate::traits::{AddressIndexValue, Database, DbTx, StorageError, TxBlockLocation};
 use btc_primitives::block::BlockHeader;
 use btc_primitives::hash::{BlockHash, TxHash};
-use btc_primitives::transaction::{Transaction, TxOut, OutPoint};
-use crate::traits::{AddressIndexValue, Database, DbTx, StorageError, TxBlockLocation};
+use btc_primitives::transaction::{OutPoint, Transaction, TxOut};
 
 /// High-level provider over raw database operations (reth-style two-tier pattern)
 pub struct BlockchainProvider<DB: Database> {
@@ -48,19 +48,28 @@ impl<DB: Database> BlockchainProvider<DB> {
     }
 
     /// Look up which block contains a transaction.
-    pub fn tx_block_location(&self, txid: &TxHash) -> Result<Option<TxBlockLocation>, StorageError> {
+    pub fn tx_block_location(
+        &self,
+        txid: &TxHash,
+    ) -> Result<Option<TxBlockLocation>, StorageError> {
         let tx = self.db.tx()?;
         tx.get_tx_block_index(txid)
     }
 
     /// Get all transaction entries for a given script hash.
-    pub fn address_txs(&self, script_hash: &[u8; 32]) -> Result<Vec<AddressIndexValue>, StorageError> {
+    pub fn address_txs(
+        &self,
+        script_hash: &[u8; 32],
+    ) -> Result<Vec<AddressIndexValue>, StorageError> {
         let tx = self.db.tx()?;
         tx.get_address_txs(script_hash)
     }
 
     /// Get unspent outputs for a given script hash.
-    pub fn address_utxos(&self, script_hash: &[u8; 32]) -> Result<Vec<AddressIndexValue>, StorageError> {
+    pub fn address_utxos(
+        &self,
+        script_hash: &[u8; 32],
+    ) -> Result<Vec<AddressIndexValue>, StorageError> {
         let entries = self.address_txs(script_hash)?;
         // Collect spent (txid, output_index) pairs
         let spent: std::collections::HashSet<(TxHash, u32)> = entries
@@ -83,12 +92,12 @@ impl<DB: Database> BlockchainProvider<DB> {
 mod tests {
     use super::*;
     use crate::redb_backend::RedbDatabase;
+    use crate::traits::DbTxMut;
     use btc_primitives::amount::Amount;
     use btc_primitives::block::BlockHeader;
     use btc_primitives::compact::CompactTarget;
     use btc_primitives::script::ScriptBuf;
-    use btc_primitives::transaction::{OutPoint, TxOut, Transaction, TxIn};
-    use crate::traits::DbTxMut;
+    use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
 
     fn temp_provider() -> (BlockchainProvider<RedbDatabase>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();

@@ -13,7 +13,7 @@ fn main() {
     let policy = Policy::parse(&policy_str).expect("invalid policy");
     let script = policy.compile();
 
-    println!("Policy:      {}", policy_str);
+    println!("Policy:      {policy_str}");
     println!("Script hex:  {}", hex::encode(script.as_bytes()));
     println!("Script size: {} bytes", script.as_bytes().len());
 }

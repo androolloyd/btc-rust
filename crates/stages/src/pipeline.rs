@@ -1,130 +1,88 @@
-use crate::stage::{Stage, StageId, StageError};
-use tracing::{info, error};
+use crate::stage::{Stage, StageBackend, StageCheckpoint, StageError, StageId};
+use std::collections::HashMap;
 
-/// Reth-style pipeline — executes stages serially, unwinds on failure
+/// Real preparation precedes one backend commit. Failed work cannot reset durable history.
+#[derive(Default)]
 pub struct Pipeline {
     stages: Vec<Box<dyn Stage>>,
-    /// Current progress per stage
-    checkpoints: std::collections::HashMap<StageId, u64>,
+    checkpoints: HashMap<StageId, StageCheckpoint>,
 }
-
 impl Pipeline {
     pub fn new() -> Self {
-        Pipeline {
-            stages: Vec::new(),
-            checkpoints: std::collections::HashMap::new(),
-        }
+        Self::default()
     }
-
     pub fn add_stage(&mut self, stage: Box<dyn Stage>) {
         self.stages.push(stage);
     }
-
-    /// Run the pipeline up to the target block
-    pub fn run(&mut self, target: u64) -> Result<(), StageError> {
-        info!(target, "pipeline starting");
-
-        for i in 0..self.stages.len() {
-            let stage = &mut self.stages[i];
-            let id = stage.id();
-            info!(%id, "executing stage");
-
-            match stage.execute(target) {
-                Ok(output) => {
-                    info!(%id, checkpoint = output.checkpoint, done = output.done, "stage completed");
-                    self.checkpoints.insert(id, output.checkpoint);
-                }
-                Err(e) => {
-                    error!(%id, error = %e, "stage failed, unwinding");
-                    // Unwind all stages that have run
-                    self.unwind(i, 0)?;
-                    return Err(e);
+    pub fn stage_ids(&self) -> Vec<StageId> {
+        self.stages.iter().map(|stage| stage.id()).collect()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.stages.is_empty()
+    }
+    pub fn run(&mut self, _target: u64) -> Result<(), StageError> {
+        Err(StageError::ProviderUnavailable)
+    }
+    pub fn run_with(
+        &mut self,
+        backend: &mut dyn StageBackend,
+        target: u64,
+    ) -> Result<StageCheckpoint, StageError> {
+        if self.stages.is_empty() {
+            return Err(StageError::ProviderUnavailable);
+        }
+        let result = (|| {
+            for stage in &mut self.stages {
+                let output = stage.execute_with(backend, target)?;
+                if !output.done || output.checkpoint != target {
+                    return Err(StageError::StageFailed(
+                        stage.id(),
+                        "provider did not finish the actual input batch".into(),
+                    ));
                 }
             }
+            backend.commit()
+        })();
+        match result {
+            Ok(checkpoint) => {
+                for stage in &self.stages {
+                    self.checkpoints.insert(stage.id(), checkpoint);
+                }
+                Ok(checkpoint)
+            }
+            Err(error) => {
+                backend.abort();
+                Err(error)
+            }
         }
-
-        info!("pipeline completed successfully");
-        Ok(())
     }
-
-    /// Unwind stages from `from_stage` back to block `target`
-    fn unwind(&mut self, from_stage: usize, target: u64) -> Result<(), StageError> {
-        for i in (0..=from_stage).rev() {
-            let stage = &mut self.stages[i];
-            let id = stage.id();
-            info!(%id, target, "unwinding stage");
-            stage.unwind(target)?;
-            self.checkpoints.insert(id, target);
-        }
-        Ok(())
-    }
-
     pub fn checkpoint(&self, id: StageId) -> Option<u64> {
-        self.checkpoints.get(&id).copied()
+        self.checkpoints.get(&id).map(|cp| cp.height)
     }
-}
-
-impl Default for Pipeline {
-    fn default() -> Self {
-        Self::new()
+    pub fn checkpoint_record(&self, id: StageId) -> Option<StageCheckpoint> {
+        self.checkpoints.get(&id).copied()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::stage::{ExecOutput, UnwindOutput};
-
-    struct TestStage {
-        id: StageId,
-        should_fail: bool,
-    }
-
-    impl Stage for TestStage {
-        fn id(&self) -> StageId { self.id }
-
-        fn execute(&mut self, target: u64) -> Result<ExecOutput, StageError> {
-            if self.should_fail {
-                Err(StageError::StageFailed(self.id, "test failure".into()))
-            } else {
-                Ok(ExecOutput { checkpoint: target, done: true })
-            }
-        }
-
-        fn unwind(&mut self, target: u64) -> Result<UnwindOutput, StageError> {
-            Ok(UnwindOutput { checkpoint: target })
-        }
-    }
-
+    use crate::{build_default_pipeline, Stage};
     #[test]
-    fn test_pipeline_success() {
-        let mut pipeline = Pipeline::new();
-        pipeline.add_stage(Box::new(TestStage {
-            id: StageId("test1"),
-            should_fail: false,
-        }));
-        pipeline.add_stage(Box::new(TestStage {
-            id: StageId("test2"),
-            should_fail: false,
-        }));
-        assert!(pipeline.run(100).is_ok());
-        assert_eq!(pipeline.checkpoint(StageId("test1")), Some(100));
-        assert_eq!(pipeline.checkpoint(StageId("test2")), Some(100));
-    }
-
-    #[test]
-    fn test_pipeline_failure_unwinds() {
-        let mut pipeline = Pipeline::new();
-        pipeline.add_stage(Box::new(TestStage {
-            id: StageId("test1"),
-            should_fail: false,
-        }));
-        pipeline.add_stage(Box::new(TestStage {
-            id: StageId("test2"),
-            should_fail: true,
-        }));
-        assert!(pipeline.run(100).is_err());
-        // After unwind, checkpoints should be 0
-        assert_eq!(pipeline.checkpoint(StageId("test1")), Some(0));
+    fn absent_downloads_or_provider_never_publish_progress() {
+        let mut pipeline = build_default_pipeline();
+        for target in [0, 1, u64::MAX] {
+            assert!(pipeline.run(target).is_err());
+            assert!(pipeline.checkpoint(crate::stage::HEADERS).is_none());
+        }
+        for mut stage in [
+            Box::new(crate::HeadersStage::new()) as Box<dyn Stage>,
+            Box::new(crate::BodiesStage::new()),
+            Box::new(crate::ExecutionStage::new()),
+            Box::new(crate::IndexingStage::new()),
+            Box::new(crate::AddressIndexStage::new()),
+        ] {
+            assert!(stage.execute(100).is_err());
+            assert!(stage.unwind(0).is_err());
+        }
     }
 }

@@ -18,6 +18,8 @@ btc-consensus = { path = "../crates/consensus" }
 btc-network = { path = "../crates/network" }
 arbitrary = { version = "1", features = ["derive"] }
 bytes = "1"
+eyre = "0.6"
+secp256k1 = "0.29"
 tokio-util = { version = "0.7", features = ["codec"] }
 
 [[bin]]
@@ -65,5 +67,35 @@ doc = false
 [[bin]]
 name = "fuzz_block_template"
 path = "fuzz_targets/fuzz_block_template.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_psbt_decode"
+path = "fuzz_targets/fuzz_psbt_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_descriptor"
+path = "fuzz_targets/fuzz_descriptor.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_bip32"
+path = "fuzz_targets/fuzz_bip32.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_erlay"
+path = "fuzz_targets/fuzz_erlay.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_compact_blocks"
+path = "fuzz_targets/fuzz_compact_blocks.rs"
 test = false
 doc = false

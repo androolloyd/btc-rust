@@ -157,10 +157,7 @@ impl TxRelay {
 
     /// Record that we have announced a transaction to a specific peer.
     pub fn mark_announced(&mut self, txid: &TxHash, peer: &SocketAddr) {
-        self.announced
-            .entry(*txid)
-            .or_default()
-            .insert(*peer);
+        self.announced.entry(*txid).or_default().insert(*peer);
     }
 }
 

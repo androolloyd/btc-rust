@@ -1,0 +1,96 @@
+name: Fuzz smoke tests
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 4 * * 1"
+permissions:
+  contents: read
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [fuzz_transaction_decode, fuzz_block_decode, fuzz_script_execute, fuzz_p2p_message, fuzz_bech32_decode, fuzz_varint_decode, fuzz_witness_verify, fuzz_block_template, fuzz_psbt_decode, fuzz_descriptor, fuzz_bip32, fuzz_erlay, fuzz_compact_blocks]
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install nightly --profile minimal
+      - run: cargo +nightly install cargo-fuzz --locked
+      - name: Seed published PSBT vectors
+        if: matrix.target == 'fuzz_psbt_decode'
+        shell: python
+        run: |
+          import json, pathlib
+          corpus = pathlib.Path("fuzz/corpus/fuzz_psbt_decode")
+          corpus.mkdir(parents=True, exist_ok=True)
+          for name in ["bip174-utxo", "bip370", "bip371", "bip341-commitments", "bip32-keys", "psbt-signatures"]:
+              source = pathlib.Path(f"crates/primitives/tests/data/{name}.json")
+              key = "psbt_vectors" if name in ["bip341-commitments", "bip32-keys", "psbt-signatures"] else "vectors"
+              for i, vector in enumerate(json.loads(source.read_text())[key]):
+                  (corpus / f"{name}-{i}").write_bytes(bytes.fromhex(vector["hex"]))
+      - name: Seed public derivation proofs
+        if: matrix.target == 'fuzz_psbt_decode'
+        run: python3 scripts/seed_psbt_derivations.py --corpus fuzz/corpus/fuzz_psbt_decode
+      - name: Seed independently signed threshold wallets
+        if: matrix.target == 'fuzz_psbt_decode'
+        shell: python
+        run: |
+          import json, pathlib
+          corpus = pathlib.Path("fuzz/corpus/fuzz_psbt_decode")
+          for i, vector in enumerate(json.loads(pathlib.Path("crates/primitives/tests/data/taproot-thresholds.json").read_text())["vectors"]):
+              for field in ["partial_psbt", "final_psbt"]:
+                  (corpus / f"threshold-{i}-{field}").write_bytes(bytes.fromhex(vector[field]))
+      - name: Seed independent ECDSA signer cases
+        if: matrix.target == 'fuzz_psbt_decode'
+        shell: python
+        run: |
+          import json, pathlib
+          corpus = pathlib.Path("fuzz/corpus/fuzz_psbt_decode")
+          for i, vector in enumerate(json.loads(pathlib.Path("crates/primitives/tests/data/ecdsa-signer.json").read_text())["vectors"]):
+              (corpus / f"signer-{i}").write_bytes(bytes.fromhex(vector["psbt"]))
+          for i, vector in enumerate(json.loads(pathlib.Path("crates/primitives/tests/data/taproot-key-signer.json").read_text())["vectors"]):
+              (corpus / f"taproot-key-signer-{i}").write_bytes(bytes.fromhex(vector["psbt"]))
+          leaves = json.loads(pathlib.Path("crates/primitives/tests/data/taproot-script-signer.json").read_text())
+          for i, vector in enumerate(leaves["vectors"] + leaves["unsupported"]):
+              (corpus / f"taproot-script-signer-{i}").write_bytes(bytes.fromhex(vector["psbt"]))
+          for i, vector in enumerate(json.loads(pathlib.Path("crates/primitives/tests/data/hd-signer.json").read_text())["vectors"]):
+              (corpus / f"hd-signer-{i}").write_bytes(bytes.fromhex(vector["psbt"]))
+      - name: Seed published descriptors
+        if: matrix.target == 'fuzz_descriptor'
+        shell: python
+        run: |
+          import json, pathlib, sys
+          sys.path.insert(0, "scripts")
+          from check_core_psbt import regtest_descriptor
+          corpus = pathlib.Path("fuzz/corpus/fuzz_descriptor")
+          corpus.mkdir(parents=True, exist_ok=True)
+          vectors = json.loads(pathlib.Path("crates/primitives/tests/data/descriptors.json").read_text())["vectors"]
+          vectors += json.loads(pathlib.Path("crates/primitives/tests/data/private-descriptors.json").read_text())["vectors"]
+          thresholds = json.loads(pathlib.Path("crates/primitives/tests/data/taproot-thresholds.json").read_text())
+          vectors += thresholds["published"] + thresholds["descriptors"]
+          for i, vector in enumerate(vectors):
+              (corpus / f"published-{i}").write_text(vector["descriptor"])
+              translated = regtest_descriptor(vector["descriptor"])
+              if translated != vector["descriptor"]:
+                  (corpus / f"regtest-{i}").write_text(translated)
+      - name: Seed published BIP32 keys
+        if: matrix.target == 'fuzz_bip32'
+        run: python3 scripts/seed_bip32.py --corpus fuzz/corpus/fuzz_bip32
+      - name: Seed independent BIP330 sketches
+        if: matrix.target == 'fuzz_erlay'
+        run: python3 scripts/seed_erlay.py --corpus fuzz/corpus/fuzz_erlay
+      - name: Seed independent BIP152 messages
+        if: matrix.target == 'fuzz_compact_blocks'
+        run: python3 scripts/seed_compact_blocks.py --corpus fuzz/corpus/fuzz_compact_blocks
+      - name: Seed framed BIP152 messages
+        if: matrix.target == 'fuzz_p2p_message'
+        run: python3 scripts/seed_compact_blocks.py --corpus fuzz/corpus/fuzz_p2p_message --p2p
+      - run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=30 -rss_limit_mb=2048
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: fuzz/artifacts

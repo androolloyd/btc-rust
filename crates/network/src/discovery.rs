@@ -33,9 +33,7 @@ pub const TESTNET_DNS_SEEDS: &[&str] = &[
 ];
 
 /// Signet DNS seeds.
-pub const SIGNET_DNS_SEEDS: &[&str] = &[
-    "seed.signet.bitcoin.sprovoost.nl",
-];
+pub const SIGNET_DNS_SEEDS: &[&str] = &["seed.signet.bitcoin.sprovoost.nl"];
 
 /// Return the DNS seed list for the given network.
 pub fn dns_seeds(network: Network) -> &'static [&'static str] {
@@ -60,7 +58,7 @@ pub async fn discover_peers(network: Network) -> Vec<SocketAddr> {
     let mut addrs = Vec::new();
 
     for seed in seeds {
-        let host = format!("{}:{}", seed, port);
+        let host = format!("{seed}:{port}");
         let result: Result<Vec<SocketAddr>, _> = tokio::net::lookup_host(host.as_str())
             .await
             .map(|iter| iter.collect());
@@ -220,10 +218,7 @@ impl PeerManager {
                 self.known_peers.push(addr);
             }
         }
-        info!(
-            known = self.known_peers.len(),
-            "bootstrap complete"
-        );
+        info!(known = self.known_peers.len(), "bootstrap complete");
     }
 
     /// Register a connected peer.
@@ -231,7 +226,7 @@ impl PeerManager {
         if !self.known_peers.contains(&addr) {
             self.known_peers.push(addr);
         }
-        self.scores.entry(addr).or_insert_with(PeerScore::new).touch();
+        self.scores.entry(addr).or_default().touch();
         self.connected.insert(addr, info);
     }
 
@@ -248,12 +243,7 @@ impl PeerManager {
             .iter()
             .copied()
             .filter(|a| !self.connected.contains_key(a))
-            .filter(|a| {
-                self.scores
-                    .get(a)
-                    .map(|s| !s.is_banned())
-                    .unwrap_or(true)
-            })
+            .filter(|a| self.scores.get(a).map(|s| !s.is_banned()).unwrap_or(true))
             .collect();
 
         if candidates.is_empty() {
@@ -272,11 +262,7 @@ impl PeerManager {
 
     /// Returns `true` if we are below our desired outbound connection count.
     pub fn needs_more_peers(&self) -> bool {
-        let outbound = self
-            .connected
-            .values()
-            .filter(|p| !p.inbound)
-            .count();
+        let outbound = self.connected.values().filter(|p| !p.inbound).count();
         outbound < self.max_outbound
     }
 
@@ -298,7 +284,7 @@ impl PeerManager {
     /// Retrieve a mutable scoring entry, creating a default one if it does
     /// not yet exist.
     pub fn score_mut(&mut self, addr: &SocketAddr) -> &mut PeerScore {
-        self.scores.entry(*addr).or_insert_with(PeerScore::new)
+        self.scores.entry(*addr).or_default()
     }
 
     /// Ban a peer immediately.
@@ -733,7 +719,10 @@ mod tests {
         let a = addr(8333);
         pm.ban_peer(&a, BanReason::WrongMagic);
         assert!(pm.score(&a).unwrap().is_banned());
-        assert_eq!(pm.score(&a).unwrap().ban_reason, Some(BanReason::WrongMagic));
+        assert_eq!(
+            pm.score(&a).unwrap().ban_reason,
+            Some(BanReason::WrongMagic)
+        );
     }
 
     #[test]

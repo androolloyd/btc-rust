@@ -2,11 +2,12 @@
 name = "btc-rust"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/example/btc-rust"
+repository = "https://github.com/androolloyd/btc-rust"
 
 [workspace]
+default-members = [".", "crates/node"]
 exclude = ["fuzz"]
 members = [
     "crates/primitives",
@@ -65,9 +66,12 @@ path = "examples/address_types.rs"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/example/btc-rust"
+repository = "https://github.com/androolloyd/btc-rust"
+
+[dev-dependencies]
+btc-storage = { workspace = true }
 
 [workspace.dependencies]
 # Internal crates
@@ -111,6 +115,9 @@ tokio = { version = "1", features = ["full"] }
 bytes = "1"
 tokio-util = { version = "0.7", features = ["codec"] }
 futures-util = { version = "0.3", features = ["sink"] }
+httparse = "1.10"
+base64 = "0.22"
+subtle = "2.6"
 
 # Logging
 tracing = "0.1"

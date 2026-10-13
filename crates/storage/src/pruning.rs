@@ -332,7 +332,10 @@ mod tests {
         };
         let manager = PruneManager::new(config);
         assert_eq!(manager.service_flags(), NODE_NETWORK_LIMITED);
-        assert_eq!(manager.service_flags() & NODE_NETWORK_LIMITED, NODE_NETWORK_LIMITED);
+        assert_eq!(
+            manager.service_flags() & NODE_NETWORK_LIMITED,
+            NODE_NETWORK_LIMITED
+        );
         assert_eq!(manager.service_flags() & NODE_NETWORK, 0);
     }
 

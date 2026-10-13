@@ -41,6 +41,13 @@ pub struct NodeConfig {
     pub datadir: PathBuf,
     pub rpc_port: u16,
     pub p2p_port: u16,
+    /// Explicitly enable the experimental loopback chain/transaction service.
+    pub electrum_port: Option<u16>,
+    pub connect_peers: Vec<std::net::SocketAddr>,
+    pub resync_legacy_checkpoint: bool,
+    pub full_rbf: bool,
+    pub mempool_policy: btc_mempool::policy::TxValidationPolicy,
+    pub mempool_flags: btc_consensus::script_engine::ScriptFlags,
     pub log_level: String,
 }
 
@@ -53,6 +60,12 @@ impl NodeConfig {
             datadir: PathBuf::from("~/.btc-rust"),
             rpc_port,
             p2p_port,
+            electrum_port: None,
+            connect_peers: Vec::new(),
+            resync_legacy_checkpoint: false,
+            full_rbf: true,
+            mempool_policy: btc_mempool::policy::TxValidationPolicy::default(),
+            mempool_flags: btc_consensus::script_engine::ScriptFlags::all(),
             log_level: "info".to_string(),
         }
     }
@@ -72,6 +85,12 @@ impl NodeConfig {
         self
     }
 
+    /// Restrict outbound connections to these addresses, disabling DNS seeds.
+    pub fn with_connect_peers(mut self, peers: Vec<std::net::SocketAddr>) -> Self {
+        self.connect_peers = peers;
+        self
+    }
+
     pub fn with_log_level(mut self, level: impl Into<String>) -> Self {
         self.log_level = level.into();
         self
@@ -88,7 +107,7 @@ pub struct DatabaseHandle {
     pub path: PathBuf,
 }
 
-/// Placeholder for the P2P networking component.
+/// Configuration for the P2P listener opened at node startup.
 #[derive(Debug)]
 pub struct NetworkHandle {
     pub port: u16,
@@ -218,18 +237,64 @@ impl Node {
         );
 
         info!(path = %self.database.path.display(), "database opened");
-        info!(port = self.network.port, "p2p network ready");
 
         // -----------------------------------------------------------------
         // 1. Create shared NodeState (single source of truth)
         // -----------------------------------------------------------------
         let node_state = NodeState::new(self.config.network);
-        node_state.syncing.store(true, std::sync::atomic::Ordering::SeqCst);
+        node_state
+            .syncing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let chain_backend = Arc::new(
+            crate::chain_backend::NodeChainBackend::open_with_legacy_resync(
+                &self.config.datadir.join("utxo.redb"),
+                node_state.clone(),
+                self.config.resync_legacy_checkpoint,
+            )?,
+        );
+
+        chain_backend
+            .configure_pipeline(self.pipeline)
+            .map_err(|error| eyre::eyre!(error.message))?;
+
+        chain_backend
+            .configure_mempool(
+                self.config.full_rbf,
+                self.config.mempool_policy.clone(),
+                self.config.mempool_flags,
+            )
+            .map_err(|error| eyre::eyre!(error.message))?;
+
+        // Fail credential setup before binding or spawning any network service.
+        let rpc_cookie = crate::rpc_cookie::RpcCookie::create(&self.config.datadir)?;
+
+        // Requested services fail before any network tasks are spawned.
+        let electrum_listener = match self.config.electrum_port {
+            Some(port) => Some(tokio::net::TcpListener::bind(("127.0.0.1", port)).await?),
+            None => None,
+        };
+
+        let p2p_listener = tokio::net::TcpListener::bind(("0.0.0.0", self.network.port)).await?;
+        let peer_table = Arc::new(crate::p2p::PeerTable::new(node_state.peer_count.clone()));
 
         // -----------------------------------------------------------------
         // 2. Create ExExManager for chain event notifications
         // -----------------------------------------------------------------
         let exex_manager = ExExManager::new(self.config.network);
+        chain_backend
+            .set_exex_sender(exex_manager.sender().clone())
+            .map_err(|e| eyre::eyre!(e.message))?;
+        let mut durable = btc_exex::durable::DurableManager::new(
+            Arc::new(btc_exex::durable::DatabaseStore::new(
+                chain_backend.db.clone(),
+            )),
+            chain_backend.exex_wakeup(),
+        );
+        durable.register(btc_exex::durable::ValidatedMetrics)?;
+        chain_backend
+            .set_exex_registry(durable.registry())
+            .map_err(|e| eyre::eyre!(e.message))?;
 
         // -----------------------------------------------------------------
         // 3. Build MetricsCollector from NodeState (shares atomics)
@@ -271,31 +336,59 @@ impl Node {
         // -----------------------------------------------------------------
         // 6. Initialize RPC server with shared state from NodeState
         // -----------------------------------------------------------------
-        let rpc_handler = Arc::new(btc_rpc::handler::RpcHandler::new_with_state(
-            Arc::clone(&node_state.chain_height),
-            Arc::clone(&node_state.best_hash),
+        let mut rpc_handler = btc_rpc::handler::RpcHandler::new_with_state(
+            node_state.chain_height.clone(),
+            node_state.best_hash.clone(),
             node_state.rpc_network_name(),
-            Arc::clone(&node_state.peer_count),
-            Arc::clone(&node_state.mempool_size),
-            Arc::clone(&node_state.mempool_bytes),
-        ));
-        let rpc = RpcServer::new(self.config.rpc_port);
+            node_state.peer_count.clone(),
+            node_state.mempool_size.clone(),
+            node_state.mempool_bytes.clone(),
+        )
+        .with_chain_backend(chain_backend.clone());
+        let rpc_peers = peer_table.clone();
+        rpc_handler.register_fallible("getpeerinfo", move |_| rpc_peers.snapshot());
+        let rpc_peers = peer_table.clone();
+        rpc_handler.register_fallible("getnetworkinfo", move |_| rpc_peers.network_info());
+        let rpc_handler = Arc::new(rpc_handler);
+        let rpc = RpcServer::new(self.config.rpc_port).with_http_auth(rpc_cookie.auth());
         let rpc_handler_clone = rpc_handler.clone();
 
         // Spawn RPC server
-        let rpc_handle = tokio::spawn(async move {
-            if let Err(e) = rpc.run(rpc_handler_clone).await {
-                tracing::error!(error = %e, "RPC server error");
-            }
+        let mut rpc_handle = tokio::spawn(async move { rpc.run(rpc_handler_clone).await });
+        let (electrum_shutdown, electrum_receiver) = tokio::sync::watch::channel(false);
+        let mut electrum_handle = if let Some(listener) = electrum_listener {
+            let port = listener.local_addr()?.port();
+            let handler =
+                Arc::new(btc_electrum::ElectrumHandler::new().with_backend(chain_backend.clone()));
+            Some(tokio::spawn(async move {
+                btc_electrum::ElectrumServer::new(port)
+                    .run_listener(listener, handler, electrum_receiver)
+                    .await
+            }))
+        } else {
+            None
+        };
+
+        let p2p_backend = chain_backend.clone();
+        let p2p_peers = peer_table.clone();
+        let p2p_shutdown = rpc_handler.clone();
+        let p2p_network = self.config.network;
+        let mut p2p_handle = tokio::spawn(async move {
+            crate::p2p::P2pServer::run(
+                p2p_listener,
+                p2p_network,
+                p2p_backend,
+                p2p_peers,
+                p2p_shutdown,
+            )
+            .await
         });
 
         // -----------------------------------------------------------------
         // 7. Initialize consensus chain state
         // -----------------------------------------------------------------
-        let params = btc_consensus::validation::ChainParams::from_network(self.config.network);
-        let chain_state = std::sync::Arc::new(tokio::sync::RwLock::new(
-            btc_consensus::ChainState::new(params),
-        ));
+        let chain_state =
+            std::sync::Arc::new(tokio::sync::RwLock::new(chain_backend.header_chain()?));
 
         // Initialize peer manager
         let peer_manager = std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -306,40 +399,71 @@ impl Node {
         // 8. Start sync manager with ExEx sender for notifications
         // -----------------------------------------------------------------
         let sync_params = btc_consensus::validation::ChainParams::from_network(self.config.network);
-        let mut sync_mgr = crate::sync::SyncManager::with_datadir(
+        let mut sync_mgr = crate::sync::SyncManager::with_backend(
             self.config.network,
             chain_state.clone(),
             peer_manager.clone(),
             sync_params,
             self.config.datadir.clone(),
-        );
+            chain_backend,
+        )?;
         sync_mgr.set_exex_sender(exex_manager.sender().clone());
         sync_mgr.set_node_state(node_state.clone());
+        sync_mgr.set_peer_table(peer_table);
+        sync_mgr.set_connect_peers(self.config.connect_peers);
 
         info!("starting initial block download");
 
-        match sync_mgr.start().await {
-            Ok(()) => {
-                info!(state = %sync_mgr.state(), "sync complete");
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "sync failed");
-                // Don't exit — the node can still serve RPC
+        let sync_shutdown = rpc_handler.clone();
+        let mut sync_handle = tokio::spawn(async move { sync_mgr.run(sync_shutdown).await });
+
+        info!("btc-node running — press Ctrl+C or use stop RPC to stop");
+        let result = tokio::select! {
+            result = tokio::signal::ctrl_c() => result.map_err(Into::into),
+            _ = rpc_handler.wait_for_shutdown() => Ok(()),
+            error = durable.wait_failed() => Err(error),
+            result = &mut p2p_handle => match result {
+                Ok(result) => result, Err(error) => Err(error.into()),
+            },
+            result = &mut rpc_handle => match result {
+                Ok(result) => result,
+                Err(error) => Err(error.into()),
+            },
+            result = async { electrum_handle.as_mut().unwrap().await }, if electrum_handle.is_some() => match result {
+                Ok(result) => result.map_err(Into::into), Err(error) => Err(error.into()),
+            },
+        };
+        info!("shutting down");
+        durable.shutdown().await;
+        rpc_handler.request_shutdown();
+        let _ = electrum_shutdown.send(true);
+        if let Some(handle) = electrum_handle.as_mut() {
+            if !handle.is_finished()
+                && tokio::time::timeout(std::time::Duration::from_secs(2), &mut *handle)
+                    .await
+                    .is_err()
+            {
+                handle.abort();
             }
         }
-
-        node_state.syncing.store(false, std::sync::atomic::Ordering::SeqCst);
-
-        // Keep running (serve RPC, listen for new blocks)
-        info!("btc-node running — press Ctrl+C to stop");
-        tokio::signal::ctrl_c().await?;
-        info!("shutting down");
-
+        if tokio::time::timeout(std::time::Duration::from_secs(2), &mut sync_handle)
+            .await
+            .is_err()
+        {
+            sync_handle.abort();
+        }
+        if !rpc_handle.is_finished() {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut rpc_handle).await;
+        }
+        if !p2p_handle.is_finished() {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut p2p_handle).await;
+        }
+        p2p_handle.abort();
         rpc_handle.abort();
         http_handle.abort();
         explorer_handle.abort();
         zmq_handle.abort();
-        Ok(())
+        result
     }
 }
 
@@ -436,7 +560,7 @@ mod tests {
     #[test]
     fn test_node_config_debug() {
         let config = NodeConfig::new(Network::Mainnet);
-        let debug = format!("{:?}", config);
+        let debug = format!("{config:?}");
         assert!(debug.contains("NodeConfig"));
     }
 
@@ -445,14 +569,14 @@ mod tests {
         let db = DatabaseHandle {
             path: PathBuf::from("/tmp/test"),
         };
-        let debug = format!("{:?}", db);
+        let debug = format!("{db:?}");
         assert!(debug.contains("DatabaseHandle"));
     }
 
     #[test]
     fn test_network_handle_debug() {
         let net = NetworkHandle { port: 8333 };
-        let debug = format!("{:?}", net);
+        let debug = format!("{net:?}");
         assert!(debug.contains("NetworkHandle"));
     }
 
@@ -467,10 +591,9 @@ mod tests {
     #[test]
     fn test_builder_config_accessor_after_partial() {
         let config = NodeConfig::new(Network::Testnet);
-        let builder = NodeBuilder::new(config)
-            .with_database(DatabaseHandle {
-                path: PathBuf::from("/tmp"),
-            });
+        let builder = NodeBuilder::new(config).with_database(DatabaseHandle {
+            path: PathBuf::from("/tmp"),
+        });
         assert_eq!(builder.config().network, Network::Testnet);
     }
 
@@ -519,7 +642,9 @@ mod tests {
         // Verify all 6 permutations of component attachment order
         let node = NodeBuilder::new(NodeConfig::new(Network::Regtest))
             .with_pipeline(Pipeline::new())
-            .with_database(DatabaseHandle { path: PathBuf::from("/tmp") })
+            .with_database(DatabaseHandle {
+                path: PathBuf::from("/tmp"),
+            })
             .with_network(NetworkHandle { port: 18444 })
             .build()
             .unwrap();
@@ -531,7 +656,9 @@ mod tests {
         let node = NodeBuilder::new(NodeConfig::new(Network::Regtest))
             .with_network(NetworkHandle { port: 18444 })
             .with_pipeline(Pipeline::new())
-            .with_database(DatabaseHandle { path: PathBuf::from("/tmp") })
+            .with_database(DatabaseHandle {
+                path: PathBuf::from("/tmp"),
+            })
             .build()
             .unwrap();
         assert_eq!(node.config.network, Network::Regtest);
@@ -541,7 +668,9 @@ mod tests {
     fn test_builder_network_then_database_then_pipeline() {
         let node = NodeBuilder::new(NodeConfig::new(Network::Regtest))
             .with_network(NetworkHandle { port: 18444 })
-            .with_database(DatabaseHandle { path: PathBuf::from("/tmp") })
+            .with_database(DatabaseHandle {
+                path: PathBuf::from("/tmp"),
+            })
             .with_pipeline(Pipeline::new())
             .build()
             .unwrap();
@@ -551,7 +680,9 @@ mod tests {
     #[test]
     fn test_builder_database_then_pipeline_then_network() {
         let node = NodeBuilder::new(NodeConfig::new(Network::Regtest))
-            .with_database(DatabaseHandle { path: PathBuf::from("/tmp") })
+            .with_database(DatabaseHandle {
+                path: PathBuf::from("/tmp"),
+            })
             .with_pipeline(Pipeline::new())
             .with_network(NetworkHandle { port: 18444 })
             .build()
@@ -566,7 +697,9 @@ mod tests {
         assert_eq!(b0.config().network, Network::Mainnet);
 
         // One component
-        let b1 = b0.with_database(DatabaseHandle { path: PathBuf::from("/tmp") });
+        let b1 = b0.with_database(DatabaseHandle {
+            path: PathBuf::from("/tmp"),
+        });
         assert_eq!(b1.config().network, Network::Mainnet);
 
         // Two components
@@ -580,7 +713,12 @@ mod tests {
 
     #[test]
     fn test_node_config_all_networks() {
-        for network in [Network::Mainnet, Network::Testnet, Network::Signet, Network::Regtest] {
+        for network in [
+            Network::Mainnet,
+            Network::Testnet,
+            Network::Signet,
+            Network::Regtest,
+        ] {
             let config = NodeConfig::new(network);
             assert_eq!(config.network, network);
             // Ports should differ from 0
@@ -607,29 +745,26 @@ mod tests {
 
     #[test]
     fn test_node_config_datadir_string() {
-        let config = NodeConfig::new(Network::Mainnet)
-            .with_datadir("/home/user/.btc-rust");
+        let config = NodeConfig::new(Network::Mainnet).with_datadir("/home/user/.btc-rust");
         assert_eq!(config.datadir, PathBuf::from("/home/user/.btc-rust"));
     }
 
     #[test]
     fn test_node_config_datadir_pathbuf() {
-        let config = NodeConfig::new(Network::Mainnet)
-            .with_datadir(PathBuf::from("/home/user/data"));
+        let config =
+            NodeConfig::new(Network::Mainnet).with_datadir(PathBuf::from("/home/user/data"));
         assert_eq!(config.datadir, PathBuf::from("/home/user/data"));
     }
 
     #[test]
     fn test_node_config_log_level_string() {
-        let config = NodeConfig::new(Network::Mainnet)
-            .with_log_level(String::from("warn"));
+        let config = NodeConfig::new(Network::Mainnet).with_log_level(String::from("warn"));
         assert_eq!(config.log_level, "warn");
     }
 
     #[test]
     fn test_node_config_log_level_str() {
-        let config = NodeConfig::new(Network::Mainnet)
-            .with_log_level("error");
+        let config = NodeConfig::new(Network::Mainnet).with_log_level("error");
         assert_eq!(config.log_level, "error");
     }
 
@@ -642,7 +777,9 @@ mod tests {
             .with_log_level("trace");
 
         let node = NodeBuilder::new(config)
-            .with_database(DatabaseHandle { path: PathBuf::from("/db/path") })
+            .with_database(DatabaseHandle {
+                path: PathBuf::from("/db/path"),
+            })
             .with_network(NetworkHandle { port: 2222 })
             .with_pipeline(Pipeline::new())
             .build()

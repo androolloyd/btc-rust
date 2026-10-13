@@ -5,19 +5,19 @@
 //! execution, [`TxBuilder`] for transaction construction, and [`weight`]
 //! utilities for script cost analysis.
 
-pub mod script_env;
-pub mod script_builder;
 pub mod debugger;
+pub mod miniscript;
+pub mod script_builder;
+pub mod script_env;
 pub mod tx_builder;
 pub mod weight;
-pub mod miniscript;
 
-pub use script_env::{ScriptEnv, Account, FundedUtxo, ScriptResult, ForgeError};
+pub use debugger::{DebugStep, ScriptDebugger};
+pub use miniscript::{Miniscript, MiniscriptError, Policy};
 pub use script_builder::ForgeScript;
-pub use debugger::{ScriptDebugger, DebugStep};
+pub use script_env::{Account, ForgeError, FundedUtxo, ScriptEnv, ScriptResult};
 pub use tx_builder::TxBuilder;
 pub use weight::{analyze_script, estimate_witness_weight, ScriptAnalysis, ScriptBranch};
-pub use miniscript::{Miniscript, Policy, MiniscriptError};
 
 // Re-export core types for convenience so users do not need to depend on
 // lower-level crates directly.

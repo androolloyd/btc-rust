@@ -1,0 +1,632 @@
+# PSBT wallet tools
+
+The compiled `btc-node` CLI parses BIP174 v0 and BIP370 v2. Inline input and
+output use hexadecimal PSBT bytes; convert Core's base64 representation explicitly when
+exchanging data with Core RPC.
+
+```sh
+btc-node --json decode-psbt "$PSBT_HEX"
+btc-node --json convert-psbt "$PSBT_HEX" --version 2
+btc-node --json convert-psbt "$PSBT_V2_HEX" --version 0
+btc-node --json extract-psbt "$FINALIZED_PSBT_HEX"
+btc-node --json verify-psbt "$FINALIZED_PSBT_HEX"
+btc-node --json verify-psbt "$PARTIALLY_SIGNED_PSBT_HEX" --partial
+btc-node --json finalize-psbt "$PARTIALLY_SIGNED_PSBT_HEX"
+btc-node --json verify-psbt-derivations "$PSBT_WITH_XPUB_ANCHORS_HEX"
+btc-node --json finalize-psbt @partially-signed.psbt
+btc-node --json --network regtest sign-psbt @unsigned.psbt --key-file /path/to/keys.wif --max-fee-sat 2000
+```
+
+Every PSBT tool also accepts `@path` to a regular file containing binary PSBT
+bytes. This handles large updater maps that exceed operating-system argument
+limits. The file is read without modification; the 32 MiB parser limit is checked
+before allocation and during reading, including a file that grows during the read.
+Hex text and Core base64 files require explicit decoding to binary first.
+
+Inspection reports the actual unsigned transaction, PSBT version, resolved
+locktime, prevouts, sequences, output values/scripts, available UTXO/final fields
+and signature counts. Taproot inspection also exposes internal keys, input merkle
+roots, leaf scripts/control blocks, output trees and key-origin/leaf-hash records.
+Paths are reported as the original u32 child indices, including hardened bits.
+Input/output `bip32_derivation` arrays also expose legacy public-key origins.
+`global_xpub_records` includes the Base58 and serialized extended public key,
+depth, parent fingerprint, child number, public key and claimed master origin;
+`global_xpubs` retains the existing count.
+Input `utxo` reports the supplied amount/script and its source, or null when absent.
+`txid_linked` means a full parent transaction hashes to the referenced txid; it does
+not mean the output has been confirmed or is currently unspent. Witness-only
+records have `txid_linked: false` and remain claims from the updater.
+`unsigned_txid` identifies the transaction being signed;
+BIP370's `psbt_id` uses zero sequences as required by its unique-identification
+rule. Decode, convert and extract set `signatures_verified` to false: parsing and copying external
+final fields do not prove that a transaction can spend its inputs. Submit extracted
+transactions through the validated mempool or an independent validating node.
+The tools do not create signatures, derive wallet keys or choose coins.
+Inspection exposes the declared `sighash_type`, per-key partial-signature types,
+the Taproot key-signature type and script-signature key/leaf/type records.
+An implicit 64-byte Taproot signature reports type zero (DEFAULT).
+
+`verify-psbt` evaluates the final transaction's spending conditions with the node's
+real ECDSA/Schnorr verifier and all supplied prevouts. It supports P2PKH/P2PK and
+bare canonical multisig, legacy P2SH with those known redeem templates,
+native/wrapped P2WPKH, native/wrapped P2WSH with P2PK,
+P2PKH or canonical multisig scripts, Taproot key paths, and version-c0 single-key
+`<32-byte key> CHECKSIG` Taproot leaves and canonical BIP387 CHECKSIGADD threshold
+leaves with up to 999 curve-valid x-only keys. Threshold witnesses contain
+one reversed-order slot per script key, empty slots for unused keys, and exactly
+the specified number of nonempty signatures. An annex is included in the Taproot digest.
+Arbitrary witness/tapscript programs, future witness/leaf/key versions,
+OP_SUCCESS and signature-free scripts return explicit errors. This bounded wallet
+scope prevents consensus forward-compatibility success from becoming a signature
+verification claim; ordinary node consensus rules are unchanged.
+
+Every input needs final fields and a resolved UTXO. Legacy inputs additionally
+require a txid-linked full parent; witness-only legacy amounts cannot establish
+the fee because legacy signatures do not commit to them. Final signature types
+must be defined and match a retained declaration. ECDSA signatures require strict
+DER and low S, and witness-v0 public keys are compressed. Wrapped witness scriptSigs
+must be canonical single pushes. Known scripts/controls and actual signature
+equations must succeed for every input. Duplicate/null inputs, excessive weight,
+out-of-range totals and outputs exceeding supplied values fail as well.
+
+On success, `spending_conditions_verified` and `signatures_verified` are true;
+`signatures_checked` counts real successful equations. `tx_hex` is the verified
+transaction and `fee_sat` is the difference of supplied values.
+`verification_scope` is `finalized_spends_against_supplied_prevouts` and
+`txid_linked_prevouts` reports full-parent linkage per input. Witness-only values
+remain supplied claims, particularly for other inputs under ANYONECANPAY.
+`partial_signatures_verified` and `active_chain_verified` remain false: unused
+partial records and key origins are not verified, and this offline command does
+not establish confirmation, unspentness, maturity, chain finality, activation at
+a historical height, mempool fee/standardness policy or full Core consensus parity.
+Submit the verified transaction through a validating node for chain admission.
+
+`verify-psbt --partial` checks every supplied partial ECDSA, Taproot key and
+Taproot script signature before finalization. Each input must be unfinalized,
+have a resolved UTXO and contain at least one partial signature. It binds ECDSA
+keys to the known P2PKH/P2PK/multisig script, using the exact legacy or BIP143
+scriptCode and supplied amount. Native/wrapped witness-v0 templates and legacy
+P2SH with known key/multisig redeem scripts are supported. Legacy inputs still
+require full parent transactions; the witness-only amount attack is rejected.
+Missing redeem/witness scripts, unrelated keys and unsupported templates fail.
+Taproot key signatures verify against the actual output key Q. Each script
+signature must name a supplied, committed version-c0 CHECKSIG or bounded
+CHECKSIGADD threshold leaf and a key in that actual script; unknown leaf hashes
+or missing controls/scripts fail.
+All prevouts enter the BIP341 digest where required. This mode uses no annex and
+no OP_CODESEPARATOR, because its supported partial-record context has neither.
+Finalized inputs are rejected; annex-bearing final witnesses belong to the
+separate final-spend verification path.
+
+On success, partial mode sets `partial_signatures_verified` and
+`signatures_verified` to true, reports `signatures_checked` and
+`signatures_per_input`, and returns `unsigned_tx_hex`/`unsigned_txid`.
+It never returns broadcast transaction bytes. The scope is
+`partial_signatures_against_supplied_prevouts`; `spending_conditions_verified`,
+`final_fields_verified`, `key_origins_verified` and `active_chain_verified` remain
+false. One valid signature in a 2-of-2 multisig verifies successfully while the
+transaction remains incomplete. This operation is read-only: it neither signs
+nor finalizes inputs. Full key-origin proofs, arbitrary script satisfaction,
+wallet signing and chain admission remain separate work.
+
+`finalize-psbt` assembles complete spends from supplied signatures for the same
+known templates. It verifies every supplied partial record, including excess
+multisig signatures and signatures for unselected Taproot leaves. Multisig uses
+the script's key order and requires the full threshold; a valid incomplete set
+returns an error. Taproot prefers a complete key path, otherwise the smallest
+serialized witness for a supported signed leaf, with deterministic Core-compatible
+ties. Wrapped witness uses an exact redeem-program push; legacy/witness multisig
+includes its empty CHECKMULTISIG dummy. Taproot thresholds choose the required
+number of shortest signatures, prefer later script keys on equal size, and
+retain all empty slots. Witness selection includes actual CompactSize lengths
+for scripts and control blocks. Repeated keys count separate equations, without
+claiming independent signers or authenticated origins. No annex or separator context is invented
+for partial records. Existing final inputs are preserved and verified, enabling
+mixed partial/final transactions and idempotent finalization.
+
+The final transaction passes the actual shared spend verifier before the result
+is returned. Present sighash declarations are checked before cleanup. BIP174/371
+cleanup removes known signing metadata, keeping UTXOs, final fields and opaque
+unknown/proprietary input records. BIP370 construction/locktime fields and global
+modification flags survive; output/global metadata remains unchanged. Failure
+does not mutate the input PSBT or return partially finalized bytes.
+
+Success returns `complete: true`, cleaned `psbt_hex`, verified `tx_hex`, fee and
+scope/linkage fields. `signatures_checked` counts final-spend equations;
+`partial_signatures_checked` and `partial_signatures_per_input` count all supplied
+partial equations, including unused records. Both partial and final verification
+flags are true, including the vacuous check of zero partial records on already
+finalized inputs. Key-origin and active-chain verification remain false. These
+are offline supplied-prevout checks; broadcast still requires chain/policy
+admission. This command creates no signatures or wallet secrets. General script
+satisfaction, HD origin proofs, signing and active-chain wallet integration remain
+unfinished.
+
+Finalizer references: [BIP174 Input Finalizer](https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki#input-finalizer),
+[BIP370 retained construction fields](https://github.com/bitcoin/bips/blob/master/bip-0370.mediawiki#input-finalizer),
+[BIP371 Taproot cleanup](https://github.com/bitcoin/bips/blob/master/bip-0371.mediawiki),
+and [Core v29 signature assembly and path selection](https://github.com/bitcoin/bitcoin/blob/v29.0/src/script/sign.cpp).
+
+V2 serialization excludes the global unsigned transaction and includes transaction
+version, counts, per-input prevouts, and per-output amounts/scripts. Optional
+sequences default to final. Locktime uses the maximum common input requirement,
+preferring height when both types are possible; incompatible requirements fail.
+Unknown modification flag bits are preserved. Conversion keeps the transaction,
+signatures, derivations and unknown/proprietary fields. V2 to v0 necessarily
+collapses construction permissions and input locktime requirements into the fixed
+transaction. V0 to v2 gives no new permission to modify that transaction.
+When partial signatures use SIGHASH_SINGLE, conversion sets the v2 pairing flag.
+V2 partial signatures forbid input modification unless ANYONECANPAY is set,
+forbid output modification unless NONE is used, and require the SINGLE pairing
+flag when applicable. Unknown flag bits are retained.
+
+The parser checks canonical CompactSize keys and lengths, unique raw keys in each
+map, singleton key shapes, fixed field lengths, unsigned v0 transaction scripts,
+v0/v2 inclusion/exclusion and required fields, and complete buffer consumption.
+It bounds blobs by the bytes remaining before allocating, caps the input at 32 MiB,
+and caps map count, total key/value pairs, final-witness item count, tree leaf count
+and each Taproot derivation's hash count at 100,000.
+These are local resource bounds, not Bitcoin consensus limits. Publicly assembled
+models should use `try_serialize`, which returns errors for invalid models;
+`serialize` retains the legacy infallible convenience API and panics for such
+models. Combining malformed models fails before changing the receiver. Combining
+different versions or v2 construction fields requires explicit reconciliation;
+this combiner does not automatically change sequences or locktime requirements.
+
+Supplied non-witness transactions must match the input txid (excluding parent
+witness data), and the referenced output must exist. If both UTXO forms are
+provided, their amounts and scripts must agree exactly. Supplied prevout amounts
+are range checked in both wire parsing and public models. Known input and output
+redeem scripts must match P2SH HASH160 commitments; witness scripts must match
+native or wrapped P2WSH SHA256 programs. Incomplete inputs can omit UTXOs, and a
+P2SH input can omit its redeem script; checks depending on absent data are deferred.
+Contradictory data fails parsing, serialization, conversion, extraction and an
+isolated combine result before the receiver changes. These checks apply at the
+tool boundary even to BIP174 examples which are structurally valid but fail the
+Signer role's script checks. This does not implement a signer.
+
+Legacy partial-signature and input/output BIP32 record keys must use compressed
+or uncompressed encodings of actual secp256k1 points. Global xpubs use BIP32's
+78-byte layout, compressed curve keys and standard xpub/tpub version bytes.
+Unsupported custom versions and private-key versions fail explicitly. A master
+extended key must have zero parent fingerprint and child number; the standalone
+BIP32 private/public decoders enforce this as well. A global xpub's origin path
+length must match its depth and its final index must match the header's child
+number. The master fingerprint must agree where directly known: the key's own
+fingerprint at depth zero or the parent fingerprint at depth one. At greater
+depths it remains a claim without the missing master ancestor. These consistency
+checks neither establish the full derivation nor link every input/output origin
+to a global xpub. Compressed/uncompressed keys retain their original encoding.
+
+`verify-psbt-derivations` separately checks every supplied legacy and Taproot
+input/output key-origin record against at least one supplied global xpub. The
+fingerprint and path prefix select candidate anchors; actual CKDpub HMAC/curve
+operations must produce the recorded point. Legacy compressed/uncompressed
+encodings compare the complete point, and Taproot records compare its x-only
+coordinate. Fingerprint collisions try alternative anchors. Matching the anchor
+itself is an identity proof with zero child steps. Shared prefixes are cached.
+The immutable wallet API is `wallet::verify_key_derivations`.
+Its shared CKDpub primitive accepts a zero child tweak as BIP32 specifies; the
+point can equal the parent's while the child chain code and header advance.
+Out-of-range tweaks and infinite child points still fail. Deterministic boundary
+tests inject post-HMAC values privately; production proofs always compute HMAC.
+
+Success reports `derivation_equations_verified: true`, the matching global xpub
+index and relative path for each record, plus record and unique child-step counts.
+Its scope is `public_derivations_from_supplied_xpubs`. The supplied anchor and its
+claimed master path are not authenticated: `key_origins_verified`,
+`wallet_ownership_verified`, `signatures_verified`, `taproot_leaf_membership_verified`
+and `active_chain_verified` remain false. The command does not establish coverage
+of every spending key or verify leaf-hash associations. Parsing, conversion,
+signature verification and finalization retain their existing separate scopes.
+
+Missing anchors/records, mismatched points/paths and paths above BIP32 depth 255
+fail explicitly. Hardened suffixes require a deeper supplied xpub; no private key
+or invented ancestor is substituted. Any unprovable supplied record fails the
+whole command without changing the PSBT. Work is bounded to 256 anchors, 4,096
+records and 10,000 child operations, including unsuccessful candidates.
+Core's literal NUMS origin annotations have no xpub anchor in the acceptance
+fixture and correctly fail complete derivation verification. Separate HD-subset
+checks explicitly omit only those optional annotations and make no complete
+origin or ownership claim.
+
+All BIP371 fields are typed, including input leaf scripts and input/output Taproot
+BIP32 origins and output trees. X-only keys must be actual secp256k1 points. Control
+blocks require `33 + 32*m` bytes with `m <= 128`, an on-curve internal key and a
+leaf version matching the control byte. Derivation counts are canonical CompactSize
+and bounded before allocation, with a complete fingerprint/path suffix. Output
+trees require even leaf versions, depths at most 128, depth-first order and exactly
+one complete root. Empty scripts and even future leaf versions remain metadata.
+These records survive serialization, conversion and combining; known Taproot
+records cannot bypass parsing through the unknown-field collection.
+
+Taproot leaves use BIP341 tagged TapLeaf/TapBranch hashing, lift the control's
+internal key on secp256k1 and apply the actual TapTweak scalar. Every supplied
+control must agree on internal key/root and declare the resulting output parity.
+Supplied internal-key/root fields must agree with those proofs. When a UTXO is
+available, the computed output key must match its native P2TR program. An explicit
+internal-key/root pair is also checked without leaf scripts. Complete output trees
+are reconstructed and, with an internal key, checked against the transaction's
+output key. Taproot fields on known non-Taproot inputs/outputs are rejected.
+
+Missing data remains incomplete: an omitted root/tree can describe unrevealed
+scripts, and an omitted UTXO cannot establish which output is spent. An internal
+key alone is not assumed to mean a key-only output. Commitment checks needing that
+data are deferred. These public commitments do not prove signature equations,
+key derivations, confirmation, unspentness or script satisfaction. Sorted branch
+hashing permits exchanging complete sibling subtrees without changing the root.
+
+Partial ECDSA signature records require strict DER, nonzero scalars below the
+curve order and one of the six defined legacy sighash bytes. High S remains
+representable and is preserved; this parser does not impose low-S policy.
+Taproot records require 64 bytes for DEFAULT, or 65 bytes with a defined nonzero
+type. Their r must be below the BIP340 field modulus and s below the curve order.
+Explicit DEFAULT, unsupported/draft types and out-of-range values fail.
+Present partial signatures must match a declared type exactly, including the
+distinction between Taproot DEFAULT and ALL. Known non-Taproot inputs cannot use
+DEFAULT, and known Taproot inputs cannot carry ECDSA partial signatures. Taproot
+SINGLE signatures require a corresponding output. Combining complementary
+records validates these relationships before changing the receiver.
+
+These checks validate encoding and metadata consistency. Parsing does not
+validate signature equations, complete sighash context, full claimed key
+derivations or script satisfactions. Remaining
+BIP174/371 general-script/annex context and full key-origin verification,
+active-chain/unspentness checks, HD/general signing and generalized finalization,
+descriptor operations and MuSig2 remain unfinished. Empty v2 creator maps can be
+represented; converting an empty-input creator to v0 is rejected by the legacy
+transaction decoder.
+
+Independent acceptance uses all 47 published BIP370 format/locktime vectors in
+`crates/primitives/tests/data/bip370.json`, including 24 invalid layouts and one
+incompatible locktime. All 17 published BIP371 vectors (six valid, eleven invalid)
+are in `crates/primitives/tests/data/bip371.json`, with source provenance and hex
+cross-checked against the accompanying base64. Malformed-input regressions cover duplicate/unknown keys,
+noncanonical/truncated key types, oversized lengths/counts, trailing data and
+invalid public models. `bip174-utxo.json` contains eight nonempty valid-format
+examples and all three published signer-script-mismatch examples, with source
+provenance and hex/base64 agreement. `scripts/check_core_psbt.py` creates and signs
+real P2PKH, P2SH-P2WPKH, P2WPKH, P2WSH, P2SH-P2WSH and Taproot key/script-path
+regtest spends with Core v29, converts signed and finalized PSBTs
+through the compiled CLI, compares the extracted bytes and asks Core to validate
+them. The finalizer additionally matches Core's exact final bytes in v0/v2 across
+twelve funded spend types and 26 hash-mode variants, preserves cleanup/unknown
+records, and submits Rust-assembled transactions for actual Core admission/mining.
+2-of-3 multisig has three valid partial records in reversed wire order; corrupting
+even the unselected one fails our explicit all-record verification. Unequal-depth
+Taproot leaves test the smallest serialized witness independently; equal-size
+leaves test deterministic selection. Mixed final/partial two-input Taproot spends
+remain valid, while corrupted existing final signatures fail. The script-path
+wallet uses a NUMS internal key and two real signing keys,
+requiring a script-path witness; input controls/origins and output trees are checked
+through the CLI. Core also decodes every published BIP371 case independently,
+compares the CLI's controls, trees, leaf hashes, fingerprints and paths against
+Core's inspection, and compares valid PSBTs before/after conversion. CI runs this with the checksum-verified
+Core binary. The PSBT fuzz target checks arbitrary decoding plus canonical
+serialization/conversion invariants, seeded with BIP174, BIP370, BIP371 and BIP341-wrapper cases.
+Full-parent inspection matches Core's active UTXO amounts/scripts; substituted
+parents, conflicting UTXOs and altered input/output scripts are rejected through
+all CLI tools. Valid signed and finalized records keep identical transaction bytes.
+
+`bip32-keys.json` retains all 17 valid public/private key pairs from BIP32 vectors
+1–4 and all 16 invalid extended keys from vector 5, with source hashes. Derivation
+from the published seeds and paths must match the exact extended key bytes,
+including leading zeros. Independently serialized PSBT wrappers carry the public
+keys and origins; these have no UTXOs/signatures and make no spendability claim.
+The fixture also retains three published BIP174 malformed-key cases, for 27 PSBT
+cases in total. The compiled tools reject substituted off-curve keys and altered
+depth/index/fingerprint records. Core independently checks curve/extended-key
+encoding and valid conversion data; its PSBT decoder preserves custom version
+bytes and does not bind origin paths to headers, so those stricter supported-version
+and origin checks are reported separately. Core-signed legacy/witness spends
+also exercise input/output key substitution. The fuzzer includes these envelopes.
+
+`bip341-commitments.json` retains all seven published scriptPubKey commitment cases,
+with exact tweaks, output keys, leaf hashes, roots and twelve control proofs,
+including an even future leaf version. It also contains independently constructed
+PSBT wrappers used by the compiled CLI, Core decoding/conversion comparison and
+the fuzzer. These wrappers have test-only witness UTXO claims and no signatures;
+they do not claim a spendable or active-chain transaction. Real Core script-path
+spends provide independent signature/finalization/acceptance evidence. Mutated
+roots, internal keys, control parities, leaf scripts, merkle paths and output trees
+fail the actual tools. Tagged commitment hashing is shared with the existing
+consensus verifier through primitives; consensus rules are unchanged.
+
+Primary specifications: [BIP174](https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki),
+[BIP32 and its vectors](https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki),
+[BIP370 and its vectors](https://github.com/bitcoin/bips/blob/master/bip-0370.mediawiki),
+[BIP371](https://github.com/bitcoin/bips/blob/master/bip-0371.mediawiki),
+[BIP341 and wallet vectors](https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki),
+and [Core v29 PSBT RPCs](https://github.com/bitcoin/bitcoin/blob/v29.0/src/rpc/rawtransaction.cpp).
+
+`psbt-signatures.json` retains 20 single-push Core v29 DER/STRICTENC/LOW_S cases
+and all 19 BIP340 signature bodies, with source hashes and 58 independently
+serialized PSBT envelopes. Numeric encoding validity is kept separate from
+BIP340 equation verification; encodings of wrong-key/message signatures remain
+representable. Core's PSBT decoder is more permissive about partial signatures
+than its script validator, and those differences are explicit in acceptance.
+Real Core-signed legacy, witness-v0 and Taproot key/script spends cover the six
+defined ECDSA and seven Taproot types, including DEFAULT, NONE, SINGLE and
+ANYONECANPAY. Metadata/encoding substitution fails the compiled tools; unchanged
+valid signatures survive conversion and independent Core finalization/admission.
+Final scriptSig/witness fields remain opaque external records. Their signature
+encoding, declared-type agreement and equations are not verified by extraction.
+The separate `verify-psbt` command checks those properties for supported templates.
+
+Final-spend references: [BIP174 Extractor and retained UTXOs](https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki#transaction-extractor),
+[BIP143 amount and script commitments](https://github.com/bitcoin/bips/blob/master/bip-0143.mediawiki),
+[BIP341 all-prevout and annex commitments](https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki),
+[BIP342 future success/key semantics](https://github.com/bitcoin/bips/blob/master/bip-0342.mediawiki),
+and [Core v29 finalized PSBT verification](https://github.com/bitcoin/bitcoin/blob/v29.0/src/psbt.cpp).
+
+Signature references: [BIP66 strict DER](https://github.com/bitcoin/bips/blob/master/bip-0066.mediawiki),
+[BIP340 vectors](https://github.com/bitcoin/bips/blob/master/bip-0340/test-vectors.csv),
+[Core v29 script vectors](https://github.com/bitcoin/bitcoin/blob/v29.0/src/test/data/script_tests.json),
+and the BIP174/BIP341/BIP370 signing rules linked above.
+
+## Bounded ECDSA signer
+
+`wallet::sign_ecdsa_psbt` and compiled `sign-psbt` now create real deterministic
+RFC6979, low-S ECDSA partial signatures for the existing exact P2PK/P2PKH,
+P2SH-wrapped, P2WPKH, wrapped P2WPKH and P2WSH/wrapped P2WSH key/hash/multisig
+templates. Multisig supports at most sixteen keys in this wallet template set.
+The signer creates only SIGHASH_ALL and rejects other requested or supplied
+signature types. Every input must be unfinalized and have at least one matching
+supplied key; multisig may still need other cosigners afterward.
+
+```sh
+btc-node --json --network regtest sign-psbt @unsigned.psbt --key-file /path/to/keys.wif --max-fee-sat 2000
+```
+
+The key file is a regular UTF-8 file, one network-matching WIF per line, with
+at most 65,536 bytes and 1,024 keys; blank lines are ignored. Compressed and
+uncompressed WIF encodings have strict checksum/version/scalar/marker checks.
+Witness-v0 signing requires compressed keys. Private file data and keys are
+not interpolated into diagnostics; the WIF wrapper's Debug omits its scalar.
+The source and transient key data use ordinary process memory, not a protected
+keystore. HD/general-script signing remains unsupported.
+
+All inputs require txid-linked full parent transactions, including witness-v0,
+with dual UTXO agreement and redeem/witness commitments checked by the shared
+PSBT parser. This prevents BIP174 note 7's repeated-signing fee attack caused
+by unauthenticated amounts in other inputs. A required absolute fee cap is
+checked against those parents before signing; every output value/script and
+that fee are returned as a receipt. The cap does not prove recipient or change
+ownership, active-chain membership, maturity/finality or unspent status.
+
+Existing partial records, including unused cosigner records, are verified.
+Only missing records for matching supplied keys are added to an isolated PSBT;
+a failure leaves its input unchanged. Re-signing valid records is idempotent.
+BIP370 input/output modification bits are cleared while its SINGLE-pairing
+bit and construction metadata survive. Every returned signature equation is
+verified again. Scope `ecdsa_sighash_all_partial_signing` reports final-spend,
+origin, change and active-chain verification as false. Use `finalize-psbt` as
+an explicit subsequent step; no transaction is broadcast by this tool.
+
+`ecdsa-signer.json` records independent Core v29 scripts, preimages and exact
+RFC6979/low-S signatures from checksum-pinned, unchanged reference modules.
+Synthetic txid-linked parents establish offline equations only. The separate
+`check_core_signer.py` harness funds actual outputs from a disposable Core HD
+wallet, has Rust sign the spends in both PSBT versions, checks Core final
+bytes/admission/fees and mines them. Core receives v0 after verified Rust v2
+conversion; these checks do not claim Core v29 native PSBT v2 support.
+
+Primary rules: [BIP174 signer checks and fee-attack note 7](https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki),
+[BIP370 signer modification flags](https://github.com/bitcoin/bips/blob/master/bip-0370.mediawiki),
+[BIP143 signature preimages](https://github.com/bitcoin/bips/blob/master/bip-0143.mediawiki) and
+[Core v29 reference ECDSA signing](https://github.com/bitcoin/bitcoin/blob/v29.0/test/functional/test_framework/key.py).
+
+Acceptance passed: all twenty-five independently generated signature cases match
+exact RFC6979/low-S bytes in both PSBT versions, including modification flags,
+idempotence, partial multisig and unchanged opaque metadata. Core funded actual
+outputs and accepted/mined all twenty-five Rust-signed spends, with exact Core
+finalizer bytes, 2,000-satoshi fees, full-parent/fee-cap/corrupt-record rejection
+and sequential cosigning. The shared WIF decoder also passes all thirty-seven
+published private descriptor outputs and eight malformed-key/context checks.
+The final gate passes 3,379 tests across 43 suites, formatting, Clippy, isolated
+features and release build (two preexisting ignored tests). Twenty-five fresh
+independent sanitizer seeds completed 1,365,693 executions in 31 seconds without
+failure. Live acceptance uses disposable regtest coins; full-chain/keystore and
+remaining wallet signing qualification remain separate.
+
+## Taproot key-path signing
+
+The general `wallet::sign_psbt` entry point and the same compiled `sign-psbt`
+command now include BIP341 key-path signing. `sign_ecdsa_psbt` remains an ECDSA-only
+compatibility entry point. Taproot creates SIGHASH_DEFAULT (64 bytes) or an
+explicit SIGHASH_ALL (65 bytes ending in 01); NONE/SINGLE/ANYONECANPAY remain
+unsupported by the signer. Existing supported signature records are verified
+and retained, including supplied known leaf signatures not used for the new key
+path. Known script-path signature creation is described below.
+
+The updater must supply the 32-byte internal key, matching exactly one supplied
+compressed WIF key. The signer normalizes odd internal parity before the actual
+BIP341 scalar tweak, then checks the resulting output key against the prevout.
+A merkle root can be supplied explicitly or derived from an already verified
+control proof. An absent root is accepted only when the actual no-tree tweak
+matches that prevout; missing tree context fails. Arbitrary unsigned leaves stay
+opaque when spending the committed key path. Existing leaf signatures still
+require supported verification context; no annex or separator is invented.
+
+New Schnorr signatures receive fresh 32-byte auxiliary data from the OS. Entropy
+failure aborts; the CLI exposes no deterministic-entropy override. Private test
+callbacks alone use fixed auxiliary bytes for independent exact vectors and
+failure injection. Re-signing a verified existing key signature preserves it,
+so idempotence does not generate another nonce.
+
+Pure native Taproot transactions can use witness UTXOs without full parents:
+DEFAULT/ALL commit every input amount and script, as BIP371 specifies. Whenever
+any input uses an ECDSA template, full txid-linked parents remain mandatory for
+**every** input, including Taproot, preserving the earlier fee-attack defense.
+Fees still require an explicit cap. Signing is bounded to 128 inputs, 1,024 WIF
+keys and 4,096 supplied/created signature records. Final-spend, chain, change and
+origin claims remain false; this is not a protected keystore or an HD signer.
+
+Receipts keep the original ECDSA scope for ECDSA-only inputs. Taproot/mixed
+receipts use `known_ecdsa_and_taproot_keypath_partial_signing`, report each input's
+signature scheme, and identify OS randomness for newly created Schnorr records.
+The same finalizer independently checks complete spending conditions afterward.
+
+`taproot-key-signer.json` retains all seven unchanged published BIP341 private
+tweaks/signature objects and twenty independently generated Core cases. The
+published object includes hash modes outside the public signer's bounded scope;
+its private tweak, preimage and fixed-aux signature primitives are tested without
+claiming those modes are enabled. Generated cases span both internal/output
+parities, tree/no-tree commitments, DEFAULT/ALL, proof-derived roots, known unused
+leaf records, two witness-only Taproot inputs and mixed ECDSA/Taproot inputs.
+The separate `check_core_signer.py --taproot-only` harness checks actual random
+signatures with unchanged Core preimages/math, then independently funds outputs
+and validates/mines their Rust-signed spends. Core receives v0 after Rust v2
+conversion, with no native-Core-v2 claim.
+
+Primary definitions: [BIP340 signing and auxiliary randomness](https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki),
+[BIP341 private tweaks and key-path signatures](https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki),
+[BIP371 Taproot UTXOs](https://github.com/bitcoin/bips/blob/master/bip-0371.mediawiki) and
+[published wallet vectors](https://github.com/bitcoin/bips/blob/master/bip-0341/wallet-test-vectors.json).
+
+Acceptance passed for all twenty generated cases through both Rust PSBT versions,
+independent Core Schnorr equations, identical final transaction bytes, explicit
+fee/context/corrupt-record rejection and all twenty funded/admitted/mined spends.
+The earlier twenty-five funded ECDSA cases also pass through the general CLI.
+The final local gate passes 3,382 tests in 43 suites, formatting, Clippy, minimal
+and isolated features and release build (two preexisting ignored tests). Twenty
+fresh sanitizer seeds completed 752,974 executions in 31 seconds without failure.
+HD/general signing, protected key storage and
+authenticated origin/change/chain checks remain unfinished.
+
+## Known Taproot script-path signing
+
+`wallet::sign_psbt` and the compiled `sign-psbt` command now create DEFAULT/ALL
+Schnorr records for exact c0 `pk`, `multi_a` and `sortedmulti_a` templates, up to
+999 keys. A matching supplied internal key keeps the key-path preference.
+Otherwise, the signer finds supplied compressed WIF keys in the actual committed
+leaf/control records, signs all matching known leaves and preserves partial
+thresholds for sequential cosigning. Repeated script keys and duplicate proofs
+share a single BIP371 `(x-only key, leaf hash)` record.
+
+Leaf signatures use the **untweaked** key and the BIP342 leaf extension, including
+the actual leaf hash and the no-separator position. Odd-key normalization belongs
+to Schnorr signing. Each new signature requires fresh OS auxiliary randomness;
+an error after earlier additions still returns no partially mutated PSBT.
+Existing signature equations, including unused cosigners/leaves/key paths, are
+verified before returning any result. Unknown unsigned leaves stay opaque;
+future-version, OP_SUCCESS, separator and arbitrary-script leaves cannot
+authorize new signatures. An optional internal-key field can be absent when
+actual control proofs establish the script path.
+
+Pure Taproot inputs keep DEFAULT/ALL's all-prevout amount/script commitment and
+witness-only support; mixed ECDSA transactions keep full parents for every input.
+The explicit fee cap and BIP370 modification rules remain enforced. In addition
+to 128 inputs, 1,024 keys and 4,096 supplied/created signature records, signing
+limits supplied control proofs to 1,024 and their total leaf-script bytes to
+1 MiB, before commitment verification. These are wallet work bounds, not new
+consensus restrictions.
+
+Script-path receipts use `known_ecdsa_and_taproot_partial_signing` with per-input
+`taproot_scriptpath_default` / `taproot_scriptpath_all` schemes; the scheme names
+the chosen creation type, while existing valid DEFAULT/ALL records can coexist
+when no type is declared. Signing does not promise threshold completion, origin,
+change or active-chain verification. Key-path-only and ECDSA-only receipts retain
+their prior scope names.
+
+Seventeen checksum-pinned Core-generated cases provide independent exact
+fixed-aux signatures and digests, including both parities/types, partial
+cosigning, duplicate proofs, multiple/opaque leaves, omitted optional internal
+keys, existing records, mixed inputs and distinct-key 128/999 thresholds. Three
+unsupported-only leaves carry actual commitments. Live acceptance independently
+funds those scripts, verifies each random Rust equation with unchanged Core
+math/preimages, compares final bytes and requires admission/mining. Both Rust
+PSBT versions use actual v2-to-v0 conversion for Core, without a native-Core-v2
+claim. Acceptance passed for all seventeen exact cases and all seventeen actual
+funded/admitted/mined Rust leaf-signed spends, including distinct-key 999-of-999.
+The earlier twenty funded/mined key-path cases also pass after the fallback change.
+Leaf script tables store each signature context once; normalized comparison
+proves all PSBTs, keys, digests and signatures survived fixture compaction.
+The local gate passes 3,385 tests across 43 suites, formatting, Clippy, minimal
+and isolated feature checks and release build (two preexisting ignored tests).
+Twenty fresh sanitizer seeds completed 635,959 executions in 31 seconds without
+failure.
+
+Primary definitions: [BIP342 signature extension](https://github.com/bitcoin/bips/blob/master/bip-0342.mediawiki),
+[BIP371 leaf signature records](https://github.com/bitcoin/bips/blob/master/bip-0371.mediawiki),
+[BIP387 thresholds](https://github.com/bitcoin/bips/blob/master/bip-0387.mediawiki) and
+[unchanged Core v29 preimages/math](https://github.com/bitcoin/bitcoin/blob/v29.0/test/functional/test_framework/script.py).
+HD/general signing, authenticated origin/change/chain checks, protected keystores
+and annex/general-script creation remain unfinished.
+
+## HD private signing
+
+`wallet_hd::sign_hd_psbt` and compiled `sign-hd-psbt` now derive actual normal and
+hardened BIP32 children before using the existing ECDSA/Taproot signature engine.
+The CLI accepts PSBT hex or bounded binary `@file`, an explicit `--max-fee-sat`,
+and a regular UTF-8 `--key-file` containing one private anchor per line. A bare
+master xprv/tprv uses its actual fingerprint; a deep anchor requires
+`[fingerprint/path]xprv` or `[fingerprint/path]tprv`. `'` and `h` mark hardened
+indices. Anchor versions must match the selected mainnet/test serialization
+family. Private input and diagnostics are redacted; no inline secret option is
+provided. This is ordinary transient process memory, not protected key storage.
+
+Origin depth, terminal index and directly known parent/master fingerprints are
+checked. When a matching supplied master exists, every deep anchor must match
+actual derivation of its full public extended-key payload, including its chain
+code and headers. Without that master, a deep anchor's prefix is an explicitly
+unverified user annotation: the tool proves only its relative child equations.
+Fingerprints select candidates, with collision handling; actual public points
+prove input derivations. Relevant supplied global xpubs require exact derived
+78-byte payload matches. Missing global xpubs do not prevent direct private
+proofs. Foreign/global records outside supplied private subtrees remain metadata.
+
+Each input needs its own proven key records. Keys proved on another input cannot
+silently authorize an input with missing origins. Legacy origins preserve the
+record's compressed/uncompressed representation; witness-v0 still requires
+compressed keys. Owned Taproot origins bind the internal key or every declared
+leaf hash to actual committed c0 known scripts. HD leaf signatures are restricted
+to those declared, proved `(key, leaf hash)` records. Unlisted unsigned leaves
+stay opaque, even when the same child key appears in them. Raw output-key
+origins, annex/separator/arbitrary contexts and future leaf signing remain
+unsupported. Existing signatures from any cosigner/path still require equations.
+Partial thresholds support a later HD cosigner. No invalid exact child index is
+silently advanced to the next index.
+
+Limits are 64 anchors, 4,096 input origin records, 256 global xpubs, 16,384 declared
+leaf memberships, 10,000 unique private child operations and BIP32 depth 255.
+Shared derivation prefixes are cached per anchor. The existing limits on 128
+inputs, 1,024 distinct signing keys, control/script work and signature records,
+fee caps, mixed full-parent requirements, OS Schnorr auxiliary randomness and
+BIP370 modification flags still apply. Failure returns no partially modified
+PSBT. Signing never finalizes or broadcasts automatically.
+
+The receipt uses `hd_known_templates_partial_signing`. It lists public input
+proofs and relative paths, step/record counts, checked global xpub counts and
+`anchor_master_paths_verified`. `owned_input_derivations_verified` means actual
+relative equations and declared input roles passed. Overall `key_origins_verified`,
+`master_identity_authenticated`, output/change proofs, final-spend and active
+chain flags remain false: supplied masters are not externally authenticated
+wallet identities, and foreign/output origin coverage is not claimed.
+
+Twenty-eight real-HMAC reference cases use standard-library HMAC and unchanged
+checksum-pinned Core curve/preimage/signature code. All seventeen published
+BIP32 real-seed paths are cross-checked before generation. Cases cover legacy,
+SegWit, Taproot key/leaf DEFAULT/ALL, mixed inputs, partial cosigning, uncompressed
+legacy records, account anchors/hardened suffixes, master affiliation, declared
+leaf restrictions and 128/999 distinct HD keys. Synthetic parents prove offline
+equations only. The live Core harness independently funds the scripts and must
+admit/mine Rust HD-signed spends; an additional actual Core HD provider updates
+unsigned PSBTs with signing disabled before Rust signs its four standard address
+families and three hardened script cases. Core receives v0 after actual Rust v2
+conversion. Acceptance passed for all twenty-eight reference cases, twenty-eight actual
+funded/mined HD-signed spends and seven actual Core HD-provider spends. The
+final local gate passes 3,389 tests in 43 suites, formatting, Clippy, minimal and
+isolated feature checks and release build (two preexisting ignored tests).
+Twenty-eight fresh sanitizer seeds completed 12,566 executions in 31 seconds
+without failure. Regtest comparisons change only fixture private/global-public
+version bytes; public points, paths, scripts and unsigned transactions remain
+unchanged.
+
+Primary definitions: [BIP32 private derivation](https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki),
+[BIP174 signer and origin records](https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki),
+[BIP371 internal/leaf origins](https://github.com/bitcoin/bips/blob/master/bip-0371.mediawiki)
+and [unchanged Core reference math](https://github.com/bitcoin/bitcoin/blob/v29.0/test/functional/test_framework/key.py).
+General script creation, protected storage, authenticated master identities,
+complete foreign/output/change origin policy and active-chain integration remain
+unfinished.

@@ -5,15 +5,15 @@ A modular Rust Bitcoin full node inspired by reth's architecture.
 ## Build & Test
 
 ```bash
-cargo build          # build all crates
-cargo test           # run all tests (~280+ tests)
+cargo build --workspace --locked # build all crates
+cargo test --workspace --all-features --locked # run all workspace tests
 cargo test -p <crate> # test individual crate
-cargo run -- --help  # CLI help
+cargo run -p btc-node -- --help # CLI help
 ```
 
 ## Architecture
 
-8-crate workspace following reth's patterns:
+12-crate workspace following reth's patterns:
 
 - **btc-primitives** — Hash, encode, script, tx, block, address, amount, bech32. All our own code, no rust-bitcoin dependency.
 - **btc-consensus** — Script engine with real CHECKSIG/secp256k1, sighash (500/500 Core vectors), UTXO processing, header chain management, taproot, segwit witness verification, chain reorgs.

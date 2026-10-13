@@ -165,11 +165,8 @@ mod tests {
 
     #[test]
     fn test_response_serialization_error() {
-        let resp = ElectrumResponse::error(
-            Value::Number(2.into()),
-            METHOD_NOT_FOUND,
-            "unknown method",
-        );
+        let resp =
+            ElectrumResponse::error(Value::Number(2.into()), METHOD_NOT_FOUND, "unknown method");
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"error\""));
         assert!(json.contains("-32601"));
@@ -178,10 +175,8 @@ mod tests {
 
     #[test]
     fn test_response_roundtrip() {
-        let resp = ElectrumResponse::success(
-            Value::String("test-id".to_string()),
-            serde_json::json!(42),
-        );
+        let resp =
+            ElectrumResponse::success(Value::String("test-id".to_string()), serde_json::json!(42));
         let json = resp.to_json();
         let parsed: ElectrumResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.id, Value::String("test-id".to_string()));
@@ -331,7 +326,7 @@ mod tests {
             code: -1,
             message: "test error".to_string(),
         };
-        let debug_str = format!("{:?}", err);
+        let debug_str = format!("{err:?}");
         assert!(debug_str.contains("test error"));
     }
 

@@ -25,6 +25,7 @@ btc-network = { workspace = true }
 btc-stages = { workspace = true }
 btc-rpc = { workspace = true }
 btc-exex = { workspace = true }
+btc-electrum = { workspace = true }
 btc-forge = { workspace = true }
 sha2 = { workspace = true }
 serde = { workspace = true }
@@ -41,6 +42,7 @@ secp256k1 = { workspace = true }
 redb = { workspace = true }
 
 [dev-dependencies]
+btc-test = { workspace = true }
 tempfile = { workspace = true }
 
 [lib]

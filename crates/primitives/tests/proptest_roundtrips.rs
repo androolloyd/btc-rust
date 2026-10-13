@@ -9,7 +9,7 @@ use btc_primitives::amount::Amount;
 use btc_primitives::block::BlockHeader;
 use btc_primitives::compact::CompactTarget;
 use btc_primitives::encode::{self, Encodable, VarInt};
-use btc_primitives::hash::{BlockHash, TxHash, hash160, sha256, sha256d};
+use btc_primitives::hash::{hash160, sha256, sha256d, BlockHash, TxHash};
 use btc_primitives::script::ScriptBuf;
 use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut, Witness};
 
@@ -18,9 +18,8 @@ use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut, Witness};
 // ---------------------------------------------------------------------------
 
 fn arb_outpoint() -> impl Strategy<Value = OutPoint> {
-    (any::<[u8; 32]>(), any::<u32>()).prop_map(|(hash, vout)| {
-        OutPoint::new(TxHash::from_bytes(hash), vout)
-    })
+    (any::<[u8; 32]>(), any::<u32>())
+        .prop_map(|(hash, vout)| OutPoint::new(TxHash::from_bytes(hash), vout))
 }
 
 fn arb_script(max_len: usize) -> impl Strategy<Value = ScriptBuf> {
@@ -28,22 +27,20 @@ fn arb_script(max_len: usize) -> impl Strategy<Value = ScriptBuf> {
 }
 
 fn arb_txin() -> impl Strategy<Value = TxIn> {
-    (arb_outpoint(), arb_script(100), any::<u32>()).prop_map(|(previous_output, script_sig, sequence)| {
-        TxIn {
+    (arb_outpoint(), arb_script(100), any::<u32>()).prop_map(
+        |(previous_output, script_sig, sequence)| TxIn {
             previous_output,
             script_sig,
             sequence,
-        }
-    })
+        },
+    )
 }
 
 fn arb_txout() -> impl Strategy<Value = TxOut> {
     // Only generate valid (non-negative, <= MAX_MONEY) output values
-    (0i64..=2_100_000_000_000_000i64, arb_script(100)).prop_map(|(value, script_pubkey)| {
-        TxOut {
-            value: Amount::from_sat(value),
-            script_pubkey,
-        }
+    (0i64..=2_100_000_000_000_000i64, arb_script(100)).prop_map(|(value, script_pubkey)| TxOut {
+        value: Amount::from_sat(value),
+        script_pubkey,
     })
 }
 
@@ -55,14 +52,12 @@ fn arb_legacy_transaction() -> impl Strategy<Value = Transaction> {
         prop::collection::vec(arb_txout(), 1..=3),
         any::<u32>(),
     )
-        .prop_map(|(version, inputs, outputs, lock_time)| {
-            Transaction {
-                version,
-                inputs,
-                outputs,
-                witness: Vec::new(),
-                lock_time,
-            }
+        .prop_map(|(version, inputs, outputs, lock_time)| Transaction {
+            version,
+            inputs,
+            outputs,
+            witness: Vec::new(),
+            lock_time,
         })
 }
 
@@ -71,8 +66,7 @@ fn arb_witness_item() -> impl Strategy<Value = Vec<u8>> {
 }
 
 fn arb_witness() -> impl Strategy<Value = Witness> {
-    prop::collection::vec(arb_witness_item(), 1..=3)
-        .prop_map(Witness::from_items)
+    prop::collection::vec(arb_witness_item(), 1..=3).prop_map(Witness::from_items)
 }
 
 /// Generate a segwit transaction with 1-3 inputs, 1-3 outputs, and matching witness data.
@@ -87,25 +81,28 @@ fn arb_segwit_transaction() -> impl Strategy<Value = Transaction> {
             let n_inputs = inputs.len();
             // Generate exactly one witness per input, at least one must be non-empty
             let witnesses = prop::collection::vec(arb_witness(), n_inputs..=n_inputs);
-            (Just(version), Just(inputs), Just(outputs), witnesses, Just(lock_time))
+            (
+                Just(version),
+                Just(inputs),
+                Just(outputs),
+                witnesses,
+                Just(lock_time),
+            )
         })
-        .prop_map(|(version, inputs, outputs, witness, lock_time)| {
-            Transaction {
+        .prop_map(
+            |(version, inputs, outputs, witness, lock_time)| Transaction {
                 version,
                 inputs,
                 outputs,
                 witness,
                 lock_time,
-            }
-        })
+            },
+        )
 }
 
 /// Strategy that produces either legacy or segwit transactions.
 fn arb_transaction() -> impl Strategy<Value = Transaction> {
-    prop_oneof![
-        arb_legacy_transaction(),
-        arb_segwit_transaction(),
-    ]
+    prop_oneof![arb_legacy_transaction(), arb_segwit_transaction(),]
 }
 
 fn arb_block_header() -> impl Strategy<Value = BlockHeader> {
@@ -117,15 +114,13 @@ fn arb_block_header() -> impl Strategy<Value = BlockHeader> {
         any::<u32>(),
         any::<u32>(),
     )
-        .prop_map(|(version, prev, merkle, time, bits, nonce)| {
-            BlockHeader {
-                version,
-                prev_blockhash: BlockHash::from_bytes(prev),
-                merkle_root: TxHash::from_bytes(merkle),
-                time,
-                bits: CompactTarget::from_u32(bits),
-                nonce,
-            }
+        .prop_map(|(version, prev, merkle, time, bits, nonce)| BlockHeader {
+            version,
+            prev_blockhash: BlockHash::from_bytes(prev),
+            merkle_root: TxHash::from_bytes(merkle),
+            time,
+            bits: CompactTarget::from_u32(bits),
+            nonce,
         })
 }
 

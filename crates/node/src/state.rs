@@ -147,10 +147,7 @@ mod tests {
         let state = NodeState::new(Network::Mainnet);
         state.update_chain_tip(100, "00000000000000aabbccdd");
         assert_eq!(state.chain_height.load(Ordering::SeqCst), 100);
-        assert_eq!(
-            *state.best_hash.read().unwrap(),
-            "00000000000000aabbccdd"
-        );
+        assert_eq!(*state.best_hash.read().unwrap(), "00000000000000aabbccdd");
     }
 
     #[test]
@@ -271,7 +268,7 @@ mod tests {
     #[test]
     fn test_node_state_debug() {
         let state = NodeState::new(Network::Mainnet);
-        let debug = format!("{:?}", state);
+        let debug = format!("{state:?}");
         assert!(debug.contains("NodeState"));
     }
 

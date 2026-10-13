@@ -46,9 +46,7 @@ impl HttpResponse {
         Self {
             status: 200,
             status_text: "OK".into(),
-            headers: vec![
-                ("Content-Type".into(), "application/json".into()),
-            ],
+            headers: vec![("Content-Type".into(), "application/json".into())],
             body: body.as_bytes().to_vec(),
         }
     }
@@ -58,9 +56,7 @@ impl HttpResponse {
         Self {
             status: 200,
             status_text: "OK".into(),
-            headers: vec![
-                ("Content-Type".into(), "text/plain; charset=utf-8".into()),
-            ],
+            headers: vec![("Content-Type".into(), "text/plain; charset=utf-8".into())],
             body: body.as_bytes().to_vec(),
         }
     }
@@ -70,9 +66,7 @@ impl HttpResponse {
         Self {
             status: 200,
             status_text: "OK".into(),
-            headers: vec![
-                ("Content-Type".into(), "text/html; charset=utf-8".into()),
-            ],
+            headers: vec![("Content-Type".into(), "text/html; charset=utf-8".into())],
             body: body.as_bytes().to_vec(),
         }
     }
@@ -82,9 +76,7 @@ impl HttpResponse {
         Self {
             status: 404,
             status_text: "Not Found".into(),
-            headers: vec![
-                ("Content-Type".into(), "application/json".into()),
-            ],
+            headers: vec![("Content-Type".into(), "application/json".into())],
             body: br#"{"error":"not found"}"#.to_vec(),
         }
     }
@@ -94,10 +86,8 @@ impl HttpResponse {
         Self {
             status: 400,
             status_text: "Bad Request".into(),
-            headers: vec![
-                ("Content-Type".into(), "application/json".into()),
-            ],
-            body: format!(r#"{{"error":"{}"}}"#, msg).into_bytes(),
+            headers: vec![("Content-Type".into(), "application/json".into())],
+            body: format!(r#"{{"error":"{msg}"}}"#).into_bytes(),
         }
     }
 
@@ -106,10 +96,8 @@ impl HttpResponse {
         Self {
             status: 500,
             status_text: "Internal Server Error".into(),
-            headers: vec![
-                ("Content-Type".into(), "application/json".into()),
-            ],
-            body: format!(r#"{{"error":"{}"}}"#, msg).into_bytes(),
+            headers: vec![("Content-Type".into(), "application/json".into())],
+            body: format!(r#"{{"error":"{msg}"}}"#).into_bytes(),
         }
     }
 
@@ -120,11 +108,9 @@ impl HttpResponse {
             format!("HTTP/1.1 {} {}\r\n", self.status, self.status_text).as_bytes(),
         );
         // Always include Content-Length.
-        buf.extend_from_slice(
-            format!("Content-Length: {}\r\n", self.body.len()).as_bytes(),
-        );
+        buf.extend_from_slice(format!("Content-Length: {}\r\n", self.body.len()).as_bytes());
         for (k, v) in &self.headers {
-            buf.extend_from_slice(format!("{}: {}\r\n", k, v).as_bytes());
+            buf.extend_from_slice(format!("{k}: {v}\r\n").as_bytes());
         }
         buf.extend_from_slice(b"\r\n");
         buf.extend_from_slice(&self.body);
@@ -167,10 +153,7 @@ pub fn parse_request(raw: &[u8]) -> Option<HttpRequest> {
             break;
         }
         if let Some((key, value)) = line.split_once(':') {
-            headers.insert(
-                key.trim().to_lowercase(),
-                value.trim().to_string(),
-            );
+            headers.insert(key.trim().to_lowercase(), value.trim().to_string());
         }
     }
 
@@ -369,12 +352,10 @@ pub fn handle_request(req: &HttpRequest, metrics: &MetricsCollector) -> HttpResp
         return HttpResponse {
             status: 200,
             status_text: "OK".into(),
-            headers: vec![
-                (
-                    "Content-Type".into(),
-                    "text/plain; version=0.0.4; charset=utf-8".into(),
-                ),
-            ],
+            headers: vec![(
+                "Content-Type".into(),
+                "text/plain; version=0.0.4; charset=utf-8".into(),
+            )],
             body: metrics.render_prometheus().into_bytes(),
         };
     }
@@ -508,10 +489,7 @@ fn handle_block_by_hash(
 }
 
 /// `GET /api/tx/:txid` -- transaction info as JSON.
-fn handle_tx(
-    params: &HashMap<String, String>,
-    _metrics: &MetricsCollector,
-) -> HttpResponse {
+fn handle_tx(params: &HashMap<String, String>, _metrics: &MetricsCollector) -> HttpResponse {
     let txid = match params.get("txid") {
         Some(t) => t,
         None => return HttpResponse::bad_request("missing txid parameter"),
@@ -576,10 +554,7 @@ fn handle_block_txids(
 }
 
 /// `GET /api/tx/:txid/hex` -- raw transaction as hex.
-fn handle_tx_hex(
-    params: &HashMap<String, String>,
-    _metrics: &MetricsCollector,
-) -> HttpResponse {
+fn handle_tx_hex(params: &HashMap<String, String>, _metrics: &MetricsCollector) -> HttpResponse {
     let txid = match params.get("txid") {
         Some(t) => t,
         None => return HttpResponse::bad_request("missing txid parameter"),
@@ -604,9 +579,7 @@ fn handle_tx_merkle_proof(
         return HttpResponse::bad_request("invalid txid");
     }
     // Stub: return a proof skeleton.
-    let json = format!(
-        r#"{{"block_height":0,"merkle":[],"pos":0}}"#,
-    );
+    let json = r#"{"block_height":0,"merkle":[],"pos":0}"#.to_string();
     HttpResponse::json(&json)
 }
 
@@ -676,10 +649,7 @@ fn handle_mempool_txids(_metrics: &MetricsCollector) -> HttpResponse {
 }
 
 /// `POST /api/tx` -- broadcast a raw transaction.
-fn handle_broadcast_tx(
-    req: &HttpRequest,
-    _metrics: &MetricsCollector,
-) -> HttpResponse {
+fn handle_broadcast_tx(req: &HttpRequest, _metrics: &MetricsCollector) -> HttpResponse {
     // The body should be the raw transaction hex.
     let body = std::str::from_utf8(&req.body).unwrap_or("").trim();
     if body.is_empty() {
@@ -698,18 +668,12 @@ fn handle_broadcast_tx(
 
 /// `GET /api/fee-estimates` -- fee rate estimates keyed by confirmation target.
 fn handle_fee_estimates(_metrics: &MetricsCollector) -> HttpResponse {
-    // Stub: return reasonable defaults.
-    HttpResponse::json(r#"{"1":20.0,"3":10.0,"6":5.0,"12":2.0,"24":1.0}"#)
+    HttpResponse::internal_error("validated fee provider unavailable on this REST service")
 }
 
-/// `GET /api/mempool` -- mempool statistics.
-fn handle_mempool(metrics: &MetricsCollector) -> HttpResponse {
-    let size = metrics.mempool_size.load(Ordering::Relaxed);
-    let bytes = metrics.mempool_bytes.load(Ordering::Relaxed);
-    let json = format!(
-        r#"{{"count":{size},"vsize":{bytes},"total_fee":0,"fee_histogram":[]}}"#,
-    );
-    HttpResponse::json(&json)
+/// No pool provider is installed in this separate metrics-only REST service.
+fn handle_mempool(_metrics: &MetricsCollector) -> HttpResponse {
+    HttpResponse::internal_error("validated mempool provider unavailable on this REST service")
 }
 
 // ---------------------------------------------------------------------------
@@ -814,10 +778,7 @@ mod tests {
         let req = parse_request(raw).unwrap();
         assert_eq!(req.method, "POST");
         assert_eq!(req.path, "/api/tx");
-        assert_eq!(
-            req.headers.get("content-type").unwrap(),
-            "application/json"
-        );
+        assert_eq!(req.headers.get("content-type").unwrap(), "application/json");
         assert_eq!(req.body, b"{\"raw\":\"aa\"}");
     }
 
@@ -859,15 +820,13 @@ mod tests {
 
     #[test]
     fn test_match_route_with_param() {
-        let params =
-            match_route("/api/block/00000000abcdef", "/api/block/:hash").unwrap();
+        let params = match_route("/api/block/00000000abcdef", "/api/block/:hash").unwrap();
         assert_eq!(params.get("hash").unwrap(), "00000000abcdef");
     }
 
     #[test]
     fn test_match_route_with_multiple_params() {
-        let params =
-            match_route("/api/address/bc1abc/txs", "/api/address/:address/txs").unwrap();
+        let params = match_route("/api/address/bc1abc/txs", "/api/address/:address/txs").unwrap();
         assert_eq!(params.get("address").unwrap(), "bc1abc");
     }
 
@@ -879,9 +838,7 @@ mod tests {
     #[test]
     fn test_match_route_no_match_length_mismatch() {
         assert!(match_route("/api/block", "/api/block/:hash").is_none());
-        assert!(
-            match_route("/api/block/abc/extra", "/api/block/:hash").is_none()
-        );
+        assert!(match_route("/api/block/abc/extra", "/api/block/:hash").is_none());
     }
 
     #[test]
@@ -1015,9 +972,7 @@ mod tests {
         m.mempool_size.store(1234, Ordering::Relaxed);
         m.mempool_bytes.store(567_890, Ordering::Relaxed);
         m.set_sync_progress(1.0);
-        m.set_best_block_hash(
-            "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5",
-        );
+        m.set_best_block_hash("0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5");
         m
     }
 
@@ -1044,13 +999,10 @@ mod tests {
     fn test_block_by_hash() {
         let m = make_metrics();
         let hash = "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5";
-        let resp = handle_request(
-            &make_request(&format!("/api/block/{}", hash)),
-            &m,
-        );
+        let resp = handle_request(&make_request(&format!("/api/block/{hash}")), &m);
         assert_eq!(resp.status, 200);
         let body = std::str::from_utf8(&resp.body).unwrap();
-        assert!(body.contains(&format!(r#""id":"{}""#, hash)));
+        assert!(body.contains(&format!(r#""id":"{hash}""#)));
         assert!(body.contains(r#""height":800000"#));
         // Verify it's valid JSON.
         let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
@@ -1092,7 +1044,7 @@ mod tests {
     fn test_tx_endpoint() {
         let m = make_metrics();
         let txid = "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b";
-        let resp = handle_request(&make_request(&format!("/api/tx/{}", txid)), &m);
+        let resp = handle_request(&make_request(&format!("/api/tx/{txid}")), &m);
         assert_eq!(resp.status, 200);
         let body = std::str::from_utf8(&resp.body).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
@@ -1129,29 +1081,17 @@ mod tests {
     }
 
     #[test]
-    fn test_fee_estimates() {
+    fn rest_fees_without_a_provider_cannot_return_invented_quotes() {
         let m = make_metrics();
-        let resp = handle_request(&make_request("/api/fee-estimates"), &m);
-        assert_eq!(resp.status, 200);
-        let body = std::str::from_utf8(&resp.body).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
-        // Should have targets 1, 3, 6, 12, 24.
-        assert!(parsed["1"].is_number());
-        assert!(parsed["3"].is_number());
-        assert!(parsed["6"].is_number());
-        assert!(parsed["12"].is_number());
-        assert!(parsed["24"].is_number());
-    }
-
-    #[test]
-    fn test_mempool_endpoint() {
-        let m = make_metrics();
-        let resp = handle_request(&make_request("/api/mempool"), &m);
-        assert_eq!(resp.status, 200);
-        let body = std::str::from_utf8(&resp.body).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
-        assert_eq!(parsed["count"].as_u64().unwrap(), 1234);
-        assert_eq!(parsed["vsize"].as_u64().unwrap(), 567_890);
+        for path in ["/api/fee-estimates", "/api/mempool"] {
+            let resp = handle_request(&make_request(path), &m);
+            assert_eq!(resp.status, 500);
+            let parsed: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+            assert!(parsed["error"]
+                .as_str()
+                .unwrap()
+                .contains("provider unavailable"));
+        }
     }
 
     #[test]
@@ -1235,7 +1175,11 @@ mod tests {
     #[test]
     fn test_response_json_content_type() {
         let resp = HttpResponse::json(r#"{"ok":true}"#);
-        let ct = resp.headers.iter().find(|(k, _)| k == "Content-Type").unwrap();
+        let ct = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k == "Content-Type")
+            .unwrap();
         assert_eq!(ct.1, "application/json");
     }
 
@@ -1243,7 +1187,11 @@ mod tests {
     fn test_response_text_content_type() {
         let resp = HttpResponse::text("hello world");
         assert_eq!(resp.status, 200);
-        let ct = resp.headers.iter().find(|(k, _)| k == "Content-Type").unwrap();
+        let ct = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k == "Content-Type")
+            .unwrap();
         assert_eq!(ct.1, "text/plain; charset=utf-8");
         assert_eq!(resp.body, b"hello world");
     }
@@ -1252,7 +1200,11 @@ mod tests {
     fn test_response_html_content_type() {
         let resp = HttpResponse::html("<h1>Hello</h1>");
         assert_eq!(resp.status, 200);
-        let ct = resp.headers.iter().find(|(k, _)| k == "Content-Type").unwrap();
+        let ct = resp
+            .headers
+            .iter()
+            .find(|(k, _)| k == "Content-Type")
+            .unwrap();
         assert_eq!(ct.1, "text/html; charset=utf-8");
         assert_eq!(resp.body, b"<h1>Hello</h1>");
     }
@@ -1330,7 +1282,7 @@ mod tests {
     #[test]
     fn test_response_debug() {
         let resp = HttpResponse::json(r#"{"ok":true}"#);
-        let debug = format!("{:?}", resp);
+        let debug = format!("{resp:?}");
         assert!(debug.contains("HttpResponse"));
     }
 
@@ -1426,7 +1378,7 @@ mod tests {
     fn test_handle_block_hash_not_hex() {
         let m = make_metrics();
         let hash = "x".repeat(64);
-        let resp = handle_request(&make_request(&format!("/api/block/{}", hash)), &m);
+        let resp = handle_request(&make_request(&format!("/api/block/{hash}")), &m);
         assert_eq!(resp.status, 400);
     }
 
@@ -1441,7 +1393,7 @@ mod tests {
     fn test_handle_tx_not_hex() {
         let m = make_metrics();
         let txid = "g".repeat(64);
-        let resp = handle_request(&make_request(&format!("/api/tx/{}", txid)), &m);
+        let resp = handle_request(&make_request(&format!("/api/tx/{txid}")), &m);
         assert_eq!(resp.status, 400);
     }
 
@@ -1495,10 +1447,7 @@ mod tests {
     fn test_block_txids() {
         let m = make_metrics();
         let hash = "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5";
-        let resp = handle_request(
-            &make_request(&format!("/api/block/{}/txids", hash)),
-            &m,
-        );
+        let resp = handle_request(&make_request(&format!("/api/block/{hash}/txids")), &m);
         assert_eq!(resp.status, 200);
         let body = std::str::from_utf8(&resp.body).unwrap();
         // Should be valid JSON array
@@ -1521,10 +1470,7 @@ mod tests {
     fn test_tx_hex() {
         let m = make_metrics();
         let txid = "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b";
-        let resp = handle_request(
-            &make_request(&format!("/api/tx/{}/hex", txid)),
-            &m,
-        );
+        let resp = handle_request(&make_request(&format!("/api/tx/{txid}/hex")), &m);
         assert_eq!(resp.status, 200);
     }
 
@@ -1543,10 +1489,7 @@ mod tests {
     fn test_tx_merkle_proof() {
         let m = make_metrics();
         let txid = "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b";
-        let resp = handle_request(
-            &make_request(&format!("/api/tx/{}/merkle-proof", txid)),
-            &m,
-        );
+        let resp = handle_request(&make_request(&format!("/api/tx/{txid}/merkle-proof")), &m);
         assert_eq!(resp.status, 200);
         let body = std::str::from_utf8(&resp.body).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
@@ -1570,10 +1513,7 @@ mod tests {
     fn test_tx_outspend() {
         let m = make_metrics();
         let txid = "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b";
-        let resp = handle_request(
-            &make_request(&format!("/api/tx/{}/outspend/0", txid)),
-            &m,
-        );
+        let resp = handle_request(&make_request(&format!("/api/tx/{txid}/outspend/0")), &m);
         assert_eq!(resp.status, 200);
         let body = std::str::from_utf8(&resp.body).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
@@ -1591,10 +1531,7 @@ mod tests {
     fn test_tx_outspend_invalid_vout() {
         let m = make_metrics();
         let txid = "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b";
-        let resp = handle_request(
-            &make_request(&format!("/api/tx/{}/outspend/abc", txid)),
-            &m,
-        );
+        let resp = handle_request(&make_request(&format!("/api/tx/{txid}/outspend/abc")), &m);
         assert_eq!(resp.status, 400);
     }
 
@@ -1629,10 +1566,7 @@ mod tests {
     fn test_scripthash_utxo() {
         let m = make_metrics();
         let hash = "0000000000000000000000000000000000000000000000000000000000000000";
-        let resp = handle_request(
-            &make_request(&format!("/api/scripthash/{}/utxo", hash)),
-            &m,
-        );
+        let resp = handle_request(&make_request(&format!("/api/scripthash/{hash}/utxo")), &m);
         assert_eq!(resp.status, 200);
         assert_eq!(std::str::from_utf8(&resp.body).unwrap(), "[]");
     }
@@ -1640,10 +1574,7 @@ mod tests {
     #[test]
     fn test_scripthash_utxo_invalid_hash() {
         let m = make_metrics();
-        let resp = handle_request(
-            &make_request("/api/scripthash/badhash/utxo"),
-            &m,
-        );
+        let resp = handle_request(&make_request("/api/scripthash/badhash/utxo"), &m);
         assert_eq!(resp.status, 400);
     }
 

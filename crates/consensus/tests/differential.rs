@@ -376,7 +376,9 @@ fn parse_flags(s: &str) -> ScriptFlags {
             "SIGPUSHONLY" => flags.verify_sigpushonly = true,
             "MINIMALDATA" => flags.verify_minimaldata = true,
             "DISCOURAGE_UPGRADABLE_NOPS" => flags.verify_discourage_upgradable_nops = true,
-            "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM" => flags.verify_discourage_upgradable_witness_program = true,
+            "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM" => {
+                flags.verify_discourage_upgradable_witness_program = true
+            }
             "MINIMALIF" => flags.verify_minimalif = true,
             "NULLFAIL" => flags.verify_nullfail = true,
             "CONST_SCRIPTCODE" => flags.verify_const_scriptcode = true,
@@ -457,7 +459,11 @@ fn build_credit_tx(script_pubkey: &ScriptBuf, amount_sat: i64) -> Transaction {
 /// - 1 input: spending from credit_tx (credit_txid, vout=0), scriptSig = test's scriptSig, sequence = 0xFFFFFFFF
 /// - 1 output: value = credit_tx.outputs[0].value, scriptPubKey = empty
 /// - locktime = 0
-fn build_mock_tx(script_sig: &ScriptBuf, script_pubkey: &ScriptBuf, amount_sat: i64) -> Transaction {
+fn build_mock_tx(
+    script_sig: &ScriptBuf,
+    script_pubkey: &ScriptBuf,
+    amount_sat: i64,
+) -> Transaction {
     let credit_tx = build_credit_tx(script_pubkey, amount_sat);
     let credit_txid = credit_tx.txid();
 
@@ -504,7 +510,9 @@ fn extract_last_push_data(script: &ScriptBuf) -> Option<Vec<u8>> {
                     last_push = None; // Non-push opcode resets
                 }
             }
-            Err(_) => { last_push = None; }
+            Err(_) => {
+                last_push = None;
+            }
         }
     }
     last_push
@@ -531,20 +539,12 @@ fn run_script_test(
     }
 
     // Step 1: SIGPUSHONLY check (if enabled or P2SH)
-    if flags.verify_sigpushonly {
-        if !is_push_only(script_sig.as_script()) {
-            return false;
-        }
+    if flags.verify_sigpushonly && !is_push_only(script_sig.as_script()) {
+        return false;
     }
 
     // Step 2: Execute scriptSig
-    let mut engine = ScriptEngine::new(
-        verifier,
-        flags,
-        Some(mock_tx),
-        0,
-        amount_sat,
-    );
+    let mut engine = ScriptEngine::new(verifier, flags, Some(mock_tx), 0, amount_sat);
 
     if engine.execute(script_sig.as_script()).is_err() {
         return false;
@@ -580,13 +580,7 @@ fn run_script_test(
         };
 
         // Build a new engine with the stack from scriptSig (minus the redeem script)
-        let mut p2sh_engine = ScriptEngine::new(
-            verifier,
-            flags,
-            Some(mock_tx),
-            0,
-            amount_sat,
-        );
+        let mut p2sh_engine = ScriptEngine::new(verifier, flags, Some(mock_tx), 0, amount_sat);
 
         // Push all items from scriptSig stack EXCEPT the last one (the redeem script)
         // Actually, in Bitcoin Core's P2SH, the stack from executing scriptSig+scriptPubKey
@@ -618,20 +612,16 @@ fn run_script_test(
         }
 
         // CLEANSTACK for P2SH checks the redeem script stack
-        if flags.verify_cleanstack {
-            if p2sh_engine.stack().len() != 1 {
-                return false;
-            }
+        if flags.verify_cleanstack && p2sh_engine.stack().len() != 1 {
+            return false;
         }
 
         return true;
     }
 
     // Step 5: CLEANSTACK check (non-P2SH)
-    if flags.verify_cleanstack {
-        if engine.stack().len() != 1 {
-            return false;
-        }
+    if flags.verify_cleanstack && engine.stack().len() != 1 {
+        return false;
     }
 
     true
@@ -650,25 +640,17 @@ fn run_script_test_detail(
     }
 
     let mock_tx = build_mock_tx(script_sig, script_pubkey, amount_sat);
-    let mut engine = ScriptEngine::new(
-        verifier,
-        flags,
-        Some(&mock_tx),
-        0,
-        amount_sat,
-    );
+    let mut engine = ScriptEngine::new(verifier, flags, Some(&mock_tx), 0, amount_sat);
 
-    match engine.execute(script_sig.as_script()) {
-        Err(e) => return format!("scriptSig error: {e}"),
-        Ok(_) => {}
+    if let Err(e) = engine.execute(script_sig.as_script()) {
+        return format!("scriptSig error: {e}");
     }
 
     let stack_after_sig: Vec<Vec<u8>> = engine.stack().to_vec();
     engine.clear_altstack();
 
-    match engine.execute(script_pubkey.as_script()) {
-        Err(e) => return format!("scriptPubKey error: {e}"),
-        Ok(_) => {}
+    if let Err(e) = engine.execute(script_pubkey.as_script()) {
+        return format!("scriptPubKey error: {e}");
     }
 
     if !engine.success() {
@@ -684,22 +666,15 @@ fn run_script_test_detail(
             None => return "P2SH: no redeem script on stack".to_string(),
         };
 
-        let mut p2sh_engine = ScriptEngine::new(
-            verifier,
-            flags,
-            Some(&mock_tx),
-            0,
-            amount_sat,
-        );
+        let mut p2sh_engine = ScriptEngine::new(verifier, flags, Some(&mock_tx), 0, amount_sat);
 
         for item in &stack_after_sig[..stack_after_sig.len() - 1] {
             let _ = p2sh_engine.push_item(item.clone());
         }
 
         let redeem_script = ScriptBuf::from_bytes(serialized_redeem);
-        match p2sh_engine.execute(redeem_script.as_script()) {
-            Err(e) => return format!("P2SH redeem error: {e}"),
-            Ok(_) => {}
+        if let Err(e) = p2sh_engine.execute(redeem_script.as_script()) {
+            return format!("P2SH redeem error: {e}");
         }
 
         if !p2sh_engine.success() {
@@ -722,6 +697,86 @@ fn run_script_test_detail(
 
 // ========================== TEST 1: script_tests.json ======================
 
+/// Assert exact released-Core P2SH outcomes through the production dispatcher.
+/// The broad historical harness above implements P2SH itself and cannot catch
+/// a missing redeem-script invocation in the actual mempool/block caller.
+#[test]
+#[cfg(feature = "segwit")]
+fn released_core_p2sh_cases_use_runtime_dispatcher() {
+    let data: serde_json::Value =
+        serde_json::from_str(include_str!("../../../testdata/core29_p2sh.json")).unwrap();
+    let cases = data["vectors"].as_array().unwrap();
+    assert_eq!(cases.len(), 17);
+    for case in cases {
+        let script_sig = parse_core_script(case["script_sig"].as_str().unwrap());
+        let script_pubkey = parse_core_script(case["script_pubkey"].as_str().unwrap());
+        assert!(script_pubkey.is_p2sh());
+        let flags = parse_flags(case["flags"].as_str().unwrap());
+        let tx = build_mock_tx(&script_sig, &script_pubkey, 0);
+        let prevout = TxOut {
+            value: Amount::ZERO,
+            script_pubkey,
+        };
+        let result = btc_consensus::witness::verify_input_with_prevouts(
+            &tx,
+            0,
+            &[prevout],
+            &Secp256k1Verifier,
+            &flags,
+        );
+        assert_eq!(
+            result.is_ok(),
+            case["expected"] == "OK",
+            "Core row {}: {}: {:?}",
+            case["core_row"],
+            case["comment"],
+            result
+        );
+    }
+}
+
+#[cfg(feature = "segwit")]
+#[test]
+fn released_core_witness_cases_use_runtime_dispatcher() {
+    let data: serde_json::Value =
+        serde_json::from_str(include_str!("../../../testdata/core29_witness.json")).unwrap();
+    let cases = data["vectors"].as_array().unwrap();
+    assert_eq!(cases.len(), 48);
+    for case in cases {
+        let script_sig = parse_core_script(case["script_sig"].as_str().unwrap());
+        let script_pubkey = parse_core_script(case["script_pubkey"].as_str().unwrap());
+        let flags = parse_flags(case["flags"].as_str().unwrap());
+        assert!(!flags.verify_cleanstack);
+        let amount = case["amount_sat"].as_i64().unwrap();
+        let mut tx = build_mock_tx(&script_sig, &script_pubkey, amount);
+        tx.witness = vec![btc_primitives::transaction::Witness::from_items(
+            case["witness"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| hex::decode(item.as_str().unwrap()).unwrap())
+                .collect(),
+        )];
+        let result = btc_consensus::witness::verify_input_with_prevouts(
+            &tx,
+            0,
+            &[TxOut {
+                value: Amount::from_sat(amount),
+                script_pubkey,
+            }],
+            &Secp256k1Verifier,
+            &flags,
+        );
+        assert_eq!(
+            result.is_ok(),
+            case["expected"] == "OK",
+            "Core row {}: {:?}",
+            case["core_row"],
+            result
+        );
+    }
+}
+
 /// Verify our script engine matches Bitcoin Core for every test in script_tests.json.
 ///
 /// Test vector format (two forms):
@@ -730,7 +785,10 @@ fn run_script_test_detail(
 ///   2. `[[witness_item..., amount], scriptSig, scriptPubKey, flags, expected_result, comment?]`
 #[test]
 fn differential_script_tests() {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/script_tests.json");
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../testdata/script_tests.json"
+    );
     let data = std::fs::read_to_string(path).unwrap();
     let vectors: serde_json::Value = serde_json::from_str(&data).unwrap();
 
@@ -749,45 +807,52 @@ fn differential_script_tests() {
         };
 
         // ---- Determine which format we have --------------------------------
-        let (witness_items, _amount_sat, script_sig_str, script_pubkey_str, flag_str, expected_str, comment) =
-            if arr[0].is_array() {
-                // Format 2: first element is [wit..., amount]
-                if arr.len() < 5 {
-                    continue;
-                }
-                let wit_arr = arr[0].as_array().unwrap();
-                let amount_f = wit_arr.last().and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let amount_sat = (amount_f * 1e8) as i64;
-                let wits: Vec<Vec<u8>> = wit_arr
-                    .iter()
-                    .take(wit_arr.len().saturating_sub(1))
-                    .filter_map(|v| v.as_str())
-                    .map(|s| hex::decode(s).unwrap_or_default())
-                    .collect();
-                let sig_s = arr[1].as_str().unwrap_or("");
-                let pub_s = arr[2].as_str().unwrap_or("");
-                let fl = arr[3].as_str().unwrap_or("");
-                let exp = arr[4].as_str().unwrap_or("");
-                let cmt = arr.get(5).and_then(|v| v.as_str()).unwrap_or("");
-                (wits, amount_sat, sig_s, pub_s, fl, exp, cmt)
-            } else {
-                // Format 1: plain
-                if arr.len() < 4 {
-                    continue;
-                }
-                let sig_s = match arr[0].as_str() {
-                    Some(s) => s,
-                    None => continue,
-                };
-                let pub_s = match arr[1].as_str() {
-                    Some(s) => s,
-                    None => continue,
-                };
-                let fl = arr[2].as_str().unwrap_or("");
-                let exp = arr[3].as_str().unwrap_or("");
-                let cmt = arr.get(4).and_then(|v| v.as_str()).unwrap_or("");
-                (Vec::new(), 0i64, sig_s, pub_s, fl, exp, cmt)
+        let (
+            witness_items,
+            _amount_sat,
+            script_sig_str,
+            script_pubkey_str,
+            flag_str,
+            expected_str,
+            comment,
+        ) = if arr[0].is_array() {
+            // Format 2: first element is [wit..., amount]
+            if arr.len() < 5 {
+                continue;
+            }
+            let wit_arr = arr[0].as_array().unwrap();
+            let amount_f = wit_arr.last().and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let amount_sat = (amount_f * 1e8) as i64;
+            let wits: Vec<Vec<u8>> = wit_arr
+                .iter()
+                .take(wit_arr.len().saturating_sub(1))
+                .filter_map(|v| v.as_str())
+                .map(|s| hex::decode(s).unwrap_or_default())
+                .collect();
+            let sig_s = arr[1].as_str().unwrap_or("");
+            let pub_s = arr[2].as_str().unwrap_or("");
+            let fl = arr[3].as_str().unwrap_or("");
+            let exp = arr[4].as_str().unwrap_or("");
+            let cmt = arr.get(5).and_then(|v| v.as_str()).unwrap_or("");
+            (wits, amount_sat, sig_s, pub_s, fl, exp, cmt)
+        } else {
+            // Format 1: plain
+            if arr.len() < 4 {
+                continue;
+            }
+            let sig_s = match arr[0].as_str() {
+                Some(s) => s,
+                None => continue,
             };
+            let pub_s = match arr[1].as_str() {
+                Some(s) => s,
+                None => continue,
+            };
+            let fl = arr[2].as_str().unwrap_or("");
+            let exp = arr[3].as_str().unwrap_or("");
+            let cmt = arr.get(4).and_then(|v| v.as_str()).unwrap_or("");
+            (Vec::new(), 0i64, sig_s, pub_s, fl, exp, cmt)
+        };
 
         // ---- Skip tests that need flags we have not implemented -----------
         if has_unimplemented_flag(flag_str) {
@@ -826,13 +891,7 @@ fn differential_script_tests() {
 
         // Compute error detail for divergence reporting (only when divergence found)
         let err_detail_fn = || -> String {
-            run_script_test_detail(
-                &verifier,
-                flags,
-                &script_sig,
-                &script_pubkey,
-                _amount_sat,
-            )
+            run_script_test_detail(&verifier, flags, &script_sig, &script_pubkey, _amount_sat)
         };
 
         if our_ok == expected_ok {
@@ -929,9 +988,7 @@ fn differential_tx_valid() {
             Ok(b) => b,
             Err(e) => {
                 failed += 1;
-                divergences.push(format!(
-                    "  [#{idx}] tx_valid: hex decode failed: {e}"
-                ));
+                divergences.push(format!("  [#{idx}] tx_valid: hex decode failed: {e}"));
                 continue;
             }
         };
@@ -947,8 +1004,7 @@ fn differential_tx_valid() {
                 // them for structural reasons — track but don't hard-fail.
                 failed += 1;
                 divergences.push(format!(
-                    "  [#{idx}] tx_valid: deserialization rejected (should accept): {e} | hex={:.80}...",
-                    tx_hex
+                    "  [#{idx}] tx_valid: deserialization rejected (should accept): {e} | hex={tx_hex:.80}..."
                 ));
             }
         }
@@ -976,9 +1032,7 @@ fn differential_tx_valid() {
     };
     eprintln!("  Pass rate: {:.1}%", pass_rate * 100.0);
     if failed > 0 {
-        eprintln!(
-            "  NOTE: {failed} divergence(s) remain — see details above."
-        );
+        eprintln!("  NOTE: {failed} divergence(s) remain — see details above.");
     }
 }
 
@@ -988,7 +1042,10 @@ fn differential_tx_valid() {
 /// deserialization time or fails structural validation.
 #[test]
 fn differential_tx_invalid() {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/tx_invalid.json");
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../testdata/tx_invalid.json"
+    );
     let data = std::fs::read_to_string(path).unwrap();
     let vectors: serde_json::Value = serde_json::from_str(&data).unwrap();
 
@@ -1041,8 +1098,7 @@ fn differential_tx_invalid() {
                     failed += 1;
                     divergences.push(format!(
                         "  [#{idx}] tx_invalid BADTX: deserialized AND passed structural checks \
-                         (should be rejected) | hex={:.80}...",
-                        tx_hex
+                         (should be rejected) | hex={tx_hex:.80}..."
                     ));
                 } else {
                     // Non-BADTX entries: invalidity may be in script evaluation.
@@ -1081,9 +1137,7 @@ fn differential_tx_invalid() {
     };
     eprintln!("  Pass rate: {:.1}%", pass_rate * 100.0);
     if failed > 0 {
-        eprintln!(
-            "  NOTE: {failed} divergence(s) remain — see details above."
-        );
+        eprintln!("  NOTE: {failed} divergence(s) remain — see details above.");
     }
 }
 
@@ -1132,7 +1186,7 @@ fn check_transaction_invalid(tx: &Transaction, flag_str: &str) -> bool {
     // Coinbase checks
     if tx.is_coinbase() {
         let sig_len = tx.inputs[0].script_sig.len();
-        if sig_len < 2 || sig_len > 100 {
+        if !(2..=100).contains(&sig_len) {
             return true;
         }
     } else {
@@ -1193,13 +1247,19 @@ mod helper_tests {
     #[test]
     fn parse_simple_opcodes() {
         let s = parse_core_script("OP_DUP OP_HASH160");
-        assert_eq!(s.as_bytes(), &[Opcode::OP_DUP as u8, Opcode::OP_HASH160 as u8]);
+        assert_eq!(
+            s.as_bytes(),
+            &[Opcode::OP_DUP as u8, Opcode::OP_HASH160 as u8]
+        );
     }
 
     #[test]
     fn parse_bare_opcodes() {
         let s = parse_core_script("DUP HASH160");
-        assert_eq!(s.as_bytes(), &[Opcode::OP_DUP as u8, Opcode::OP_HASH160 as u8]);
+        assert_eq!(
+            s.as_bytes(),
+            &[Opcode::OP_DUP as u8, Opcode::OP_HASH160 as u8]
+        );
     }
 
     #[test]
@@ -1234,10 +1294,7 @@ mod helper_tests {
     fn parse_pushdata1() {
         // "0x4c 0x01 0x07" → OP_PUSHDATA1, length=1, data=0x07
         let s = parse_core_script("0x4c 0x01 0x07");
-        assert_eq!(
-            s.as_bytes(),
-            &[Opcode::OP_PUSHDATA1 as u8, 0x01, 0x07]
-        );
+        assert_eq!(s.as_bytes(), &[Opcode::OP_PUSHDATA1 as u8, 0x01, 0x07]);
     }
 
     #[test]

@@ -1,7 +1,7 @@
-//! Output Descriptors (BIP380-387).
+//! Output descriptors (BIP380-387 subset).
 //!
 //! Output descriptors are a human-readable language for describing how to
-//! derive `scriptPubKey`s for wallet operations. They cover all standard
+//! derive `scriptPubKey`s for wallet operations. Supported expansion covers
 //! Bitcoin output types (P2PK, P2PKH, P2WPKH, P2SH, P2WSH, P2TR, multisig)
 //! and support a checksum for safe copy-pasting.
 //!
@@ -9,13 +9,18 @@
 //! - `Descriptor` enum covering all standard descriptor types
 //! - Parsing from descriptor strings (`Descriptor::parse`)
 //! - Serialization back to descriptor strings (`Descriptor::to_string`)
-//! - Simplified `script_pubkey` derivation (pk, pkh, wpkh)
+//! - Public/private key expansion into scripts, addresses and Taproot control proofs
 //! - BIP380 descriptor checksum computation (`descriptor_checksum`)
 
-use crate::hash::hash160;
 use crate::script::ScriptBuf;
 use std::fmt;
 use thiserror::Error;
+
+#[path = "descriptor_expand.rs"]
+mod expand;
+pub use expand::{DescriptorExpansion, ExpandedTapLeaf, PrivateDescriptorExpansion};
+
+pub const MAX_DESCRIPTOR_SIZE: usize = 262_144;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -45,6 +50,8 @@ pub enum DescriptorError {
     UnsupportedScriptPubkey,
     #[error("invalid hex in raw descriptor: {0}")]
     InvalidHex(String),
+    #[error("descriptor expansion failed: {0}")]
+    Expansion(&'static str),
 }
 
 // ---------------------------------------------------------------------------
@@ -63,8 +70,8 @@ pub enum TapTree {
 impl fmt::Display for TapTree {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TapTree::Leaf(script) => write!(f, "{}", script),
-            TapTree::Branch(left, right) => write!(f, "{{{},{}}}", left, right),
+            TapTree::Leaf(script) => write!(f, "{script}"),
+            TapTree::Branch(left, right) => write!(f, "{{{left},{right}}}"),
         }
     }
 }
@@ -92,6 +99,10 @@ pub enum Descriptor {
     Multi(u32, Vec<String>),
     /// `sortedmulti(k, KEY, KEY, ...)` -- k-of-n multisig with sorted keys.
     SortedMulti(u32, Vec<String>),
+    /// `multi_a(k, KEY, ...)` -- CHECKSIGADD threshold, only in Taproot leaves.
+    MultiA(u32, Vec<String>),
+    /// `sortedmulti_a(k, KEY, ...)` -- threshold with sorted x-only child keys.
+    SortedMultiA(u32, Vec<String>),
     /// `addr(ADDRESS)` -- A raw address.
     Addr(String),
     /// `raw(HEX)` -- A raw hex scriptPubKey.
@@ -103,8 +114,7 @@ pub enum Descriptor {
 // ---------------------------------------------------------------------------
 
 /// The character set used by the descriptor checksum, analogous to bech32.
-const INPUT_CHARSET: &str =
-    "0123456789()[],'/*abcdefgh@:$%{}\
+const INPUT_CHARSET: &str = "0123456789()[],'/*abcdefgh@:$%{}\
      IJKLMNOPQRSTUVWXYZ&+-.;<=>?!^_|~\
      ijklmnopqrstuvwxyzABCDEFGH`#\"\\ ";
 
@@ -113,11 +123,21 @@ const CHECKSUM_CHARSET: &[u8] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
 fn polymod(c: u64, val: u64) -> u64 {
     let c0 = c >> 35;
     let mut c = ((c & 0x7ffffffff) << 5) ^ val;
-    if c0 & 1 != 0 { c ^= 0xf5dee51989; }
-    if c0 & 2 != 0 { c ^= 0xa9fdca3312; }
-    if c0 & 4 != 0 { c ^= 0x1bab10e32d; }
-    if c0 & 8 != 0 { c ^= 0x3706b1677a; }
-    if c0 & 16 != 0 { c ^= 0x644d626ffd; }
+    if c0 & 1 != 0 {
+        c ^= 0xf5dee51989;
+    }
+    if c0 & 2 != 0 {
+        c ^= 0xa9fdca3312;
+    }
+    if c0 & 4 != 0 {
+        c ^= 0x1bab10e32d;
+    }
+    if c0 & 8 != 0 {
+        c ^= 0x3706b1677a;
+    }
+    if c0 & 16 != 0 {
+        c ^= 0x644d626ffd;
+    }
     c
 }
 
@@ -131,10 +151,9 @@ pub fn descriptor_checksum(desc: &str) -> Result<String, DescriptorError> {
     let mut clscount: u64 = 0;
 
     for ch in desc.chars() {
-        let pos = INPUT_CHARSET
-            .find(ch)
-            .ok_or_else(|| DescriptorError::InvalidKey(format!("invalid character '{}' in descriptor", ch)))?
-            as u64;
+        let pos = INPUT_CHARSET.find(ch).ok_or_else(|| {
+            DescriptorError::InvalidKey(format!("invalid character '{ch}' in descriptor"))
+        })? as u64;
         c = polymod(c, pos & 31);
         cls = cls * 3 + (pos >> 5);
         clscount += 1;
@@ -183,11 +202,13 @@ impl Descriptor {
     /// Parse a descriptor from a string.
     ///
     /// Accepts optional `#checksum` suffix. If present, the checksum is verified.
+    /// Key validity and supported script contexts are checked by `expand`.
     pub fn parse(s: &str) -> Result<Self, DescriptorError> {
         let s = s.trim();
         if s.is_empty() {
             return Err(DescriptorError::Empty);
         }
+        check_structure(s)?;
 
         // Strip and verify checksum if present.
         let desc_str = if let Some(hash_pos) = s.rfind('#') {
@@ -217,8 +238,8 @@ impl Descriptor {
 
         // Find the matching close paren (handling nesting).
         let args_start = open_paren + 1;
-        let close_paren = find_matching_paren(s, open_paren)
-            .ok_or(DescriptorError::MissingCloseParen)?;
+        let close_paren =
+            find_matching_paren(s, open_paren).ok_or(DescriptorError::MissingCloseParen)?;
 
         // Check for trailing characters after the close paren.
         if close_paren + 1 != s.len() {
@@ -260,6 +281,14 @@ impl Descriptor {
                 let (k, keys) = parse_multi_args(args)?;
                 Ok(Descriptor::SortedMulti(k, keys))
             }
+            "multi_a" => {
+                let (k, keys) = parse_multi_args(args)?;
+                Ok(Descriptor::MultiA(k, keys))
+            }
+            "sortedmulti_a" => {
+                let (k, keys) = parse_multi_args(args)?;
+                Ok(Descriptor::SortedMultiA(k, keys))
+            }
             "addr" => Ok(Descriptor::Addr(args.to_string())),
             "raw" => Ok(Descriptor::Raw(args.to_string())),
             other => Err(DescriptorError::UnknownType(other.to_string())),
@@ -268,40 +297,10 @@ impl Descriptor {
 
     /// Derive the `scriptPubKey` for this descriptor.
     ///
-    /// Currently supports: `pk`, `pkh`, `wpkh`, `raw`.
-    /// Other types return `DescriptorError::UnsupportedScriptPubkey`.
+    /// Fixed public descriptors use mainnet address interpretation. Use
+    /// `expand` for ranged descriptors or a different address network.
     pub fn script_pubkey(&self) -> Result<ScriptBuf, DescriptorError> {
-        match self {
-            Descriptor::Pk(key_hex) => {
-                // pk(KEY) -> <KEY> OP_CHECKSIG
-                let key_bytes = hex::decode(key_hex)
-                    .map_err(|_| DescriptorError::InvalidKey(key_hex.clone()))?;
-                let mut script = ScriptBuf::new();
-                script.push_slice(&key_bytes);
-                script.push_opcode(crate::script::Opcode::OP_CHECKSIG);
-                Ok(script)
-            }
-            Descriptor::Pkh(key_hex) => {
-                // pkh(KEY) -> OP_DUP OP_HASH160 <HASH160(KEY)> OP_EQUALVERIFY OP_CHECKSIG
-                let key_bytes = hex::decode(key_hex)
-                    .map_err(|_| DescriptorError::InvalidKey(key_hex.clone()))?;
-                let pkh = hash160(&key_bytes);
-                Ok(ScriptBuf::p2pkh(&pkh))
-            }
-            Descriptor::Wpkh(key_hex) => {
-                // wpkh(KEY) -> OP_0 <HASH160(KEY)>
-                let key_bytes = hex::decode(key_hex)
-                    .map_err(|_| DescriptorError::InvalidKey(key_hex.clone()))?;
-                let pkh = hash160(&key_bytes);
-                Ok(ScriptBuf::p2wpkh(&pkh))
-            }
-            Descriptor::Raw(hex_str) => {
-                let bytes = hex::decode(hex_str)
-                    .map_err(|_| DescriptorError::InvalidHex(hex_str.clone()))?;
-                Ok(ScriptBuf::from_bytes(bytes))
-            }
-            _ => Err(DescriptorError::UnsupportedScriptPubkey),
-        }
+        Ok(self.expand(None, crate::Network::Mainnet)?.script_pubkey)
     }
 }
 
@@ -312,29 +311,41 @@ impl Descriptor {
 impl fmt::Display for Descriptor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Descriptor::Pk(key) => write!(f, "pk({})", key),
-            Descriptor::Pkh(key) => write!(f, "pkh({})", key),
-            Descriptor::Wpkh(key) => write!(f, "wpkh({})", key),
-            Descriptor::Sh(inner) => write!(f, "sh({})", inner),
-            Descriptor::Wsh(inner) => write!(f, "wsh({})", inner),
-            Descriptor::Tr(key, None) => write!(f, "tr({})", key),
-            Descriptor::Tr(key, Some(tree)) => write!(f, "tr({},{})", key, tree),
+            Descriptor::Pk(key) => write!(f, "pk({key})"),
+            Descriptor::Pkh(key) => write!(f, "pkh({key})"),
+            Descriptor::Wpkh(key) => write!(f, "wpkh({key})"),
+            Descriptor::Sh(inner) => write!(f, "sh({inner})"),
+            Descriptor::Wsh(inner) => write!(f, "wsh({inner})"),
+            Descriptor::Tr(key, None) => write!(f, "tr({key})"),
+            Descriptor::Tr(key, Some(tree)) => write!(f, "tr({key},{tree})"),
             Descriptor::Multi(k, keys) => {
-                write!(f, "multi({}", k)?;
+                write!(f, "multi({k}")?;
                 for key in keys {
-                    write!(f, ",{}", key)?;
+                    write!(f, ",{key}")?;
                 }
                 write!(f, ")")
             }
             Descriptor::SortedMulti(k, keys) => {
-                write!(f, "sortedmulti({}", k)?;
+                write!(f, "sortedmulti({k}")?;
                 for key in keys {
-                    write!(f, ",{}", key)?;
+                    write!(f, ",{key}")?;
                 }
                 write!(f, ")")
             }
-            Descriptor::Addr(addr) => write!(f, "addr({})", addr),
-            Descriptor::Raw(hex) => write!(f, "raw({})", hex),
+            Descriptor::MultiA(k, keys) | Descriptor::SortedMultiA(k, keys) => {
+                let name = if matches!(self, Descriptor::SortedMultiA(..)) {
+                    "sortedmulti_a"
+                } else {
+                    "multi_a"
+                };
+                write!(f, "{name}({k}")?;
+                for key in keys {
+                    write!(f, ",{key}")?;
+                }
+                write!(f, ")")
+            }
+            Descriptor::Addr(addr) => write!(f, "addr({addr})"),
+            Descriptor::Raw(hex) => write!(f, "raw({hex})"),
         }
     }
 }
@@ -342,6 +353,46 @@ impl fmt::Display for Descriptor {
 // ---------------------------------------------------------------------------
 // Parsing helpers
 // ---------------------------------------------------------------------------
+
+/// Bound recursion before parsing, and prevent mismatched delimiter underflow.
+fn check_structure(s: &str) -> Result<(), DescriptorError> {
+    // Fixed budget before checksum/recursion; accommodates 999 annotated
+    // compressed or ordinary extended-key expressions.
+    if s.len() > MAX_DESCRIPTOR_SIZE || !s.is_ascii() {
+        return Err(DescriptorError::Expansion(
+            "descriptor size/character limit",
+        ));
+    }
+    let body = s.split('#').next().unwrap_or(s);
+    let mut stack = Vec::new();
+    for byte in body.bytes() {
+        match byte {
+            b'(' | b'{' | b'[' => {
+                if stack.len() >= 132 {
+                    return Err(DescriptorError::Expansion("descriptor nesting limit"));
+                }
+                stack.push(byte);
+            }
+            b')' | b'}' | b']' => {
+                let expected = match byte {
+                    b')' => b'(',
+                    b'}' => b'{',
+                    _ => b'[',
+                };
+                if stack.pop() != Some(expected) {
+                    return Err(DescriptorError::Expansion(
+                        "mismatched descriptor delimiters",
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    if !stack.is_empty() {
+        return Err(DescriptorError::MissingCloseParen);
+    }
+    Ok(())
+}
 
 /// Find the index of the closing parenthesis that matches the opening paren at `open`.
 fn find_matching_paren(s: &str, open: usize) -> Option<usize> {
@@ -418,10 +469,7 @@ fn parse_multi_args(args: &str) -> Result<(u32, Vec<String>), DescriptorError> {
         return Err(DescriptorError::MultiNoKeys);
     }
     if k as usize > keys.len() {
-        return Err(DescriptorError::ThresholdTooHigh {
-            k,
-            n: keys.len(),
-        });
+        return Err(DescriptorError::ThresholdTooHigh { k, n: keys.len() });
     }
 
     Ok((k, keys))
@@ -432,8 +480,9 @@ fn parse_taptree(s: &str) -> Result<TapTree, DescriptorError> {
     let s = s.trim();
     if s.starts_with('{') && s.ends_with('}') {
         let inner = &s[1..s.len() - 1];
-        let comma = find_top_level_comma(inner)
-            .ok_or_else(|| DescriptorError::InvalidKey("missing comma in taptree branch".to_string()))?;
+        let comma = find_top_level_comma(inner).ok_or_else(|| {
+            DescriptorError::InvalidKey("missing comma in taptree branch".to_string())
+        })?;
         let left = parse_taptree(&inner[..comma])?;
         let right = parse_taptree(&inner[comma + 1..])?;
         Ok(TapTree::Branch(Box::new(left), Box::new(right)))
@@ -454,10 +503,16 @@ mod tests {
 
     #[test]
     fn test_parse_pk() {
-        let desc = Descriptor::parse("pk(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)").unwrap();
+        let desc = Descriptor::parse(
+            "pk(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)",
+        )
+        .unwrap();
         assert!(matches!(desc, Descriptor::Pk(_)));
         if let Descriptor::Pk(key) = &desc {
-            assert_eq!(key, "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798");
+            assert_eq!(
+                key,
+                "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+            );
         }
     }
 
@@ -507,7 +562,10 @@ mod tests {
         let desc = Descriptor::parse(input).unwrap();
         assert_eq!(desc.to_string(), input);
         if let Descriptor::Tr(key, tree) = &desc {
-            assert_eq!(key, "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798");
+            assert_eq!(
+                key,
+                "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+            );
             assert!(tree.is_none());
         } else {
             panic!("expected Tr");
@@ -592,8 +650,7 @@ mod tests {
         for ch in checksum.chars() {
             assert!(
                 CHECKSUM_CHARSET.contains(&(ch as u8)),
-                "unexpected character '{}' in checksum",
-                ch
+                "unexpected character '{ch}' in checksum"
             );
         }
     }
@@ -602,14 +659,17 @@ mod tests {
     fn test_descriptor_checksum_different_descriptors() {
         let c1 = descriptor_checksum("pkh(key1)").unwrap();
         let c2 = descriptor_checksum("pkh(key2)").unwrap();
-        assert_ne!(c1, c2, "different descriptors should produce different checksums");
+        assert_ne!(
+            c1, c2,
+            "different descriptors should produce different checksums"
+        );
     }
 
     #[test]
     fn test_parse_with_valid_checksum() {
         let desc_str = "pkh(key)";
         let checksum = descriptor_checksum(desc_str).unwrap();
-        let with_checksum = format!("{}#{}", desc_str, checksum);
+        let with_checksum = format!("{desc_str}#{checksum}");
         let desc = Descriptor::parse(&with_checksum).unwrap();
         assert!(matches!(desc, Descriptor::Pkh(_)));
     }
@@ -621,7 +681,7 @@ mod tests {
         if let Err(DescriptorError::InvalidChecksum { .. }) = result {
             // expected
         } else {
-            panic!("expected InvalidChecksum error, got: {:?}", result);
+            panic!("expected InvalidChecksum error, got: {result:?}");
         }
     }
 
@@ -629,7 +689,7 @@ mod tests {
     fn test_verify_checksum_valid() {
         let desc = "wpkh(key)";
         let checksum = descriptor_checksum(desc).unwrap();
-        let full = format!("{}#{}", desc, checksum);
+        let full = format!("{desc}#{checksum}");
         assert!(verify_checksum(&full).unwrap());
     }
 
@@ -686,10 +746,13 @@ mod tests {
     }
 
     #[test]
-    fn test_unsupported_script_pubkey() {
+    fn test_addr_script_pubkey() {
         let desc = Descriptor::Addr("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_string());
-        let result = desc.script_pubkey();
-        assert!(matches!(result, Err(DescriptorError::UnsupportedScriptPubkey)));
+        assert_eq!(
+            hex::encode(desc.script_pubkey().unwrap().as_bytes()),
+            "0014751e76e8199196d454941c45d1b3a323f1433bd6"
+        );
+        assert!(desc.expand(None, crate::Network::Regtest).is_err());
     }
 
     #[test]
@@ -826,40 +889,40 @@ mod tests {
     fn test_descriptor_error_display() {
         // Cover all error Display impls via format!
         let e1 = DescriptorError::Empty;
-        assert!(format!("{}", e1).contains("empty"));
+        assert!(format!("{e1}").contains("empty"));
 
         let e2 = DescriptorError::MissingCloseParen;
-        assert!(format!("{}", e2).contains("closing parenthesis"));
+        assert!(format!("{e2}").contains("closing parenthesis"));
 
         let e3 = DescriptorError::TrailingCharacters("extra".into());
-        assert!(format!("{}", e3).contains("extra"));
+        assert!(format!("{e3}").contains("extra"));
 
         let e4 = DescriptorError::UnknownType("foo".into());
-        assert!(format!("{}", e4).contains("foo"));
+        assert!(format!("{e4}").contains("foo"));
 
         let e5 = DescriptorError::InvalidKey("badkey".into());
-        assert!(format!("{}", e5).contains("badkey"));
+        assert!(format!("{e5}").contains("badkey"));
 
         let e6 = DescriptorError::InvalidThreshold("abc".into());
-        assert!(format!("{}", e6).contains("abc"));
+        assert!(format!("{e6}").contains("abc"));
 
         let e7 = DescriptorError::ThresholdTooHigh { k: 5, n: 2 };
-        assert!(format!("{}", e7).contains("5"));
+        assert!(format!("{e7}").contains("5"));
 
         let e8 = DescriptorError::MultiNoKeys;
-        assert!(format!("{}", e8).contains("at least one key"));
+        assert!(format!("{e8}").contains("at least one key"));
 
         let e9 = DescriptorError::InvalidChecksum {
             expected: "aaa".into(),
             got: "bbb".into(),
         };
-        assert!(format!("{}", e9).contains("aaa"));
+        assert!(format!("{e9}").contains("aaa"));
 
         let e10 = DescriptorError::UnsupportedScriptPubkey;
-        assert!(format!("{}", e10).contains("not supported"));
+        assert!(format!("{e10}").contains("not supported"));
 
         let e11 = DescriptorError::InvalidHex("badhex".into());
-        assert!(format!("{}", e11).contains("badhex"));
+        assert!(format!("{e11}").contains("badhex"));
     }
 
     #[test]
@@ -882,49 +945,73 @@ mod tests {
     #[test]
     fn test_raw_invalid_hex() {
         let desc = Descriptor::Raw("zzzz".to_string());
-        assert!(matches!(desc.script_pubkey(), Err(DescriptorError::InvalidHex(_))));
+        assert!(matches!(
+            desc.script_pubkey(),
+            Err(DescriptorError::InvalidHex(_))
+        ));
     }
 
     #[test]
     fn test_pkh_invalid_key_hex() {
         let desc = Descriptor::Pkh("not_hex".to_string());
-        assert!(matches!(desc.script_pubkey(), Err(DescriptorError::InvalidKey(_))));
+        assert!(matches!(
+            desc.script_pubkey(),
+            Err(DescriptorError::InvalidKey(_))
+        ));
     }
 
     #[test]
     fn test_wpkh_invalid_key_hex() {
         let desc = Descriptor::Wpkh("not_hex".to_string());
-        assert!(matches!(desc.script_pubkey(), Err(DescriptorError::InvalidKey(_))));
+        assert!(matches!(
+            desc.script_pubkey(),
+            Err(DescriptorError::InvalidKey(_))
+        ));
     }
 
     #[test]
-    fn test_sh_unsupported_script_pubkey() {
+    fn test_sh_invalid_public_key() {
         let desc = Descriptor::Sh(Box::new(Descriptor::Pk("aa".to_string())));
-        assert!(matches!(desc.script_pubkey(), Err(DescriptorError::UnsupportedScriptPubkey)));
+        assert!(matches!(
+            desc.script_pubkey(),
+            Err(DescriptorError::InvalidKey(_))
+        ));
     }
 
     #[test]
-    fn test_wsh_unsupported_script_pubkey() {
+    fn test_wsh_invalid_public_key() {
         let desc = Descriptor::Wsh(Box::new(Descriptor::Pk("aa".to_string())));
-        assert!(matches!(desc.script_pubkey(), Err(DescriptorError::UnsupportedScriptPubkey)));
+        assert!(matches!(
+            desc.script_pubkey(),
+            Err(DescriptorError::InvalidKey(_))
+        ));
     }
 
     #[test]
-    fn test_tr_unsupported_script_pubkey() {
+    fn test_tr_invalid_public_key() {
         let desc = Descriptor::Tr("key".to_string(), None);
-        assert!(matches!(desc.script_pubkey(), Err(DescriptorError::UnsupportedScriptPubkey)));
+        assert!(matches!(
+            desc.script_pubkey(),
+            Err(DescriptorError::InvalidKey(_))
+        ));
     }
 
     #[test]
-    fn test_multi_unsupported_script_pubkey() {
+    fn test_multi_invalid_public_key() {
         let desc = Descriptor::Multi(1, vec!["k1".to_string()]);
-        assert!(matches!(desc.script_pubkey(), Err(DescriptorError::UnsupportedScriptPubkey)));
+        assert!(matches!(
+            desc.script_pubkey(),
+            Err(DescriptorError::InvalidKey(_))
+        ));
     }
 
     #[test]
-    fn test_sortedmulti_unsupported_script_pubkey() {
+    fn test_sortedmulti_invalid_public_key() {
         let desc = Descriptor::SortedMulti(1, vec!["k1".to_string()]);
-        assert!(matches!(desc.script_pubkey(), Err(DescriptorError::UnsupportedScriptPubkey)));
+        assert!(matches!(
+            desc.script_pubkey(),
+            Err(DescriptorError::InvalidKey(_))
+        ));
     }
 
     #[test]

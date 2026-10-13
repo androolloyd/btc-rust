@@ -32,14 +32,22 @@ pub trait Decodable: Sized {
 /// Encode a value to bytes
 pub fn encode<T: Encodable>(value: &T) -> Vec<u8> {
     let mut buf = Vec::with_capacity(value.encoded_size());
-    value.encode(&mut buf).expect("encoding to vec should not fail");
+    value
+        .encode(&mut buf)
+        .expect("encoding to vec should not fail");
     buf
 }
 
 /// Decode a value from bytes
 pub fn decode<T: Decodable>(bytes: &[u8]) -> Result<T, EncodeError> {
     let mut cursor = io::Cursor::new(bytes);
-    T::decode(&mut cursor)
+    let value = T::decode(&mut cursor)?;
+    if cursor.position() != bytes.len() as u64 {
+        return Err(EncodeError::InvalidData(
+            "trailing bytes after value".into(),
+        ));
+    }
+    Ok(value)
 }
 
 /// A variable-length integer encoding used throughout the Bitcoin wire protocol (1, 3, 5, or 9 bytes).
@@ -92,6 +100,12 @@ impl Decodable for VarInt {
             0xfd => reader.read_u16_le()? as u64,
             n => n as u64,
         };
+        if (first == 0xfd && value < 0xfd)
+            || (first == 0xfe && value <= 0xffff)
+            || (first == 0xff && value <= 0xffff_ffff)
+        {
+            return Err(EncodeError::InvalidData("noncanonical CompactSize".into()));
+        }
         Ok(VarInt(value))
     }
 }
@@ -197,7 +211,9 @@ macro_rules! impl_int_encodable {
             fn encode<W: Write>(&self, writer: &mut W) -> Result<usize, EncodeError> {
                 writer.$write(*self)
             }
-            fn encoded_size(&self) -> usize { $size }
+            fn encoded_size(&self) -> usize {
+                $size
+            }
         }
         impl Decodable for $ty {
             fn decode<R: Read>(reader: &mut R) -> Result<Self, EncodeError> {
@@ -231,9 +247,9 @@ impl Decodable for Vec<u8> {
     fn decode<R: Read>(reader: &mut R) -> Result<Self, EncodeError> {
         let len = VarInt::decode(reader)?.0 as usize;
         if len > MAX_VEC_DECODE_SIZE {
-            return Err(EncodeError::InvalidData(
-                format!("vec length {} exceeds maximum {}", len, MAX_VEC_DECODE_SIZE)
-            ));
+            return Err(EncodeError::InvalidData(format!(
+                "vec length {len} exceeds maximum {MAX_VEC_DECODE_SIZE}"
+            )));
         }
         reader.read_bytes(len)
     }
@@ -247,7 +263,9 @@ impl Write for CountWriter {
         self.0 += buf.len();
         Ok(buf.len())
     }
-    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -412,13 +430,13 @@ mod tests {
 
     #[test]
     fn test_encode_error_display() {
-        let e1 = EncodeError::Io(io::Error::new(io::ErrorKind::Other, "test"));
-        assert!(format!("{}", e1).contains("test"));
+        let e1 = EncodeError::Io(io::Error::other("test"));
+        assert!(format!("{e1}").contains("test"));
         let e2 = EncodeError::InvalidData("bad data".into());
-        assert!(format!("{}", e2).contains("bad data"));
+        assert!(format!("{e2}").contains("bad data"));
         let e3 = EncodeError::VarIntTooLarge;
-        assert!(format!("{}", e3).contains("varint"));
+        assert!(format!("{e3}").contains("varint"));
         let e4 = EncodeError::UnexpectedEof;
-        assert!(format!("{}", e4).contains("end"));
+        assert!(format!("{e4}").contains("end"));
     }
 }

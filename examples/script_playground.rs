@@ -2,9 +2,9 @@
 //!
 //! Usage: cargo run --example script_playground
 
-use btc_primitives::script::{Opcode, ScriptBuf};
 use btc_consensus::script_engine::{ScriptEngine, ScriptFlags};
 use btc_consensus::sig_verify::Secp256k1Verifier;
+use btc_primitives::script::{Opcode, ScriptBuf};
 
 fn main() {
     // Build: 2 + 3 == 5
@@ -20,7 +20,7 @@ fn main() {
     let exec_result = engine.execute(script.as_script());
 
     println!("Script: {}", hex::encode(script.as_bytes()));
-    println!("Execution: {:?}", exec_result);
+    println!("Execution: {exec_result:?}");
     println!(
         "Result: {}",
         if engine.success() {

@@ -4,6 +4,10 @@
 //! to chain state changes without forking the node. Extensions implement the
 //! [`ExEx`] trait and receive [`ExExNotification`]s through a broadcast channel
 //! managed by the [`ExExManager`].
+//! The production node also uses [`durable::DurableManager`] for supervised
+//! journal replay with atomic application-state and acknowledged-cursor commits.
+
+pub mod durable;
 
 #[cfg(feature = "ordinals")]
 pub mod ordinals;
@@ -35,10 +39,7 @@ pub enum ExExNotification {
     },
 
     /// A block has been reverted (disconnected) from the chain tip.
-    BlockReverted {
-        height: u64,
-        hash: BlockHash,
-    },
+    BlockReverted { height: u64, hash: BlockHash },
 
     /// A chain reorganisation has occurred.
     ChainReorged {
@@ -170,10 +171,10 @@ impl ExExManager {
         }
     }
 
-    /// Register an extension by name (for tracking/diagnostics).
-    pub fn register(&mut self, name: &str) {
-        info!(name, "ExEx: registered extension");
-        self.extensions.push(name.to_string());
+    /// Deprecated name-only registration fails explicitly. DurableManager
+    /// accepts an actual extension implementation and supervises its execution.
+    pub fn register(&mut self, _name: &str) -> eyre::Result<()> {
+        Err(eyre::eyre!("name-only registration cannot start an extension; use durable::DurableManager::register with an actual implementation"))
     }
 
     /// List the names of all registered extensions.
@@ -511,10 +512,7 @@ mod tests {
         let mut ctx = manager.subscribe();
 
         let hash = BlockHash::from_bytes([0xab; 32]);
-        manager.notify(ExExNotification::BlockReverted {
-            height: 100,
-            hash,
-        });
+        manager.notify(ExExNotification::BlockReverted { height: 100, hash });
 
         let notification = ctx.notifications.recv().await.unwrap();
         match notification {
@@ -582,15 +580,11 @@ mod tests {
 
         assert!(manager.registered_extensions().is_empty());
 
-        manager.register("logging");
-        manager.register("metrics");
-        manager.register("indexer");
+        assert!(manager.register("logging").is_err());
+        assert!(manager.register("metrics").is_err());
+        assert!(manager.register("indexer").is_err());
 
-        let extensions = manager.registered_extensions();
-        assert_eq!(extensions.len(), 3);
-        assert_eq!(extensions[0], "logging");
-        assert_eq!(extensions[1], "metrics");
-        assert_eq!(extensions[2], "indexer");
+        assert!(manager.registered_extensions().is_empty());
 
         // subscribe should return a context with the correct network.
         let ctx = manager.subscribe();
@@ -689,10 +683,9 @@ mod tests {
 
         // Use sender() directly to emit a notification
         let hash = BlockHash::from_bytes([0xcc; 32]);
-        let _ = manager.sender().send(ExExNotification::BlockReverted {
-            height: 55,
-            hash,
-        });
+        let _ = manager
+            .sender()
+            .send(ExExNotification::BlockReverted { height: 55, hash });
 
         let notif = ctx.notifications.recv().await.unwrap();
         match notif {
@@ -919,10 +912,7 @@ mod tests {
         });
 
         // BlockReverted
-        manager.notify(ExExNotification::BlockReverted {
-            height: 1,
-            hash,
-        });
+        manager.notify(ExExNotification::BlockReverted { height: 1, hash });
 
         // ChainReorged
         let old_tip = BlockHash::from_bytes([0xaa; 32]);

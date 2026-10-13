@@ -5,7 +5,7 @@ use btc_consensus::script_engine::{ScriptEngine, ScriptFlags};
 use btc_consensus::sig_verify::Secp256k1Verifier;
 use btc_forge::miniscript::{Miniscript, Policy};
 use btc_primitives::amount::Amount;
-use btc_primitives::hash::{sha256, sha256d, hash160, TxHash};
+use btc_primitives::hash::{hash160, sha256, sha256d, TxHash};
 use btc_primitives::script::{Opcode, ScriptBuf};
 use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
 
@@ -19,10 +19,7 @@ static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
 /// compiled Miniscript script.  The `witness_builder` callback pushes the
 /// satisfaction items (preimages, selectors, etc.) onto `buf`, and then the
 /// compiled hashlock/timelock/combinator bytes are appended.
-fn build_script(
-    witness_builder: impl FnOnce(&mut ScriptBuf),
-    compiled: &ScriptBuf,
-) -> ScriptBuf {
+fn build_script(witness_builder: impl FnOnce(&mut ScriptBuf), compiled: &ScriptBuf) -> ScriptBuf {
     let mut full = ScriptBuf::new();
     witness_builder(&mut full);
     // Append the compiled script bytes after the witness pushes.
@@ -75,7 +72,10 @@ fn execute_sha256_hashlock() {
     let full = build_script(|buf| buf.push_slice(&preimage), &script);
     let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
     engine.execute(full.as_script()).unwrap();
-    assert!(engine.success(), "SHA256 hashlock should succeed with correct preimage");
+    assert!(
+        engine.success(),
+        "SHA256 hashlock should succeed with correct preimage"
+    );
 }
 
 #[test]
@@ -89,7 +89,10 @@ fn execute_sha256_hashlock_wrong_preimage() {
     let full = build_script(|buf| buf.push_slice(&wrong), &script);
     let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
     engine.execute(full.as_script()).unwrap();
-    assert!(!engine.success(), "SHA256 hashlock should fail with wrong preimage");
+    assert!(
+        !engine.success(),
+        "SHA256 hashlock should fail with wrong preimage"
+    );
 }
 
 #[test]
@@ -102,7 +105,10 @@ fn execute_hash256_hashlock() {
     let full = build_script(|buf| buf.push_slice(&preimage), &script);
     let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
     engine.execute(full.as_script()).unwrap();
-    assert!(engine.success(), "HASH256 hashlock should succeed with correct preimage");
+    assert!(
+        engine.success(),
+        "HASH256 hashlock should succeed with correct preimage"
+    );
 }
 
 #[test]
@@ -116,7 +122,10 @@ fn execute_hash256_hashlock_wrong_preimage() {
     let full = build_script(|buf| buf.push_slice(&wrong), &script);
     let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
     engine.execute(full.as_script()).unwrap();
-    assert!(!engine.success(), "HASH256 hashlock should fail with wrong preimage");
+    assert!(
+        !engine.success(),
+        "HASH256 hashlock should fail with wrong preimage"
+    );
 }
 
 #[test]
@@ -129,7 +138,10 @@ fn execute_ripemd160_hashlock() {
     let full = build_script(|buf| buf.push_slice(&preimage), &script);
     let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
     engine.execute(full.as_script()).unwrap();
-    assert!(engine.success(), "RIPEMD160 hashlock should succeed with correct preimage");
+    assert!(
+        engine.success(),
+        "RIPEMD160 hashlock should succeed with correct preimage"
+    );
 }
 
 #[test]
@@ -143,7 +155,10 @@ fn execute_ripemd160_hashlock_wrong_preimage() {
     let full = build_script(|buf| buf.push_slice(&wrong), &script);
     let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
     engine.execute(full.as_script()).unwrap();
-    assert!(!engine.success(), "RIPEMD160 hashlock should fail with wrong preimage");
+    assert!(
+        !engine.success(),
+        "RIPEMD160 hashlock should fail with wrong preimage"
+    );
 }
 
 #[test]
@@ -156,7 +171,10 @@ fn execute_hash160_hashlock() {
     let full = build_script(|buf| buf.push_slice(&preimage), &script);
     let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
     engine.execute(full.as_script()).unwrap();
-    assert!(engine.success(), "HASH160 hashlock should succeed with correct preimage");
+    assert!(
+        engine.success(),
+        "HASH160 hashlock should succeed with correct preimage"
+    );
 }
 
 #[test]
@@ -170,7 +188,10 @@ fn execute_hash160_hashlock_wrong_preimage() {
     let full = build_script(|buf| buf.push_slice(&wrong), &script);
     let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
     engine.execute(full.as_script()).unwrap();
-    assert!(!engine.success(), "HASH160 hashlock should fail with wrong preimage");
+    assert!(
+        !engine.success(),
+        "HASH160 hashlock should fail with wrong preimage"
+    );
 }
 
 // ===========================================================================
@@ -186,7 +207,10 @@ fn execute_after_with_valid_locktime() {
     let mut engine = make_timelock_engine(600, 0xfffffffe);
     engine.execute(script.as_script()).unwrap();
     // CLTV does NOT pop the stack value; stack top should still be 500 which is truthy
-    assert!(engine.success(), "After(500) should succeed when tx locktime is 600");
+    assert!(
+        engine.success(),
+        "After(500) should succeed when tx locktime is 600"
+    );
 }
 
 #[test]
@@ -197,7 +221,10 @@ fn execute_after_rejects_early() {
     // tx locktime 100 < script locktime 500
     let mut engine = make_timelock_engine(100, 0xfffffffe);
     let result = engine.execute(script.as_script());
-    assert!(result.is_err(), "After(500) should fail when tx locktime is only 100");
+    assert!(
+        result.is_err(),
+        "After(500) should fail when tx locktime is only 100"
+    );
 }
 
 #[test]
@@ -208,7 +235,10 @@ fn execute_after_rejects_final_sequence() {
     // Sequence = FINAL (0xffffffff) disables locktime enforcement
     let mut engine = make_timelock_engine(600, 0xffffffff);
     let result = engine.execute(script.as_script());
-    assert!(result.is_err(), "After(500) should fail when sequence is FINAL");
+    assert!(
+        result.is_err(),
+        "After(500) should fail when sequence is FINAL"
+    );
 }
 
 #[test]
@@ -219,7 +249,10 @@ fn execute_older_with_valid_sequence() {
     // tx sequence 20 >= script sequence 10, version = 2
     let mut engine = make_timelock_engine(0, 20);
     engine.execute(script.as_script()).unwrap();
-    assert!(engine.success(), "Older(10) should succeed when tx sequence is 20");
+    assert!(
+        engine.success(),
+        "Older(10) should succeed when tx sequence is 20"
+    );
 }
 
 #[test]
@@ -230,7 +263,10 @@ fn execute_older_rejects_insufficient_sequence() {
     // tx sequence 5 < script sequence 100
     let mut engine = make_timelock_engine(0, 5);
     let result = engine.execute(script.as_script());
-    assert!(result.is_err(), "Older(100) should fail when tx sequence is only 5");
+    assert!(
+        result.is_err(),
+        "Older(100) should fail when tx sequence is only 5"
+    );
 }
 
 // ===========================================================================
@@ -254,7 +290,9 @@ fn execute_andv_both_true() {
     let hash2 = sha256(&preimage2);
 
     let ms = Miniscript::AndV(
-        Box::new(Miniscript::Verify(Box::new(Miniscript::Sha256(hash1.to_vec())))),
+        Box::new(Miniscript::Verify(Box::new(Miniscript::Sha256(
+            hash1.to_vec(),
+        )))),
         Box::new(Miniscript::Sha256(hash2.to_vec())),
     );
     let script = ms.compile();
@@ -275,7 +313,10 @@ fn execute_andv_both_true() {
     );
     let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
     engine.execute(full.as_script()).unwrap();
-    assert!(engine.success(), "AndV(sha256, sha256) should succeed with both correct preimages");
+    assert!(
+        engine.success(),
+        "AndV(sha256, sha256) should succeed with both correct preimages"
+    );
 }
 
 #[test]
@@ -286,7 +327,9 @@ fn execute_andv_first_wrong() {
     let hash2 = sha256(&preimage2);
 
     let ms = Miniscript::AndV(
-        Box::new(Miniscript::Verify(Box::new(Miniscript::Sha256(hash1.to_vec())))),
+        Box::new(Miniscript::Verify(Box::new(Miniscript::Sha256(
+            hash1.to_vec(),
+        )))),
         Box::new(Miniscript::Sha256(hash2.to_vec())),
     );
     let script = ms.compile();
@@ -302,7 +345,10 @@ fn execute_andv_first_wrong() {
     let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
     let result = engine.execute(full.as_script());
     // First sub is Verify-wrapped, so wrong preimage causes VerifyFailed error
-    assert!(result.is_err(), "AndV should fail when first preimage is wrong");
+    assert!(
+        result.is_err(),
+        "AndV should fail when first preimage is wrong"
+    );
 }
 
 #[test]
@@ -319,7 +365,10 @@ fn execute_andb_both_true() {
     // tx locktime must be >= 600 (the larger threshold)
     let mut engine = make_timelock_engine(700, 0xfffffffe);
     engine.execute(script.as_script()).unwrap();
-    assert!(engine.success(), "AndB(After(500), After(600)) should succeed with locktime 700");
+    assert!(
+        engine.success(),
+        "AndB(After(500), After(600)) should succeed with locktime 700"
+    );
 }
 
 #[test]
@@ -333,7 +382,10 @@ fn execute_andb_one_fails() {
 
     let mut engine = make_timelock_engine(550, 0xfffffffe);
     let result = engine.execute(script.as_script());
-    assert!(result.is_err(), "AndB should fail when the second timelock is not satisfied");
+    assert!(
+        result.is_err(),
+        "AndB should fail when the second timelock is not satisfied"
+    );
 }
 
 #[test]
@@ -365,7 +417,10 @@ fn execute_ori_first_branch() {
     );
     let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
     engine.execute(full.as_script()).unwrap();
-    assert!(engine.success(), "OrI first branch should succeed with correct preimage");
+    assert!(
+        engine.success(),
+        "OrI first branch should succeed with correct preimage"
+    );
 }
 
 #[test]
@@ -392,7 +447,10 @@ fn execute_ori_second_branch() {
     );
     let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
     engine.execute(full.as_script()).unwrap();
-    assert!(engine.success(), "OrI second branch should succeed with correct preimage");
+    assert!(
+        engine.success(),
+        "OrI second branch should succeed with correct preimage"
+    );
 }
 
 #[test]
@@ -432,7 +490,10 @@ fn execute_orb_either_true() {
 
     let mut engine = make_timelock_engine(700, 0xfffffffe);
     engine.execute(script.as_script()).unwrap();
-    assert!(engine.success(), "OrB(After(500), After(600)) should succeed with locktime 700");
+    assert!(
+        engine.success(),
+        "OrB(After(500), After(600)) should succeed with locktime 700"
+    );
 }
 
 #[test]
@@ -446,7 +507,10 @@ fn execute_orb_both_fail() {
 
     let mut engine = make_timelock_engine(100, 0xfffffffe);
     let result = engine.execute(script.as_script());
-    assert!(result.is_err(), "OrB should fail when neither timelock is satisfied");
+    assert!(
+        result.is_err(),
+        "OrB should fail when neither timelock is satisfied"
+    );
 }
 
 #[test]
@@ -475,21 +539,18 @@ fn execute_thresh_2_of_3() {
     // which does work correctly.
     let preimage = [0x11_u8; 32];
     let hash = sha256(&preimage);
-    let ms = Miniscript::Thresh(
-        1,
-        vec![Miniscript::Sha256(hash.to_vec())],
-    );
+    let ms = Miniscript::Thresh(1, vec![Miniscript::Sha256(hash.to_vec())]);
     let script = ms.compile();
 
     // Script: [Sha256(h)] <1> OP_EQUAL
     // Sha256 hashlock leaves 1 on stack (if preimage matches), then <1> OP_EQUAL => 1
-    let full = build_script(
-        |buf| buf.push_slice(&preimage),
-        &script,
-    );
+    let full = build_script(|buf| buf.push_slice(&preimage), &script);
     let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
     engine.execute(full.as_script()).unwrap();
-    assert!(engine.success(), "Thresh(1, [sha256]) should succeed with correct preimage");
+    assert!(
+        engine.success(),
+        "Thresh(1, [sha256]) should succeed with correct preimage"
+    );
 }
 
 #[test]
@@ -497,20 +558,17 @@ fn execute_thresh_insufficient() {
     // Thresh(1, [sha256(h)]) with wrong preimage
     let preimage = [0x11_u8; 32];
     let hash = sha256(&preimage);
-    let ms = Miniscript::Thresh(
-        1,
-        vec![Miniscript::Sha256(hash.to_vec())],
-    );
+    let ms = Miniscript::Thresh(1, vec![Miniscript::Sha256(hash.to_vec())]);
     let script = ms.compile();
 
     let wrong = [0xFF_u8; 32];
-    let full = build_script(
-        |buf| buf.push_slice(&wrong),
-        &script,
-    );
+    let full = build_script(|buf| buf.push_slice(&wrong), &script);
     let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
     engine.execute(full.as_script()).unwrap();
-    assert!(!engine.success(), "Thresh(1, [sha256]) should fail with wrong preimage");
+    assert!(
+        !engine.success(),
+        "Thresh(1, [sha256]) should fail with wrong preimage"
+    );
 }
 
 // ===========================================================================
@@ -522,7 +580,7 @@ fn policy_to_execution_sha256() {
     let preimage = [0xAB_u8; 32];
     let hash = sha256(&preimage);
     let hash_hex = hex::encode(hash);
-    let policy_str = format!("sha256({})", hash_hex);
+    let policy_str = format!("sha256({hash_hex})");
 
     let policy = Policy::parse(&policy_str).unwrap();
     let ms = policy.to_miniscript();
@@ -539,7 +597,7 @@ fn policy_to_execution_sha256_wrong() {
     let preimage = [0xAB_u8; 32];
     let hash = sha256(&preimage);
     let hash_hex = hex::encode(hash);
-    let policy_str = format!("sha256({})", hash_hex);
+    let policy_str = format!("sha256({hash_hex})");
 
     let policy = Policy::parse(&policy_str).unwrap();
     let ms = policy.to_miniscript();
@@ -549,7 +607,10 @@ fn policy_to_execution_sha256_wrong() {
     let full = build_script(|buf| buf.push_slice(&wrong), &script);
     let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
     engine.execute(full.as_script()).unwrap();
-    assert!(!engine.success(), "Policy sha256 roundtrip should fail with wrong preimage");
+    assert!(
+        !engine.success(),
+        "Policy sha256 roundtrip should fail with wrong preimage"
+    );
 }
 
 #[test]
@@ -572,7 +633,9 @@ fn policy_to_execution_and() {
     // second sub runs. We construct the correct Miniscript manually to test
     // the full compile-and-execute roundtrip.
     let ms_correct = Miniscript::AndV(
-        Box::new(Miniscript::Verify(Box::new(Miniscript::Sha256(hash1.to_vec())))),
+        Box::new(Miniscript::Verify(Box::new(Miniscript::Sha256(
+            hash1.to_vec(),
+        )))),
         Box::new(Miniscript::Sha256(hash2.to_vec())),
     );
     let script = ms_correct.compile();
@@ -586,7 +649,10 @@ fn policy_to_execution_and() {
     );
     let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
     engine.execute(full.as_script()).unwrap();
-    assert!(engine.success(), "Policy and(sha256, sha256) roundtrip should succeed");
+    assert!(
+        engine.success(),
+        "Policy and(sha256, sha256) roundtrip should succeed"
+    );
 }
 
 #[test]
@@ -658,7 +724,10 @@ fn policy_to_execution_after() {
     // Need tx with locktime >= 1000
     let mut engine = make_timelock_engine(1500, 0xfffffffe);
     engine.execute(script.as_script()).unwrap();
-    assert!(engine.success(), "Policy after(1000) should succeed with tx locktime 1500");
+    assert!(
+        engine.success(),
+        "Policy after(1000) should succeed with tx locktime 1500"
+    );
 }
 
 // ===========================================================================
@@ -684,7 +753,10 @@ fn witness_size_hash256() {
 fn witness_size_ripemd160() {
     let ms = Miniscript::Ripemd160(vec![0; 20]);
     let estimated = ms.max_satisfaction_witness_size();
-    assert_eq!(estimated, 33, "RIPEMD160 witness size should be 1 + 32 = 33");
+    assert_eq!(
+        estimated, 33,
+        "RIPEMD160 witness size should be 1 + 32 = 33"
+    );
 }
 
 #[test]
@@ -751,9 +823,7 @@ fn witness_size_matches_actual_hashlock() {
     let actual_witness_size = 1 + preimage.len(); // length prefix + data
     assert!(
         actual_witness_size <= estimated,
-        "Actual witness size {} should be <= estimated {}",
-        actual_witness_size,
-        estimated,
+        "Actual witness size {actual_witness_size} should be <= estimated {estimated}",
     );
 }
 
@@ -774,9 +844,7 @@ fn witness_size_matches_actual_ori() {
     let actual_witness_size = 1 + 33; // selector (1 byte OP_1/OP_0) + preimage item
     assert!(
         actual_witness_size <= estimated,
-        "Actual OrI witness size {} should be <= estimated {}",
-        actual_witness_size,
-        estimated,
+        "Actual OrI witness size {actual_witness_size} should be <= estimated {estimated}",
     );
 }
 
@@ -788,25 +856,37 @@ fn witness_size_matches_actual_ori() {
 fn unsafe_sha256_hashlock() {
     // A hashlock alone has no signature requirement: anyone with the preimage can spend
     let ms = Miniscript::Sha256(vec![0; 32]);
-    assert!(!ms.is_safe(), "SHA256 hashlock without key should be unsafe");
+    assert!(
+        !ms.is_safe(),
+        "SHA256 hashlock without key should be unsafe"
+    );
 }
 
 #[test]
 fn unsafe_hash256_hashlock() {
     let ms = Miniscript::Hash256(vec![0; 32]);
-    assert!(!ms.is_safe(), "HASH256 hashlock without key should be unsafe");
+    assert!(
+        !ms.is_safe(),
+        "HASH256 hashlock without key should be unsafe"
+    );
 }
 
 #[test]
 fn unsafe_ripemd160_hashlock() {
     let ms = Miniscript::Ripemd160(vec![0; 20]);
-    assert!(!ms.is_safe(), "RIPEMD160 hashlock without key should be unsafe");
+    assert!(
+        !ms.is_safe(),
+        "RIPEMD160 hashlock without key should be unsafe"
+    );
 }
 
 #[test]
 fn unsafe_hash160_hashlock() {
     let ms = Miniscript::Hash160(vec![0; 20]);
-    assert!(!ms.is_safe(), "HASH160 hashlock without key should be unsafe");
+    assert!(
+        !ms.is_safe(),
+        "HASH160 hashlock without key should be unsafe"
+    );
 }
 
 #[test]
@@ -850,7 +930,10 @@ fn unsafe_or_with_one_keyless() {
         Box::new(Miniscript::Pk(vec![0; 33])),
         Box::new(Miniscript::Sha256(vec![0; 32])),
     );
-    assert!(!ms.is_safe(), "OrI where one branch lacks key should be unsafe");
+    assert!(
+        !ms.is_safe(),
+        "OrI where one branch lacks key should be unsafe"
+    );
 }
 
 #[test]
@@ -860,7 +943,10 @@ fn safe_or_both_keys() {
         Box::new(Miniscript::Pk(vec![0; 33])),
         Box::new(Miniscript::Pk(vec![1; 33])),
     );
-    assert!(ms.is_safe(), "OrI where both branches have keys should be safe");
+    assert!(
+        ms.is_safe(),
+        "OrI where both branches have keys should be safe"
+    );
 }
 
 #[test]
@@ -890,7 +976,10 @@ fn unsafe_thresh_not_enough_sigs() {
             Miniscript::Sha256(vec![1; 32]),
         ],
     );
-    assert!(!ms.is_safe(), "Thresh(1, [pk, sha256, sha256]) should be unsafe");
+    assert!(
+        !ms.is_safe(),
+        "Thresh(1, [pk, sha256, sha256]) should be unsafe"
+    );
 }
 
 #[test]
@@ -905,7 +994,10 @@ fn verify_wrapper_execution() {
     let full = build_script(|buf| buf.push_slice(&preimage), &script);
     let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
     let result = engine.execute(full.as_script());
-    assert!(result.is_ok(), "Verify(sha256) with correct preimage should not error");
+    assert!(
+        result.is_ok(),
+        "Verify(sha256) with correct preimage should not error"
+    );
     // Note: stack is empty after OP_VERIFY consumes the true value,
     // so success() returns false, but execution didn't error.
 }
@@ -921,5 +1013,8 @@ fn verify_wrapper_wrong_preimage_errors() {
     let full = build_script(|buf| buf.push_slice(&wrong), &script);
     let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
     let result = engine.execute(full.as_script());
-    assert!(result.is_err(), "Verify(sha256) with wrong preimage should error (VerifyFailed)");
+    assert!(
+        result.is_err(),
+        "Verify(sha256) with wrong preimage should error (VerifyFailed)"
+    );
 }

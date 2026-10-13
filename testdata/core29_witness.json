@@ -1,0 +1,624 @@
+{
+  "source": "https://github.com/bitcoin/bitcoin/blob/v29.0/src/test/data/script_tests.json",
+  "source_sha256": "195d1ae4c1701ffa4e4b0ac14ba2b451da0e73fb22292656cd0f2196a78010db",
+  "license": "MIT",
+  "scope": "All 48 native/wrapped witness-v0 conditional rows 1197..1247. Exact runtime dispatcher outcomes; CLEANSTACK is absent from the supplied flags.",
+  "vectors": [
+    {
+      "core_row": 1197,
+      "witness": [
+        "01",
+        "635168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "",
+      "script_pubkey": "0 0x20 0xc7eaf06d5ae01a58e376e126eb1e6fab2036076922b96b2711ffbec1e590665d",
+      "flags": "P2SH,WITNESS",
+      "expected": "OK",
+      "comment": ""
+    },
+    {
+      "core_row": 1198,
+      "witness": [
+        "02",
+        "635168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "",
+      "script_pubkey": "0 0x20 0xc7eaf06d5ae01a58e376e126eb1e6fab2036076922b96b2711ffbec1e590665d",
+      "flags": "P2SH,WITNESS",
+      "expected": "OK",
+      "comment": ""
+    },
+    {
+      "core_row": 1199,
+      "witness": [
+        "0100",
+        "635168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "",
+      "script_pubkey": "0 0x20 0xc7eaf06d5ae01a58e376e126eb1e6fab2036076922b96b2711ffbec1e590665d",
+      "flags": "P2SH,WITNESS",
+      "expected": "OK",
+      "comment": ""
+    },
+    {
+      "core_row": 1200,
+      "witness": [
+        "",
+        "635168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "",
+      "script_pubkey": "0 0x20 0xc7eaf06d5ae01a58e376e126eb1e6fab2036076922b96b2711ffbec1e590665d",
+      "flags": "P2SH,WITNESS",
+      "expected": "CLEANSTACK",
+      "comment": ""
+    },
+    {
+      "core_row": 1201,
+      "witness": [
+        "00",
+        "635168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "",
+      "script_pubkey": "0 0x20 0xc7eaf06d5ae01a58e376e126eb1e6fab2036076922b96b2711ffbec1e590665d",
+      "flags": "P2SH,WITNESS",
+      "expected": "CLEANSTACK",
+      "comment": ""
+    },
+    {
+      "core_row": 1202,
+      "witness": [
+        "01",
+        "635168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "",
+      "script_pubkey": "0 0x20 0xc7eaf06d5ae01a58e376e126eb1e6fab2036076922b96b2711ffbec1e590665d",
+      "flags": "P2SH,WITNESS,MINIMALIF",
+      "expected": "OK",
+      "comment": ""
+    },
+    {
+      "core_row": 1203,
+      "witness": [
+        "02",
+        "635168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "",
+      "script_pubkey": "0 0x20 0xc7eaf06d5ae01a58e376e126eb1e6fab2036076922b96b2711ffbec1e590665d",
+      "flags": "P2SH,WITNESS,MINIMALIF",
+      "expected": "MINIMALIF",
+      "comment": ""
+    },
+    {
+      "core_row": 1204,
+      "witness": [
+        "0100",
+        "635168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "",
+      "script_pubkey": "0 0x20 0xc7eaf06d5ae01a58e376e126eb1e6fab2036076922b96b2711ffbec1e590665d",
+      "flags": "P2SH,WITNESS,MINIMALIF",
+      "expected": "MINIMALIF",
+      "comment": ""
+    },
+    {
+      "core_row": 1205,
+      "witness": [
+        "",
+        "635168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "",
+      "script_pubkey": "0 0x20 0xc7eaf06d5ae01a58e376e126eb1e6fab2036076922b96b2711ffbec1e590665d",
+      "flags": "P2SH,WITNESS,MINIMALIF",
+      "expected": "CLEANSTACK",
+      "comment": ""
+    },
+    {
+      "core_row": 1206,
+      "witness": [
+        "00",
+        "635168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "",
+      "script_pubkey": "0 0x20 0xc7eaf06d5ae01a58e376e126eb1e6fab2036076922b96b2711ffbec1e590665d",
+      "flags": "P2SH,WITNESS,MINIMALIF",
+      "expected": "MINIMALIF",
+      "comment": ""
+    },
+    {
+      "core_row": 1207,
+      "witness": [
+        "635168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "",
+      "script_pubkey": "0 0x20 0xc7eaf06d5ae01a58e376e126eb1e6fab2036076922b96b2711ffbec1e590665d",
+      "flags": "P2SH,WITNESS",
+      "expected": "UNBALANCED_CONDITIONAL",
+      "comment": ""
+    },
+    {
+      "core_row": 1208,
+      "witness": [
+        "635168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "",
+      "script_pubkey": "0 0x20 0xc7eaf06d5ae01a58e376e126eb1e6fab2036076922b96b2711ffbec1e590665d",
+      "flags": "P2SH,WITNESS,MINIMALIF",
+      "expected": "UNBALANCED_CONDITIONAL",
+      "comment": ""
+    },
+    {
+      "core_row": 1210,
+      "witness": [
+        "01",
+        "645168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "",
+      "script_pubkey": "0 0x20 0xf913eacf2e38a5d6fc3a8311d72ae704cb83866350a984dd3e5eb76d2a8c28e8",
+      "flags": "P2SH,WITNESS",
+      "expected": "CLEANSTACK",
+      "comment": ""
+    },
+    {
+      "core_row": 1211,
+      "witness": [
+        "02",
+        "645168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "",
+      "script_pubkey": "0 0x20 0xf913eacf2e38a5d6fc3a8311d72ae704cb83866350a984dd3e5eb76d2a8c28e8",
+      "flags": "P2SH,WITNESS",
+      "expected": "CLEANSTACK",
+      "comment": ""
+    },
+    {
+      "core_row": 1212,
+      "witness": [
+        "0100",
+        "645168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "",
+      "script_pubkey": "0 0x20 0xf913eacf2e38a5d6fc3a8311d72ae704cb83866350a984dd3e5eb76d2a8c28e8",
+      "flags": "P2SH,WITNESS",
+      "expected": "CLEANSTACK",
+      "comment": ""
+    },
+    {
+      "core_row": 1213,
+      "witness": [
+        "",
+        "645168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "",
+      "script_pubkey": "0 0x20 0xf913eacf2e38a5d6fc3a8311d72ae704cb83866350a984dd3e5eb76d2a8c28e8",
+      "flags": "P2SH,WITNESS",
+      "expected": "OK",
+      "comment": ""
+    },
+    {
+      "core_row": 1214,
+      "witness": [
+        "00",
+        "645168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "",
+      "script_pubkey": "0 0x20 0xf913eacf2e38a5d6fc3a8311d72ae704cb83866350a984dd3e5eb76d2a8c28e8",
+      "flags": "P2SH,WITNESS",
+      "expected": "OK",
+      "comment": ""
+    },
+    {
+      "core_row": 1215,
+      "witness": [
+        "01",
+        "645168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "",
+      "script_pubkey": "0 0x20 0xf913eacf2e38a5d6fc3a8311d72ae704cb83866350a984dd3e5eb76d2a8c28e8",
+      "flags": "P2SH,WITNESS,MINIMALIF",
+      "expected": "CLEANSTACK",
+      "comment": ""
+    },
+    {
+      "core_row": 1216,
+      "witness": [
+        "02",
+        "645168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "",
+      "script_pubkey": "0 0x20 0xf913eacf2e38a5d6fc3a8311d72ae704cb83866350a984dd3e5eb76d2a8c28e8",
+      "flags": "P2SH,WITNESS,MINIMALIF",
+      "expected": "MINIMALIF",
+      "comment": ""
+    },
+    {
+      "core_row": 1217,
+      "witness": [
+        "0100",
+        "645168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "",
+      "script_pubkey": "0 0x20 0xf913eacf2e38a5d6fc3a8311d72ae704cb83866350a984dd3e5eb76d2a8c28e8",
+      "flags": "P2SH,WITNESS,MINIMALIF",
+      "expected": "MINIMALIF",
+      "comment": ""
+    },
+    {
+      "core_row": 1218,
+      "witness": [
+        "",
+        "645168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "",
+      "script_pubkey": "0 0x20 0xf913eacf2e38a5d6fc3a8311d72ae704cb83866350a984dd3e5eb76d2a8c28e8",
+      "flags": "P2SH,WITNESS,MINIMALIF",
+      "expected": "OK",
+      "comment": ""
+    },
+    {
+      "core_row": 1219,
+      "witness": [
+        "00",
+        "645168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "",
+      "script_pubkey": "0 0x20 0xf913eacf2e38a5d6fc3a8311d72ae704cb83866350a984dd3e5eb76d2a8c28e8",
+      "flags": "P2SH,WITNESS,MINIMALIF",
+      "expected": "MINIMALIF",
+      "comment": ""
+    },
+    {
+      "core_row": 1220,
+      "witness": [
+        "645168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "",
+      "script_pubkey": "0 0x20 0xf913eacf2e38a5d6fc3a8311d72ae704cb83866350a984dd3e5eb76d2a8c28e8",
+      "flags": "P2SH,WITNESS",
+      "expected": "UNBALANCED_CONDITIONAL",
+      "comment": ""
+    },
+    {
+      "core_row": 1221,
+      "witness": [
+        "645168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "",
+      "script_pubkey": "0 0x20 0xf913eacf2e38a5d6fc3a8311d72ae704cb83866350a984dd3e5eb76d2a8c28e8",
+      "flags": "P2SH,WITNESS,MINIMALIF",
+      "expected": "UNBALANCED_CONDITIONAL",
+      "comment": ""
+    },
+    {
+      "core_row": 1223,
+      "witness": [
+        "01",
+        "635168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "0x22 0x0020c7eaf06d5ae01a58e376e126eb1e6fab2036076922b96b2711ffbec1e590665d",
+      "script_pubkey": "HASH160 0x14 0x9b27ee6d9010c21bf837b334d043be5d150e7ba7 EQUAL",
+      "flags": "P2SH,WITNESS",
+      "expected": "OK",
+      "comment": ""
+    },
+    {
+      "core_row": 1224,
+      "witness": [
+        "02",
+        "635168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "0x22 0x0020c7eaf06d5ae01a58e376e126eb1e6fab2036076922b96b2711ffbec1e590665d",
+      "script_pubkey": "HASH160 0x14 0x9b27ee6d9010c21bf837b334d043be5d150e7ba7 EQUAL",
+      "flags": "P2SH,WITNESS",
+      "expected": "OK",
+      "comment": ""
+    },
+    {
+      "core_row": 1225,
+      "witness": [
+        "0100",
+        "635168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "0x22 0x0020c7eaf06d5ae01a58e376e126eb1e6fab2036076922b96b2711ffbec1e590665d",
+      "script_pubkey": "HASH160 0x14 0x9b27ee6d9010c21bf837b334d043be5d150e7ba7 EQUAL",
+      "flags": "P2SH,WITNESS",
+      "expected": "OK",
+      "comment": ""
+    },
+    {
+      "core_row": 1226,
+      "witness": [
+        "",
+        "635168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "0x22 0x0020c7eaf06d5ae01a58e376e126eb1e6fab2036076922b96b2711ffbec1e590665d",
+      "script_pubkey": "HASH160 0x14 0x9b27ee6d9010c21bf837b334d043be5d150e7ba7 EQUAL",
+      "flags": "P2SH,WITNESS",
+      "expected": "CLEANSTACK",
+      "comment": ""
+    },
+    {
+      "core_row": 1227,
+      "witness": [
+        "00",
+        "635168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "0x22 0x0020c7eaf06d5ae01a58e376e126eb1e6fab2036076922b96b2711ffbec1e590665d",
+      "script_pubkey": "HASH160 0x14 0x9b27ee6d9010c21bf837b334d043be5d150e7ba7 EQUAL",
+      "flags": "P2SH,WITNESS",
+      "expected": "CLEANSTACK",
+      "comment": ""
+    },
+    {
+      "core_row": 1228,
+      "witness": [
+        "01",
+        "635168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "0x22 0x0020c7eaf06d5ae01a58e376e126eb1e6fab2036076922b96b2711ffbec1e590665d",
+      "script_pubkey": "HASH160 0x14 0x9b27ee6d9010c21bf837b334d043be5d150e7ba7 EQUAL",
+      "flags": "P2SH,WITNESS,MINIMALIF",
+      "expected": "OK",
+      "comment": ""
+    },
+    {
+      "core_row": 1229,
+      "witness": [
+        "02",
+        "635168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "0x22 0x0020c7eaf06d5ae01a58e376e126eb1e6fab2036076922b96b2711ffbec1e590665d",
+      "script_pubkey": "HASH160 0x14 0x9b27ee6d9010c21bf837b334d043be5d150e7ba7 EQUAL",
+      "flags": "P2SH,WITNESS,MINIMALIF",
+      "expected": "MINIMALIF",
+      "comment": ""
+    },
+    {
+      "core_row": 1230,
+      "witness": [
+        "0100",
+        "635168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "0x22 0x0020c7eaf06d5ae01a58e376e126eb1e6fab2036076922b96b2711ffbec1e590665d",
+      "script_pubkey": "HASH160 0x14 0x9b27ee6d9010c21bf837b334d043be5d150e7ba7 EQUAL",
+      "flags": "P2SH,WITNESS,MINIMALIF",
+      "expected": "MINIMALIF",
+      "comment": ""
+    },
+    {
+      "core_row": 1231,
+      "witness": [
+        "",
+        "635168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "0x22 0x0020c7eaf06d5ae01a58e376e126eb1e6fab2036076922b96b2711ffbec1e590665d",
+      "script_pubkey": "HASH160 0x14 0x9b27ee6d9010c21bf837b334d043be5d150e7ba7 EQUAL",
+      "flags": "P2SH,WITNESS,MINIMALIF",
+      "expected": "CLEANSTACK",
+      "comment": ""
+    },
+    {
+      "core_row": 1232,
+      "witness": [
+        "00",
+        "635168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "0x22 0x0020c7eaf06d5ae01a58e376e126eb1e6fab2036076922b96b2711ffbec1e590665d",
+      "script_pubkey": "HASH160 0x14 0x9b27ee6d9010c21bf837b334d043be5d150e7ba7 EQUAL",
+      "flags": "P2SH,WITNESS,MINIMALIF",
+      "expected": "MINIMALIF",
+      "comment": ""
+    },
+    {
+      "core_row": 1233,
+      "witness": [
+        "635168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "0x22 0x0020c7eaf06d5ae01a58e376e126eb1e6fab2036076922b96b2711ffbec1e590665d",
+      "script_pubkey": "HASH160 0x14 0x9b27ee6d9010c21bf837b334d043be5d150e7ba7 EQUAL",
+      "flags": "P2SH,WITNESS",
+      "expected": "UNBALANCED_CONDITIONAL",
+      "comment": ""
+    },
+    {
+      "core_row": 1234,
+      "witness": [
+        "635168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "0x22 0x0020c7eaf06d5ae01a58e376e126eb1e6fab2036076922b96b2711ffbec1e590665d",
+      "script_pubkey": "HASH160 0x14 0x9b27ee6d9010c21bf837b334d043be5d150e7ba7 EQUAL",
+      "flags": "P2SH,WITNESS,MINIMALIF",
+      "expected": "UNBALANCED_CONDITIONAL",
+      "comment": ""
+    },
+    {
+      "core_row": 1236,
+      "witness": [
+        "01",
+        "645168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "0x22 0x0020f913eacf2e38a5d6fc3a8311d72ae704cb83866350a984dd3e5eb76d2a8c28e8",
+      "script_pubkey": "HASH160 0x14 0xdbb7d1c0a56b7a9c423300c8cca6e6e065baf1dc EQUAL",
+      "flags": "P2SH,WITNESS",
+      "expected": "CLEANSTACK",
+      "comment": ""
+    },
+    {
+      "core_row": 1237,
+      "witness": [
+        "02",
+        "645168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "0x22 0x0020f913eacf2e38a5d6fc3a8311d72ae704cb83866350a984dd3e5eb76d2a8c28e8",
+      "script_pubkey": "HASH160 0x14 0xdbb7d1c0a56b7a9c423300c8cca6e6e065baf1dc EQUAL",
+      "flags": "P2SH,WITNESS",
+      "expected": "CLEANSTACK",
+      "comment": ""
+    },
+    {
+      "core_row": 1238,
+      "witness": [
+        "0100",
+        "645168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "0x22 0x0020f913eacf2e38a5d6fc3a8311d72ae704cb83866350a984dd3e5eb76d2a8c28e8",
+      "script_pubkey": "HASH160 0x14 0xdbb7d1c0a56b7a9c423300c8cca6e6e065baf1dc EQUAL",
+      "flags": "P2SH,WITNESS",
+      "expected": "CLEANSTACK",
+      "comment": ""
+    },
+    {
+      "core_row": 1239,
+      "witness": [
+        "",
+        "645168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "0x22 0x0020f913eacf2e38a5d6fc3a8311d72ae704cb83866350a984dd3e5eb76d2a8c28e8",
+      "script_pubkey": "HASH160 0x14 0xdbb7d1c0a56b7a9c423300c8cca6e6e065baf1dc EQUAL",
+      "flags": "P2SH,WITNESS",
+      "expected": "OK",
+      "comment": ""
+    },
+    {
+      "core_row": 1240,
+      "witness": [
+        "00",
+        "645168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "0x22 0x0020f913eacf2e38a5d6fc3a8311d72ae704cb83866350a984dd3e5eb76d2a8c28e8",
+      "script_pubkey": "HASH160 0x14 0xdbb7d1c0a56b7a9c423300c8cca6e6e065baf1dc EQUAL",
+      "flags": "P2SH,WITNESS",
+      "expected": "OK",
+      "comment": ""
+    },
+    {
+      "core_row": 1241,
+      "witness": [
+        "01",
+        "645168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "0x22 0x0020f913eacf2e38a5d6fc3a8311d72ae704cb83866350a984dd3e5eb76d2a8c28e8",
+      "script_pubkey": "HASH160 0x14 0xdbb7d1c0a56b7a9c423300c8cca6e6e065baf1dc EQUAL",
+      "flags": "P2SH,WITNESS,MINIMALIF",
+      "expected": "CLEANSTACK",
+      "comment": ""
+    },
+    {
+      "core_row": 1242,
+      "witness": [
+        "02",
+        "645168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "0x22 0x0020f913eacf2e38a5d6fc3a8311d72ae704cb83866350a984dd3e5eb76d2a8c28e8",
+      "script_pubkey": "HASH160 0x14 0xdbb7d1c0a56b7a9c423300c8cca6e6e065baf1dc EQUAL",
+      "flags": "P2SH,WITNESS,MINIMALIF",
+      "expected": "MINIMALIF",
+      "comment": ""
+    },
+    {
+      "core_row": 1243,
+      "witness": [
+        "0100",
+        "645168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "0x22 0x0020f913eacf2e38a5d6fc3a8311d72ae704cb83866350a984dd3e5eb76d2a8c28e8",
+      "script_pubkey": "HASH160 0x14 0xdbb7d1c0a56b7a9c423300c8cca6e6e065baf1dc EQUAL",
+      "flags": "P2SH,WITNESS,MINIMALIF",
+      "expected": "MINIMALIF",
+      "comment": ""
+    },
+    {
+      "core_row": 1244,
+      "witness": [
+        "",
+        "645168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "0x22 0x0020f913eacf2e38a5d6fc3a8311d72ae704cb83866350a984dd3e5eb76d2a8c28e8",
+      "script_pubkey": "HASH160 0x14 0xdbb7d1c0a56b7a9c423300c8cca6e6e065baf1dc EQUAL",
+      "flags": "P2SH,WITNESS,MINIMALIF",
+      "expected": "OK",
+      "comment": ""
+    },
+    {
+      "core_row": 1245,
+      "witness": [
+        "00",
+        "645168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "0x22 0x0020f913eacf2e38a5d6fc3a8311d72ae704cb83866350a984dd3e5eb76d2a8c28e8",
+      "script_pubkey": "HASH160 0x14 0xdbb7d1c0a56b7a9c423300c8cca6e6e065baf1dc EQUAL",
+      "flags": "P2SH,WITNESS,MINIMALIF",
+      "expected": "MINIMALIF",
+      "comment": ""
+    },
+    {
+      "core_row": 1246,
+      "witness": [
+        "645168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "0x22 0x0020f913eacf2e38a5d6fc3a8311d72ae704cb83866350a984dd3e5eb76d2a8c28e8",
+      "script_pubkey": "HASH160 0x14 0xdbb7d1c0a56b7a9c423300c8cca6e6e065baf1dc EQUAL",
+      "flags": "P2SH,WITNESS",
+      "expected": "UNBALANCED_CONDITIONAL",
+      "comment": ""
+    },
+    {
+      "core_row": 1247,
+      "witness": [
+        "645168"
+      ],
+      "amount_sat": 1,
+      "script_sig": "0x22 0x0020f913eacf2e38a5d6fc3a8311d72ae704cb83866350a984dd3e5eb76d2a8c28e8",
+      "script_pubkey": "HASH160 0x14 0xdbb7d1c0a56b7a9c423300c8cca6e6e065baf1dc EQUAL",
+      "flags": "P2SH,WITNESS,MINIMALIF",
+      "expected": "UNBALANCED_CONDITIONAL",
+      "comment": ""
+    }
+  ]
+}

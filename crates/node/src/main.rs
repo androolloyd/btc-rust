@@ -45,6 +45,14 @@ struct Cli {
     #[arg(long, global = true)]
     port: Option<u16>,
 
+    /// Enable the experimental loopback Electrum chain/transaction subset.
+    #[arg(long, global = true)]
+    electrum_port: Option<u16>,
+
+    /// Connect only to these IP:port peers; repeat to supply alternatives.
+    #[arg(long = "connect", global = true)]
+    connect_peers: Vec<std::net::SocketAddr>,
+
     /// Log level
     #[arg(long, default_value = "info", global = true)]
     log_level: String,
@@ -89,6 +97,10 @@ enum Commands {
         /// serialized UTXO set and starts syncing from the snapshot height.
         #[arg(long)]
         assumeutxo: Option<String>,
+
+        /// Archive an unverified tip-only database and validate again from genesis.
+        #[arg(long, conflicts_with = "assumeutxo")]
+        resync_legacy_checkpoint: bool,
 
         /// Disable full RBF (revert to BIP125 opt-in RBF behavior).
         /// By default, full RBF is enabled (Bitcoin Core v29+ behavior).
@@ -148,6 +160,115 @@ enum Commands {
     DecodeTx {
         /// Raw transaction hex
         hex: String,
+    },
+
+    /// Inspect PSBT v0/v2 hex (format checks; no signing or signature verification)
+    DecodePsbt {
+        /// PSBT hex or @path to a binary PSBT file
+        hex: String,
+    },
+
+    /// Convert PSBT hex between v0/v2, preserving the transaction and wallet metadata
+    ConvertPsbt {
+        /// PSBT hex or @path to a binary PSBT file
+        hex: String,
+        /// Target PSBT version: 0 or 2
+        #[arg(long, value_parser = ["0", "2"])]
+        version: String,
+    },
+
+    /// Extract externally finalized PSBT fields (does not verify signatures)
+    ExtractPsbt {
+        /// PSBT hex or @path to a binary PSBT file
+        hex: String,
+    },
+
+    /// Assemble and verify supported PSBT spends from supplied signatures (offline)
+    FinalizePsbt {
+        /// PSBT hex or @path to a binary PSBT file
+        hex: String,
+    },
+
+    /// Verify public key derivations from supplied PSBT global xpubs (offline)
+    VerifyPsbtDerivations {
+        /// PSBT hex or @path to a binary PSBT file
+        hex: String,
+    },
+
+    /// Expand a public descriptor into scripts, an address and control proofs
+    DeriveDescriptor {
+        descriptor: String,
+        /// Required for a final /* wildcard; forbidden for fixed descriptors
+        #[arg(long)]
+        index: Option<u32>,
+    },
+
+    /// Expand a private descriptor file into public scripts and control proofs
+    DerivePrivateDescriptor {
+        /// UTF-8 regular file containing the descriptor (never inline secrets)
+        #[arg(long)]
+        file: std::path::PathBuf,
+        /// Required for /*, /*h or /*'; forbidden for fixed descriptors
+        #[arg(long)]
+        index: Option<u32>,
+    },
+
+    /// Sign known ECDSA/Taproot PSBT inputs with WIF keys (offline)
+    SignPsbt {
+        /// PSBT hex or @path to a binary PSBT file
+        hex: String,
+        /// Regular UTF-8 file, one network-matching WIF key per line
+        #[arg(long)]
+        key_file: std::path::PathBuf,
+        /// Maximum absolute transaction fee in satoshis (required)
+        #[arg(long)]
+        max_fee_sat: u64,
+    },
+
+    /// Sign known PSBT templates by actual normal/hardened HD private derivation
+    SignHdPsbt {
+        /// PSBT hex or @path to a binary PSBT file
+        hex: String,
+        /// Regular UTF-8 file: master xprv/tprv or [fingerprint/path]private anchor per line
+        #[arg(long)]
+        key_file: std::path::PathBuf,
+        /// Maximum absolute transaction fee in satoshis (required)
+        #[arg(long)]
+        max_fee_sat: u64,
+    },
+
+    /// Build an experimental BIP330 sketch of supplied witness transaction IDs
+    ErlaySketch {
+        #[arg(long)]
+        capacity: usize,
+        #[arg(long)]
+        salt_a: u64,
+        #[arg(long)]
+        salt_b: u64,
+        /// Display-order wtxid hex; repeat for each local transaction
+        #[arg(long = "wtxid")]
+        wtxids: Vec<String>,
+    },
+
+    /// Reconcile received BIP330 sketch bytes against supplied local wtxids
+    ErlayReconcile {
+        /// Raw BIP330 skdata hex (without a CompactSize message wrapper)
+        hex: String,
+        #[arg(long)]
+        salt_a: u64,
+        #[arg(long)]
+        salt_b: u64,
+        #[arg(long = "wtxid")]
+        wtxids: Vec<String>,
+    },
+
+    /// Verify supported PSBT signatures against supplied prevouts (offline)
+    VerifyPsbt {
+        /// PSBT hex or @path to a binary PSBT file
+        hex: String,
+        /// Check partial signatures on unfinalized inputs instead of final spends
+        #[arg(long)]
+        partial: bool,
     },
 
     /// Decode a raw script hex
@@ -211,7 +332,8 @@ async fn main() -> eyre::Result<()> {
 
     let mut config = NodeConfig::new(network)
         .with_datadir(&cli.datadir)
-        .with_log_level(&cli.log_level);
+        .with_log_level(&cli.log_level)
+        .with_connect_peers(cli.connect_peers);
 
     if let Some(rpc_port) = cli.rpc_port {
         config = config.with_rpc_port(rpc_port);
@@ -219,6 +341,7 @@ async fn main() -> eyre::Result<()> {
     if let Some(p2p_port) = cli.port {
         config = config.with_p2p_port(p2p_port);
     }
+    config.electrum_port = cli.electrum_port;
 
     match cli.command {
         Some(Commands::Run {
@@ -227,6 +350,7 @@ async fn main() -> eyre::Result<()> {
             dust_limit,
             datacarrier_size,
             assumeutxo,
+            resync_legacy_checkpoint,
             no_full_rbf,
             op_return_limit,
             zmq_pub_hashblock,
@@ -243,6 +367,7 @@ async fn main() -> eyre::Result<()> {
                 dust_limit,
                 datacarrier_size,
                 assumeutxo,
+                resync_legacy_checkpoint,
                 no_full_rbf,
                 op_return_limit,
                 zmq_pub_hashblock,
@@ -263,6 +388,7 @@ async fn main() -> eyre::Result<()> {
                 None,
                 None,
                 false,
+                false,
                 None,
                 None,
                 None,
@@ -277,8 +403,125 @@ async fn main() -> eyre::Result<()> {
         Some(Commands::Config) => cmd_config(config, format),
         Some(Commands::Init) => cmd_init(config, format),
         Some(Commands::Version) => cmd_version(format),
-        Some(Commands::Rpc { method, params }) => cmd_rpc(config, format, &method, &params),
+        Some(Commands::Rpc { method, params }) => cmd_rpc(config, format, &method, &params).await,
         Some(Commands::DecodeTx { hex }) => cmd_decode_tx(&hex, format),
+        Some(Commands::DecodePsbt { hex }) => {
+            output::emit(format, &cli::decode_psbt(&hex)?);
+            Ok(())
+        }
+        Some(Commands::ConvertPsbt { hex, version }) => {
+            output::emit(format, &cli::convert_psbt(&hex, version.parse()?)?);
+            Ok(())
+        }
+        Some(Commands::ExtractPsbt { hex }) => {
+            output::emit(format, &cli::extract_psbt(&hex)?);
+            Ok(())
+        }
+        Some(Commands::FinalizePsbt { hex }) => {
+            output::emit(format, &cli::finalize_psbt(&hex)?);
+            Ok(())
+        }
+        Some(Commands::VerifyPsbtDerivations { hex }) => {
+            output::emit(format, &cli::verify_psbt_derivations(&hex)?);
+            Ok(())
+        }
+        Some(Commands::ErlaySketch {
+            capacity,
+            salt_a,
+            salt_b,
+            wtxids,
+        }) => {
+            output::emit(
+                format,
+                &cli::erlay_sketch(capacity, salt_a, salt_b, &wtxids)?,
+            );
+            Ok(())
+        }
+        Some(Commands::ErlayReconcile {
+            hex,
+            salt_a,
+            salt_b,
+            wtxids,
+        }) => {
+            output::emit(
+                format,
+                &cli::erlay_reconcile(&hex, salt_a, salt_b, &wtxids)?,
+            );
+            Ok(())
+        }
+        Some(Commands::DeriveDescriptor { descriptor, index }) => {
+            eyre::ensure!(
+                matches!(
+                    cli.network.as_str(),
+                    "mainnet" | "testnet" | "testnet4" | "signet" | "regtest"
+                ),
+                "unsupported descriptor network"
+            );
+            output::emit(
+                format,
+                &cli::derive_descriptor(&descriptor, index, network)?,
+            );
+            Ok(())
+        }
+        Some(Commands::DerivePrivateDescriptor { file, index }) => {
+            eyre::ensure!(
+                matches!(
+                    cli.network.as_str(),
+                    "mainnet" | "testnet" | "testnet4" | "signet" | "regtest"
+                ),
+                "unsupported descriptor network"
+            );
+            output::emit(
+                format,
+                &cli::derive_private_descriptor(&file, index, network)?,
+            );
+            Ok(())
+        }
+        Some(Commands::SignPsbt {
+            hex,
+            key_file,
+            max_fee_sat,
+        }) => {
+            eyre::ensure!(
+                matches!(
+                    cli.network.as_str(),
+                    "mainnet" | "testnet" | "testnet4" | "signet" | "regtest"
+                ),
+                "unsupported signer network"
+            );
+            output::emit(
+                format,
+                &cli::sign_psbt(&hex, &key_file, max_fee_sat, network)?,
+            );
+            Ok(())
+        }
+        Some(Commands::SignHdPsbt {
+            hex,
+            key_file,
+            max_fee_sat,
+        }) => {
+            eyre::ensure!(
+                matches!(
+                    cli.network.as_str(),
+                    "mainnet" | "testnet" | "testnet4" | "signet" | "regtest"
+                ),
+                "unsupported HD signer network"
+            );
+            output::emit(
+                format,
+                &cli::sign_hd_psbt(&hex, &key_file, max_fee_sat, network)?,
+            );
+            Ok(())
+        }
+        Some(Commands::VerifyPsbt { hex, partial }) => {
+            let verified = if partial {
+                cli::verify_psbt_partials(&hex)?
+            } else {
+                cli::verify_psbt(&hex)?
+            };
+            output::emit(format, &verified);
+            Ok(())
+        }
         Some(Commands::DecodeScript { hex }) => cmd_decode_script(&hex, format),
         Some(Commands::DecodeHeader { hex }) => cmd_decode_header(&hex, format),
         Some(Commands::Playground) => cmd_playground(),
@@ -290,7 +533,7 @@ async fn main() -> eyre::Result<()> {
 }
 
 async fn cmd_run(
-    config: NodeConfig,
+    mut config: NodeConfig,
     format: OutputFormat,
     interactive: bool,
     policy: &str,
@@ -298,6 +541,7 @@ async fn cmd_run(
     dust_limit: Option<u64>,
     datacarrier_size: Option<usize>,
     assumeutxo: Option<String>,
+    resync_legacy_checkpoint: bool,
     no_full_rbf: bool,
     op_return_limit: Option<usize>,
     zmq_pub_hashblock: Option<String>,
@@ -309,12 +553,37 @@ async fn cmd_run(
     match policy {
         "core" | "consensus" | "all" => {}
         other => {
-            output::emit_error(format, 2, &format!("unknown policy preset '{}': expected 'core', 'consensus', or 'all'", other));
+            output::emit_error(
+                format,
+                2,
+                &format!("unknown policy preset '{other}': expected 'core', 'consensus', or 'all'"),
+            );
         }
     }
 
     let full_rbf = !no_full_rbf;
-    let effective_op_return_limit = op_return_limit.unwrap_or(btc_mempool::policy::MAX_OP_RETURN_SIZE);
+    config.resync_legacy_checkpoint = resync_legacy_checkpoint;
+    let effective_op_return_limit =
+        op_return_limit.unwrap_or(btc_mempool::policy::MAX_OP_RETURN_SIZE);
+
+    config.full_rbf = full_rbf;
+    config.mempool_flags = match policy {
+        "consensus" => ScriptFlags::consensus(),
+        "all" => ScriptFlags::all(),
+        _ => ScriptFlags::core_compliant(),
+    };
+    config.mempool_flags.verify_nullfail &= !no_nullfail;
+    if policy != "consensus" {
+        config.mempool_flags.verify_discourage_upgradable_nops = true;
+        config
+            .mempool_flags
+            .verify_discourage_upgradable_witness_program = true;
+    }
+    if let Some(value) = dust_limit {
+        config.mempool_policy.dust_limit = btc_primitives::Amount::from_sat(i64::try_from(value)?);
+    }
+    config.mempool_policy.max_op_return_size =
+        datacarrier_size.unwrap_or(effective_op_return_limit);
 
     // Collect ZMQ topics from CLI flags
     let mut zmq_topics: Vec<String> = Vec::new();
@@ -338,18 +607,21 @@ async fn cmd_run(
             "P2P port: {}, RPC port: {}",
             config.p2p_port, config.rpc_port
         );
-        eprintln!("Policy preset: {}", policy);
+        eprintln!("Policy preset: {policy}");
         if no_nullfail {
             eprintln!("  NULLFAIL: disabled");
         }
         if let Some(dl) = dust_limit {
-            eprintln!("  Dust limit: {} sat", dl);
+            eprintln!("  Dust limit: {dl} sat");
         }
         if let Some(ds) = datacarrier_size {
-            eprintln!("  OP_RETURN data limit: {} bytes", ds);
+            eprintln!("  OP_RETURN data limit: {ds} bytes");
         }
-        eprintln!("  Full RBF: {}", if full_rbf { "enabled" } else { "disabled" });
-        eprintln!("  OP_RETURN limit: {} bytes", effective_op_return_limit);
+        eprintln!(
+            "  Full RBF: {}",
+            if full_rbf { "enabled" } else { "disabled" }
+        );
+        eprintln!("  OP_RETURN limit: {effective_op_return_limit} bytes");
         if !zmq_topics.is_empty() {
             eprintln!("  ZMQ topics: {}", zmq_topics.join(", "));
         }
@@ -377,8 +649,11 @@ async fn cmd_run(
     if let Some(ref snapshot_path) = assumeutxo {
         let path = std::path::Path::new(snapshot_path);
         if !path.exists() {
-            output::emit_error(format, 1, &format!("assumeutxo snapshot file not found: {}", snapshot_path));
-            return Ok(());
+            output::emit_error(
+                format,
+                1,
+                &format!("assumeutxo snapshot file not found: {snapshot_path}"),
+            );
         }
 
         output::emit_progress(
@@ -392,8 +667,7 @@ async fn cmd_run(
         match btc_storage::redb_backend::RedbDatabase::new(&db_path) {
             Ok(db) => {
                 if let Err(e) = db.init_tables() {
-                    output::emit_error(format, 5, &format!("failed to init database tables: {}", e));
-                    return Ok(());
+                    output::emit_error(format, 5, &format!("failed to init database tables: {e}"));
                 }
                 match btc_storage::snapshot::load_utxo_snapshot(path, &db) {
                     Ok(metadata) => {
@@ -407,14 +681,16 @@ async fn cmd_run(
                         );
                     }
                     Err(e) => {
-                        output::emit_error(format, 5, &format!("failed to load UTXO snapshot: {}", e));
-                        return Ok(());
+                        output::emit_error(
+                            format,
+                            5,
+                            &format!("failed to load UTXO snapshot: {e}"),
+                        );
                     }
                 }
             }
             Err(e) => {
-                output::emit_error(format, 5, &format!("failed to open database: {}", e));
-                return Ok(());
+                output::emit_error(format, 5, &format!("failed to open database: {e}"));
             }
         }
     }
@@ -483,13 +759,13 @@ fn cmd_version(format: OutputFormat) -> eyre::Result<()> {
     Ok(())
 }
 
-fn cmd_rpc(
+async fn cmd_rpc(
     config: NodeConfig,
     _format: OutputFormat,
     method: &str,
     params: &[String],
 ) -> eyre::Result<()> {
-    let result = cli::build_rpc_request(method, params, config.rpc_port);
+    let result = cli::call_rpc(method, params, config.rpc_port).await?;
     // Always emit JSON-RPC responses as JSON (the protocol is JSON-native)
     output::emit(OutputFormat::Json, &result);
     Ok(())
@@ -625,7 +901,7 @@ fn cmd_playground() -> eyre::Result<()> {
                         format_stack(engine.stack());
                     }
                     Err(e) => {
-                        println!("Execution error: {}", e);
+                        println!("Execution error: {e}");
                         println!("Stack at error:");
                         format_stack(engine.stack());
                     }
@@ -636,11 +912,11 @@ fn cmd_playground() -> eyre::Result<()> {
                 let s = script.as_script();
                 for instruction in s.instructions() {
                     match instruction {
-                        Ok(Instruction::Op(op)) => print!("{:?} ", op),
+                        Ok(Instruction::Op(op)) => print!("{op:?} "),
                         Ok(Instruction::PushBytes(data)) => {
                             print!("PUSH({}) ", hex::encode(data));
                         }
-                        Err(e) => print!("ERROR({}) ", e),
+                        Err(e) => print!("ERROR({e}) "),
                     }
                 }
                 println!();
@@ -660,13 +936,13 @@ fn cmd_playground() -> eyre::Result<()> {
                 for instruction in s.instructions() {
                     match instruction {
                         Ok(Instruction::Op(op)) => {
-                            println!("  step {}: {:?}", step, op);
+                            println!("  step {step}: {op:?}");
                         }
                         Ok(Instruction::PushBytes(data)) => {
                             println!("  step {}: PUSH({})", step, hex::encode(data));
                         }
                         Err(e) => {
-                            println!("  step {}: ERROR: {}", step, e);
+                            println!("  step {step}: ERROR: {e}");
                         }
                     }
                     step += 1;
@@ -685,7 +961,7 @@ fn cmd_playground() -> eyre::Result<()> {
                         format_stack(engine.stack());
                     }
                     Err(e) => {
-                        println!("Execution error: {}", e);
+                        println!("Execution error: {e}");
                         println!("Stack at error:");
                         format_stack(engine.stack());
                     }
@@ -714,14 +990,14 @@ fn cmd_playground() -> eyre::Result<()> {
                     match cli::parse_opcode_or_data(token) {
                         Some(ScriptItem::Op(op)) => {
                             script.push_opcode(op);
-                            println!("+ {:?}", op);
+                            println!("+ {op:?}");
                         }
                         Some(ScriptItem::Data(d)) => {
                             let len = d.len();
                             script.push_slice(&d);
                             println!("+ PUSH({} bytes: {})", len, hex::encode(&d));
                         }
-                        None => println!("Unknown: {}", token),
+                        None => println!("Unknown: {token}"),
                     }
                 }
             }

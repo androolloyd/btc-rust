@@ -5,6 +5,8 @@
 
 /// Block header table: BlockHash -> BlockHeader
 pub const TABLE_HEADERS: &str = "Headers";
+/// Complete block bodies: BlockHash -> consensus-encoded Block.
+pub const TABLE_BLOCKS: &str = "Blocks";
 
 /// Block height index: u64 -> BlockHash
 pub const TABLE_BLOCK_INDEX: &str = "BlockIndex";

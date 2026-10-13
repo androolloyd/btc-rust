@@ -1,8 +1,8 @@
-use btc_primitives::block::{Block, BlockHeader};
-use btc_primitives::hash::{BlockHash, TxHash, sha256d};
-use btc_primitives::compact::CompactTarget;
-use btc_primitives::script::ScriptBuf;
 use btc_primitives::amount::Amount;
+use btc_primitives::block::{Block, BlockHeader};
+use btc_primitives::compact::CompactTarget;
+use btc_primitives::hash::{sha256d, BlockHash, TxHash};
+use btc_primitives::script::ScriptBuf;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -25,6 +25,8 @@ pub enum ValidationError {
     CoinbaseRewardTooHigh { got: Amount, max: Amount },
     #[error("block too large: {size} weight units > {max} weight units")]
     BlockTooLarge { size: usize, max: usize },
+    #[error("bad-blk-sigops: signature-operation cost {cost} exceeds {max}")]
+    TooManySigops { cost: usize, max: usize },
     #[error("block version too low")]
     BadVersion,
     #[error("duplicate transaction")]
@@ -37,6 +39,8 @@ pub enum ValidationError {
     WitnessCommitmentMismatch,
     #[error("BIP141: block has witness data but no witness commitment in coinbase")]
     MissingWitnessCommitment,
+    #[error("BIP141: coinbase witness must contain exactly one 32-byte reserved value")]
+    InvalidWitnessReservedValue,
 }
 
 /// Maximum block size (1MB legacy limit, 4MW weight limit)
@@ -45,11 +49,19 @@ pub const MAX_BLOCK_WEIGHT: usize = 4_000_000;
 
 /// Block subsidy schedule
 pub fn block_subsidy(height: u64) -> Amount {
-    let halvings = height / 210_000;
+    subsidy_for_interval(height, 210_000)
+}
+
+pub fn block_subsidy_with_params(height: u64, params: &ChainParams) -> Amount {
+    subsidy_for_interval(height, params.subsidy_halving_interval)
+}
+
+fn subsidy_for_interval(height: u64, interval: u64) -> Amount {
+    let halvings = height / interval;
     if halvings >= 64 {
         return Amount::ZERO;
     }
-    Amount::from_sat(50 * 100_000_000 >> halvings)
+    Amount::from_sat((50 * 100_000_000) >> halvings)
 }
 
 /// Validates block headers (stateless checks)
@@ -103,7 +115,15 @@ impl BlockValidator {
 
         // CVE-2012-2459: check for duplicate transactions
         let mut seen_txids = std::collections::HashSet::new();
+        let mut sigops = 0usize;
         for tx in &block.transactions {
+            sigops = sigops.saturating_add(crate::sigops::legacy_sigop_cost(tx));
+            if sigops > crate::sigops::MAX_BLOCK_SIGOPS_COST {
+                return Err(ValidationError::TooManySigops {
+                    cost: sigops,
+                    max: crate::sigops::MAX_BLOCK_SIGOPS_COST,
+                });
+            }
             if !seen_txids.insert(tx.txid()) {
                 return Err(ValidationError::DuplicateTransaction);
             }
@@ -122,13 +142,10 @@ impl BlockValidator {
     ///
     /// Call this after segwit activation height.
     pub fn verify_witness_commitment(block: &Block) -> Result<(), ValidationError> {
-        // Check if any non-coinbase tx has witness data
-        let has_witness = block.transactions.iter().skip(1).any(|tx| tx.is_segwit());
-        if !has_witness {
-            return Ok(());
-        }
-
-        let coinbase = &block.transactions[0];
+        let coinbase = block
+            .transactions
+            .first()
+            .ok_or(ValidationError::NoTransactions)?;
 
         // Find the witness commitment output (scan from last to first, use the
         // last matching output per Bitcoin Core's behavior).
@@ -152,33 +169,45 @@ impl BlockValidator {
 
         let expected_commitment = match commitment_hash {
             Some(h) => h,
-            None => return Err(ValidationError::MissingWitnessCommitment),
+            None => {
+                return if block.transactions.iter().any(|tx| tx.is_segwit()) {
+                    Err(ValidationError::MissingWitnessCommitment)
+                } else {
+                    Ok(())
+                };
+            }
         };
 
         // Get the witness nonce from the coinbase witness.
         // BIP141: coinbase must have exactly one witness item of 32 bytes.
-        let witness_nonce = if !coinbase.witness.is_empty()
-            && !coinbase.witness[0].is_empty()
-            && coinbase.witness[0].get(0).map_or(false, |item| item.len() == 32)
+        let witness_nonce = if coinbase.witness.len() == 1
+            && coinbase.witness[0].len() == 1
+            && coinbase.witness[0]
+                .get(0)
+                .is_some_and(|item| item.len() == 32)
         {
             let mut nonce = [0u8; 32];
             nonce.copy_from_slice(coinbase.witness[0].get(0).unwrap());
             nonce
         } else {
-            // Default nonce is 32 zero bytes
-            [0u8; 32]
+            return Err(ValidationError::InvalidWitnessReservedValue);
         };
 
         // Compute the witness merkle root.
         // The witness merkle tree is computed from wtxids, with the coinbase
         // wtxid replaced by 0x00...00 (32 zero bytes).
-        let wtxids: Vec<TxHash> = block.transactions.iter().enumerate().map(|(i, tx)| {
-            if i == 0 {
-                TxHash::ZERO // coinbase wtxid is always zero in the witness merkle tree
-            } else {
-                tx.wtxid()
-            }
-        }).collect();
+        let wtxids: Vec<TxHash> = block
+            .transactions
+            .iter()
+            .enumerate()
+            .map(|(i, tx)| {
+                if i == 0 {
+                    TxHash::ZERO // coinbase wtxid is always zero in the witness merkle tree
+                } else {
+                    tx.wtxid()
+                }
+            })
+            .collect();
 
         let wtxid_bytes: Vec<[u8; 32]> = wtxids.iter().map(|h| h.to_bytes()).collect();
         let witness_root_bytes = btc_primitives::block::merkle_root(&wtxid_bytes);
@@ -211,6 +240,9 @@ pub fn encode_bip34_height(height: u64) -> Vec<u8> {
         // OP_0 — push empty byte vector (CScriptNum for 0)
         return vec![0x00];
     }
+    if height <= 16 {
+        return vec![0x50 + height as u8];
+    }
 
     // Encode the height as a minimal little-endian signed integer
     // (CScriptNum encoding).
@@ -222,7 +254,7 @@ pub fn encode_bip34_height(height: u64) -> Vec<u8> {
     }
     // If the most significant byte has its high bit set, we need an
     // extra 0x00 byte so the value is not interpreted as negative.
-    if data.last().map_or(false, |&b| b & 0x80 != 0) {
+    if data.last().is_some_and(|&b| b & 0x80 != 0) {
         data.push(0x00);
     }
 
@@ -242,6 +274,10 @@ pub fn decode_bip34_height(script_sig: &[u8]) -> Option<u64> {
     }
 
     let push_len = script_sig[0] as usize;
+
+    if (0x51..=0x60).contains(&script_sig[0]) {
+        return Some((script_sig[0] - 0x50) as u64);
+    }
 
     // OP_0 encodes height 0
     if push_len == 0 {
@@ -321,16 +357,18 @@ pub struct AssumeUtxoParams {
 }
 
 /// Chain parameters — network-specific consensus rules
+#[derive(Clone)]
 pub struct ChainParams {
     pub network: btc_primitives::network::Network,
     pub genesis_hash: BlockHash,
     pub pow_limit: CompactTarget,
-    pub pow_target_timespan: u32,    // 14 days in seconds
-    pub pow_target_spacing: u32,     // 10 minutes in seconds
+    pub pow_target_timespan: u32, // 14 days in seconds
+    pub pow_target_spacing: u32,  // 10 minutes in seconds
     pub subsidy_halving_interval: u64,
     pub bip34_height: u64,
     pub bip65_height: u64,
     pub bip66_height: u64,
+    pub bip68_height: u64,
     pub segwit_height: u64,
     pub taproot_height: u64,
     /// When set, skip script verification for blocks at or below the block
@@ -349,12 +387,31 @@ pub struct ChainParams {
 }
 
 impl ChainParams {
+    /// Consensus flags for the historical activation height.
+    pub fn script_flags(&self, height: u64) -> crate::script_engine::ScriptFlags {
+        let p2sh_height = match self.network {
+            btc_primitives::network::Network::Mainnet => 173805,
+            btc_primitives::network::Network::Testnet => 514,
+            _ => 0,
+        };
+        crate::script_engine::ScriptFlags {
+            verify_p2sh: height >= p2sh_height,
+            verify_dersig: height >= self.bip66_height,
+            verify_checklocktimeverify: height >= self.bip65_height,
+            verify_checksequenceverify: height >= self.bip68_height,
+            verify_witness: height >= self.segwit_height,
+            verify_nulldummy: height >= self.segwit_height,
+            verify_taproot: height >= self.taproot_height,
+            ..crate::script_engine::ScriptFlags::none()
+        }
+    }
     pub fn mainnet() -> Self {
         ChainParams {
             network: btc_primitives::network::Network::Mainnet,
             genesis_hash: BlockHash::from_hex(
-                "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"
-            ).unwrap(),
+                "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+            )
+            .unwrap(),
             pow_limit: CompactTarget::MAX_TARGET,
             pow_target_timespan: 14 * 24 * 60 * 60,
             pow_target_spacing: 10 * 60,
@@ -362,26 +419,30 @@ impl ChainParams {
             bip34_height: 227931,
             bip65_height: 388381,
             bip66_height: 363725,
+            bip68_height: 419328,
             segwit_height: 481824,
             taproot_height: 709632,
             // Block 810000 — the latest hardcoded checkpoint, used as the
             // assume-valid block during IBD.
-            assume_valid: Some(BlockHash::from_hex(
-                "00000000000000000002c71f45de7cf52e0dfd1a8ce8b0a69f13bf67e9c53e67"
-            ).unwrap()),
+            assume_valid: Some(
+                BlockHash::from_hex(
+                    "00000000000000000002c71f45de7cf52e0dfd1a8ce8b0a69f13bf67e9c53e67",
+                )
+                .unwrap(),
+            ),
             signet_challenge: None,
             // AssumeUTXO snapshot at block 840,000 (matching Bitcoin Core v28)
             assume_utxo: Some(AssumeUtxoParams {
                 snapshot_height: 840_000,
                 snapshot_hash: BlockHash::from_hex(
-                    "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5"
-                ).unwrap(),
+                    "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5",
+                )
+                .unwrap(),
                 snapshot_txout_count: 180_932_459,
                 snapshot_muhash: [
-                    0x6a, 0x29, 0x07, 0xf7, 0xc8, 0x16, 0x26, 0x09,
-                    0xbf, 0x30, 0x53, 0x39, 0xaa, 0x78, 0x0e, 0x96,
-                    0xf0, 0x2e, 0x03, 0xb5, 0x50, 0x5c, 0x56, 0xaa,
-                    0x57, 0x0b, 0x5c, 0x1c, 0x8e, 0x23, 0xa8, 0x06,
+                    0x6a, 0x29, 0x07, 0xf7, 0xc8, 0x16, 0x26, 0x09, 0xbf, 0x30, 0x53, 0x39, 0xaa,
+                    0x78, 0x0e, 0x96, 0xf0, 0x2e, 0x03, 0xb5, 0x50, 0x5c, 0x56, 0xaa, 0x57, 0x0b,
+                    0x5c, 0x1c, 0x8e, 0x23, 0xa8, 0x06,
                 ],
             }),
         }
@@ -391,8 +452,9 @@ impl ChainParams {
         ChainParams {
             network: btc_primitives::network::Network::Testnet,
             genesis_hash: BlockHash::from_hex(
-                "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943"
-            ).unwrap(),
+                "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943",
+            )
+            .unwrap(),
             pow_limit: CompactTarget::MAX_TARGET,
             pow_target_timespan: 14 * 24 * 60 * 60,
             pow_target_spacing: 10 * 60,
@@ -400,6 +462,7 @@ impl ChainParams {
             bip34_height: 21111,
             bip65_height: 581885,
             bip66_height: 330776,
+            bip68_height: 770112,
             segwit_height: 834624,
             taproot_height: 0, // always active on testnet
             assume_valid: None,
@@ -414,15 +477,17 @@ impl ChainParams {
         ChainParams {
             network: btc_primitives::network::Network::Testnet4,
             genesis_hash: BlockHash::from_hex(
-                "00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043"
-            ).unwrap(),
+                "00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043",
+            )
+            .unwrap(),
             pow_limit: CompactTarget::MAX_TARGET,
             pow_target_timespan: 14 * 24 * 60 * 60,
             pow_target_spacing: 10 * 60,
             subsidy_halving_interval: 210_000,
-            bip34_height: 1,    // active from genesis on testnet4
+            bip34_height: 1, // active from genesis on testnet4
             bip65_height: 1,
             bip66_height: 1,
+            bip68_height: 1,
             segwit_height: 1,
             taproot_height: 1,
             assume_valid: None,
@@ -432,17 +497,17 @@ impl ChainParams {
     }
 
     pub fn signet() -> Self {
-        // Default signet challenge: 1-of-2 multisig controlled by signet operators
-        let challenge_bytes = hex::decode(
-            "512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430\
-             2103348f40a18fc8ebbf4a26a07f8fb37c46eb9e6f1f87d3e0e5e8af20c6d26ae27852ae"
-        ).expect("valid hex for default signet challenge");
+        let challenge_bytes = crate::signet::SignetChallenge::default_signet()
+            .script
+            .as_bytes()
+            .to_vec();
 
         ChainParams {
             network: btc_primitives::network::Network::Signet,
             genesis_hash: BlockHash::from_hex(
-                "00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6"
-            ).unwrap(),
+                "00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6",
+            )
+            .unwrap(),
             pow_limit: CompactTarget(0x1e0377ae),
             pow_target_timespan: 14 * 24 * 60 * 60,
             pow_target_spacing: 10 * 60,
@@ -450,13 +515,17 @@ impl ChainParams {
             bip34_height: 1,
             bip65_height: 1,
             bip66_height: 1,
+            bip68_height: 1,
             segwit_height: 1,
             taproot_height: 1,
             // Use a recent signet block as assume-valid to speed up IBD
             // Block 250000 on signet
-            assume_valid: Some(BlockHash::from_hex(
-                "0000003a3b62a0d42a58b3898e7e4e27fce68a0e5ab5c11a45fc56e8388554a4"
-            ).unwrap()),
+            assume_valid: Some(
+                BlockHash::from_hex(
+                    "0000003a3b62a0d42a58b3898e7e4e27fce68a0e5ab5c11a45fc56e8388554a4",
+                )
+                .unwrap(),
+            ),
             signet_challenge: Some(ScriptBuf::from_bytes(challenge_bytes)),
             assume_utxo: None,
         }
@@ -466,15 +535,17 @@ impl ChainParams {
         ChainParams {
             network: btc_primitives::network::Network::Regtest,
             genesis_hash: BlockHash::from_hex(
-                "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"
-            ).unwrap(),
+                "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206",
+            )
+            .unwrap(),
             pow_limit: CompactTarget(0x207fffff),
             pow_target_timespan: 14 * 24 * 60 * 60,
             pow_target_spacing: 10 * 60,
             subsidy_halving_interval: 150,
-            bip34_height: 500,
-            bip65_height: 1351,
-            bip66_height: 1251,
+            bip34_height: 1,
+            bip65_height: 1,
+            bip66_height: 1,
+            bip68_height: 1,
             segwit_height: 0,
             taproot_height: 0,
             assume_valid: None,
@@ -511,7 +582,12 @@ impl ChainParams {
     ///    can be skipped for this block (and all prior ones).
     /// 2. Height path: if `height` is below the height at which the
     ///    assume-valid block was found, scripts can be skipped.
-    pub fn should_verify_scripts(&self, height: u64, hash: &BlockHash, assume_valid_height: Option<u64>) -> bool {
+    pub fn should_verify_scripts(
+        &self,
+        height: u64,
+        hash: &BlockHash,
+        assume_valid_height: Option<u64>,
+    ) -> bool {
         match (&self.assume_valid, assume_valid_height) {
             // If assume-valid is set and we know its height, skip scripts for
             // blocks at or below that height.
@@ -573,8 +649,9 @@ mod tests {
         let raw_header = hex::decode(
             "0100000000000000000000000000000000000000000000000000000000000000\
              000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa\
-             4b1e5e4a29ab5f49ffff001d1dac2b7c"
-        ).unwrap();
+             4b1e5e4a29ab5f49ffff001d1dac2b7c",
+        )
+        .unwrap();
 
         let header: BlockHeader = btc_primitives::encode::decode(&raw_header).unwrap();
         assert!(BlockValidator::validate_header(&header).is_ok());
@@ -627,7 +704,7 @@ mod tests {
     #[test]
     fn test_should_verify_scripts_matching_hash_no_height() {
         let params = ChainParams::mainnet();
-        let av_hash = params.assume_valid.clone().unwrap();
+        let av_hash = params.assume_valid.unwrap();
         // When the block hash matches assume-valid and no height is known yet,
         // skip scripts for this block.
         assert!(!params.should_verify_scripts(810000, &av_hash, None));
@@ -672,9 +749,9 @@ mod tests {
 
     #[test]
     fn test_validate_block_rejects_duplicate_txids() {
-        use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint};
         use btc_primitives::hash::TxHash;
         use btc_primitives::script::ScriptBuf;
+        use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
 
         // Create a coinbase transaction
         let coinbase_tx = Transaction {
@@ -712,7 +789,7 @@ mod tests {
         let txids = vec![
             coinbase_tx.txid().to_bytes(),
             dup_tx.txid().to_bytes(),
-            dup_tx.txid().to_bytes(),  // duplicate!
+            dup_tx.txid().to_bytes(), // duplicate!
         ];
         let merkle = btc_primitives::block::merkle_root(&txids);
 
@@ -739,9 +816,9 @@ mod tests {
 
     #[test]
     fn test_validate_block_rejects_oversized_block() {
-        use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint};
         use btc_primitives::hash::TxHash;
         use btc_primitives::script::ScriptBuf;
+        use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
 
         // Create a coinbase tx with a very large script to exceed MAX_BLOCK_SIZE
         let large_script = vec![0x00u8; MAX_BLOCK_SIZE + 1];
@@ -782,11 +859,11 @@ mod tests {
 
     #[test]
     fn test_witness_commitment_verification() {
-        use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint, Witness};
+        use btc_primitives::block::{merkle_root, Block, BlockHeader};
+        use btc_primitives::compact::CompactTarget;
         use btc_primitives::hash::TxHash;
         use btc_primitives::script::ScriptBuf;
-        use btc_primitives::block::{Block, BlockHeader, merkle_root};
-        use btc_primitives::compact::CompactTarget;
+        use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut, Witness};
 
         // Build a segwit transaction (has witness data)
         let segwit_tx = Transaction {
@@ -798,7 +875,10 @@ mod tests {
             }],
             outputs: vec![TxOut {
                 value: Amount::from_sat(49_000),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x00, 0x14, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb]),
+                script_pubkey: ScriptBuf::from_bytes(vec![
+                    0x00, 0x14, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb,
+                    0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb,
+                ]),
             }],
             witness: vec![Witness::from_items(vec![vec![0x30; 72], vec![0x02; 33]])],
             lock_time: 0,
@@ -861,16 +941,20 @@ mod tests {
 
         // Valid commitment should pass
         let result = BlockValidator::verify_witness_commitment(&block);
-        assert!(result.is_ok(), "valid witness commitment should pass: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "valid witness commitment should pass: {:?}",
+            result.err()
+        );
     }
 
     #[test]
     fn test_witness_commitment_missing() {
-        use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint, Witness};
-        use btc_primitives::hash::TxHash;
-        use btc_primitives::script::ScriptBuf;
         use btc_primitives::block::{Block, BlockHeader};
         use btc_primitives::compact::CompactTarget;
+        use btc_primitives::hash::TxHash;
+        use btc_primitives::script::ScriptBuf;
+        use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut, Witness};
 
         // Segwit tx but NO witness commitment in coinbase
         let segwit_tx = Transaction {
@@ -916,16 +1000,19 @@ mod tests {
         };
 
         let result = BlockValidator::verify_witness_commitment(&block);
-        assert!(matches!(result, Err(ValidationError::MissingWitnessCommitment)));
+        assert!(matches!(
+            result,
+            Err(ValidationError::MissingWitnessCommitment)
+        ));
     }
 
     #[test]
     fn test_no_witness_commitment_needed_for_legacy_blocks() {
-        use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint};
-        use btc_primitives::hash::TxHash;
-        use btc_primitives::script::ScriptBuf;
         use btc_primitives::block::{Block, BlockHeader};
         use btc_primitives::compact::CompactTarget;
+        use btc_primitives::hash::TxHash;
+        use btc_primitives::script::ScriptBuf;
+        use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
 
         // Block with only legacy txs (no witness data) — no commitment needed
         let coinbase = Transaction {
@@ -956,7 +1043,10 @@ mod tests {
         };
 
         let result = BlockValidator::verify_witness_commitment(&block);
-        assert!(result.is_ok(), "legacy-only block needs no witness commitment");
+        assert!(
+            result.is_ok(),
+            "legacy-only block needs no witness commitment"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -972,16 +1062,16 @@ mod tests {
 
     #[test]
     fn test_encode_bip34_height_1() {
-        // Height 1 => [0x01, 0x01]
+        // CScript's integer overload emits OP_1 for height 1.
         let encoded = encode_bip34_height(1);
-        assert_eq!(encoded, vec![0x01, 0x01]);
+        assert_eq!(encoded, vec![0x51]);
     }
 
     #[test]
     fn test_encode_bip34_height_16() {
-        // Height 16 => [0x01, 0x10]
+        // Height 16 => OP_16.
         let encoded = encode_bip34_height(16);
-        assert_eq!(encoded, vec![0x01, 0x10]);
+        assert_eq!(encoded, vec![0x60]);
     }
 
     #[test]
@@ -1029,16 +1119,22 @@ mod tests {
 
     #[test]
     fn test_decode_bip34_height_roundtrip() {
-        for height in [0u64, 1, 16, 127, 128, 255, 256, 1000, 227931, 500000, 800000] {
+        for height in [
+            0u64, 1, 16, 127, 128, 255, 256, 1000, 227931, 500000, 800000,
+        ] {
             let encoded = encode_bip34_height(height);
             let decoded = decode_bip34_height(&encoded);
-            assert_eq!(decoded, Some(height), "roundtrip failed for height {height}");
+            assert_eq!(
+                decoded,
+                Some(height),
+                "roundtrip failed for height {height}"
+            );
         }
     }
 
     #[test]
     fn test_validate_bip34_below_activation() {
-        use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint};
+        use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
 
         // Below BIP34 activation height, any coinbase scriptSig is fine.
         let coinbase_tx = Transaction {
@@ -1074,7 +1170,7 @@ mod tests {
 
     #[test]
     fn test_validate_bip34_valid_height() {
-        use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint};
+        use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
 
         let height = 227931u64;
         let height_push = encode_bip34_height(height);
@@ -1114,7 +1210,7 @@ mod tests {
 
     #[test]
     fn test_validate_bip34_wrong_height() {
-        use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint};
+        use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
 
         let actual_height = 227931u64;
         // Encode a different height in the coinbase
@@ -1160,7 +1256,7 @@ mod tests {
 
     #[test]
     fn test_validate_bip34_empty_scriptsig() {
-        use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint};
+        use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
 
         let coinbase_tx = Transaction {
             version: 1,
@@ -1200,11 +1296,7 @@ mod tests {
     // ---- Coverage: validate_block no transactions ----
 
     // Helper to mine a valid block header (for regtest difficulty)
-    fn mine_header_for_test(
-        prev_hash: BlockHash,
-        merkle_root: TxHash,
-        time: u32,
-    ) -> BlockHeader {
+    fn mine_header_for_test(prev_hash: BlockHash, merkle_root: TxHash, time: u32) -> BlockHeader {
         let bits = CompactTarget::from_u32(0x207fffff); // regtest
         let mut header = BlockHeader {
             version: 1,
@@ -1228,14 +1320,17 @@ mod tests {
             transactions: vec![],
         };
         let result = BlockValidator::validate_block(&block);
-        assert!(matches!(result.unwrap_err(), ValidationError::NoTransactions));
+        assert!(matches!(
+            result.unwrap_err(),
+            ValidationError::NoTransactions
+        ));
     }
 
     // ---- Coverage: validate_block no coinbase ----
 
     #[test]
     fn test_validate_block_no_coinbase() {
-        use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint};
+        use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
         let non_coinbase = Transaction {
             version: 1,
             inputs: vec![TxIn {
@@ -1267,7 +1362,7 @@ mod tests {
 
     #[test]
     fn test_validate_block_multiple_coinbase() {
-        use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint};
+        use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
         let coinbase = Transaction {
             version: 1,
             inputs: vec![TxIn {
@@ -1306,14 +1401,17 @@ mod tests {
             transactions: vec![coinbase, coinbase2],
         };
         let result = BlockValidator::validate_block(&block);
-        assert!(matches!(result.unwrap_err(), ValidationError::MultipleCoinbase));
+        assert!(matches!(
+            result.unwrap_err(),
+            ValidationError::MultipleCoinbase
+        ));
     }
 
     // ---- Coverage: validate_block bad merkle root ----
 
     #[test]
     fn test_validate_block_bad_merkle_root() {
-        use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint};
+        use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
         let coinbase = Transaction {
             version: 1,
             inputs: vec![TxIn {
@@ -1329,13 +1427,17 @@ mod tests {
             lock_time: 0,
         };
 
-        let header = mine_header_for_test(BlockHash::ZERO, TxHash::from_bytes([0xaa; 32]), 1231006505);
+        let header =
+            mine_header_for_test(BlockHash::ZERO, TxHash::from_bytes([0xaa; 32]), 1231006505);
         let block = Block {
             header,
             transactions: vec![coinbase],
         };
         let result = BlockValidator::validate_block(&block);
-        assert!(matches!(result.unwrap_err(), ValidationError::InvalidMerkleRoot));
+        assert!(matches!(
+            result.unwrap_err(),
+            ValidationError::InvalidMerkleRoot
+        ));
     }
 
     // ---- Coverage: encode/decode_bip34_height zero ----
@@ -1356,7 +1458,11 @@ mod tests {
         for height in [1u64, 127, 128, 255, 256, 65535, 100_000, 500_000] {
             let encoded = encode_bip34_height(height);
             let decoded = decode_bip34_height(&encoded);
-            assert_eq!(decoded, Some(height), "roundtrip failed for height {height}");
+            assert_eq!(
+                decoded,
+                Some(height),
+                "roundtrip failed for height {height}"
+            );
         }
     }
 
@@ -1376,7 +1482,7 @@ mod tests {
 
     #[test]
     fn test_bip34_below_activation() {
-        use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint};
+        use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
         let coinbase = Transaction {
             version: 1,
             inputs: vec![TxIn {
@@ -1412,7 +1518,7 @@ mod tests {
 
     #[test]
     fn test_bip34_height_mismatch() {
-        use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint};
+        use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
         // Encode height 50 in coinbase but validate at height 60
         // Both 50 and 60 produce 1-byte height encoding (same length prefix)
         let encoded_50 = encode_bip34_height(50);
@@ -1444,7 +1550,10 @@ mod tests {
         };
 
         let result = validate_bip34_coinbase(&block, 60, 1);
-        assert!(matches!(result.unwrap_err(), ValidationError::Bip34HeightMismatch { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            ValidationError::Bip34HeightMismatch { .. }
+        ));
     }
 
     // ---- Coverage: from_network ----
@@ -1486,7 +1595,7 @@ mod tests {
 
     #[test]
     fn test_verify_witness_commitment_no_witness() {
-        use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint};
+        use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
         // Block where no non-coinbase tx has witness => should pass
         let coinbase = Transaction {
             version: 1,
@@ -1537,7 +1646,7 @@ mod tests {
 
     #[test]
     fn test_verify_witness_commitment_missing() {
-        use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint, Witness};
+        use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut, Witness};
         // Block with segwit tx but coinbase has no witness commitment output
         let coinbase = Transaction {
             version: 1,
@@ -1582,14 +1691,17 @@ mod tests {
         };
 
         let result = BlockValidator::verify_witness_commitment(&block);
-        assert!(matches!(result.unwrap_err(), ValidationError::MissingWitnessCommitment));
+        assert!(matches!(
+            result.unwrap_err(),
+            ValidationError::MissingWitnessCommitment
+        ));
     }
 
     // ---- Coverage: verify_witness_commitment mismatch ----
 
     #[test]
     fn test_verify_witness_commitment_mismatch() {
-        use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint, Witness};
+        use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut, Witness};
         // Build coinbase with a fake witness commitment
         let mut commitment_script = vec![0x6a, 0x24]; // OP_RETURN PUSH(36)
         commitment_script.extend_from_slice(&[0xaa, 0x21, 0xa9, 0xed]); // commitment prefix
@@ -1638,14 +1750,17 @@ mod tests {
         };
 
         let result = BlockValidator::verify_witness_commitment(&block);
-        assert!(matches!(result.unwrap_err(), ValidationError::WitnessCommitmentMismatch));
+        assert!(matches!(
+            result.unwrap_err(),
+            ValidationError::WitnessCommitmentMismatch
+        ));
     }
 
     // ---- Coverage: block weight too large ----
 
     #[test]
     fn test_validate_block_too_large() {
-        use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint};
+        use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
 
         let coinbase = Transaction {
             version: 1,
@@ -1673,7 +1788,10 @@ mod tests {
         };
 
         let result = BlockValidator::validate_block(&block);
-        assert!(matches!(result.unwrap_err(), ValidationError::BlockTooLarge { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            ValidationError::BlockTooLarge { .. }
+        ));
     }
 
     // ---- Coverage: validate_bip34_coinbase with no transactions ----

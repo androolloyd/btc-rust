@@ -3,29 +3,38 @@ use std::sync::Arc;
 
 use redb::{ReadableTable, TableDefinition};
 
-use btc_primitives::block::BlockHeader;
+use btc_primitives::block::{Block, BlockHeader};
 use btc_primitives::encode::{decode, encode};
 use btc_primitives::hash::{BlockHash, TxHash};
 use btc_primitives::transaction::{OutPoint, Transaction, TxOut};
 
 use crate::tables::{
-    META_BEST_HASH, META_BEST_HEIGHT, TABLE_ADDRESS_INDEX, TABLE_BLOCK_INDEX, TABLE_HEADERS,
-    TABLE_META, TABLE_TRANSACTIONS, TABLE_TX_BLOCK_INDEX, TABLE_UTXOS,
+    META_BEST_HASH, META_BEST_HEIGHT, TABLE_ADDRESS_INDEX, TABLE_BLOCKS, TABLE_BLOCK_INDEX,
+    TABLE_HEADERS, TABLE_META, TABLE_TRANSACTIONS, TABLE_TX_BLOCK_INDEX, TABLE_UTXOS,
 };
 use crate::traits::{AddressIndexValue, Database, DbTx, DbTxMut, StorageError, TxBlockLocation};
+
+#[path = "exex_journal.rs"]
+mod exex_journal;
+#[path = "legacy_checkpoint.rs"]
+mod legacy_checkpoint;
+#[path = "script_index.rs"]
+mod script_index;
+pub use legacy_checkpoint::LegacyCheckpointArchive;
 
 /// Table definitions for redb.
 /// All tables use `&[u8]` keys and `&[u8]` values — serialization is handled
 /// in the trait implementations using btc_primitives::encode.
+const UNDO: TableDefinition<&[u8], &[u8]> = TableDefinition::new("BlockUndoV1");
+const MEMPOOL: TableDefinition<&[u8], &[u8]> = TableDefinition::new("Mempool");
 const HEADERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new(TABLE_HEADERS);
+const BLOCKS: TableDefinition<&[u8], &[u8]> = TableDefinition::new(TABLE_BLOCKS);
 const BLOCK_INDEX: TableDefinition<&[u8], &[u8]> = TableDefinition::new(TABLE_BLOCK_INDEX);
 const TRANSACTIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new(TABLE_TRANSACTIONS);
 const UTXOS: TableDefinition<&[u8], &[u8]> = TableDefinition::new(TABLE_UTXOS);
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new(TABLE_META);
-const TX_BLOCK_INDEX: TableDefinition<&[u8], &[u8]> =
-    TableDefinition::new(TABLE_TX_BLOCK_INDEX);
-const ADDRESS_INDEX: TableDefinition<&[u8], &[u8]> =
-    TableDefinition::new(TABLE_ADDRESS_INDEX);
+const TX_BLOCK_INDEX: TableDefinition<&[u8], &[u8]> = TableDefinition::new(TABLE_TX_BLOCK_INDEX);
+const ADDRESS_INDEX: TableDefinition<&[u8], &[u8]> = TableDefinition::new(TABLE_ADDRESS_INDEX);
 
 /// Concrete redb-backed database implementing the `Database` trait.
 pub struct RedbDatabase {
@@ -45,7 +54,27 @@ impl RedbDatabase {
             .db
             .begin_write()
             .map_err(|e| StorageError::Database(e.to_string()))?;
+        write_txn
+            .open_table(UNDO)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        write_txn
+            .open_table(MEMPOOL)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        write_txn
+            .open_table(script_index::HISTORY)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        write_txn
+            .open_table(script_index::MANIFEST)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        for definition in [exex_journal::EVENTS, exex_journal::STATES] {
+            write_txn
+                .open_table(definition)
+                .map_err(script_index::error)?;
+        }
         // Opening a table inside a write-transaction creates it if missing.
+        write_txn
+            .open_table(BLOCKS)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
         write_txn
             .open_table(HEADERS)
             .map_err(|e| StorageError::Database(e.to_string()))?;
@@ -71,6 +100,63 @@ impl RedbDatabase {
             .commit()
             .map_err(|e| StorageError::Database(e.to_string()))?;
         Ok(())
+    }
+    pub fn coin_count(&self) -> Result<usize, StorageError> {
+        let tx = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let table = tx
+            .open_table(UTXOS)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let mut count = 0;
+        for row in table
+            .iter()
+            .map_err(|e| StorageError::Database(e.to_string()))?
+        {
+            let (key, _) = row.map_err(|e| StorageError::Database(e.to_string()))?;
+            if key.value().len() != 36 {
+                return Err(StorageError::Corruption("invalid coin key".into()));
+            }
+            if key.value()[35] & 0x80 == 0 {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+    pub fn stored_headers(&self) -> Result<Vec<BlockHeader>, StorageError> {
+        let tx = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let table = tx
+            .open_table(HEADERS)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        table
+            .iter()
+            .map_err(|e| StorageError::Database(e.to_string()))?
+            .map(|row| {
+                let (_, value) = row.map_err(|e| StorageError::Database(e.to_string()))?;
+                decode(value.value()).map_err(|e| StorageError::Corruption(e.to_string()))
+            })
+            .collect()
+    }
+    pub fn mempool_transactions(&self) -> Result<Vec<Transaction>, StorageError> {
+        let tx = self
+            .db
+            .begin_read()
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let table = tx
+            .open_table(MEMPOOL)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        table
+            .iter()
+            .map_err(|e| StorageError::Database(e.to_string()))?
+            .map(|row| {
+                let (_, value) = row.map_err(|e| StorageError::Database(e.to_string()))?;
+                decode(value.value()).map_err(|e| StorageError::Corruption(e.to_string()))
+            })
+            .collect()
     }
 }
 
@@ -124,7 +210,12 @@ fn outpoint_key(outpoint: &OutPoint) -> [u8; 36] {
 
 /// Encode an address-index key: script_hash(32) + height(8 BE) + tx_position(4 BE) + output_index(4 BE) = 48 bytes.
 /// This gives lexicographic ordering by (script_hash, height, tx_position, output_index).
-fn address_index_key(script_hash: &[u8; 32], height: u64, tx_position: u32, output_index: u32) -> [u8; 48] {
+fn address_index_key(
+    script_hash: &[u8; 32],
+    height: u64,
+    tx_position: u32,
+    output_index: u32,
+) -> [u8; 48] {
     let mut key = [0u8; 48];
     key[..32].copy_from_slice(script_hash);
     key[32..40].copy_from_slice(&height.to_be_bytes());
@@ -153,7 +244,10 @@ fn decode_tx_block_location(data: &[u8]) -> Result<TxBlockLocation, StorageError
     let mut pos_buf = [0u8; 4];
     pos_buf.copy_from_slice(&data[32..36]);
     let tx_position = u32::from_le_bytes(pos_buf);
-    Ok(TxBlockLocation { block_hash, tx_position })
+    Ok(TxBlockLocation {
+        block_hash,
+        tx_position,
+    })
 }
 
 /// Encode an AddressIndexValue for storage.
@@ -221,7 +315,109 @@ pub struct RedbTx {
 // produces its own `ReadOnlyTable` value (not a shared mutable reference).
 unsafe impl Sync for RedbTx {}
 
+fn stage_checkpoint(
+    tx: &impl ReadableTable<&'static str, &'static [u8]>,
+) -> Result<Option<(u64, BlockHash)>, StorageError> {
+    tx.get("validated_stages_v1")
+        .map_err(script_index::error)?
+        .map(|v| {
+            let b = v.value();
+            if b.len() != 76
+                || &b[..4] != b"STG1"
+                || btc_primitives::hash::sha256(&b[..44]) != b[44..]
+            {
+                return Err(StorageError::Corruption(
+                    "invalid stage checkpoint receipt".into(),
+                ));
+            }
+            Ok((
+                u64::from_be_bytes(b[4..12].try_into().unwrap()),
+                BlockHash::from_slice(&b[12..44]),
+            ))
+        })
+        .transpose()
+}
 impl DbTx for RedbTx {
+    fn exex_journal_tip(&self) -> Result<Option<crate::exex::JournalTip>, StorageError> {
+        exex_journal::read_tip(&self.inner.open_table(META).map_err(script_index::error)?)
+    }
+    fn exex_journal_entry(
+        &self,
+        sequence: u64,
+    ) -> Result<Option<crate::exex::JournalEntry>, StorageError> {
+        exex_journal::read_entry(
+            &self
+                .inner
+                .open_table(exex_journal::EVENTS)
+                .map_err(script_index::error)?,
+            sequence,
+        )
+    }
+    fn exex_state(&self, name: &str) -> Result<Option<crate::exex::ExtensionState>, StorageError> {
+        exex_journal::read_state(
+            &self
+                .inner
+                .open_table(exex_journal::STATES)
+                .map_err(script_index::error)?,
+            name,
+        )
+    }
+    fn stage_checkpoint(&self) -> Result<Option<(u64, BlockHash)>, StorageError> {
+        stage_checkpoint(&self.inner.open_table(META).map_err(script_index::error)?)
+    }
+
+    fn fee_observations(&self) -> Result<Option<Vec<u8>>, StorageError> {
+        let table = self.inner.open_table(META).map_err(script_index::error)?;
+        let value = table
+            .get("validated_fees_v1")
+            .map_err(script_index::error)?;
+        match value {
+            Some(value) if value.value().len() > crate::traits::MAX_FEE_STATE_BYTES => Err(
+                StorageError::Corruption("fee observation receipt exceeds limit".into()),
+            ),
+            Some(value) => Ok(Some(value.value().to_vec())),
+            None => Ok(None),
+        }
+    }
+    fn script_index_tip(&self) -> Result<Option<(u64, BlockHash)>, StorageError> {
+        script_index::read_tip(&self.inner.open_table(META).map_err(script_index::error)?)
+    }
+    fn script_history(
+        &self,
+        hash: &[u8; 32],
+        limit: usize,
+    ) -> Result<Vec<crate::traits::ScriptHistoryEntry>, StorageError> {
+        script_index::history(
+            &self
+                .inner
+                .open_table(script_index::HISTORY)
+                .map_err(script_index::error)?,
+            hash,
+            limit,
+        )
+    }
+    fn get_block_undo(&self, hash: &BlockHash) -> Result<Option<Vec<u8>>, StorageError> {
+        let table = self
+            .inner
+            .open_table(UNDO)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let value = table
+            .get(hash.as_bytes().as_slice())
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(value.map(|v| v.value().to_vec()))
+    }
+    fn get_block(&self, hash: &BlockHash) -> Result<Option<Block>, StorageError> {
+        let table = self
+            .inner
+            .open_table(BLOCKS)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let value = table
+            .get(hash.as_bytes().as_slice())
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        value
+            .map(|v| decode(v.value()).map_err(|e| StorageError::Corruption(e.to_string())))
+            .transpose()
+    }
     fn get_block_header(&self, hash: &BlockHash) -> Result<Option<BlockHeader>, StorageError> {
         let table = self
             .inner
@@ -366,7 +562,10 @@ impl DbTx for RedbTx {
         }
     }
 
-    fn get_address_txs(&self, script_hash: &[u8; 32]) -> Result<Vec<AddressIndexValue>, StorageError> {
+    fn get_address_txs(
+        &self,
+        script_hash: &[u8; 32],
+    ) -> Result<Vec<AddressIndexValue>, StorageError> {
         let table = self
             .inner
             .open_table(ADDRESS_INDEX)
@@ -437,6 +636,86 @@ pub struct RedbTxMut {
 unsafe impl Sync for RedbTxMut {}
 
 impl DbTx for RedbTxMut {
+    fn exex_journal_tip(&self) -> Result<Option<crate::exex::JournalTip>, StorageError> {
+        exex_journal::read_tip(&self.inner.open_table(META).map_err(script_index::error)?)
+    }
+    fn exex_journal_entry(
+        &self,
+        sequence: u64,
+    ) -> Result<Option<crate::exex::JournalEntry>, StorageError> {
+        exex_journal::read_entry(
+            &self
+                .inner
+                .open_table(exex_journal::EVENTS)
+                .map_err(script_index::error)?,
+            sequence,
+        )
+    }
+    fn exex_state(&self, name: &str) -> Result<Option<crate::exex::ExtensionState>, StorageError> {
+        exex_journal::read_state(
+            &self
+                .inner
+                .open_table(exex_journal::STATES)
+                .map_err(script_index::error)?,
+            name,
+        )
+    }
+    fn stage_checkpoint(&self) -> Result<Option<(u64, BlockHash)>, StorageError> {
+        stage_checkpoint(&self.inner.open_table(META).map_err(script_index::error)?)
+    }
+
+    fn fee_observations(&self) -> Result<Option<Vec<u8>>, StorageError> {
+        let table = self.inner.open_table(META).map_err(script_index::error)?;
+        let value = table
+            .get("validated_fees_v1")
+            .map_err(script_index::error)?;
+        match value {
+            Some(value) if value.value().len() > crate::traits::MAX_FEE_STATE_BYTES => Err(
+                StorageError::Corruption("fee observation receipt exceeds limit".into()),
+            ),
+            Some(value) => Ok(Some(value.value().to_vec())),
+            None => Ok(None),
+        }
+    }
+    fn script_index_tip(&self) -> Result<Option<(u64, BlockHash)>, StorageError> {
+        script_index::read_tip(&self.inner.open_table(META).map_err(script_index::error)?)
+    }
+    fn script_history(
+        &self,
+        hash: &[u8; 32],
+        limit: usize,
+    ) -> Result<Vec<crate::traits::ScriptHistoryEntry>, StorageError> {
+        script_index::history(
+            &self
+                .inner
+                .open_table(script_index::HISTORY)
+                .map_err(script_index::error)?,
+            hash,
+            limit,
+        )
+    }
+    fn get_block_undo(&self, hash: &BlockHash) -> Result<Option<Vec<u8>>, StorageError> {
+        let table = self
+            .inner
+            .open_table(UNDO)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let value = table
+            .get(hash.as_bytes().as_slice())
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(value.map(|v| v.value().to_vec()))
+    }
+    fn get_block(&self, hash: &BlockHash) -> Result<Option<Block>, StorageError> {
+        let table = self
+            .inner
+            .open_table(BLOCKS)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let value = table
+            .get(hash.as_bytes().as_slice())
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        value
+            .map(|v| decode(v.value()).map_err(|e| StorageError::Corruption(e.to_string())))
+            .transpose()
+    }
     fn get_block_header(&self, hash: &BlockHash) -> Result<Option<BlockHeader>, StorageError> {
         let table = self
             .inner
@@ -584,7 +863,10 @@ impl DbTx for RedbTxMut {
         }
     }
 
-    fn get_address_txs(&self, script_hash: &[u8; 32]) -> Result<Vec<AddressIndexValue>, StorageError> {
+    fn get_address_txs(
+        &self,
+        script_hash: &[u8; 32],
+    ) -> Result<Vec<AddressIndexValue>, StorageError> {
         let table = self
             .inner
             .open_table(ADDRESS_INDEX)
@@ -631,11 +913,129 @@ impl DbTx for RedbTxMut {
 }
 
 impl DbTxMut for RedbTxMut {
-    fn put_block_header(
+    fn initialize_exex_journal(&self, genesis: BlockHash) -> Result<(), StorageError> {
+        exex_journal::initialize(self, genesis)
+    }
+    fn append_exex_event(
         &self,
-        hash: &BlockHash,
-        header: &BlockHeader,
+        connected: bool,
+        height: u64,
+        block: &Block,
     ) -> Result<(), StorageError> {
+        exex_journal::append(self, connected, height, block)
+    }
+    fn set_exex_state(
+        &self,
+        name: &str,
+        state: &crate::exex::ExtensionState,
+    ) -> Result<(), StorageError> {
+        exex_journal::set_state(self, name, state)
+    }
+    fn set_stage_checkpoint(&self, height: u64, hash: &BlockHash) -> Result<(), StorageError> {
+        let mut bytes = b"STG1".to_vec();
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.extend_from_slice(hash.as_bytes());
+        let digest = btc_primitives::hash::sha256(&bytes);
+        bytes.extend_from_slice(&digest);
+        self.inner
+            .open_table(META)
+            .map_err(script_index::error)?
+            .insert("validated_stages_v1", bytes.as_slice())
+            .map_err(script_index::error)?;
+        Ok(())
+    }
+    fn index_script_plan(
+        &self,
+        plan: &crate::index_plan::BlockIndexPlan,
+        remove: bool,
+    ) -> Result<(), StorageError> {
+        script_index::index_plan(self, plan, remove)
+    }
+
+    fn index_script_block(
+        &self,
+        height: u64,
+        block: &Block,
+        undo: &btc_consensus::utxo::UtxoSetUpdate,
+        remove: bool,
+    ) -> Result<(), StorageError> {
+        script_index::index_block(self, height, block, undo, remove)
+    }
+    fn set_fee_observations(&self, bytes: &[u8]) -> Result<(), StorageError> {
+        if bytes.len() > crate::traits::MAX_FEE_STATE_BYTES {
+            return Err(StorageError::Database(
+                "fee observation receipt exceeds limit".into(),
+            ));
+        }
+        self.inner
+            .open_table(META)
+            .map_err(script_index::error)?
+            .insert("validated_fees_v1", bytes)
+            .map_err(script_index::error)?;
+        Ok(())
+    }
+    fn set_script_index_tip(&self, height: u64, hash: &BlockHash) -> Result<(), StorageError> {
+        let mut bytes = height.to_be_bytes().to_vec();
+        bytes.extend_from_slice(hash.as_bytes());
+        self.inner
+            .open_table(META)
+            .map_err(script_index::error)?
+            .insert(script_index::RECEIPT, bytes.as_slice())
+            .map_err(script_index::error)?;
+        Ok(())
+    }
+    fn put_block_undo(&self, hash: &BlockHash, bytes: &[u8]) -> Result<(), StorageError> {
+        self.inner
+            .open_table(UNDO)
+            .map_err(|e| StorageError::Database(e.to_string()))?
+            .insert(hash.as_bytes().as_slice(), bytes)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(())
+    }
+    fn delete_block_hash_by_height(&self, height: u64) -> Result<(), StorageError> {
+        self.inner
+            .open_table(BLOCK_INDEX)
+            .map_err(|e| StorageError::Database(e.to_string()))?
+            .remove(height_key(height).as_slice())
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(())
+    }
+    fn delete_tx_block_index(&self, txid: &TxHash) -> Result<(), StorageError> {
+        self.inner
+            .open_table(TX_BLOCK_INDEX)
+            .map_err(|e| StorageError::Database(e.to_string()))?
+            .remove(txid.as_bytes().as_slice())
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(())
+    }
+    fn replace_mempool(&self, transactions: &[Transaction]) -> Result<(), StorageError> {
+        let mut table = self
+            .inner
+            .open_table(MEMPOOL)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        table
+            .retain(|_, _| false)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        for transaction in transactions {
+            let raw = encode(transaction);
+            table
+                .insert(transaction.txid().as_bytes().as_slice(), raw.as_slice())
+                .map_err(|e| StorageError::Database(e.to_string()))?;
+        }
+        Ok(())
+    }
+    fn put_block(&self, hash: &BlockHash, block: &Block) -> Result<(), StorageError> {
+        let mut table = self
+            .inner
+            .open_table(BLOCKS)
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        let bytes = encode(block);
+        table
+            .insert(hash.as_bytes().as_slice(), bytes.as_slice())
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(())
+    }
+    fn put_block_header(&self, hash: &BlockHash, header: &BlockHeader) -> Result<(), StorageError> {
         let mut table = self
             .inner
             .open_table(HEADERS)
@@ -648,11 +1048,7 @@ impl DbTxMut for RedbTxMut {
         Ok(())
     }
 
-    fn put_block_hash_by_height(
-        &self,
-        height: u64,
-        hash: &BlockHash,
-    ) -> Result<(), StorageError> {
+    fn put_block_hash_by_height(&self, height: u64, hash: &BlockHash) -> Result<(), StorageError> {
         let mut table = self
             .inner
             .open_table(BLOCK_INDEX)
@@ -747,7 +1143,12 @@ impl DbTxMut for RedbTxMut {
             .inner
             .open_table(ADDRESS_INDEX)
             .map_err(|e| StorageError::Database(e.to_string()))?;
-        let key = address_index_key(script_hash, entry.height, entry.tx_position, entry.output_index);
+        let key = address_index_key(
+            script_hash,
+            entry.height,
+            entry.tx_position,
+            entry.output_index,
+        );
         let value = encode_address_index_value(entry);
         table
             .insert(key.as_slice(), value.as_slice())
@@ -791,6 +1192,47 @@ mod tests {
             time: 1231006505,
             bits: CompactTarget::MAX_TARGET,
             nonce: 2083236893,
+        }
+    }
+
+    #[test]
+    fn corrupt_stage_receipts_fail_and_aborted_writes_preserve_previous_bytes() {
+        let (db, _dir) = temp_db();
+        let hash = btc_consensus::validation::ChainParams::regtest().genesis_hash;
+        let write = db.tx_mut().unwrap();
+        write.set_stage_checkpoint(0, &hash).unwrap();
+        write.commit().unwrap();
+        {
+            let write = db.tx_mut().unwrap();
+            write.set_stage_checkpoint(1, &hash).unwrap();
+        }
+        assert_eq!(
+            db.tx().unwrap().stage_checkpoint().unwrap(),
+            Some((0, hash))
+        );
+        let mut good = b"STG1".to_vec();
+        good.extend_from_slice(&0u64.to_be_bytes());
+        good.extend_from_slice(hash.as_bytes());
+        good.extend_from_slice(&btc_primitives::hash::sha256(&good));
+        for bytes in [
+            vec![],
+            good[..75].to_vec(),
+            {
+                let mut b = good.clone();
+                b[12] ^= 1;
+                b
+            },
+            vec![0; 1024],
+        ] {
+            let write = db.tx_mut().unwrap();
+            {
+                let mut table = write.inner.open_table(META).unwrap();
+                table
+                    .insert("validated_stages_v1", bytes.as_slice())
+                    .unwrap();
+            }
+            write.commit().unwrap();
+            assert!(db.tx().unwrap().stage_checkpoint().is_err());
         }
     }
 
@@ -1044,9 +1486,7 @@ mod tests {
         assert_eq!(loaded, Some(transaction));
 
         // Missing txid.
-        let missing = tx
-            .get_transaction(&TxHash::from_bytes([0xee; 32]))
-            .unwrap();
+        let missing = tx.get_transaction(&TxHash::from_bytes([0xee; 32])).unwrap();
         assert_eq!(missing, None);
 
         tx.commit().unwrap();
@@ -1134,9 +1574,7 @@ mod tests {
     fn test_transaction_missing() {
         let (db, _dir) = temp_db();
         let tx = db.tx().unwrap();
-        let missing = tx
-            .get_transaction(&TxHash::from_bytes([0xfe; 32]))
-            .unwrap();
+        let missing = tx.get_transaction(&TxHash::from_bytes([0xfe; 32])).unwrap();
         assert_eq!(missing, None);
     }
 

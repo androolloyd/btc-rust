@@ -1,7 +1,10 @@
-pub mod traits;
+pub mod exex;
+pub mod index_plan;
 pub mod provider;
-pub mod tables;
 pub mod pruning;
+pub mod tables;
+pub mod traits;
+pub mod undo;
 pub mod utxo_store;
 
 #[cfg(feature = "redb")]
@@ -16,8 +19,8 @@ pub mod leveldb_backend;
 #[cfg(feature = "snapshot")]
 pub mod snapshot;
 
-pub use traits::{Database, DbTx, DbTxMut, TxBlockLocation, AddressIndexValue};
 pub use provider::BlockchainProvider;
+pub use traits::{AddressIndexValue, Database, DbTx, DbTxMut, TxBlockLocation};
 pub use utxo_store::PersistentUtxoSet;
 
 #[cfg(feature = "redb")]
@@ -27,4 +30,4 @@ pub use redb_backend::RedbDatabase;
 pub use qmdb_backend::QmdbDatabase;
 
 #[cfg(feature = "snapshot")]
-pub use snapshot::{UtxoSnapshotEntry, load_utxo_snapshot, SnapshotError};
+pub use snapshot::{load_utxo_snapshot, SnapshotError, UtxoSnapshotEntry};

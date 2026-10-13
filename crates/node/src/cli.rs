@@ -65,6 +65,573 @@ pub fn script_type(script: &Script) -> &str {
 // Decode helpers
 // ---------------------------------------------------------------------------
 
+fn erlay_set(
+    salt_a: u64,
+    salt_b: u64,
+    wtxids: &[String],
+) -> eyre::Result<btc_network::erlay::ReconciliationSet> {
+    use btc_network::erlay::{ReconciliationSet, ShortIdKey, MAX_SET_SIZE};
+    use btc_primitives::hash::TxHash;
+    eyre::ensure!(
+        wtxids.len() <= MAX_SET_SIZE,
+        "too many witness transaction IDs"
+    );
+    let hashes = wtxids
+        .iter()
+        .map(|hash| TxHash::from_hex(hash))
+        .collect::<Result<std::collections::HashSet<_>, _>>()?;
+    Ok(ReconciliationSet::new(
+        ShortIdKey::new(salt_a, salt_b),
+        &hashes,
+    )?)
+}
+
+/// Offline BIP330 primitive tooling; this does not activate live Erlay relay.
+pub fn erlay_sketch(
+    capacity: usize,
+    salt_a: u64,
+    salt_b: u64,
+    wtxids: &[String],
+) -> eyre::Result<serde_json::Value> {
+    // Check capacity before hashing/allocating the caller's local set.
+    btc_network::erlay::Minisketch::new(capacity)?;
+    let snapshot = erlay_set(salt_a, salt_b, wtxids)?;
+    let sketch = snapshot.build_sketch(capacity)?;
+    Ok(serde_json::json!({
+        "scope": "experimental_bip330_sketch", "capacity": sketch.capacity(),
+        "hex": hex::encode(sketch.serialize()), "live_relay": false,
+    }))
+}
+
+pub fn erlay_reconcile(
+    text: &str,
+    salt_a: u64,
+    salt_b: u64,
+    wtxids: &[String],
+) -> eyre::Result<serde_json::Value> {
+    use btc_network::erlay::{Minisketch, MAX_CAPACITY};
+    eyre::ensure!(
+        text.len() <= MAX_CAPACITY * 8,
+        "sketch exceeds local capacity"
+    );
+    let peer = Minisketch::deserialize(&hex::decode(text)?)?;
+    let snapshot = erlay_set(salt_a, salt_b, wtxids)?;
+    let result = snapshot.reconcile(&peer)?;
+    Ok(serde_json::json!({
+        "scope": "experimental_bip330_reconciliation", "capacity": peer.capacity(),
+        "they_need_wtxids": result.they_need.iter().map(|hash| hash.to_hex()).collect::<Vec<_>>(),
+        "we_need_ids": result.we_need_ids, "live_relay": false,
+        "original_difference_verified": false,
+    }))
+}
+
+/// Derive scripts/addresses from public descriptors without wallet/chain claims.
+pub fn derive_descriptor(
+    text: &str,
+    index: Option<u32>,
+    network: Network,
+) -> eyre::Result<serde_json::Value> {
+    use btc_primitives::descriptor::Descriptor;
+    let descriptor = Descriptor::parse(text)?;
+    let expanded = descriptor.expand(index, network)?;
+    descriptor_json(descriptor, expanded, index, "public_descriptor_scripts")
+}
+
+/// Private material is read from a bounded regular file, never an argv value.
+/// Parse failures are redacted: parser diagnostics may include source text.
+pub fn derive_private_descriptor(
+    path: &std::path::Path,
+    index: Option<u32>,
+    network: Network,
+) -> eyre::Result<serde_json::Value> {
+    use btc_primitives::descriptor::{Descriptor, MAX_DESCRIPTOR_SIZE};
+    use eyre::{ensure, WrapErr};
+    use std::io::Read;
+    let file = std::fs::File::open(path).wrap_err("could not open private descriptor file")?;
+    let metadata = file
+        .metadata()
+        .wrap_err("could not inspect private descriptor file")?;
+    ensure!(
+        metadata.is_file(),
+        "private descriptor input must be a regular file"
+    );
+    ensure!(
+        metadata.len() <= MAX_DESCRIPTOR_SIZE as u64,
+        "private descriptor exceeds size limit"
+    );
+    let mut bytes = Vec::new();
+    file.take((MAX_DESCRIPTOR_SIZE + 1) as u64)
+        .read_to_end(&mut bytes)
+        .wrap_err("could not read private descriptor file")?;
+    ensure!(
+        bytes.len() <= MAX_DESCRIPTOR_SIZE,
+        "private descriptor exceeds size limit"
+    );
+    let text =
+        std::str::from_utf8(&bytes).map_err(|_| eyre::eyre!("invalid private descriptor text"))?;
+    let descriptor = Descriptor::parse(text)
+        .map_err(|_| eyre::eyre!("invalid private descriptor syntax or checksum"))?;
+    let resolved = descriptor.expand_private(index, network)?;
+    let mut output = descriptor_json(
+        resolved.public_descriptor,
+        resolved.expansion,
+        index,
+        "private_descriptor_scripts",
+    )?;
+    output["descriptor_is_fixed"] = serde_json::json!(true);
+    output["key_origins_preserved"] = serde_json::json!(false);
+    Ok(output)
+}
+
+fn descriptor_json(
+    descriptor: btc_primitives::descriptor::Descriptor,
+    expanded: btc_primitives::descriptor::DescriptorExpansion,
+    index: Option<u32>,
+    scope: &str,
+) -> eyre::Result<serde_json::Value> {
+    use btc_primitives::descriptor::descriptor_checksum;
+    let text = descriptor.to_string();
+    Ok(serde_json::json!({
+        "expansion_scope": scope,
+        "descriptor": format!("{}#{}", text, descriptor_checksum(&text)?),
+        "is_ranged": expanded.is_ranged,
+        "index": index,
+        "derivation_steps": expanded.derivation_steps,
+        "script_pubkey": hex::encode(expanded.script_pubkey.as_bytes()),
+        "address": expanded.address.map(|address| address.to_string()),
+        "redeem_script": expanded.redeem_script.map(|script| hex::encode(script.as_bytes())),
+        "witness_script": expanded.witness_script.map(|script| hex::encode(script.as_bytes())),
+        "internal_key": expanded.internal_key.map(hex::encode),
+        "merkle_root": expanded.merkle_root.map(hex::encode),
+        "tap_leaves": expanded.tap_leaves.iter().map(|leaf| serde_json::json!({
+            "script": hex::encode(leaf.script.as_bytes()), "leaf_version": 0xc0,
+            "leaf_hash": hex::encode(leaf.leaf_hash), "control_block": hex::encode(&leaf.control_block),
+        })).collect::<Vec<_>>(),
+        "key_origins_verified": false,
+        "wallet_ownership_verified": false,
+        "signatures_verified": false,
+        "active_chain_verified": false,
+    }))
+}
+
+fn parse_psbt_hex(hex_str: &str) -> eyre::Result<btc_primitives::psbt::Psbt> {
+    if let Some(path) = hex_str.strip_prefix('@') {
+        use eyre::WrapErr;
+        use std::io::Read;
+        eyre::ensure!(!path.is_empty(), "missing binary PSBT file path");
+        let file = std::fs::File::open(path).wrap_err("could not open binary PSBT file")?;
+        let metadata = file
+            .metadata()
+            .wrap_err("could not inspect binary PSBT file")?;
+        eyre::ensure!(
+            metadata.is_file(),
+            "binary PSBT input must be a regular file"
+        );
+        eyre::ensure!(
+            metadata.len() <= btc_primitives::psbt::MAX_PSBT_SIZE as u64,
+            "PSBT exceeds parser size limit"
+        );
+        let mut bytes = Vec::new();
+        file.take((btc_primitives::psbt::MAX_PSBT_SIZE + 1) as u64)
+            .read_to_end(&mut bytes)
+            .wrap_err("could not read binary PSBT file")?;
+        eyre::ensure!(
+            bytes.len() <= btc_primitives::psbt::MAX_PSBT_SIZE,
+            "PSBT exceeds parser size limit"
+        );
+        return Ok(btc_primitives::psbt::Psbt::deserialize(&bytes)?);
+    }
+    if hex_str.len() > btc_primitives::psbt::MAX_PSBT_SIZE * 2 {
+        eyre::bail!("PSBT exceeds parser size limit");
+    }
+    Ok(btc_primitives::psbt::Psbt::deserialize(&hex::decode(
+        hex_str,
+    )?)?)
+}
+
+/// Inspect BIP32 key origins without treating them as verified derivations.
+fn key_derivations_json(
+    entries: &[(Vec<u8>, btc_primitives::psbt::KeySource)],
+) -> serde_json::Value {
+    serde_json::json!(entries
+        .iter()
+        .map(|(key, source)| serde_json::json!({
+            "pubkey": hex::encode(key),
+            "master_fingerprint": hex::encode(source.0),
+            "path": source.1,
+        }))
+        .collect::<Vec<_>>())
+}
+
+/// Inspect Taproot key origins without treating them as verified derivations.
+fn tap_derivations_json(
+    entries: &[(Vec<u8>, btc_primitives::psbt::TapKeySource)],
+) -> serde_json::Value {
+    serde_json::json!(entries
+        .iter()
+        .map(|(key, source)| serde_json::json!({
+            "pubkey": hex::encode(key),
+            "leaf_hashes": source.leaf_hashes.iter().map(hex::encode).collect::<Vec<_>>(),
+            "master_fingerprint": hex::encode(source.key_source.0),
+            "path": source.key_source.1,
+        }))
+        .collect::<Vec<_>>())
+}
+
+fn tap_signature_hash_type(signature: &[u8]) -> u8 {
+    if signature.len() == 64 {
+        0
+    } else {
+        signature[64]
+    }
+}
+
+/// Inspect PSBT spending data. Signatures, key derivations and active-chain status remain unverified.
+pub fn decode_psbt(hex_str: &str) -> eyre::Result<serde_json::Value> {
+    let psbt = parse_psbt_hex(hex_str)?;
+    let utxos = (0..psbt.inputs.len())
+        .map(|index| psbt.input_utxo(index))
+        .collect::<Result<Vec<_>, _>>()?;
+    let xpubs = psbt
+        .xpub
+        .iter()
+        .map(|(data, source)| {
+            let key = btc_primitives::bip32::ExtendedPubKey::deserialize(data)?;
+            Ok(serde_json::json!({
+                "xpub": key.to_base58(),
+                "serialized_xpub": hex::encode(data),
+                "depth": key.depth,
+                "parent_fingerprint": hex::encode(key.parent_fingerprint),
+                "child_number": key.child_number.0,
+                "pubkey": hex::encode(key.public_key.serialize()),
+                "master_fingerprint": hex::encode(source.0),
+                "path": source.1,
+            }))
+        })
+        .collect::<Result<Vec<_>, btc_primitives::bip32::Bip32Error>>()?;
+    Ok(serde_json::json!({
+        "psbt_version": psbt.version,
+        "tx_version": psbt.unsigned_tx.version,
+        "locktime": psbt.unsigned_tx.lock_time,
+        "fallback_locktime": psbt.fallback_lock_time,
+        "tx_modifiable": psbt.tx_modifiable,
+        "unsigned_tx_hex": hex::encode(btc_primitives::encode(&psbt.unsigned_tx)),
+        "unsigned_txid": psbt.unsigned_tx.txid().to_hex(),
+        "psbt_id": psbt.unique_id()?.to_hex(),
+        "signatures_verified": false,
+        "inputs": psbt.inputs.iter().enumerate().map(|(i, input)| {
+            let txin = &psbt.unsigned_tx.inputs[i];
+            serde_json::json!({
+                "txid": txin.previous_output.txid.to_hex(),
+                "vout": txin.previous_output.vout,
+                "sequence": txin.sequence,
+                "required_time_locktime": input.required_time_lock_time,
+                "required_height_locktime": input.required_height_lock_time,
+                "has_non_witness_utxo": input.non_witness_utxo.is_some(),
+                "has_witness_utxo": input.witness_utxo.is_some(),
+                "utxo": utxos[i].map(|output| serde_json::json!({
+                    "value_sat": output.value.as_sat(),
+                    "script_pubkey": hex::encode(output.script_pubkey.as_bytes()),
+                    "source": if input.non_witness_utxo.is_some() { "non_witness_utxo" } else { "witness_utxo" },
+                    "txid_linked": input.non_witness_utxo.is_some(),
+                })),
+                "partial_signatures": input.partial_sigs.len(),
+                "sighash_type": input.sighash_type,
+                "partial_signature_records": input.partial_sigs.iter().map(|(key, sig)| serde_json::json!({
+                    "pubkey": hex::encode(key), "sighash_type": sig[sig.len() - 1],
+                })).collect::<Vec<_>>(),
+                "bip32_derivation": key_derivations_json(&input.bip32_derivation),
+                "has_tap_key_signature": input.tap_key_sig.is_some(),
+                "tap_key_signature_sighash_type": input.tap_key_sig.as_ref().map(|sig| tap_signature_hash_type(sig)),
+                "tap_script_signatures": input.tap_script_sigs.len(),
+                "tap_script_signature_records": input.tap_script_sigs.iter().map(|(key, sig)| serde_json::json!({
+                    "pubkey": hex::encode(&key[..32]), "leaf_hash": hex::encode(&key[32..]),
+                    "sighash_type": tap_signature_hash_type(sig),
+                })).collect::<Vec<_>>(),
+                "tap_internal_key": input.tap_internal_key.as_ref().map(hex::encode),
+                "tap_merkle_root": input.tap_merkle_root.map(hex::encode),
+                "tap_leaf_scripts": input.tap_leaf_scripts.iter().map(|(control, leaf)| serde_json::json!({
+                    "control_block": hex::encode(control),
+                    "leaf_version": leaf.leaf_version,
+                    "script": hex::encode(leaf.script.as_bytes()),
+                })).collect::<Vec<_>>(),
+                "tap_bip32_derivation": tap_derivations_json(&input.tap_bip32_derivation),
+                "has_final_fields": input.final_script_sig.is_some() || input.final_script_witness.is_some(),
+                "unknown_fields": input.unknown.len(),
+            })
+        }).collect::<Vec<_>>(),
+        "outputs": psbt.unsigned_tx.outputs.iter().zip(&psbt.outputs).map(|(output, fields)| serde_json::json!({
+            "value_sat": output.value.as_sat(),
+            "script_pubkey": hex::encode(output.script_pubkey.as_bytes()),
+            "bip32_derivation": key_derivations_json(&fields.bip32_derivation),
+            "tap_internal_key": fields.tap_internal_key.as_ref().map(hex::encode),
+            "tap_tree": fields.tap_tree.as_ref().map(|tree| tree.iter().map(|leaf| serde_json::json!({
+                "depth": leaf.depth,
+                "leaf_version": leaf.leaf_version,
+                "script": hex::encode(leaf.script.as_bytes()),
+            })).collect::<Vec<_>>()),
+            "tap_bip32_derivation": tap_derivations_json(&fields.tap_bip32_derivation),
+        })).collect::<Vec<_>>(),
+        "global_xpubs": psbt.xpub.len(),
+        "global_xpub_records": xpubs,
+        "unknown_global_fields": psbt.unknown.len(),
+        "proprietary_global_fields": psbt.proprietary.len(),
+    }))
+}
+
+/// Verify public derivations relative to supplied, unauthenticated xpub anchors.
+pub fn verify_psbt_derivations(hex_str: &str) -> eyre::Result<serde_json::Value> {
+    let verified = crate::wallet::verify_key_derivations(&parse_psbt_hex(hex_str)?)?;
+    Ok(serde_json::json!({
+        "verification_scope": "public_derivations_from_supplied_xpubs",
+        "derivation_equations_verified": true,
+        "origin_records_checked": verified.records.len(),
+        "derivation_steps_checked": verified.derivation_steps_checked,
+        "key_origins_verified": false,
+        "wallet_ownership_verified": false,
+        "signatures_verified": false,
+        "taproot_leaf_membership_verified": false,
+        "active_chain_verified": false,
+        "records": verified.records.iter().map(|record| serde_json::json!({
+            "scope": record.scope, "index": record.index, "pubkey": hex::encode(&record.pubkey),
+            "key_type": if record.taproot { "taproot_xonly" } else { "legacy_public_key" },
+            "master_fingerprint": hex::encode(record.source.0), "path": record.source.1,
+            "global_xpub_index": record.global_xpub_index, "relative_path": record.relative_path,
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+/// Convert version encoding without changing the transaction being signed.
+pub fn convert_psbt(hex_str: &str, version: u32) -> eyre::Result<serde_json::Value> {
+    let original = parse_psbt_hex(hex_str)?;
+    let converted = original.convert_version(version)?;
+    Ok(serde_json::json!({
+        "psbt_version": converted.version,
+        "psbt_hex": hex::encode(converted.try_serialize()?),
+        "unsigned_txid": converted.unsigned_tx.txid().to_hex(),
+        "signatures_verified": false,
+        "construction_fields_collapsed": original.version == 2 && version == 0,
+    }))
+}
+
+/// Extract externally finalized fields; submission still requires full validation.
+pub fn extract_psbt(hex_str: &str) -> eyre::Result<serde_json::Value> {
+    let tx = parse_psbt_hex(hex_str)?.finalize()?;
+    Ok(serde_json::json!({
+        "tx_hex": hex::encode(btc_primitives::encode(&tx)),
+        "txid": tx.txid().to_hex(),
+        "signatures_verified": false,
+    }))
+}
+
+/// Construct and verify supported final spends, returning a cleaned PSBT.
+pub fn finalize_psbt(hex_str: &str) -> eyre::Result<serde_json::Value> {
+    let finalized = crate::wallet::finalize_psbt(&parse_psbt_hex(hex_str)?)?;
+    let verified = finalized.verified;
+    Ok(serde_json::json!({
+        "psbt_hex": hex::encode(finalized.psbt.try_serialize()?),
+        "psbt_version": finalized.psbt.version,
+        "complete": true,
+        "tx_hex": hex::encode(btc_primitives::encode(&verified.transaction)),
+        "txid": verified.transaction.txid().to_hex(),
+        "verification_scope": "finalized_spends_against_supplied_prevouts",
+        "spending_conditions_verified": true,
+        "signatures_verified": true,
+        "signatures_checked": verified.signatures_checked,
+        "partial_signatures_verified": true,
+        "partial_signatures_checked": finalized.partial_signatures_checked,
+        "partial_signatures_per_input": finalized.partial_signatures_per_input,
+        "key_origins_verified": false,
+        "active_chain_verified": false,
+        "txid_linked_prevouts": verified.txid_linked_prevouts,
+        "fee_sat": verified.fee_sat,
+    }))
+}
+
+/// WIF secrets enter only through a bounded regular file, one key per line.
+pub fn sign_psbt(
+    hex_str: &str,
+    key_file: &std::path::Path,
+    max_fee_sat: u64,
+    network: Network,
+) -> eyre::Result<serde_json::Value> {
+    use btc_primitives::wif::WifPrivateKey;
+    use eyre::{ensure, WrapErr};
+    use std::io::Read;
+    const MAX_KEY_FILE_SIZE: usize = 65_536;
+    let psbt = parse_psbt_hex(hex_str)?;
+    let file = std::fs::File::open(key_file).wrap_err("could not open WIF key file")?;
+    let metadata = file.metadata().wrap_err("could not inspect WIF key file")?;
+    ensure!(metadata.is_file(), "WIF key input must be a regular file");
+    ensure!(
+        metadata.len() <= MAX_KEY_FILE_SIZE as u64,
+        "WIF key file exceeds size limit"
+    );
+    let mut bytes = Vec::new();
+    file.take((MAX_KEY_FILE_SIZE + 1) as u64)
+        .read_to_end(&mut bytes)
+        .wrap_err("could not read WIF key file")?;
+    ensure!(
+        bytes.len() <= MAX_KEY_FILE_SIZE,
+        "WIF key file exceeds size limit"
+    );
+    let text = std::str::from_utf8(&bytes).map_err(|_| eyre::eyre!("invalid WIF key file text"))?;
+    let mut keys = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        ensure!(keys.len() < 1024, "WIF key count exceeds 1024");
+        keys.push(
+            WifPrivateKey::from_wif(line, network)
+                .wrap_err_with(|| format!("invalid WIF at line {}", index + 1))?,
+        );
+    }
+    let signed = crate::wallet::sign_psbt(&psbt, &keys, max_fee_sat)?;
+    signing_receipt(&signed, max_fee_sat)
+}
+
+/// Private extended keys enter only through a bounded regular UTF-8 file.
+pub fn sign_hd_psbt(
+    hex_str: &str,
+    key_file: &std::path::Path,
+    max_fee_sat: u64,
+    network: Network,
+) -> eyre::Result<serde_json::Value> {
+    use eyre::{ensure, WrapErr};
+    use std::io::Read;
+    const MAX_FILE: usize = 262_144;
+    let psbt = parse_psbt_hex(hex_str)?;
+    let file = std::fs::File::open(key_file).wrap_err("could not open HD anchor file")?;
+    let metadata = file
+        .metadata()
+        .wrap_err("could not inspect HD anchor file")?;
+    ensure!(metadata.is_file(), "HD anchor input must be a regular file");
+    ensure!(
+        metadata.len() <= MAX_FILE as u64,
+        "HD anchor file exceeds size limit"
+    );
+    let mut bytes = Vec::new();
+    file.take((MAX_FILE + 1) as u64)
+        .read_to_end(&mut bytes)
+        .wrap_err("could not read HD anchor file")?;
+    ensure!(bytes.len() <= MAX_FILE, "HD anchor file exceeds size limit");
+    let text =
+        std::str::from_utf8(&bytes).map_err(|_| eyre::eyre!("invalid HD anchor file text"))?;
+    let mut anchors = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        ensure!(anchors.len() < 64, "HD anchor count exceeds 64");
+        anchors.push(
+            crate::wallet_hd::HdSigningAnchor::parse(line, network)
+                .wrap_err_with(|| format!("invalid HD anchor at line {}", index + 1))?,
+        );
+    }
+    let signed = crate::wallet_hd::sign_hd_psbt(&psbt, &anchors, max_fee_sat)?;
+    let mut receipt = signing_receipt(&signed.signed, max_fee_sat)?;
+    receipt["signing_scope"] = serde_json::json!("hd_known_templates_partial_signing");
+    receipt["hd_derivation_scope"] =
+        serde_json::json!("owned_input_keys_relative_to_supplied_private_anchors");
+    receipt["owned_input_derivations_verified"] = serde_json::json!(true);
+    receipt["input_derivations_checked"] = serde_json::json!(signed.input_derivations.len());
+    receipt["derivation_steps_checked"] = serde_json::json!(signed.derivation_steps_checked);
+    receipt["anchor_master_paths_verified"] =
+        serde_json::json!(signed.anchor_master_paths_verified);
+    receipt["global_xpubs_checked"] = serde_json::json!(signed.global_xpubs_checked);
+    receipt["foreign_input_derivations_preserved"] =
+        serde_json::json!(signed.input_foreign_records);
+    receipt["output_derivations_verified"] = serde_json::json!(false);
+    receipt["master_identity_authenticated"] = serde_json::json!(false);
+    receipt["input_derivation_proofs"] =
+        serde_json::json!(signed.input_derivations.iter().map(|proof| serde_json::json!({
+        "input": proof.input, "pubkey": hex::encode(&proof.pubkey), "taproot": proof.taproot,
+        "master_fingerprint": hex::encode(proof.source.0), "path": proof.source.1,
+        "anchor_index": proof.anchor_index, "relative_path": proof.relative_path,
+    })).collect::<Vec<_>>());
+    Ok(receipt)
+}
+
+fn signing_receipt(
+    signed: &crate::wallet::SignedPsbt,
+    max_fee_sat: u64,
+) -> eyre::Result<serde_json::Value> {
+    let has_taproot = signed
+        .input_signature_schemes
+        .iter()
+        .any(|scheme| scheme.starts_with("taproot"));
+    let has_scriptpath = signed
+        .input_signature_schemes
+        .iter()
+        .any(|scheme| scheme.starts_with("taproot_scriptpath"));
+    Ok(serde_json::json!({
+        "psbt_hex": hex::encode(signed.psbt.try_serialize()?),
+        "psbt_version": signed.psbt.version,
+        "signing_scope": if has_scriptpath {"known_ecdsa_and_taproot_partial_signing"} else if has_taproot {"known_ecdsa_and_taproot_keypath_partial_signing"} else {"ecdsa_sighash_all_partial_signing"},
+        "input_signature_schemes": signed.input_signature_schemes,
+        "schnorr_aux_randomness": if has_taproot {Some("os_random_for_new_signatures")} else {None},
+        "unsigned_txid": signed.verified.unsigned_transaction.txid().to_hex(),
+        "outputs": signed.verified.unsigned_transaction.outputs.iter().map(|out| serde_json::json!({
+            "value_sat": out.value.as_sat(), "script_pubkey": hex::encode(out.script_pubkey.as_bytes()),
+        })).collect::<Vec<_>>(),
+        "fee_sat": signed.verified.fee_sat,
+        "max_fee_sat": max_fee_sat,
+        "signatures_added": signed.signatures_added,
+        "signatures_added_per_input": signed.signatures_added_per_input,
+        "signatures_checked": signed.verified.signatures_checked,
+        "signatures_per_input": signed.verified.signatures_per_input,
+        "signatures_verified": true,
+        "partial_signatures_verified": true,
+        "spending_conditions_verified": false,
+        "final_fields_verified": false,
+        "key_origins_verified": false,
+        "change_outputs_verified": false,
+        "active_chain_verified": false,
+        "txid_linked_prevouts": signed.verified.txid_linked_prevouts,
+    }))
+}
+
+/// Verify supported finalized spends against supplied prevouts, without a chain lookup.
+pub fn verify_psbt(hex_str: &str) -> eyre::Result<serde_json::Value> {
+    let verified = crate::wallet::verify_finalized_psbt(&parse_psbt_hex(hex_str)?)?;
+    Ok(serde_json::json!({
+        "tx_hex": hex::encode(btc_primitives::encode(&verified.transaction)),
+        "txid": verified.transaction.txid().to_hex(),
+        "verification_scope": "finalized_spends_against_supplied_prevouts",
+        "spending_conditions_verified": true,
+        "signatures_verified": true,
+        "signatures_checked": verified.signatures_checked,
+        "partial_signatures_verified": false,
+        "active_chain_verified": false,
+        "txid_linked_prevouts": verified.txid_linked_prevouts,
+        "fee_sat": verified.fee_sat,
+    }))
+}
+
+/// Verify present partial records, without claiming final script satisfaction.
+pub fn verify_psbt_partials(hex_str: &str) -> eyre::Result<serde_json::Value> {
+    let verified = crate::wallet::verify_partial_signatures(&parse_psbt_hex(hex_str)?)?;
+    Ok(serde_json::json!({
+        "unsigned_tx_hex": hex::encode(btc_primitives::encode(&verified.unsigned_transaction)),
+        "unsigned_txid": verified.unsigned_transaction.txid().to_hex(),
+        "verification_scope": "partial_signatures_against_supplied_prevouts",
+        "signatures_verified": true,
+        "partial_signatures_verified": true,
+        "signatures_checked": verified.signatures_checked,
+        "signatures_per_input": verified.signatures_per_input,
+        "spending_conditions_verified": false,
+        "final_fields_verified": false,
+        "key_origins_verified": false,
+        "active_chain_verified": false,
+        "taproot_annex_present": false,
+        "txid_linked_prevouts": verified.txid_linked_prevouts,
+        "fee_sat": verified.fee_sat,
+    }))
+}
+
 /// Decode a raw transaction hex string and return a JSON representation.
 pub fn decode_tx(hex_str: &str) -> eyre::Result<serde_json::Value> {
     let bytes = hex::decode(hex_str)?;
@@ -103,11 +670,9 @@ pub fn decode_script(hex_str: &str) -> eyre::Result<serde_json::Value> {
     let mut ops = Vec::new();
     for instruction in script.instructions() {
         match instruction {
-            Ok(Instruction::Op(op)) => ops.push(format!("{:?}", op)),
-            Ok(Instruction::PushBytes(data)) => {
-                ops.push(format!("PUSH({})", hex::encode(data)))
-            }
-            Err(e) => ops.push(format!("ERROR: {}", e)),
+            Ok(Instruction::Op(op)) => ops.push(format!("{op:?}")),
+            Ok(Instruction::PushBytes(data)) => ops.push(format!("PUSH({})", hex::encode(data))),
+            Err(e) => ops.push(format!("ERROR: {e}")),
         }
     }
 
@@ -146,8 +711,7 @@ pub fn decode_header(hex_str: &str) -> eyre::Result<serde_json::Value> {
 ///
 /// Returns a structured JSON object with decoded fields and computed sizes.
 pub fn simulate_tx(hex_str: &str) -> eyre::Result<serde_json::Value> {
-    let bytes =
-        hex::decode(hex_str).map_err(|e| eyre::eyre!("invalid hex: {}", e))?;
+    let bytes = hex::decode(hex_str).map_err(|e| eyre::eyre!("invalid hex: {}", e))?;
     let tx: Transaction = btc_primitives::decode(&bytes)
         .map_err(|e| eyre::eyre!("failed to decode transaction: {}", e))?;
 
@@ -173,7 +737,7 @@ pub fn simulate_tx(hex_str: &str) -> eyre::Result<serde_json::Value> {
 
     // Weight = base_size * 3 + total_size  (BIP141)
     let weight = legacy_size * 3 + total_size;
-    let vsize = (weight + 3) / 4; // ceiling division
+    let vsize = weight.div_ceil(4); // ceiling division
 
     let is_coinbase = tx.is_coinbase();
     let total_output: i64 = tx.outputs.iter().map(|o| o.value.as_sat()).sum();
@@ -237,8 +801,8 @@ pub fn simulate_tx(hex_str: &str) -> eyre::Result<serde_json::Value> {
 
 /// Compile a miniscript policy string into Bitcoin Script.
 pub fn compile_policy(policy_str: &str) -> eyre::Result<serde_json::Value> {
-    let policy = Policy::parse(policy_str)
-        .map_err(|e| eyre::eyre!("failed to parse policy: {}", e))?;
+    let policy =
+        Policy::parse(policy_str).map_err(|e| eyre::eyre!("failed to parse policy: {}", e))?;
 
     let script = policy.compile();
     let script_ref = script.as_script();
@@ -247,11 +811,11 @@ pub fn compile_policy(policy_str: &str) -> eyre::Result<serde_json::Value> {
     let mut asm_ops = Vec::new();
     for instruction in script_ref.instructions() {
         match instruction {
-            Ok(Instruction::Op(op)) => asm_ops.push(format!("{:?}", op)),
+            Ok(Instruction::Op(op)) => asm_ops.push(format!("{op:?}")),
             Ok(Instruction::PushBytes(data)) => {
                 asm_ops.push(format!("PUSH({})", hex::encode(data)))
             }
-            Err(e) => asm_ops.push(format!("ERROR: {}", e)),
+            Err(e) => asm_ops.push(format!("ERROR: {e}")),
         }
     }
 
@@ -270,15 +834,10 @@ pub fn compile_policy(policy_str: &str) -> eyre::Result<serde_json::Value> {
 // ---------------------------------------------------------------------------
 
 /// Parse and classify a Bitcoin address for watching.
-pub fn watch_address(
-    address_str: &str,
-    network: Network,
-) -> eyre::Result<serde_json::Value> {
+pub fn watch_address(address_str: &str, network: Network) -> eyre::Result<serde_json::Value> {
     let addr = Address::from_bech32(address_str, network)
         .or_else(|_| Address::from_base58(address_str, network))
-        .map_err(|e| {
-            eyre::eyre!("failed to parse address '{}': {}", address_str, e)
-        })?;
+        .map_err(|e| eyre::eyre!("failed to parse address '{}': {}", address_str, e))?;
 
     let script_pubkey = addr.script_pubkey();
     let spk_bytes = script_pubkey.as_bytes();
@@ -317,9 +876,8 @@ pub fn build_status(config: &NodeConfig) -> output::NodeStatus {
     output::NodeStatus {
         network: config.network.to_string(),
         chain_height: 0,
-        best_block_hash:
-            "0000000000000000000000000000000000000000000000000000000000000000"
-                .to_string(),
+        best_block_hash: "0000000000000000000000000000000000000000000000000000000000000000"
+            .to_string(),
         peer_count: 0,
         mempool_size: 0,
         syncing: false,
@@ -374,20 +932,13 @@ pub fn build_explore(config: &NodeConfig, explorer_port: u16) -> serde_json::Val
 }
 
 /// Build the JSON-RPC envelope for the `rpc` subcommand.
-pub fn build_rpc_request(
-    method: &str,
-    params: &[String],
-    rpc_port: u16,
-) -> serde_json::Value {
+pub fn build_rpc_request(method: &str, params: &[String], _rpc_port: u16) -> serde_json::Value {
     let params_json: serde_json::Value = if params.is_empty() {
         serde_json::Value::Array(vec![])
     } else {
         let parsed: Vec<serde_json::Value> = params
             .iter()
-            .map(|p| {
-                serde_json::from_str(p)
-                    .unwrap_or(serde_json::Value::String(p.clone()))
-            })
+            .map(|p| serde_json::from_str(p).unwrap_or(serde_json::Value::String(p.clone())))
             .collect();
         serde_json::Value::Array(parsed)
     };
@@ -399,19 +950,32 @@ pub fn build_rpc_request(
         "id": 1,
     });
 
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "result": null,
-        "error": {
-            "code": -32600,
-            "message": "RPC client not yet connected",
-            "data": {
-                "request": request,
-                "target": format!("127.0.0.1:{}", rpc_port),
-            }
+    request
+}
+
+/// Call the node's newline-delimited TCP JSON-RPC server.
+pub async fn call_rpc(
+    method: &str,
+    params: &[String],
+    rpc_port: u16,
+) -> eyre::Result<serde_json::Value> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+    let request = build_rpc_request(method, params, rpc_port);
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", rpc_port)).await?;
+        let mut bytes = serde_json::to_vec(&request)?;
+        bytes.push(b'\n');
+        stream.write_all(&bytes).await?;
+        let mut reader = tokio::io::BufReader::new(stream.take(8 * 1024 * 1024));
+        let mut line = String::new();
+        reader.read_line(&mut line).await?;
+        if !line.ends_with('\n') {
+            eyre::bail!("RPC response closed or exceeded size limit");
         }
+        Ok::<_, eyre::Report>(serde_json::from_str(&line)?)
     })
+    .await
+    .map_err(|_| eyre::eyre!("RPC request timed out"))?
 }
 
 // ---------------------------------------------------------------------------
@@ -516,12 +1080,8 @@ pub fn parse_opcode_or_data(input: &str) -> Option<ScriptItem> {
             "OP_CHECKMULTISIG" => Some(Opcode::OP_CHECKMULTISIG),
             "OP_CHECKMULTISIGVERIFY" => Some(Opcode::OP_CHECKMULTISIGVERIFY),
             "OP_NOP1" => Some(Opcode::OP_NOP1),
-            "OP_CHECKLOCKTIMEVERIFY" | "OP_CLTV" => {
-                Some(Opcode::OP_CHECKLOCKTIMEVERIFY)
-            }
-            "OP_CHECKSEQUENCEVERIFY" | "OP_CSV" => {
-                Some(Opcode::OP_CHECKSEQUENCEVERIFY)
-            }
+            "OP_CHECKLOCKTIMEVERIFY" | "OP_CLTV" => Some(Opcode::OP_CHECKLOCKTIMEVERIFY),
+            "OP_CHECKSEQUENCEVERIFY" | "OP_CSV" => Some(Opcode::OP_CHECKSEQUENCEVERIFY),
             "OP_NOP4" => Some(Opcode::OP_NOP4),
             "OP_NOP5" => Some(Opcode::OP_NOP5),
             "OP_NOP6" => Some(Opcode::OP_NOP6),
@@ -566,11 +1126,11 @@ pub fn format_stack_to_string(stack: &[Vec<u8>]) -> String {
             if !item.is_empty() && (item.last().unwrap() & 0x80) != 0 {
                 val = -(val & !(0x80i64 << ((item.len() - 1) * 8)));
             }
-            format!(" ({})", val)
+            format!(" ({val})")
         } else {
             String::new()
         };
-        lines.push(format!("  [{}] {}{}", i, hex_str, int_repr));
+        lines.push(format!("  [{i}] {hex_str}{int_repr}"));
     }
     lines.join("\n")
 }
@@ -587,9 +1147,277 @@ mod tests {
     use btc_primitives::script::ScriptBuf;
     use btc_primitives::transaction::{OutPoint, TxIn, TxOut};
 
+    #[test]
+    fn signer_key_file_scope_bounds_and_secret_diagnostics() {
+        use std::io::{Seek, Write};
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../primitives/tests/data/ecdsa-signer.json"
+        ))
+        .unwrap();
+        let vector = &fixture["vectors"][0];
+        let psbt = vector["psbt"].as_str().unwrap();
+        let secret = vector["wifs"][0].as_str().unwrap();
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "{secret}").unwrap();
+        let signed = sign_psbt(psbt, file.path(), 1000, Network::Mainnet).unwrap();
+        assert!(!signed.to_string().contains(secret));
+        assert_eq!(signed["signing_scope"], "ecdsa_sighash_all_partial_signing");
+        assert_eq!(signed["signatures_added"], 1);
+        assert_eq!(signed["signatures_verified"], true);
+        for field in [
+            "spending_conditions_verified",
+            "final_fields_verified",
+            "key_origins_verified",
+            "change_outputs_verified",
+            "active_chain_verified",
+        ] {
+            assert_eq!(signed[field], false);
+        }
+        assert_eq!(signed["txid_linked_prevouts"], serde_json::json!([true]));
+        assert!(sign_psbt(psbt, file.path(), 999, Network::Mainnet).is_err());
+        assert!(sign_psbt(psbt, file.path(), 1000, Network::Regtest).is_err());
+        for bad in [
+            format!("{secret}\n{secret}"),
+            format!("{secret}/0"),
+            format!("[bad]{secret}"),
+            "".to_owned(),
+            "\u{ffff}".to_owned(),
+        ] {
+            file.as_file().set_len(0).unwrap();
+            file.rewind().unwrap();
+            write!(file, "{bad}").unwrap();
+            let error = sign_psbt(psbt, file.path(), 1000, Network::Mainnet).unwrap_err();
+            assert!(!format!("{error:?}").contains(secret));
+        }
+        file.as_file().set_len(65_537).unwrap();
+        assert!(sign_psbt(psbt, file.path(), 1000, Network::Mainnet)
+            .unwrap_err()
+            .to_string()
+            .contains("size limit"));
+        #[cfg(unix)]
+        assert!(sign_psbt(
+            psbt,
+            std::path::Path::new("/dev/null"),
+            1000,
+            Network::Mainnet
+        )
+        .is_err());
+    }
+
     // -----------------------------------------------------------------------
     // parse_network
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn private_descriptor_file_returns_public_data_and_redacts_parser_errors() {
+        use btc_primitives::descriptor::MAX_DESCRIPTOR_SIZE;
+        use std::io::{Seek, Write};
+        let secret = "L4rK1yDtCWekvXuE6oXD9jCYfFNV2cWRpVuPLBcCU2z8TrisoyY1";
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "tr({secret},{{pk({secret}),multi_a(1,{secret})}})").unwrap();
+        let output = derive_private_descriptor(file.path(), None, Network::Mainnet).unwrap();
+        let text = output.to_string();
+        assert!(!text.contains(secret));
+        assert_eq!(output["expansion_scope"], "private_descriptor_scripts");
+        assert_eq!(output["descriptor_is_fixed"], true);
+        assert_eq!(output["key_origins_preserved"], false);
+        for field in [
+            "key_origins_verified",
+            "wallet_ownership_verified",
+            "signatures_verified",
+            "active_chain_verified",
+        ] {
+            assert_eq!(output[field], false);
+        }
+        assert_eq!(
+            derive_descriptor(
+                output["descriptor"].as_str().unwrap(),
+                None,
+                Network::Mainnet
+            )
+            .unwrap()["script_pubkey"],
+            output["script_pubkey"]
+        );
+        for bad in [
+            format!("{secret}(a)"),
+            format!("multi({secret},{secret})"),
+            format!("pk({secret})#{secret}"),
+            format!("pk({secret}){secret}"),
+            format!("tr({secret},{secret}(a))"),
+            format!("pk([123]{secret})"),
+        ] {
+            file.as_file().set_len(0).unwrap();
+            file.rewind().unwrap();
+            write!(file, "{bad}").unwrap();
+            let error = derive_private_descriptor(file.path(), None, Network::Mainnet).unwrap_err();
+            assert!(!format!("{error:?}").contains(secret));
+        }
+        file.as_file()
+            .set_len((MAX_DESCRIPTOR_SIZE + 1) as u64)
+            .unwrap();
+        assert!(
+            derive_private_descriptor(file.path(), None, Network::Mainnet)
+                .unwrap_err()
+                .to_string()
+                .contains("size limit")
+        );
+        #[cfg(unix)]
+        assert!(derive_private_descriptor(
+            std::path::Path::new("/dev/null"),
+            None,
+            Network::Mainnet
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn binary_psbt_files_support_large_wallet_inputs_with_read_bounds() {
+        use std::io::{Seek, Write};
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../primitives/tests/data/taproot-thresholds.json"
+        ))
+        .unwrap();
+        let vector = fixture["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == "two-of-999")
+            .unwrap();
+        let raw = vector["partial_psbt"].as_str().unwrap();
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&hex::decode(raw).unwrap()).unwrap();
+        let argument = format!("@{}", file.path().display());
+        assert_eq!(decode_psbt(&argument).unwrap(), decode_psbt(raw).unwrap());
+        assert_eq!(
+            verify_psbt_partials(&argument).unwrap()["signatures_checked"],
+            3
+        );
+        assert_eq!(
+            convert_psbt(&argument, 2).unwrap(),
+            convert_psbt(raw, 2).unwrap()
+        );
+        let finalized = finalize_psbt(&argument).unwrap();
+        assert_eq!(finalized["signatures_checked"], 2);
+        let bytes = hex::decode(finalized["psbt_hex"].as_str().unwrap()).unwrap();
+        file.as_file_mut().set_len(0).unwrap();
+        file.as_file_mut().rewind().unwrap();
+        file.write_all(&bytes).unwrap();
+        assert_eq!(
+            extract_psbt(&argument).unwrap()["tx_hex"],
+            finalized["tx_hex"]
+        );
+        assert_eq!(
+            verify_psbt(&argument).unwrap()["tx_hex"],
+            finalized["tx_hex"]
+        );
+        file.as_file_mut()
+            .set_len(btc_primitives::psbt::MAX_PSBT_SIZE as u64 + 1)
+            .unwrap();
+        assert!(decode_psbt(&argument)
+            .unwrap_err()
+            .to_string()
+            .contains("size limit"));
+        assert!(decode_psbt("@").is_err());
+        #[cfg(unix)]
+        assert!(decode_psbt("@/dev/null").is_err());
+    }
+
+    #[test]
+    fn psbt_cli_inspects_and_converts_published_vector() {
+        let fixtures: serde_json::Value =
+            serde_json::from_str(include_str!("../../primitives/tests/data/bip370.json")).unwrap();
+        let vector = fixtures["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["status"] == "valid")
+            .unwrap();
+        let original = vector["hex"].as_str().unwrap();
+        let decoded = decode_psbt(original).unwrap();
+        assert_eq!(decoded["psbt_version"], 2);
+        assert_eq!(decoded["inputs"].as_array().unwrap().len(), 1);
+        assert_eq!(decoded["outputs"].as_array().unwrap().len(), 2);
+        assert_eq!(decoded["signatures_verified"], false);
+        let converted = convert_psbt(original, 0).unwrap();
+        assert_eq!(converted["construction_fields_collapsed"], true);
+        let v0 = decode_psbt(converted["psbt_hex"].as_str().unwrap()).unwrap();
+        assert_eq!(decoded["unsigned_tx_hex"], v0["unsigned_tx_hex"]);
+        assert_eq!(v0["psbt_version"], 0);
+        assert!(convert_psbt(original, 1).is_err());
+        assert!(decode_psbt("70736274ff010000").is_err());
+    }
+
+    #[test]
+    fn psbt_cli_reports_published_taproot_structures() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../primitives/tests/data/bip371.json")).unwrap();
+        let vectors = fixture["vectors"].as_array().unwrap();
+        let vector = vectors
+            .iter()
+            .find(|v| {
+                v["case"]
+                    .as_str()
+                    .unwrap()
+                    .contains("script path only output")
+            })
+            .unwrap();
+        let raw = vector["hex"].as_str().unwrap();
+        let before = decode_psbt(raw).unwrap();
+        let output = &before["outputs"][0];
+        assert_eq!(output["tap_tree"].as_array().unwrap().len(), 3);
+        assert_eq!(output["tap_tree"][0]["depth"], 2);
+        assert_eq!(output["tap_tree"][2]["depth"], 1);
+        assert_eq!(output["tap_bip32_derivation"].as_array().unwrap().len(), 4);
+        assert_eq!(
+            output["tap_bip32_derivation"][0]["leaf_hashes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(before["signatures_verified"], false);
+        let converted = convert_psbt(raw, 2).unwrap();
+        let after = decode_psbt(converted["psbt_hex"].as_str().unwrap()).unwrap();
+        assert_eq!(before["outputs"], after["outputs"]);
+        let invalid = vectors
+            .iter()
+            .find(|v| {
+                v["case"]
+                    .as_str()
+                    .unwrap()
+                    .contains("PSBT_IN_TAP_LEAF_SCRIPT")
+            })
+            .unwrap();
+        assert!(decode_psbt(invalid["hex"].as_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn psbt_cli_resolves_linked_prevouts_and_rejects_script_substitutions() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../primitives/tests/data/bip174-utxo.json"))
+                .unwrap();
+        let cases = fixture["vectors"].as_array().unwrap();
+        let first = cases[0]["hex"].as_str().unwrap();
+        let decoded = decode_psbt(first).unwrap();
+        assert_eq!(decoded["inputs"][0]["utxo"]["source"], "non_witness_utxo");
+        assert_eq!(decoded["inputs"][0]["utxo"]["txid_linked"], true);
+        assert_eq!(
+            decoded["inputs"][0]["utxo"]["script_pubkey"]
+                .as_str()
+                .unwrap()
+                .len(),
+            50
+        );
+        for case in cases
+            .iter()
+            .filter(|case| case["status"] == "script_mismatch")
+        {
+            let raw = case["hex"].as_str().unwrap();
+            assert!(decode_psbt(raw).is_err());
+            assert!(convert_psbt(raw, 2).is_err());
+            assert!(extract_psbt(raw).is_err());
+        }
+    }
 
     #[test]
     fn test_parse_network_mainnet() {
@@ -842,7 +1670,10 @@ mod tests {
         assert!(result["weight"].as_u64().unwrap() > 0);
         assert!(result["vsize"].as_u64().unwrap() > 0);
         assert_eq!(result["is_coinbase"], false);
-        assert_eq!(result["simulation"]["valid"], "indeterminate (dry-run without UTXO set)");
+        assert_eq!(
+            result["simulation"]["valid"],
+            "indeterminate (dry-run without UTXO set)"
+        );
     }
 
     #[test]
@@ -862,7 +1693,7 @@ mod tests {
     #[test]
     fn test_compile_policy_after() {
         let result = compile_policy("after(100)").unwrap();
-        assert!(result["script_hex"].as_str().unwrap().len() > 0);
+        assert!(!result["script_hex"].as_str().unwrap().is_empty());
         assert!(result["script_size"].as_u64().unwrap() > 0);
         assert_eq!(result["policy"], "after(100)");
     }
@@ -879,8 +1710,10 @@ mod tests {
     #[test]
     fn test_watch_address_bech32() {
         // A valid regtest bech32 address
-        let result =
-            watch_address("bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080", Network::Regtest);
+        let result = watch_address(
+            "bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
+            Network::Regtest,
+        );
         assert!(result.is_ok());
         let info = result.unwrap();
         assert_eq!(info["type"], "p2wpkh");
@@ -987,46 +1820,27 @@ mod tests {
         let result = build_rpc_request("getblockcount", &[], 8332);
         assert_eq!(result["jsonrpc"], "2.0");
         assert_eq!(result["id"], 1);
-        assert!(result["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("not yet connected"));
-        let req = &result["error"]["data"]["request"];
+        let req = &result;
         assert_eq!(req["method"], "getblockcount");
         assert_eq!(req["params"], serde_json::json!([]));
     }
 
     #[test]
     fn test_build_rpc_request_with_params() {
-        let result = build_rpc_request(
-            "getblockhash",
-            &["100".to_string()],
-            18332,
-        );
-        let req = &result["error"]["data"]["request"];
+        let result = build_rpc_request("getblockhash", &["100".to_string()], 18332);
+        let req = &result;
         assert_eq!(req["method"], "getblockhash");
         // "100" should parse as a JSON number
         assert_eq!(req["params"][0], 100);
-        assert_eq!(
-            result["error"]["data"]["target"],
-            "127.0.0.1:18332"
-        );
     }
 
     #[test]
     fn test_build_rpc_request_with_string_params() {
-        let result = build_rpc_request(
-            "getblock",
-            &["00000000000000001111".to_string()],
-            8332,
-        );
-        let req = &result["error"]["data"]["request"];
+        let result = build_rpc_request("getblock", &["00000000000000001111".to_string()], 8332);
+        let req = &result;
         assert_eq!(req["method"], "getblock");
         // Non-JSON string stays as string
-        assert_eq!(
-            req["params"][0],
-            "00000000000000001111"
-        );
+        assert_eq!(req["params"][0], "00000000000000001111");
     }
 
     // -----------------------------------------------------------------------
@@ -1099,12 +1913,13 @@ mod tests {
 
     #[test]
     fn test_parse_opcode_all_nops() {
-        for name in &["OP_NOP", "OP_NOP1", "OP_NOP4", "OP_NOP5", "OP_NOP6",
-                       "OP_NOP7", "OP_NOP8", "OP_NOP9", "OP_NOP10"] {
+        for name in &[
+            "OP_NOP", "OP_NOP1", "OP_NOP4", "OP_NOP5", "OP_NOP6", "OP_NOP7", "OP_NOP8", "OP_NOP9",
+            "OP_NOP10",
+        ] {
             assert!(
                 matches!(parse_opcode_or_data(name), Some(ScriptItem::Op(_))),
-                "failed to parse {}",
-                name
+                "failed to parse {name}"
             );
         }
     }
@@ -1112,14 +1927,20 @@ mod tests {
     #[test]
     fn test_parse_opcode_crypto_ops() {
         for name in &[
-            "OP_RIPEMD160", "OP_SHA1", "OP_SHA256", "OP_HASH160", "OP_HASH256",
-            "OP_CHECKSIG", "OP_CHECKSIGVERIFY", "OP_CHECKMULTISIG",
-            "OP_CHECKMULTISIGVERIFY", "OP_CHECKSIGADD",
+            "OP_RIPEMD160",
+            "OP_SHA1",
+            "OP_SHA256",
+            "OP_HASH160",
+            "OP_HASH256",
+            "OP_CHECKSIG",
+            "OP_CHECKSIGVERIFY",
+            "OP_CHECKMULTISIG",
+            "OP_CHECKMULTISIGVERIFY",
+            "OP_CHECKSIGADD",
         ] {
             assert!(
                 matches!(parse_opcode_or_data(name), Some(ScriptItem::Op(_))),
-                "failed to parse {}",
-                name
+                "failed to parse {name}"
             );
         }
     }
@@ -1127,15 +1948,28 @@ mod tests {
     #[test]
     fn test_parse_opcode_stack_ops() {
         for name in &[
-            "OP_TOALTSTACK", "OP_FROMALTSTACK", "OP_2DROP", "OP_2DUP",
-            "OP_3DUP", "OP_2OVER", "OP_2ROT", "OP_2SWAP", "OP_IFDUP",
-            "OP_DEPTH", "OP_DROP", "OP_NIP", "OP_OVER", "OP_PICK",
-            "OP_ROLL", "OP_ROT", "OP_SWAP", "OP_TUCK",
+            "OP_TOALTSTACK",
+            "OP_FROMALTSTACK",
+            "OP_2DROP",
+            "OP_2DUP",
+            "OP_3DUP",
+            "OP_2OVER",
+            "OP_2ROT",
+            "OP_2SWAP",
+            "OP_IFDUP",
+            "OP_DEPTH",
+            "OP_DROP",
+            "OP_NIP",
+            "OP_OVER",
+            "OP_PICK",
+            "OP_ROLL",
+            "OP_ROT",
+            "OP_SWAP",
+            "OP_TUCK",
         ] {
             assert!(
                 matches!(parse_opcode_or_data(name), Some(ScriptItem::Op(_))),
-                "failed to parse {}",
-                name
+                "failed to parse {name}"
             );
         }
     }
@@ -1143,27 +1977,47 @@ mod tests {
     #[test]
     fn test_parse_opcode_arithmetic_ops() {
         for name in &[
-            "OP_1ADD", "OP_1SUB", "OP_NEGATE", "OP_ABS", "OP_NOT",
-            "OP_0NOTEQUAL", "OP_ADD", "OP_SUB", "OP_BOOLAND", "OP_BOOLOR",
-            "OP_NUMEQUAL", "OP_NUMEQUALVERIFY", "OP_NUMNOTEQUAL",
-            "OP_LESSTHAN", "OP_GREATERTHAN", "OP_LESSTHANOREQUAL",
-            "OP_GREATERTHANOREQUAL", "OP_MIN", "OP_MAX", "OP_WITHIN",
+            "OP_1ADD",
+            "OP_1SUB",
+            "OP_NEGATE",
+            "OP_ABS",
+            "OP_NOT",
+            "OP_0NOTEQUAL",
+            "OP_ADD",
+            "OP_SUB",
+            "OP_BOOLAND",
+            "OP_BOOLOR",
+            "OP_NUMEQUAL",
+            "OP_NUMEQUALVERIFY",
+            "OP_NUMNOTEQUAL",
+            "OP_LESSTHAN",
+            "OP_GREATERTHAN",
+            "OP_LESSTHANOREQUAL",
+            "OP_GREATERTHANOREQUAL",
+            "OP_MIN",
+            "OP_MAX",
+            "OP_WITHIN",
         ] {
             assert!(
                 matches!(parse_opcode_or_data(name), Some(ScriptItem::Op(_))),
-                "failed to parse {}",
-                name
+                "failed to parse {name}"
             );
         }
     }
 
     #[test]
     fn test_parse_opcode_control_flow() {
-        for name in &["OP_IF", "OP_NOTIF", "OP_ELSE", "OP_ENDIF", "OP_VERIFY", "OP_RETURN"] {
+        for name in &[
+            "OP_IF",
+            "OP_NOTIF",
+            "OP_ELSE",
+            "OP_ENDIF",
+            "OP_VERIFY",
+            "OP_RETURN",
+        ] {
             assert!(
                 matches!(parse_opcode_or_data(name), Some(ScriptItem::Op(_))),
-                "failed to parse {}",
-                name
+                "failed to parse {name}"
             );
         }
     }
@@ -1173,8 +2027,7 @@ mod tests {
         for name in &["OP_SIZE", "OP_EQUAL", "OP_EQUALVERIFY"] {
             assert!(
                 matches!(parse_opcode_or_data(name), Some(ScriptItem::Op(_))),
-                "failed to parse {}",
-                name
+                "failed to parse {name}"
             );
         }
     }
@@ -1404,19 +2257,15 @@ mod tests {
             &[r#"{"hex":"abc"}"#.to_string()],
             8332,
         );
-        let req = &result["error"]["data"]["request"];
+        let req = &result;
         // JSON string params should be parsed as JSON objects
         assert_eq!(req["params"][0]["hex"], "abc");
     }
 
     #[test]
     fn test_build_rpc_request_multiple_params() {
-        let result = build_rpc_request(
-            "getblock",
-            &["abc123".to_string(), "2".to_string()],
-            8332,
-        );
-        let req = &result["error"]["data"]["request"];
+        let result = build_rpc_request("getblock", &["abc123".to_string(), "2".to_string()], 8332);
+        let req = &result;
         assert_eq!(req["params"].as_array().unwrap().len(), 2);
     }
 
@@ -1471,11 +2320,10 @@ mod tests {
     #[test]
     fn test_parse_opcode_numbers_2_through_16() {
         for n in 2..=16 {
-            let name = format!("OP_{}", n);
+            let name = format!("OP_{n}");
             assert!(
                 matches!(parse_opcode_or_data(&name), Some(ScriptItem::Op(_))),
-                "failed to parse {}",
-                name
+                "failed to parse {name}"
             );
         }
     }
@@ -1704,8 +2552,7 @@ mod tests {
         // Build a P2WSH address manually (witness version 0, 32-byte program)
         let witness_program = [0u8; 32];
         let addr_str =
-            btc_primitives::bech32::encode_witness_address("bcrt", 0, &witness_program)
-                .unwrap();
+            btc_primitives::bech32::encode_witness_address("bcrt", 0, &witness_program).unwrap();
         let result = watch_address(&addr_str, Network::Regtest);
         assert!(result.is_ok());
         let info = result.unwrap();
@@ -1717,8 +2564,7 @@ mod tests {
         // Build a P2TR address: witness version 1, 32 byte program
         let witness_program = [0x01u8; 32];
         let addr_str =
-            btc_primitives::bech32::encode_witness_address("bcrt", 1, &witness_program)
-                .unwrap();
+            btc_primitives::bech32::encode_witness_address("bcrt", 1, &witness_program).unwrap();
         let result = watch_address(&addr_str, Network::Regtest);
         assert!(result.is_ok());
         let info = result.unwrap();
@@ -1729,9 +2575,9 @@ mod tests {
     fn test_compile_policy_pk() {
         // A simple pk() policy
         let key_hex = "02".to_string() + &"ab".repeat(32);
-        let policy = format!("pk({})", key_hex);
+        let policy = format!("pk({key_hex})");
         let result = compile_policy(&policy).unwrap();
-        assert!(result["script_hex"].as_str().unwrap().len() > 0);
+        assert!(!result["script_hex"].as_str().unwrap().is_empty());
         assert!(result["asm"].as_str().unwrap().contains("OP_CHECKSIG"));
     }
 }

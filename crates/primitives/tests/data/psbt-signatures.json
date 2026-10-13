@@ -1,0 +1,702 @@
+{
+  "sources": [
+    {
+      "url": "https://raw.githubusercontent.com/bitcoin/bitcoin/v29.0/src/test/data/script_tests.json",
+      "sha256": "195d1ae4c1701ffa4e4b0ac14ba2b451da0e73fb22292656cd0f2196a78010db",
+      "license": "MIT"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/bitcoin/bips/master/bip-0340/test-vectors.csv",
+      "sha256": "34c9d1d9c3a88d524bc80778540dc43f8306ec249a7485293063c376db851c2d",
+      "license": "BSD-2-Clause"
+    }
+  ],
+  "scope": "Core single-push DER/STRICTENC/LOW_S regressions with source error results and independent numeric scalar/type classification, plus all 19 BIP340 signature bodies. Encoding validity is not equation verification; wrong-key/message/equation cases intentionally remain representable when their numeric encoding is valid. Independently serialized PSBT wrappers have test-only unsigned envelopes, fixed curve-valid keys, no UTXOs and no spendability claim.",
+  "ecdsa": [
+    {
+      "source_row": 1004,
+      "case": "Overly long signature is incorrectly encoded for DERSIG",
+      "signature": "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "core_script_error": "SIG_DER",
+      "der_valid": false,
+      "scalar_valid": false,
+      "sighash_type": 0,
+      "encoding_valid": false
+    },
+    {
+      "source_row": 1005,
+      "case": "Missing S is incorrectly encoded for DERSIG",
+      "signature": "30220220000000000000000000000000000000000000000000000000000000000000000000",
+      "core_script_error": "SIG_DER",
+      "der_valid": false,
+      "scalar_valid": false,
+      "sighash_type": 0,
+      "encoding_valid": false
+    },
+    {
+      "source_row": 1006,
+      "case": "S with invalid S length is incorrectly encoded for DERSIG",
+      "signature": "3024021077777777777777777777777777777777020a7777777777777777777777777777777701",
+      "core_script_error": "SIG_DER",
+      "der_valid": false,
+      "scalar_valid": false,
+      "sighash_type": 1,
+      "encoding_valid": false
+    },
+    {
+      "source_row": 1007,
+      "case": "Non-integer R is incorrectly encoded for DERSIG",
+      "signature": "302403107777777777777777777777777777777702107777777777777777777777777777777701",
+      "core_script_error": "SIG_DER",
+      "der_valid": false,
+      "scalar_valid": false,
+      "sighash_type": 1,
+      "encoding_valid": false
+    },
+    {
+      "source_row": 1008,
+      "case": "Non-integer S is incorrectly encoded for DERSIG",
+      "signature": "302402107777777777777777777777777777777703107777777777777777777777777777777701",
+      "core_script_error": "SIG_DER",
+      "der_valid": false,
+      "scalar_valid": false,
+      "sighash_type": 1,
+      "encoding_valid": false
+    },
+    {
+      "source_row": 1009,
+      "case": "Zero-length R is incorrectly encoded for DERSIG",
+      "signature": "3014020002107777777777777777777777777777777701",
+      "core_script_error": "SIG_DER",
+      "der_valid": false,
+      "scalar_valid": false,
+      "sighash_type": 1,
+      "encoding_valid": false
+    },
+    {
+      "source_row": 1010,
+      "case": "Zero-length S is incorrectly encoded for DERSIG",
+      "signature": "3014021077777777777777777777777777777777020001",
+      "core_script_error": "SIG_DER",
+      "der_valid": false,
+      "scalar_valid": false,
+      "sighash_type": 1,
+      "encoding_valid": false
+    },
+    {
+      "source_row": 1011,
+      "case": "Negative S is incorrectly encoded for DERSIG",
+      "signature": "302402107777777777777777777777777777777702108777777777777777777777777777777701",
+      "core_script_error": "SIG_DER",
+      "der_valid": false,
+      "scalar_valid": false,
+      "sighash_type": 1,
+      "encoding_valid": false
+    },
+    {
+      "source_row": 1038,
+      "case": "P2PK with too much R padding",
+      "signature": "304402200060558477337b9022e70534f1fea71a318caf836812465a2509931c5e7c4987022078ec32bd50ac9e03a349ba953dfd9fe1c8d2dd8bdb1d38ddca844d3d5c78c11801",
+      "core_script_error": "SIG_DER",
+      "der_valid": false,
+      "scalar_valid": false,
+      "sighash_type": 1,
+      "encoding_valid": false
+    },
+    {
+      "source_row": 1040,
+      "case": "P2PK with too much S padding",
+      "signature": "304502202de8c03fc525285c9c535631019a5f2af7c6454fa9eb392a3756a4917c420edd02210046130bf2baf7cfc065067c8b9e33a066d9c15edcea9feb0ca2d233e3597925b401",
+      "core_script_error": "SIG_DER",
+      "der_valid": false,
+      "scalar_valid": false,
+      "sighash_type": 1,
+      "encoding_valid": false
+    },
+    {
+      "source_row": 1042,
+      "case": "P2PK with too little R padding",
+      "signature": "30440220d7a0417c3f6d1a15094d1cf2a3378ca0503eb8a57630953a9e2987e21ddd0a6502207a6266d686c99090920249991d3d42065b6d43eb70187b219c0db82e4f94d1a201",
+      "core_script_error": "SIG_DER",
+      "der_valid": false,
+      "scalar_valid": false,
+      "sighash_type": 1,
+      "encoding_valid": false
+    },
+    {
+      "source_row": 1044,
+      "case": "P2PK NOT with bad sig with too much R padding",
+      "signature": "30440220005ece1335e7f757a1a1f476a7fb5bd90964e8a022489f890614a04acfb734c002206c12b8294a6513c7710e8c82d3c23d75cdbfe83200eb7efb495701958501a5d601",
+      "core_script_error": "SIG_DER",
+      "der_valid": false,
+      "scalar_valid": false,
+      "sighash_type": 1,
+      "encoding_valid": false
+    },
+    {
+      "source_row": 1046,
+      "case": "P2PK NOT with too much R padding",
+      "signature": "30440220005ece1335e7f657a1a1f476a7fb5bd90964e8a022489f890614a04acfb734c002206c12b8294a6513c7710e8c82d3c23d75cdbfe83200eb7efb495701958501a5d601",
+      "core_script_error": "SIG_DER",
+      "der_valid": false,
+      "scalar_valid": false,
+      "sighash_type": 1,
+      "encoding_valid": false
+    },
+    {
+      "source_row": 1048,
+      "case": "BIP66 example 1, with DERSIG",
+      "signature": "30440220d7a0417c3f6d1a15094d1cf2a3378ca0503eb8a57630953a9e2987e21ddd0a6502207a6266d686c99090920249991d3d42065b6d43eb70187b219c0db82e4f94d1a201",
+      "core_script_error": "SIG_DER",
+      "der_valid": false,
+      "scalar_valid": false,
+      "sighash_type": 1,
+      "encoding_valid": false
+    },
+    {
+      "source_row": 1050,
+      "case": "BIP66 example 2, with DERSIG",
+      "signature": "304402208e43c0b91f7c1e5bc58e41c8185f8a6086e111b0090187968a86f2822462d3c902200a58f4076b1133b18ff1dc83ee51676e44c60cc608d9534e0df5ace0424fc0be01",
+      "core_script_error": "SIG_DER",
+      "der_valid": false,
+      "scalar_valid": false,
+      "sighash_type": 1,
+      "encoding_valid": false
+    },
+    {
+      "source_row": 1055,
+      "case": "BIP66 example 4, with DERSIG, non-null DER-compliant signature",
+      "signature": "300602010102010101",
+      "core_script_error": "OK",
+      "der_valid": true,
+      "scalar_valid": true,
+      "sighash_type": 1,
+      "encoding_valid": true
+    },
+    {
+      "source_row": 1075,
+      "case": "P2PK with multi-byte hashtype, with DERSIG",
+      "signature": "304402203e4516da7253cf068effec6b95c41221c0cf3a8e6ccb8cbf1725b562e9afde2c022054e1c258c2981cdfba5df1f46661fb6541c44f77ca0092f3600331abfffb12510101",
+      "core_script_error": "SIG_DER",
+      "der_valid": false,
+      "scalar_valid": false,
+      "sighash_type": 1,
+      "encoding_valid": false
+    },
+    {
+      "source_row": 1077,
+      "case": "P2PK with high S",
+      "signature": "304502203e4516da7253cf068effec6b95c41221c0cf3a8e6ccb8cbf1725b562e9afde2c022100ab1e3da73d67e32045a20e0b999e049978ea8d6ee5480d485fcf2ce0d03b2ef001",
+      "core_script_error": "SIG_HIGH_S",
+      "der_valid": true,
+      "scalar_valid": true,
+      "sighash_type": 1,
+      "encoding_valid": true
+    },
+    {
+      "source_row": 1088,
+      "case": "P2PK with undefined hashtype",
+      "signature": "304402206177d513ec2cda444c021a1f4f656fc4c72ba108ae063e157eb86dc3575784940220666fc66702815d0e5413bb9b1df22aed44f5f1efb8b99d41dd5dc9a5be6d205205",
+      "core_script_error": "SIG_HASHTYPE",
+      "der_valid": true,
+      "scalar_valid": true,
+      "sighash_type": 5,
+      "encoding_valid": false
+    },
+    {
+      "source_row": 1090,
+      "case": "P2PK NOT with invalid sig and undefined hashtype",
+      "signature": "304402207409b5b320296e5e2136a7b281a7f803028ca4ca44e2b83eebd46932677725de02202d4eea1c8d3c98e6f42614f54764e6e5e6542e213eb4d079737e9a8b6e9812ec05",
+      "core_script_error": "SIG_HASHTYPE",
+      "der_valid": true,
+      "scalar_valid": true,
+      "sighash_type": 5,
+      "encoding_valid": false
+    }
+  ],
+  "schnorr": [
+    {
+      "index": 0,
+      "case": "",
+      "signature": "e907831f80848d1069a5371b402410364bdf1c5f8307b0084c55f1ce2dca821525f66a4a85ea8b71e482a74f382d2ce5ebeee8fdb2172f477df4900d310536c0",
+      "verification_result": true,
+      "encoding_valid": true
+    },
+    {
+      "index": 1,
+      "case": "",
+      "signature": "6896bd60eeae296db48a229ff71dfe071bde413e6d43f917dc8dcf8c78de33418906d11ac976abccb20b091292bff4ea897efcb639ea871cfa95f6de339e4b0a",
+      "verification_result": true,
+      "encoding_valid": true
+    },
+    {
+      "index": 2,
+      "case": "",
+      "signature": "5831aaeed7b44bb74e5eab94ba9d4294c49bcf2a60728d8b4c200f50dd313c1bab745879a5ad954a72c45a91c3a51d3c7adea98d82f8481e0e1e03674a6f3fb7",
+      "verification_result": true,
+      "encoding_valid": true
+    },
+    {
+      "index": 3,
+      "case": "test fails if msg is reduced modulo p or n",
+      "signature": "7eb0509757e246f19449885651611cb965ecc1a187dd51b64fda1edc9637d5ec97582b9cb13db3933705b32ba982af5af25fd78881ebb32771fc5922efc66ea3",
+      "verification_result": true,
+      "encoding_valid": true
+    },
+    {
+      "index": 4,
+      "case": "",
+      "signature": "00000000000000000000003b78ce563f89a0ed9414f5aa28ad0d96d6795f9c6376afb1548af603b3eb45c9f8207dee1060cb71c04e80f593060b07d28308d7f4",
+      "verification_result": true,
+      "encoding_valid": true
+    },
+    {
+      "index": 5,
+      "case": "public key not on the curve",
+      "signature": "6cff5c3ba86c69ea4b7376f31a9bcb4f74c1976089b2d9963da2e5543e17776969e89b4c5564d00349106b8497785dd7d1d713a8ae82b32fa79d5f7fc407d39b",
+      "verification_result": false,
+      "encoding_valid": true
+    },
+    {
+      "index": 6,
+      "case": "has_even_y(R) is false",
+      "signature": "fff97bd5755eeea420453a14355235d382f6472f8568a18b2f057a14602975563cc27944640ac607cd107ae10923d9ef7a73c643e166be5ebeafa34b1ac553e2",
+      "verification_result": false,
+      "encoding_valid": true
+    },
+    {
+      "index": 7,
+      "case": "negated message",
+      "signature": "1fa62e331edbc21c394792d2ab1100a7b432b013df3f6ff4f99fcb33e0e1515f28890b3edb6e7189b630448b515ce4f8622a954cfe545735aaea5134fccdb2bd",
+      "verification_result": false,
+      "encoding_valid": true
+    },
+    {
+      "index": 8,
+      "case": "negated s value",
+      "signature": "6cff5c3ba86c69ea4b7376f31a9bcb4f74c1976089b2d9963da2e5543e177769961764b3aa9b2ffcb6ef947b6887a226e8d7c93e00c5ed0c1834ff0d0c2e6da6",
+      "verification_result": false,
+      "encoding_valid": true
+    },
+    {
+      "index": 9,
+      "case": "sG - eP is infinite. Test fails in single verification if has_even_y(inf) is defined as true and x(inf) as 0",
+      "signature": "0000000000000000000000000000000000000000000000000000000000000000123dda8328af9c23a94c1feecfd123ba4fb73476f0d594dcb65c6425bd186051",
+      "verification_result": false,
+      "encoding_valid": true
+    },
+    {
+      "index": 10,
+      "case": "sG - eP is infinite. Test fails in single verification if has_even_y(inf) is defined as true and x(inf) as 1",
+      "signature": "00000000000000000000000000000000000000000000000000000000000000017615fbaf5ae28864013c099742deadb4dba87f11ac6754f93780d5a1837cf197",
+      "verification_result": false,
+      "encoding_valid": true
+    },
+    {
+      "index": 11,
+      "case": "sig[0:32] is not an X coordinate on the curve",
+      "signature": "4a298dacae57395a15d0795ddbfd1dcb564da82b0f269bc70a74f8220429ba1d69e89b4c5564d00349106b8497785dd7d1d713a8ae82b32fa79d5f7fc407d39b",
+      "verification_result": false,
+      "encoding_valid": true
+    },
+    {
+      "index": 12,
+      "case": "sig[0:32] is equal to field size",
+      "signature": "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f69e89b4c5564d00349106b8497785dd7d1d713a8ae82b32fa79d5f7fc407d39b",
+      "verification_result": false,
+      "encoding_valid": false
+    },
+    {
+      "index": 13,
+      "case": "sig[32:64] is equal to curve order",
+      "signature": "6cff5c3ba86c69ea4b7376f31a9bcb4f74c1976089b2d9963da2e5543e177769fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141",
+      "verification_result": false,
+      "encoding_valid": false
+    },
+    {
+      "index": 14,
+      "case": "public key is not a valid X coordinate because it exceeds the field size",
+      "signature": "6cff5c3ba86c69ea4b7376f31a9bcb4f74c1976089b2d9963da2e5543e17776969e89b4c5564d00349106b8497785dd7d1d713a8ae82b32fa79d5f7fc407d39b",
+      "verification_result": false,
+      "encoding_valid": true
+    },
+    {
+      "index": 15,
+      "case": "message of size 0 (added 2022-12)",
+      "signature": "71535db165ecd9fbbc046e5ffaea61186bb6ad436732fccc25291a55895464cf6069ce26bf03466228f19a3a62db8a649f2d560fac652827d1af0574e427ab63",
+      "verification_result": true,
+      "encoding_valid": true
+    },
+    {
+      "index": 16,
+      "case": "message of size 1 (added 2022-12)",
+      "signature": "08a20a0afef64124649232e0693c583ab1b9934ae63b4c3511f3ae1134c6a303ea3173bfea6683bd101fa5aa5dbc1996fe7cacfc5a577d33ec14564cec2bacbf",
+      "verification_result": true,
+      "encoding_valid": true
+    },
+    {
+      "index": 17,
+      "case": "message of size 17 (added 2022-12)",
+      "signature": "5130f39a4059b43bc7cac09a19ece52b5d8699d1a71e3c52da9afdb6b50ac370c4a482b77bf960f8681540e25b6771ece1e5a37fd80e5a51897c5566a97ea5a5",
+      "verification_result": true,
+      "encoding_valid": true
+    },
+    {
+      "index": 18,
+      "case": "message of size 100 (added 2022-12)",
+      "signature": "403b12b0d8555a344175ea7ec746566303321e5dbfa8be6f091635163eca79a8585ed3e3170807e7c03b720fc54c7b23897fcba0e9d0b4a06894cfd249f22367",
+      "verification_result": true,
+      "encoding_valid": true
+    }
+  ],
+  "psbt_vectors": [
+    {
+      "case": "Overly long signature is incorrectly encoded for DERSIG",
+      "status": "invalid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000000022020279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817984a00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "kind": "ecdsa"
+    },
+    {
+      "case": "Missing S is incorrectly encoded for DERSIG",
+      "status": "invalid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000000022020279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179825302202200000000000000000000000000000000000000000000000000000000000000000000000",
+      "kind": "ecdsa"
+    },
+    {
+      "case": "S with invalid S length is incorrectly encoded for DERSIG",
+      "status": "invalid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000000022020279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798273024021077777777777777777777777777777777020a77777777777777777777777777777777010000",
+      "kind": "ecdsa"
+    },
+    {
+      "case": "Non-integer R is incorrectly encoded for DERSIG",
+      "status": "invalid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000000022020279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798273024031077777777777777777777777777777777021077777777777777777777777777777777010000",
+      "kind": "ecdsa"
+    },
+    {
+      "case": "Non-integer S is incorrectly encoded for DERSIG",
+      "status": "invalid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000000022020279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798273024021077777777777777777777777777777777031077777777777777777777777777777777010000",
+      "kind": "ecdsa"
+    },
+    {
+      "case": "Zero-length R is incorrectly encoded for DERSIG",
+      "status": "invalid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000000022020279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817981730140200021077777777777777777777777777777777010000",
+      "kind": "ecdsa"
+    },
+    {
+      "case": "Zero-length S is incorrectly encoded for DERSIG",
+      "status": "invalid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000000022020279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817981730140210777777777777777777777777777777770200010000",
+      "kind": "ecdsa"
+    },
+    {
+      "case": "Negative S is incorrectly encoded for DERSIG",
+      "status": "invalid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000000022020279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798273024021077777777777777777777777777777777021087777777777777777777777777777777010000",
+      "kind": "ecdsa"
+    },
+    {
+      "case": "P2PK with too much R padding",
+      "status": "invalid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000000022020279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179847304402200060558477337b9022e70534f1fea71a318caf836812465a2509931c5e7c4987022078ec32bd50ac9e03a349ba953dfd9fe1c8d2dd8bdb1d38ddca844d3d5c78c118010000",
+      "kind": "ecdsa"
+    },
+    {
+      "case": "P2PK with too much S padding",
+      "status": "invalid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000000022020279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179848304502202de8c03fc525285c9c535631019a5f2af7c6454fa9eb392a3756a4917c420edd02210046130bf2baf7cfc065067c8b9e33a066d9c15edcea9feb0ca2d233e3597925b4010000",
+      "kind": "ecdsa"
+    },
+    {
+      "case": "P2PK with too little R padding",
+      "status": "invalid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000000022020279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817984730440220d7a0417c3f6d1a15094d1cf2a3378ca0503eb8a57630953a9e2987e21ddd0a6502207a6266d686c99090920249991d3d42065b6d43eb70187b219c0db82e4f94d1a2010000",
+      "kind": "ecdsa"
+    },
+    {
+      "case": "P2PK NOT with bad sig with too much R padding",
+      "status": "invalid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000000022020279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817984730440220005ece1335e7f757a1a1f476a7fb5bd90964e8a022489f890614a04acfb734c002206c12b8294a6513c7710e8c82d3c23d75cdbfe83200eb7efb495701958501a5d6010000",
+      "kind": "ecdsa"
+    },
+    {
+      "case": "P2PK NOT with too much R padding",
+      "status": "invalid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000000022020279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817984730440220005ece1335e7f657a1a1f476a7fb5bd90964e8a022489f890614a04acfb734c002206c12b8294a6513c7710e8c82d3c23d75cdbfe83200eb7efb495701958501a5d6010000",
+      "kind": "ecdsa"
+    },
+    {
+      "case": "BIP66 example 1, with DERSIG",
+      "status": "invalid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000000022020279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817984730440220d7a0417c3f6d1a15094d1cf2a3378ca0503eb8a57630953a9e2987e21ddd0a6502207a6266d686c99090920249991d3d42065b6d43eb70187b219c0db82e4f94d1a2010000",
+      "kind": "ecdsa"
+    },
+    {
+      "case": "BIP66 example 2, with DERSIG",
+      "status": "invalid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000000022020279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179847304402208e43c0b91f7c1e5bc58e41c8185f8a6086e111b0090187968a86f2822462d3c902200a58f4076b1133b18ff1dc83ee51676e44c60cc608d9534e0df5ace0424fc0be010000",
+      "kind": "ecdsa"
+    },
+    {
+      "case": "BIP66 example 4, with DERSIG, non-null DER-compliant signature",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000000022020279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798093006020101020101010000",
+      "kind": "ecdsa"
+    },
+    {
+      "case": "P2PK with multi-byte hashtype, with DERSIG",
+      "status": "invalid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000000022020279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179848304402203e4516da7253cf068effec6b95c41221c0cf3a8e6ccb8cbf1725b562e9afde2c022054e1c258c2981cdfba5df1f46661fb6541c44f77ca0092f3600331abfffb125101010000",
+      "kind": "ecdsa"
+    },
+    {
+      "case": "P2PK with high S",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000000022020279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179848304502203e4516da7253cf068effec6b95c41221c0cf3a8e6ccb8cbf1725b562e9afde2c022100ab1e3da73d67e32045a20e0b999e049978ea8d6ee5480d485fcf2ce0d03b2ef0010000",
+      "kind": "ecdsa"
+    },
+    {
+      "case": "P2PK with undefined hashtype",
+      "status": "invalid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000000022020279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179847304402206177d513ec2cda444c021a1f4f656fc4c72ba108ae063e157eb86dc3575784940220666fc66702815d0e5413bb9b1df22aed44f5f1efb8b99d41dd5dc9a5be6d2052050000",
+      "kind": "ecdsa"
+    },
+    {
+      "case": "P2PK NOT with invalid sig and undefined hashtype",
+      "status": "invalid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000000022020279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179847304402207409b5b320296e5e2136a7b281a7f803028ca4ca44e2b83eebd46932677725de02202d4eea1c8d3c98e6f42614f54764e6e5e6542e213eb4d079737e9a8b6e9812ec050000",
+      "kind": "ecdsa"
+    },
+    {
+      "case": "BIP340 signature 0: tap_key",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c300000000000001510000000000011340e907831f80848d1069a5371b402410364bdf1c5f8307b0084c55f1ce2dca821525f66a4a85ea8b71e482a74f382d2ce5ebeee8fdb2172f477df4900d310536c00000",
+      "kind": "tap_key"
+    },
+    {
+      "case": "BIP340 signature 0: tap_script",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c300000000000001510000000000411479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798111111111111111111111111111111111111111111111111111111111111111140e907831f80848d1069a5371b402410364bdf1c5f8307b0084c55f1ce2dca821525f66a4a85ea8b71e482a74f382d2ce5ebeee8fdb2172f477df4900d310536c00000",
+      "kind": "tap_script"
+    },
+    {
+      "case": "BIP340 signature 1: tap_key",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c3000000000000015100000000000113406896bd60eeae296db48a229ff71dfe071bde413e6d43f917dc8dcf8c78de33418906d11ac976abccb20b091292bff4ea897efcb639ea871cfa95f6de339e4b0a0000",
+      "kind": "tap_key"
+    },
+    {
+      "case": "BIP340 signature 1: tap_script",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c300000000000001510000000000411479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817981111111111111111111111111111111111111111111111111111111111111111406896bd60eeae296db48a229ff71dfe071bde413e6d43f917dc8dcf8c78de33418906d11ac976abccb20b091292bff4ea897efcb639ea871cfa95f6de339e4b0a0000",
+      "kind": "tap_script"
+    },
+    {
+      "case": "BIP340 signature 2: tap_key",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c3000000000000015100000000000113405831aaeed7b44bb74e5eab94ba9d4294c49bcf2a60728d8b4c200f50dd313c1bab745879a5ad954a72c45a91c3a51d3c7adea98d82f8481e0e1e03674a6f3fb70000",
+      "kind": "tap_key"
+    },
+    {
+      "case": "BIP340 signature 2: tap_script",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c300000000000001510000000000411479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817981111111111111111111111111111111111111111111111111111111111111111405831aaeed7b44bb74e5eab94ba9d4294c49bcf2a60728d8b4c200f50dd313c1bab745879a5ad954a72c45a91c3a51d3c7adea98d82f8481e0e1e03674a6f3fb70000",
+      "kind": "tap_script"
+    },
+    {
+      "case": "BIP340 signature 3: tap_key",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c3000000000000015100000000000113407eb0509757e246f19449885651611cb965ecc1a187dd51b64fda1edc9637d5ec97582b9cb13db3933705b32ba982af5af25fd78881ebb32771fc5922efc66ea30000",
+      "kind": "tap_key"
+    },
+    {
+      "case": "BIP340 signature 3: tap_script",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c300000000000001510000000000411479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817981111111111111111111111111111111111111111111111111111111111111111407eb0509757e246f19449885651611cb965ecc1a187dd51b64fda1edc9637d5ec97582b9cb13db3933705b32ba982af5af25fd78881ebb32771fc5922efc66ea30000",
+      "kind": "tap_script"
+    },
+    {
+      "case": "BIP340 signature 4: tap_key",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000000001134000000000000000000000003b78ce563f89a0ed9414f5aa28ad0d96d6795f9c6376afb1548af603b3eb45c9f8207dee1060cb71c04e80f593060b07d28308d7f40000",
+      "kind": "tap_key"
+    },
+    {
+      "case": "BIP340 signature 4: tap_script",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c300000000000001510000000000411479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179811111111111111111111111111111111111111111111111111111111111111114000000000000000000000003b78ce563f89a0ed9414f5aa28ad0d96d6795f9c6376afb1548af603b3eb45c9f8207dee1060cb71c04e80f593060b07d28308d7f40000",
+      "kind": "tap_script"
+    },
+    {
+      "case": "BIP340 signature 5: tap_key",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c3000000000000015100000000000113406cff5c3ba86c69ea4b7376f31a9bcb4f74c1976089b2d9963da2e5543e17776969e89b4c5564d00349106b8497785dd7d1d713a8ae82b32fa79d5f7fc407d39b0000",
+      "kind": "tap_key"
+    },
+    {
+      "case": "BIP340 signature 5: tap_script",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c300000000000001510000000000411479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817981111111111111111111111111111111111111111111111111111111111111111406cff5c3ba86c69ea4b7376f31a9bcb4f74c1976089b2d9963da2e5543e17776969e89b4c5564d00349106b8497785dd7d1d713a8ae82b32fa79d5f7fc407d39b0000",
+      "kind": "tap_script"
+    },
+    {
+      "case": "BIP340 signature 6: tap_key",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c300000000000001510000000000011340fff97bd5755eeea420453a14355235d382f6472f8568a18b2f057a14602975563cc27944640ac607cd107ae10923d9ef7a73c643e166be5ebeafa34b1ac553e20000",
+      "kind": "tap_key"
+    },
+    {
+      "case": "BIP340 signature 6: tap_script",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c300000000000001510000000000411479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798111111111111111111111111111111111111111111111111111111111111111140fff97bd5755eeea420453a14355235d382f6472f8568a18b2f057a14602975563cc27944640ac607cd107ae10923d9ef7a73c643e166be5ebeafa34b1ac553e20000",
+      "kind": "tap_script"
+    },
+    {
+      "case": "BIP340 signature 7: tap_key",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c3000000000000015100000000000113401fa62e331edbc21c394792d2ab1100a7b432b013df3f6ff4f99fcb33e0e1515f28890b3edb6e7189b630448b515ce4f8622a954cfe545735aaea5134fccdb2bd0000",
+      "kind": "tap_key"
+    },
+    {
+      "case": "BIP340 signature 7: tap_script",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c300000000000001510000000000411479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817981111111111111111111111111111111111111111111111111111111111111111401fa62e331edbc21c394792d2ab1100a7b432b013df3f6ff4f99fcb33e0e1515f28890b3edb6e7189b630448b515ce4f8622a954cfe545735aaea5134fccdb2bd0000",
+      "kind": "tap_script"
+    },
+    {
+      "case": "BIP340 signature 8: tap_key",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c3000000000000015100000000000113406cff5c3ba86c69ea4b7376f31a9bcb4f74c1976089b2d9963da2e5543e177769961764b3aa9b2ffcb6ef947b6887a226e8d7c93e00c5ed0c1834ff0d0c2e6da60000",
+      "kind": "tap_key"
+    },
+    {
+      "case": "BIP340 signature 8: tap_script",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c300000000000001510000000000411479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817981111111111111111111111111111111111111111111111111111111111111111406cff5c3ba86c69ea4b7376f31a9bcb4f74c1976089b2d9963da2e5543e177769961764b3aa9b2ffcb6ef947b6887a226e8d7c93e00c5ed0c1834ff0d0c2e6da60000",
+      "kind": "tap_script"
+    },
+    {
+      "case": "BIP340 signature 9: tap_key",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c3000000000000015100000000000113400000000000000000000000000000000000000000000000000000000000000000123dda8328af9c23a94c1feecfd123ba4fb73476f0d594dcb65c6425bd1860510000",
+      "kind": "tap_key"
+    },
+    {
+      "case": "BIP340 signature 9: tap_script",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c300000000000001510000000000411479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817981111111111111111111111111111111111111111111111111111111111111111400000000000000000000000000000000000000000000000000000000000000000123dda8328af9c23a94c1feecfd123ba4fb73476f0d594dcb65c6425bd1860510000",
+      "kind": "tap_script"
+    },
+    {
+      "case": "BIP340 signature 10: tap_key",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000000001134000000000000000000000000000000000000000000000000000000000000000017615fbaf5ae28864013c099742deadb4dba87f11ac6754f93780d5a1837cf1970000",
+      "kind": "tap_key"
+    },
+    {
+      "case": "BIP340 signature 10: tap_script",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c300000000000001510000000000411479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179811111111111111111111111111111111111111111111111111111111111111114000000000000000000000000000000000000000000000000000000000000000017615fbaf5ae28864013c099742deadb4dba87f11ac6754f93780d5a1837cf1970000",
+      "kind": "tap_script"
+    },
+    {
+      "case": "BIP340 signature 11: tap_key",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c3000000000000015100000000000113404a298dacae57395a15d0795ddbfd1dcb564da82b0f269bc70a74f8220429ba1d69e89b4c5564d00349106b8497785dd7d1d713a8ae82b32fa79d5f7fc407d39b0000",
+      "kind": "tap_key"
+    },
+    {
+      "case": "BIP340 signature 11: tap_script",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c300000000000001510000000000411479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817981111111111111111111111111111111111111111111111111111111111111111404a298dacae57395a15d0795ddbfd1dcb564da82b0f269bc70a74f8220429ba1d69e89b4c5564d00349106b8497785dd7d1d713a8ae82b32fa79d5f7fc407d39b0000",
+      "kind": "tap_script"
+    },
+    {
+      "case": "BIP340 signature 12: tap_key",
+      "status": "invalid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c300000000000001510000000000011340fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f69e89b4c5564d00349106b8497785dd7d1d713a8ae82b32fa79d5f7fc407d39b0000",
+      "kind": "tap_key"
+    },
+    {
+      "case": "BIP340 signature 12: tap_script",
+      "status": "invalid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c300000000000001510000000000411479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798111111111111111111111111111111111111111111111111111111111111111140fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f69e89b4c5564d00349106b8497785dd7d1d713a8ae82b32fa79d5f7fc407d39b0000",
+      "kind": "tap_script"
+    },
+    {
+      "case": "BIP340 signature 13: tap_key",
+      "status": "invalid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c3000000000000015100000000000113406cff5c3ba86c69ea4b7376f31a9bcb4f74c1976089b2d9963da2e5543e177769fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd03641410000",
+      "kind": "tap_key"
+    },
+    {
+      "case": "BIP340 signature 13: tap_script",
+      "status": "invalid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c300000000000001510000000000411479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817981111111111111111111111111111111111111111111111111111111111111111406cff5c3ba86c69ea4b7376f31a9bcb4f74c1976089b2d9963da2e5543e177769fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd03641410000",
+      "kind": "tap_script"
+    },
+    {
+      "case": "BIP340 signature 14: tap_key",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c3000000000000015100000000000113406cff5c3ba86c69ea4b7376f31a9bcb4f74c1976089b2d9963da2e5543e17776969e89b4c5564d00349106b8497785dd7d1d713a8ae82b32fa79d5f7fc407d39b0000",
+      "kind": "tap_key"
+    },
+    {
+      "case": "BIP340 signature 14: tap_script",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c300000000000001510000000000411479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817981111111111111111111111111111111111111111111111111111111111111111406cff5c3ba86c69ea4b7376f31a9bcb4f74c1976089b2d9963da2e5543e17776969e89b4c5564d00349106b8497785dd7d1d713a8ae82b32fa79d5f7fc407d39b0000",
+      "kind": "tap_script"
+    },
+    {
+      "case": "BIP340 signature 15: tap_key",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000000001134071535db165ecd9fbbc046e5ffaea61186bb6ad436732fccc25291a55895464cf6069ce26bf03466228f19a3a62db8a649f2d560fac652827d1af0574e427ab630000",
+      "kind": "tap_key"
+    },
+    {
+      "case": "BIP340 signature 15: tap_script",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c300000000000001510000000000411479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179811111111111111111111111111111111111111111111111111111111111111114071535db165ecd9fbbc046e5ffaea61186bb6ad436732fccc25291a55895464cf6069ce26bf03466228f19a3a62db8a649f2d560fac652827d1af0574e427ab630000",
+      "kind": "tap_script"
+    },
+    {
+      "case": "BIP340 signature 16: tap_key",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c30000000000000151000000000001134008a20a0afef64124649232e0693c583ab1b9934ae63b4c3511f3ae1134c6a303ea3173bfea6683bd101fa5aa5dbc1996fe7cacfc5a577d33ec14564cec2bacbf0000",
+      "kind": "tap_key"
+    },
+    {
+      "case": "BIP340 signature 16: tap_script",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c300000000000001510000000000411479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179811111111111111111111111111111111111111111111111111111111111111114008a20a0afef64124649232e0693c583ab1b9934ae63b4c3511f3ae1134c6a303ea3173bfea6683bd101fa5aa5dbc1996fe7cacfc5a577d33ec14564cec2bacbf0000",
+      "kind": "tap_script"
+    },
+    {
+      "case": "BIP340 signature 17: tap_key",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c3000000000000015100000000000113405130f39a4059b43bc7cac09a19ece52b5d8699d1a71e3c52da9afdb6b50ac370c4a482b77bf960f8681540e25b6771ece1e5a37fd80e5a51897c5566a97ea5a50000",
+      "kind": "tap_key"
+    },
+    {
+      "case": "BIP340 signature 17: tap_script",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c300000000000001510000000000411479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f817981111111111111111111111111111111111111111111111111111111111111111405130f39a4059b43bc7cac09a19ece52b5d8699d1a71e3c52da9afdb6b50ac370c4a482b77bf960f8681540e25b6771ece1e5a37fd80e5a51897c5566a97ea5a50000",
+      "kind": "tap_script"
+    },
+    {
+      "case": "BIP340 signature 18: tap_key",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c300000000000001510000000000011340403b12b0d8555a344175ea7ec746566303321e5dbfa8be6f091635163eca79a8585ed3e3170807e7c03b720fc54c7b23897fcba0e9d0b4a06894cfd249f223670000",
+      "kind": "tap_key"
+    },
+    {
+      "case": "BIP340 signature 18: tap_script",
+      "status": "valid",
+      "hex": "70736274ff01003d0200000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0000000000ffffffff0150c300000000000001510000000000411479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798111111111111111111111111111111111111111111111111111111111111111140403b12b0d8555a344175ea7ec746566303321e5dbfa8be6f091635163eca79a8585ed3e3170807e7c03b720fc54c7b23897fcba0e9d0b4a06894cfd249f223670000",
+      "kind": "tap_script"
+    }
+  ]
+}

@@ -9,15 +9,13 @@ use tracing::{debug, info, warn};
 
 use btc_consensus::chain::ChainState;
 use btc_consensus::reorg::{self, ReorgManager, ReorgResult};
-use btc_consensus::utxo::{connect_block, InMemoryUtxoSet};
+use btc_consensus::utxo::{connect_block_with_context, InMemoryUtxoSet, LockTimeContext};
 use btc_consensus::validation::{BlockValidator, ChainParams};
-use btc_consensus::{ParallelValidator, ParallelConfig};
+use btc_consensus::{ParallelConfig, ParallelValidator};
 use btc_exex::ExExNotification;
 use btc_network::connection::{Connection, ConnectionError};
 use btc_network::discovery::PeerManager;
-use btc_network::message::{
-    GetHeadersMessage, InvItem, InvType, NetworkMessage,
-};
+use btc_network::message::{GetHeadersMessage, InvItem, InvType, NetworkMessage};
 use btc_network::protocol::ProtocolVersion;
 use btc_primitives::hash::BlockHash;
 use btc_primitives::network::Network;
@@ -52,7 +50,7 @@ impl Checkpoint {
     pub fn new(height: u64, hash: BlockHash) -> Self {
         Self {
             height,
-            hash: format!("{}", hash),
+            hash: format!("{hash}"),
         }
     }
 }
@@ -61,8 +59,7 @@ impl Checkpoint {
 pub fn save_checkpoint(datadir: &Path, checkpoint: &Checkpoint) -> std::io::Result<()> {
     std::fs::create_dir_all(datadir)?;
     let path = datadir.join("checkpoint.json");
-    let json = serde_json::to_string_pretty(checkpoint)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let json = serde_json::to_string_pretty(checkpoint).map_err(std::io::Error::other)?;
     std::fs::write(&path, json)?;
     info!(height = checkpoint.height, path = %path.display(), "checkpoint saved");
     Ok(())
@@ -80,10 +77,9 @@ pub fn load_checkpoint(datadir: &Path) -> Option<Checkpoint> {
 
 /// Open (or create) a `PersistentUtxoSet` backed by a redb database at the
 /// given path. Returns `None` if the database cannot be opened.
-pub fn open_persistent_utxo_set(
-    db_path: &Path,
-) -> Option<PersistentUtxoSet<RedbDatabase>> {
-    let db = RedbDatabase::new(db_path).ok()?; db.init_tables().ok()?;
+pub fn open_persistent_utxo_set(db_path: &Path) -> Option<PersistentUtxoSet<RedbDatabase>> {
+    let db = RedbDatabase::new(db_path).ok()?;
+    db.init_tables().ok()?;
     Some(PersistentUtxoSet::new(Arc::new(db)))
 }
 
@@ -119,10 +115,10 @@ impl std::fmt::Display for SyncState {
             SyncState::Idle => write!(f, "idle"),
             SyncState::ConnectingPeers => write!(f, "connecting_peers"),
             SyncState::DownloadingHeaders { progress, target } => {
-                write!(f, "downloading_headers ({}/{})", progress, target)
+                write!(f, "downloading_headers ({progress}/{target})")
             }
             SyncState::DownloadingBlocks { progress, target } => {
-                write!(f, "downloading_blocks ({}/{})", progress, target)
+                write!(f, "downloading_blocks ({progress}/{target})")
             }
             SyncState::Synced => write!(f, "synced"),
         }
@@ -238,8 +234,7 @@ pub fn validate_policy(policy: &str) -> Result<(), String> {
     match policy {
         "core" | "consensus" | "all" => Ok(()),
         other => Err(format!(
-            "unknown policy preset '{}': expected 'core', 'consensus', or 'all'",
-            other
+            "unknown policy preset '{other}': expected 'core', 'consensus', or 'all'"
         )),
     }
 }
@@ -262,7 +257,10 @@ pub fn classify_inv_items(items: &[InvItem]) -> (usize, usize) {
 /// Determine the output format from CLI flags.
 ///
 /// Priority: `--json` flag > `--output <format>` > auto-detect.
-pub fn determine_output_format(json_flag: bool, output_opt: Option<&str>) -> crate::output::OutputFormat {
+pub fn determine_output_format(
+    json_flag: bool,
+    output_opt: Option<&str>,
+) -> crate::output::OutputFormat {
     if json_flag {
         crate::output::OutputFormat::Json
     } else {
@@ -274,10 +272,7 @@ pub fn determine_output_format(json_flag: bool, output_opt: Option<&str>) -> cra
 ///
 /// `received_count` is the number of headers in the batch,
 /// `new_height` is the chain height after accepting the headers.
-pub fn next_state_after_headers(
-    received_count: usize,
-    new_height: u64,
-) -> SyncState {
+pub fn next_state_after_headers(received_count: usize, new_height: u64) -> SyncState {
     if is_header_sync_complete(received_count) {
         // Headers complete -- transition to block download
         SyncState::DownloadingHeaders {
@@ -436,6 +431,14 @@ pub struct SyncManager {
     /// height so the sync manager starts block download from snapshot_height + 1.
     /// Background validation from genesis is a TODO.
     snapshot_height: Option<u64>,
+    validated_tip: Option<(u64, BlockHash)>,
+    chain_backend: Option<Arc<crate::chain_backend::NodeChainBackend>>,
+    peer_table: Option<Arc<crate::p2p::PeerTable>>,
+    outbound_peer: Option<crate::p2p::PeerGuard>,
+    outbound_address: Option<SocketAddr>,
+    /// An explicit list disables DNS discovery; useful for private/regtest peers.
+    connect_peers: Vec<SocketAddr>,
+    shutdown: Option<Arc<btc_rpc::handler::RpcHandler>>,
 }
 
 impl SyncManager {
@@ -463,6 +466,13 @@ impl SyncManager {
             datadir: None,
             persistent_utxo: None,
             snapshot_height: None,
+            validated_tip: None,
+            chain_backend: None,
+            peer_table: None,
+            outbound_peer: None,
+            outbound_address: None,
+            connect_peers: Vec::new(),
+            shutdown: None,
         }
     }
 
@@ -503,11 +513,43 @@ impl SyncManager {
             datadir: Some(datadir),
             persistent_utxo,
             snapshot_height: None,
+            validated_tip: None,
+            chain_backend: None,
+            peer_table: None,
+            outbound_peer: None,
+            outbound_address: None,
+            connect_peers: Vec::new(),
+            shutdown: None,
         }
+    }
+
+    /// Share the authoritative block backend with RPC, without opening a second DB.
+    pub fn with_backend(
+        network: Network,
+        chain_state: Arc<RwLock<ChainState>>,
+        peer_manager: Arc<RwLock<PeerManager>>,
+        chain_params: ChainParams,
+        datadir: PathBuf,
+        backend: Arc<crate::chain_backend::NodeChainBackend>,
+    ) -> Result<Self, SyncError> {
+        let mut manager = Self::new(network, chain_state, peer_manager, chain_params);
+        manager.validated_tip = Some(
+            backend
+                .tip()
+                .map_err(|e| SyncError::BlockValidation(e.to_string()))?,
+        );
+        manager.datadir = Some(datadir);
+        manager.chain_backend = Some(backend);
+        Ok(manager)
     }
 
     /// Set the ExEx broadcast sender so that block commit events are emitted.
     pub fn set_exex_sender(&mut self, sender: broadcast::Sender<ExExNotification>) {
+        if let Some(backend) = &self.chain_backend {
+            if let Err(error) = backend.set_exex_sender(sender.clone()) {
+                warn!(error = %error.message, "could not attach ExEx sender");
+            }
+        }
         self.exex_sender = Some(sender);
     }
 
@@ -515,6 +557,49 @@ impl SyncManager {
     /// sub-systems (RPC, HTTP, metrics, etc.).
     pub fn set_node_state(&mut self, state: NodeState) {
         self.node_state = Some(state);
+    }
+
+    pub fn set_peer_table(&mut self, table: Arc<crate::p2p::PeerTable>) {
+        self.peer_table = Some(table);
+    }
+
+    pub fn set_connect_peers(&mut self, peers: Vec<SocketAddr>) {
+        self.connect_peers = peers;
+    }
+
+    /// Retry a disconnected/failed session with bounded backoff. Every attempt
+    /// resumes from the durable backend, including blocks committed by RPC or
+    /// inbound peers while this connection was unavailable.
+    pub async fn run(&mut self, shutdown: Arc<btc_rpc::handler::RpcHandler>) {
+        self.shutdown = Some(shutdown.clone());
+        let mut delay = std::time::Duration::from_secs(1);
+        loop {
+            let started = tokio::time::Instant::now();
+            let result = tokio::select! {
+                biased;
+                _ = shutdown.wait_for_shutdown() => None,
+                result = self.start() => Some(result),
+            };
+            self.outbound_peer.take();
+            if let Some(address) = self.outbound_address.take() {
+                self.peer_manager.write().await.remove_peer(&address);
+            }
+            let Some(result) = result else {
+                return;
+            };
+            if let Err(error) = result {
+                warn!(%error, "outbound sync connection ended; retrying");
+            }
+            if started.elapsed() >= std::time::Duration::from_secs(60) {
+                delay = std::time::Duration::from_secs(1);
+            }
+            tokio::select! {
+                biased;
+                _ = shutdown.wait_for_shutdown() => return,
+                _ = tokio::time::sleep(delay) => {},
+            }
+            delay = (delay * 2).min(std::time::Duration::from_secs(60));
+        }
     }
 
     /// Return a reference to the reorg manager (for testing / inspection).
@@ -529,7 +614,7 @@ impl SyncManager {
 
     /// Return `true` if a persistent UTXO set is configured.
     pub fn has_persistent_utxo(&self) -> bool {
-        self.persistent_utxo.is_some()
+        self.persistent_utxo.is_some() || self.chain_backend.is_some()
     }
 
     /// Set the AssumeUTXO snapshot height.  When set, the sync manager will
@@ -538,7 +623,10 @@ impl SyncManager {
     /// TODO: implement background validation from genesis to snapshot height
     /// to fully validate the snapshot.
     pub fn set_snapshot_height(&mut self, height: u64) {
-        info!(height, "AssumeUTXO snapshot height set — will sync from snapshot");
+        info!(
+            height,
+            "AssumeUTXO snapshot height set — will sync from snapshot"
+        );
         self.snapshot_height = Some(height);
     }
 
@@ -553,12 +641,22 @@ impl SyncManager {
 
     /// Return the current sync state.
     pub fn state(&self) -> &SyncState {
+        if self.chain_backend.is_some()
+            && matches!(self.sync_state, SyncState::DownloadingHeaders { .. })
+            && self
+                .node_state
+                .as_ref()
+                .is_some_and(|state| !state.syncing.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            static SYNCED: SyncState = SyncState::Synced;
+            return &SYNCED;
+        }
         &self.sync_state
     }
 
     /// Return the sync progress as a fraction in `[0.0, 1.0]`.
     pub fn progress(&self) -> f64 {
-        compute_progress(&self.sync_state)
+        compute_progress(self.state())
     }
 
     /// Return the network this manager operates on.
@@ -580,13 +678,36 @@ impl SyncManager {
 
         // Phase 1 -- bootstrap peer addresses.
         self.sync_state = SyncState::ConnectingPeers;
-        {
+        if self.connect_peers.is_empty() {
             let mut pm = self.peer_manager.write().await;
             pm.bootstrap().await;
         }
 
         // Phase 2 -- connect to peers and handshake.
         let mut conn = self.connect_to_peer().await?;
+        if self.chain_backend.is_some() {
+            // Shared sessions stream bounded bodies from the durable locator,
+            // including competing branches, without a separate header-only tip.
+            // Zero means the remote header target is still unknown. Only the
+            // shared session's caught-up signal can expose Synced via state().
+            let height = self
+                .chain_backend
+                .as_ref()
+                .unwrap()
+                .tip()
+                .map_err(|e| SyncError::Aborted(e.to_string()))?
+                .0;
+            self.sync_state = SyncState::DownloadingHeaders {
+                progress: height,
+                target: 0,
+            };
+            if let Some(state) = &self.node_state {
+                state
+                    .syncing
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            return self.steady_state_loop(&mut conn).await;
+        }
 
         // Phase 3 -- determine the remote tip height.
         let best_height = {
@@ -605,25 +726,40 @@ impl SyncManager {
         // Use checkpoint height, snapshot height, or chain state height —
         // skip blocks we already validated or that are covered by the snapshot.
         let block_start = {
-            let cp_height = self.datadir.as_ref()
-                .and_then(|d| load_checkpoint(d))
-                .map(|cp| cp.height)
-                .unwrap_or(0);
+            let persisted = match &self.persistent_utxo {
+                Some(p) => p
+                    .validated_tip()
+                    .map_err(|e| SyncError::BlockValidation(e.to_string()))?,
+                None => self.validated_tip,
+            };
+            self.validated_tip = persisted;
+            if let Some((h, hash)) = persisted {
+                let chain = self.chain_state.read().await;
+                if chain.get_header_by_height(h).map(|e| e.header.block_hash()) != Some(hash) {
+                    return Err(SyncError::BlockValidation(
+                        "persisted UTXO tip is not on the synchronized header chain".into(),
+                    ));
+                }
+            }
+            let cp_height = persisted.map(|(h, _)| h).unwrap_or(0);
             let snap_height = self.snapshot_height.unwrap_or(0);
             // Start from whichever is highest: chain_state height, checkpoint, or snapshot
-            let max_validated = std::cmp::max(best_height, std::cmp::max(cp_height, snap_height));
+            let max_validated = std::cmp::max(cp_height, snap_height);
             max_validated + 1
         };
         if self.snapshot_height.is_some() {
             info!(
                 snapshot_height = self.snapshot_height.unwrap(),
-                block_start,
-                "AssumeUTXO: skipping to post-snapshot sync"
+                block_start, "AssumeUTXO: skipping to post-snapshot sync"
             );
             // TODO: spawn background validation from genesis to snapshot_height
         }
         if peer_tip >= block_start {
-            info!(from = block_start, to = peer_tip, "starting block download (skipping already-validated blocks)");
+            info!(
+                from = block_start,
+                to = peer_tip,
+                "starting block download (skipping already-validated blocks)"
+            );
             self.sync_blocks(&mut conn, block_start, peer_tip).await?;
         }
 
@@ -634,29 +770,29 @@ impl SyncManager {
             cs.best_height()
         };
         info!(height = final_height, "initial block download complete");
-
-        // Save checkpoint after block sync completes.
-        if let Some(ref datadir) = self.datadir {
-            let cs = self.chain_state.read().await;
-            let best = cs.best_header();
-            let cp = Checkpoint::new(cs.best_height(), best.header.block_hash());
-            if let Err(e) = save_checkpoint(datadir, &cp) {
-                warn!(error = %e, "failed to save checkpoint after block sync");
-            }
+        if let Some(state) = &self.node_state {
+            state
+                .syncing
+                .store(false, std::sync::atomic::Ordering::SeqCst);
         }
 
-        // Flush persistent UTXO cache if available.
-        if let Some(ref mut persistent) = self.persistent_utxo {
-            if let Err(e) = persistent.flush_cache() {
-                warn!(error = %e, "failed to flush persistent UTXO cache");
+        // Commit UTXOs and the validated tip atomically before publishing a
+        // convenience JSON checkpoint. Header progress is never a body checkpoint.
+        if let Some((height, hash)) = self.validated_tip {
+            if let Some(ref mut persistent) = self.persistent_utxo {
+                persistent.flush_cache_with_tip(height, hash).map_err(|e| {
+                    SyncError::BlockValidation(format!("UTXO persistence failed: {e}"))
+                })?;
+                if let Some(ref datadir) = self.datadir {
+                    save_checkpoint(datadir, &Checkpoint::new(height, hash))
+                        .map_err(|e| SyncError::BlockValidation(e.to_string()))?;
+                }
             }
         }
 
         // Phase 7 -- steady-state listening for new blocks and transactions.
         info!("entering steady state - listening for new blocks and transactions");
-        self.steady_state_loop(&mut conn).await;
-
-        Ok(())
+        self.steady_state_loop(&mut conn).await
     }
 
     // ------------------------------------------------------------------
@@ -664,41 +800,19 @@ impl SyncManager {
     // ------------------------------------------------------------------
 
     /// After IBD completes, listen for new block and transaction announcements.
-    async fn steady_state_loop(&mut self, peer: &mut Connection) {
-        loop {
-            match peer.recv_message().await {
-                Ok(NetworkMessage::Inv(items)) => {
-                    // Separate block and tx announcements.
-                    let block_items: Vec<_> = items.iter()
-                        .filter(|i| matches!(i.inv_type, InvType::Block | InvType::WitnessBlock))
-                        .collect();
-                    let tx_items: Vec<_> = items.iter()
-                        .filter(|i| matches!(i.inv_type, InvType::Tx | InvType::WitnessTx))
-                        .collect();
-
-                    if !block_items.is_empty() {
-                        debug!(count = block_items.len(), "steady state: received block inv");
-                    }
-                    if !tx_items.is_empty() {
-                        debug!(count = tx_items.len(), "steady state: received tx inv announcements");
-                    }
-                }
-                Ok(NetworkMessage::Tx(tx)) => {
-                    let txid = tx.txid();
-                    debug!(%txid, "steady state: received transaction from peer");
-                }
-                Ok(NetworkMessage::Ping(nonce)) => {
-                    peer.send_message(NetworkMessage::Pong(nonce)).await.ok();
-                }
-                Ok(other) => {
-                    debug!(cmd = other.command(), "steady state: ignoring message");
-                }
-                Err(e) => {
-                    warn!(error = %e, "peer disconnected in steady state");
-                    break;
-                }
-            }
-        }
+    async fn steady_state_loop(&mut self, peer: &mut Connection) -> Result<(), SyncError> {
+        let backend = self.chain_backend.clone().ok_or_else(|| {
+            SyncError::Aborted("steady-state relay requires the shared validated backend".into())
+        })?;
+        crate::p2p::run_peer_session(
+            peer,
+            backend,
+            self.shutdown.clone(),
+            self.node_state.clone(),
+            true,
+        )
+        .await
+        .map_err(|e| SyncError::Aborted(e.to_string()))
     }
 
     // ------------------------------------------------------------------
@@ -708,7 +822,9 @@ impl SyncManager {
     /// Connect to a single outbound peer, trying multiple addresses until one works.
     async fn connect_to_peer(&mut self) -> Result<Connection, SyncError> {
         // Collect all known peers and try them in order
-        let addrs: Vec<SocketAddr> = {
+        let addrs: Vec<SocketAddr> = if !self.connect_peers.is_empty() {
+            self.connect_peers.clone()
+        } else {
             let pm = self.peer_manager.read().await;
             // Try up to 20 peers
             let mut candidates = Vec::new();
@@ -727,17 +843,12 @@ impl SyncManager {
         }
 
         for addr in &addrs {
-            // Skip IPv6 if likely unsupported
-            if addr.is_ipv6() {
-                debug!(%addr, "skipping IPv6 peer");
-                continue;
-            }
-
             info!(%addr, "connecting to peer");
             let conn_result = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                Connection::connect_outbound(*addr, self.network),
-            ).await;
+                Connection::connect_outbound_negotiated(*addr, self.network),
+            )
+            .await;
 
             let mut conn = match conn_result {
                 Ok(Ok(c)) => c,
@@ -751,19 +862,34 @@ impl SyncManager {
                 }
             };
 
-            let our_height = {
-                let cs = self.chain_state.read().await;
-                cs.best_height() as i32
+            let our_height = if let Some(backend) = &self.chain_backend {
+                i32::try_from(
+                    backend
+                        .tip()
+                        .map_err(|e| SyncError::Aborted(e.to_string()))?
+                        .0,
+                )
+                .map_err(|e| SyncError::Aborted(e.to_string()))?
+            } else {
+                self.chain_state.read().await.best_height() as i32
             };
 
             let handshake_result = tokio::time::timeout(
                 std::time::Duration::from_secs(10),
-                conn.perform_handshake(self.network, our_height),
-            ).await;
+                conn.perform_handshake_with_relay(self.network, our_height, true),
+            )
+            .await;
 
             match handshake_result {
                 Ok(Ok(handshake)) => {
                     if let Some(ver) = handshake.peer_version() {
+                        if let Some(table) = &self.peer_table {
+                            self.outbound_peer = Some(
+                                table
+                                    .register(*addr, false, &conn, ver)
+                                    .map_err(|e| SyncError::Aborted(e.to_string()))?,
+                            );
+                        }
                         let peer_info = btc_network::peer::PeerInfo {
                             addr: *addr,
                             state: btc_network::peer::PeerState::Ready,
@@ -777,6 +903,7 @@ impl SyncManager {
                         let mut pm = self.peer_manager.write().await;
                         pm.add_peer(*addr, peer_info);
                     }
+                    self.outbound_address = Some(*addr);
                     info!(%addr, "peer connected and handshake complete");
                     return Ok(conn);
                 }
@@ -799,10 +926,7 @@ impl SyncManager {
     /// Download all headers from the peer until we are caught up.
     ///
     /// Returns the height of the highest header we now have.
-    pub async fn sync_headers(
-        &mut self,
-        peer: &mut Connection,
-    ) -> Result<u64, SyncError> {
+    pub async fn sync_headers(&mut self, peer: &mut Connection) -> Result<u64, SyncError> {
         loop {
             // Build locator from our current best chain.
             let (locators, our_height, old_best_hash) = {
@@ -841,9 +965,8 @@ impl SyncManager {
             {
                 let mut cs = self.chain_state.write().await;
                 for header in &headers {
-                    cs.accept_header(header.clone()).map_err(|e| {
-                        SyncError::HeaderValidation(e.to_string())
-                    })?;
+                    cs.accept_header(*header)
+                        .map_err(|e| SyncError::HeaderValidation(e.to_string()))?;
                 }
             }
 
@@ -864,7 +987,7 @@ impl SyncManager {
             if new_best_hash != old_best_hash {
                 let cs = self.chain_state.read().await;
                 let new_entry = cs.get_header(&new_best_hash);
-                let is_descendant = new_entry.map_or(false, |e| {
+                let is_descendant = new_entry.is_some_and(|e| {
                     // Walk back from new tip to see if old_best_hash is an
                     // ancestor.  Quick check: if the new best is simply one
                     // batch ahead (prev of first new header == old best) this
@@ -938,7 +1061,10 @@ impl SyncManager {
                     }
                 }
                 other => {
-                    debug!(command = other.command(), "ignoring message during header sync");
+                    debug!(
+                        command = other.command(),
+                        "ignoring message during header sync"
+                    );
                 }
             }
         }
@@ -976,9 +1102,7 @@ impl SyncManager {
                         let block_hash = entry.header.block_hash();
                         items.push(InvItem {
                             inv_type: InvType::WitnessBlock,
-                            hash: btc_primitives::hash::Hash256::from_bytes(
-                                *block_hash.as_bytes(),
-                            ),
+                            hash: btc_primitives::hash::Hash256::from_bytes(*block_hash.as_bytes()),
                         });
                         hash_map.insert(block_hash, h);
                     }
@@ -986,10 +1110,10 @@ impl SyncManager {
                 (items, hash_map)
             };
 
-            if inv_items.is_empty() {
-                warn!(height, "no header found at height, skipping");
-                height = batch_end + 1;
-                continue;
+            if inv_items.len() as u64 != batch_end - height + 1 {
+                return Err(SyncError::BlockValidation(
+                    "missing header for requested block range".into(),
+                ));
             }
 
             let expected_count = inv_items.len();
@@ -1008,11 +1132,12 @@ impl SyncManager {
             // and keep waiting.  Apply a generous per-message timeout so we
             // don't hang forever on a stalled peer.
             let mut received = 0;
+            let mut queued = std::collections::BTreeMap::new();
+            let mut next_height = height;
             while received < expected_count {
-                let recv_result = tokio::time::timeout(
-                    std::time::Duration::from_secs(120),
-                    peer.recv_message(),
-                ).await;
+                let recv_result =
+                    tokio::time::timeout(std::time::Duration::from_secs(120), peer.recv_message())
+                        .await;
 
                 let msg = match recv_result {
                     Ok(Ok(m)) => m,
@@ -1033,15 +1158,12 @@ impl SyncManager {
                             expected = expected_count,
                             "timeout waiting for block from peer"
                         );
-                        return Err(SyncError::Aborted(
-                            "timeout waiting for block data".into(),
-                        ));
+                        return Err(SyncError::Aborted("timeout waiting for block data".into()));
                     }
                 };
 
                 match msg {
                     NetworkMessage::Block(block) => {
-                        received += 1;
                         let block_hash = block.block_hash();
 
                         // Verify the received block hash was one we requested
@@ -1057,207 +1179,298 @@ impl SyncManager {
                             }
                         };
 
-                        downloaded += 1;
-                        let tx_count = block.transactions.len();
+                        queued.insert(block_height, block);
+                        received += 1;
+                        while let Some(block) = queued.remove(&next_height) {
+                            let block_height = next_height;
+                            next_height += 1;
+                            let block_hash = block.block_hash();
+                            downloaded += 1;
+                            let tx_count = block.transactions.len();
 
-                        debug!(
-                            height = block_height,
-                            hash = %block_hash,
-                            txs = tx_count,
-                            "block received"
-                        );
-
-                        // -------------------------------------------------
-                        // Step 1: Context-free block structure validation
-                        // -------------------------------------------------
-                        if let Err(e) = BlockValidator::validate_block(&block) {
-                            warn!(
+                            debug!(
                                 height = block_height,
                                 hash = %block_hash,
-                                error = %e,
-                                "block failed structural validation"
+                                txs = tx_count,
+                                "block received"
                             );
-                            return Err(SyncError::BlockValidation(format!(
-                                "block {} at height {}: {}",
-                                block_hash, block_height, e
-                            )));
-                        }
 
-                        // -------------------------------------------------
-                        // Step 2: Connect block to UTXO set (contextual
-                        // validation: no double-spends, coinbase maturity,
-                        // value conservation, reward limit).
-                        // -------------------------------------------------
-                        let utxo_update = {
-                            // Use persistent UTXO set if available (for resume),
-                            // otherwise fall back to in-memory set.
-                            let utxo_set = self.utxo_set.read().await;
-                            let connect_result = if let Some(ref persistent) = self.persistent_utxo {
-                                // Try persistent first (has data from previous runs)
-                                connect_block(&block, block_height, persistent)
-                                    .or_else(|_| connect_block(&block, block_height, &*utxo_set))
+                            let utxo_update = if let Some(ref backend) = self.chain_backend {
+                                let accepted = backend
+                                    .submit_block(&block)
+                                    .map_err(|e| SyncError::BlockValidation(e.message))?;
+                                if accepted.height != block_height {
+                                    return Err(SyncError::BlockValidation(
+                                        "validated/downloaded height mismatch".into(),
+                                    ));
+                                }
+                                self.validated_tip = Some((accepted.height, accepted.hash));
+                                accepted.update
                             } else {
-                                connect_block(&block, block_height, &*utxo_set)
-                            };
-                            match connect_result {
-                                Ok(update) => update,
-                                Err(e) => {
+                                // -------------------------------------------------
+                                // Step 1: Context-free block structure validation
+                                // -------------------------------------------------
+                                if let Err(e) = BlockValidator::validate_block(&block) {
                                     warn!(
                                         height = block_height,
                                         hash = %block_hash,
                                         error = %e,
-                                        "block failed UTXO validation"
+                                        "block failed structural validation"
                                     );
                                     return Err(SyncError::BlockValidation(format!(
-                                        "UTXO error for block {} at height {}: {}",
-                                        block_hash, block_height, e
+                                        "block {block_hash} at height {block_height}: {e}"
                                     )));
                                 }
-                            }
-                        };
 
-                        // -------------------------------------------------
-                        // Track assume-valid height: if this block's hash
-                        // matches chain_params.assume_valid, record its
-                        // height so future blocks can skip scripts.
-                        // -------------------------------------------------
-                        if let Some(ref av_hash) = self.chain_params.assume_valid {
-                            if &block_hash == av_hash && self.assume_valid_height.is_none() {
-                                info!(
-                                    height = block_height,
-                                    hash = %block_hash,
-                                    "assume-valid block found, recording height"
-                                );
-                                self.assume_valid_height = Some(block_height);
-                            }
-                        }
+                                if block_height >= self.chain_params.segwit_height {
+                                    BlockValidator::verify_witness_commitment(&block)
+                                        .map_err(|e| SyncError::BlockValidation(e.to_string()))?;
+                                }
 
-                        // -------------------------------------------------
-                        // Step 3: Optionally verify scripts (skip when
-                        // below assume-valid to speed up IBD).
-                        // Must happen BEFORE applying the UTXO update so
-                        // that the spent outputs are still available for
-                        // script verification lookups.
-                        // -------------------------------------------------
-                        if self.chain_params.should_verify_scripts(
-                            block_height,
-                            &block_hash,
-                            self.assume_valid_height,
-                        ) {
-                            let utxo_set = self.utxo_set.read().await;
-                            let validator = ParallelValidator::new(ParallelConfig::default());
-                            // Use persistent UTXO set if available (for resume scenarios
-                            // where in-memory set is empty), otherwise use in-memory.
-                            let validate_result = if let Some(ref persistent) = self.persistent_utxo {
-                                validator.validate_block_scripts(&block, persistent, block_height, &self.chain_params)
-                            } else {
-                                validator.validate_block_scripts(&block, &*utxo_set, block_height, &self.chain_params)
-                            };
-                            if let Err(errors) = validate_result {
-                                // During IBD, log script failures as warnings but continue.
-                                // UTXO validation (Step 2) already passed, so chain state is safe.
-                                // Script verification issues will be fixed and re-validated.
-                                let first_err = &errors[0];
-                                warn!(
-                                    height = block_height,
-                                    hash = %block_hash,
-                                    failures = errors.len(),
-                                    first_tx = first_err.0,
-                                    first_input = first_err.1,
-                                    first_error = %first_err.2,
-                                    "script verification warning (continuing sync)"
-                                );
-                                return Err(SyncError::BlockValidation(format!(
+                                if self.network == Network::Signet {
+                                    btc_consensus::signet::validate_signet_block(
+                                        &block,
+                                        &btc_consensus::signet::SignetChallenge::default_signet(),
+                                    )
+                                    .map_err(|e| SyncError::BlockValidation(e.to_string()))?;
+                                }
+
+                                // -------------------------------------------------
+                                // Step 2: Connect block to UTXO set (contextual
+                                // validation: no double-spends, coinbase maturity,
+                                // value conservation, reward limit).
+                                // -------------------------------------------------
+                                let utxo_update = {
+                                    // Use persistent UTXO set if available (for resume),
+                                    // otherwise fall back to in-memory set.
+                                    let utxo_set = self.utxo_set.read().await;
+                                    let chain = self.chain_state.read().await;
+                                    let prev = chain
+                                        .get_header(&block.header.prev_blockhash)
+                                        .ok_or_else(|| {
+                                            SyncError::BlockValidation(
+                                                "missing previous header".into(),
+                                            )
+                                        })?;
+                                    let ancestor_mtp = |h| {
+                                        chain
+                                            .get_header_by_height(h)
+                                            .map(|e| chain.median_time_past(e))
+                                    };
+                                    let context = LockTimeContext {
+                                        median_time_past: chain.median_time_past(prev),
+                                        ancestor_mtp: &ancestor_mtp,
+                                    };
+                                    let connect_result =
+                                        if let Some(ref persistent) = self.persistent_utxo {
+                                            // Try persistent first (has data from previous runs)
+                                            connect_block_with_context(
+                                                &block,
+                                                block_height,
+                                                persistent,
+                                                &self.chain_params,
+                                                Some(&context),
+                                            )
+                                        } else {
+                                            connect_block_with_context(
+                                                &block,
+                                                block_height,
+                                                &*utxo_set,
+                                                &self.chain_params,
+                                                Some(&context),
+                                            )
+                                        };
+                                    match connect_result {
+                                        Ok(update) => update,
+                                        Err(e) => {
+                                            warn!(
+                                                height = block_height,
+                                                hash = %block_hash,
+                                                error = %e,
+                                                "block failed UTXO validation"
+                                            );
+                                            return Err(SyncError::BlockValidation(format!(
+                                        "UTXO error for block {block_hash} at height {block_height}: {e}"
+                                    )));
+                                        }
+                                    }
+                                };
+
+                                // -------------------------------------------------
+                                // Track assume-valid height: if this block's hash
+                                // matches chain_params.assume_valid, record its
+                                // height so future blocks can skip scripts.
+                                // -------------------------------------------------
+                                if let Some(ref av_hash) = self.chain_params.assume_valid {
+                                    if &block_hash == av_hash && self.assume_valid_height.is_none()
+                                    {
+                                        info!(
+                                            height = block_height,
+                                            hash = %block_hash,
+                                            "assume-valid block found, recording height"
+                                        );
+                                        self.assume_valid_height = Some(block_height);
+                                    }
+                                }
+
+                                // -------------------------------------------------
+                                // Step 3: Optionally verify scripts (skip when
+                                // below assume-valid to speed up IBD).
+                                // Must happen BEFORE applying the UTXO update so
+                                // that the spent outputs are still available for
+                                // script verification lookups.
+                                // -------------------------------------------------
+                                if self.chain_params.should_verify_scripts(
+                                    block_height,
+                                    &block_hash,
+                                    self.assume_valid_height,
+                                ) {
+                                    let utxo_set = self.utxo_set.read().await;
+                                    let validator =
+                                        ParallelValidator::new(ParallelConfig::default());
+                                    // Use persistent UTXO set if available (for resume scenarios
+                                    // where in-memory set is empty), otherwise use in-memory.
+                                    let validate_result =
+                                        if let Some(ref persistent) = self.persistent_utxo {
+                                            validator.validate_block_scripts(
+                                                &block,
+                                                persistent,
+                                                block_height,
+                                                &self.chain_params,
+                                            )
+                                        } else {
+                                            validator.validate_block_scripts(
+                                                &block,
+                                                &*utxo_set,
+                                                block_height,
+                                                &self.chain_params,
+                                            )
+                                        };
+                                    if let Err(errors) = validate_result {
+                                        // During IBD, log script failures as warnings but continue.
+                                        // UTXO validation (Step 2) already passed, so chain state is safe.
+                                        // Script verification issues will be fixed and re-validated.
+                                        let first_err = &errors[0];
+                                        warn!(
+                                            height = block_height,
+                                            hash = %block_hash,
+                                            failures = errors.len(),
+                                            first_tx = first_err.0,
+                                            first_input = first_err.1,
+                                            first_error = %first_err.2,
+                                            "script verification warning (continuing sync)"
+                                        );
+                                        return Err(SyncError::BlockValidation(format!(
                                     "script verification failed for block {} at height {}: {} error(s), first: tx {} input {}: {}",
                                     block_hash, block_height, errors.len(),
                                     first_err.0, first_err.1, first_err.2
                                 )));
-                            }
-                        }
-
-                        // -------------------------------------------------
-                        // Step 4: Apply UTXO updates to the in-memory set
-                        // -------------------------------------------------
-                        {
-                            let mut utxo_set = self.utxo_set.write().await;
-                            utxo_set.apply_update(&utxo_update);
-                            
-                            if block_height % 500 == 0 {
-                                info!(
-                                    height = block_height,
-                                    utxo_count = utxo_set.len(),
-                                    created = utxo_update.created.len(),
-                                    spent = utxo_update.spent.len(),
-                                    "UTXO set status"
-                                );
-                            }
-                        }
-
-                        // -------------------------------------------------
-                        // Step 4b: Persist UTXO updates in batches of 500 blocks
-                        // The in-memory UTXO set (Step 4) has the authoritative
-                        // state; we only persist periodically for crash recovery.
-                        // -------------------------------------------------
-                        if let Some(ref mut persistent) = self.persistent_utxo {
-                            // Always apply (updates the in-memory cache inside PersistentUtxoSet)
-                            persistent.apply_update_cached(&utxo_update);
-                            // Flush to disk every 500 blocks + save checkpoint
-                            if block_height % 500 == 0 {
-                                if let Err(e) = persistent.flush_cache() {
-                                    warn!(height = block_height, error = %e, "failed to flush UTXO cache");
+                                    }
                                 }
-                                // Save checkpoint so restarts skip these blocks
-                                if let Some(ref datadir) = self.datadir {
-                                    let cp = Checkpoint::new(block_height, block_hash);
-                                    let _ = save_checkpoint(datadir, &cp);
+
+                                // -------------------------------------------------
+                                // Step 4: Apply UTXO updates to the in-memory set
+                                // -------------------------------------------------
+                                {
+                                    let mut utxo_set = self.utxo_set.write().await;
+                                    utxo_set.apply_update(&utxo_update);
+
+                                    if block_height % 500 == 0 {
+                                        info!(
+                                            height = block_height,
+                                            utxo_count = utxo_set.len(),
+                                            created = utxo_update.created.len(),
+                                            spent = utxo_update.spent.len(),
+                                            "UTXO set status"
+                                        );
+                                    }
                                 }
+
+                                // -------------------------------------------------
+                                // Step 4b: Persist UTXO updates in batches of 500 blocks
+                                // The in-memory UTXO set (Step 4) has the authoritative
+                                // state; we only persist periodically for crash recovery.
+                                // -------------------------------------------------
+                                self.validated_tip = Some((block_height, block_hash));
+                                if let Some(ref mut persistent) = self.persistent_utxo {
+                                    // Always apply (updates the in-memory cache inside PersistentUtxoSet)
+                                    persistent.apply_update_cached(&utxo_update);
+
+                                    // Flush to disk every 500 blocks + save checkpoint
+                                    if block_height % 500 == 0 {
+                                        persistent
+                                            .flush_cache_with_tip(block_height, block_hash)
+                                            .map_err(|e| {
+                                            SyncError::BlockValidation(format!(
+                                                "UTXO persistence failed: {e}"
+                                            ))
+                                        })?;
+                                        // Save checkpoint so restarts skip these blocks
+                                        if let Some(ref datadir) = self.datadir {
+                                            let cp = Checkpoint::new(block_height, block_hash);
+                                            save_checkpoint(datadir, &cp).map_err(|e| {
+                                                SyncError::BlockValidation(e.to_string())
+                                            })?;
+                                        }
+                                    }
+                                }
+
+                                utxo_update
+                            };
+
+                            // -------------------------------------------------
+                            // Step 5: Store undo data for reorg protection and
+                            // prune old entries beyond the configured depth.
+                            // -------------------------------------------------
+                            self.reorg_manager
+                                .store_undo(block_height, utxo_update.clone());
+                            let max_undo = self.reorg_manager.max_undo_depth();
+                            if block_height > max_undo {
+                                self.reorg_manager.prune_undo(block_height - max_undo);
                             }
-                        }
 
-                        // -------------------------------------------------
-                        // Step 5: Store undo data for reorg protection and
-                        // prune old entries beyond the configured depth.
-                        // -------------------------------------------------
-                        self.reorg_manager.store_undo(block_height, utxo_update.clone());
-                        let max_undo = self.reorg_manager.max_undo_depth();
-                        if block_height > max_undo {
-                            self.reorg_manager.prune_undo(block_height - max_undo);
-                        }
+                            // -------------------------------------------------
+                            // Step 6: Emit ExEx notification and update NodeState
+                            // -------------------------------------------------
+                            if let Some(ref sender) = self.exex_sender {
+                                sender
+                                    .send(ExExNotification::BlockCommitted {
+                                        height: block_height,
+                                        hash: block_hash,
+                                        block: block.clone(),
+                                        utxo_changes: utxo_update,
+                                    })
+                                    .ok();
+                            }
+                            if let Some(ref ns) = self.node_state {
+                                ns.update_chain_tip(block_height, &block_hash.to_string());
+                            }
 
-                        // -------------------------------------------------
-                        // Step 6: Emit ExEx notification and update NodeState
-                        // -------------------------------------------------
-                        if let Some(ref sender) = self.exex_sender {
-                            sender.send(ExExNotification::BlockCommitted {
-                                height: block_height,
-                                hash: block_hash,
-                                block: block.clone(),
-                                utxo_changes: utxo_update,
-                            }).ok();
-                        }
-                        if let Some(ref ns) = self.node_state {
-                            ns.update_chain_tip(block_height, &block_hash.to_string());
-                        }
+                            let in_memory_utxo_count = self.utxo_set.read().await.len();
+                            debug!(
+                                height = block_height,
+                                hash = %block_hash,
+                                utxos = in_memory_utxo_count,
+                                "block validated and connected"
+                            );
 
-                        debug!(
-                            height = block_height,
-                            hash = %block_hash,
-                            utxos = self.utxo_set.read().await.len(),
-                            "block validated and connected"
-                        );
-
-                        self.sync_state = SyncState::DownloadingBlocks {
-                            progress: downloaded,
-                            target: total,
-                        };
+                            self.sync_state = SyncState::DownloadingBlocks {
+                                progress: downloaded,
+                                target: total,
+                            };
+                        }
                     }
                     NetworkMessage::Inv(items) => {
                         // Handle tx announcements during block sync.
-                        let tx_items: Vec<_> = items.iter()
+                        let tx_items: Vec<_> = items
+                            .iter()
                             .filter(|i| matches!(i.inv_type, InvType::Tx | InvType::WitnessTx))
                             .collect();
                         if !tx_items.is_empty() {
-                            debug!(count = tx_items.len(), "received tx inv announcements during block sync");
+                            debug!(
+                                count = tx_items.len(),
+                                "received tx inv announcements during block sync"
+                            );
                         }
                     }
                     NetworkMessage::Tx(tx) => {
@@ -1309,6 +1522,11 @@ impl SyncManager {
         new_tip: BlockHash,
         new_blocks: &[btc_primitives::block::Block],
     ) -> Result<ReorgResult, SyncError> {
+        if self.chain_backend.is_some() {
+            return Err(SyncError::Aborted(
+                "persistent chain reorganization is not yet supported".into(),
+            ));
+        }
         info!(%old_tip, %new_tip, "handling chain reorganization");
 
         let mut cs = self.chain_state.write().await;
@@ -1346,6 +1564,86 @@ mod tests {
     use btc_consensus::validation::ChainParams;
 
     // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn reversed_peer_blocks_share_validated_rpc_state() {
+        use btc_test::TestNode;
+        let mut miner = TestNode::new();
+        let blocks = miner.mine_blocks(3);
+        let params = ChainParams::regtest();
+        let mut chain = ChainState::new(ChainParams::regtest());
+        for block in &blocks {
+            chain.accept_header(block.header).unwrap();
+        }
+        let expected = blocks[2].block_hash();
+        let chain = Arc::new(RwLock::new(chain));
+        let peers = Arc::new(RwLock::new(PeerManager::new(Network::Regtest)));
+        let dir = tempfile::tempdir().unwrap();
+        let state = NodeState::new(Network::Regtest);
+        let backend = Arc::new(
+            crate::chain_backend::NodeChainBackend::open(
+                &dir.path().join("utxo.redb"),
+                state.clone(),
+            )
+            .unwrap(),
+        );
+        let rpc = btc_rpc::handler::RpcHandler::new().with_chain_backend(backend.clone());
+        let mut sync = SyncManager::with_backend(
+            Network::Regtest,
+            chain,
+            peers,
+            params,
+            dir.path().to_path_buf(),
+            backend.clone(),
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut connection = Connection::from_stream(stream, Network::Regtest);
+            assert!(matches!(
+                connection.recv_message().await.unwrap(),
+                NetworkMessage::GetData(_)
+            ));
+            // An unrequested block must not reduce the number of requested blocks awaited.
+            let mut unrequested = blocks[0].clone();
+            unrequested.header.nonce = unrequested.header.nonce.wrapping_add(10);
+            connection
+                .send_message(NetworkMessage::Block(unrequested))
+                .await
+                .unwrap();
+            for block in blocks.into_iter().rev() {
+                connection
+                    .send_message(NetworkMessage::Block(block))
+                    .await
+                    .unwrap();
+            }
+        });
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let mut connection = Connection::from_stream(stream, Network::Regtest);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            sync.sync_blocks(&mut connection, 1, 3),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(sync.validated_tip, Some((3, expected)));
+        assert_eq!(backend.tip().unwrap(), (3, expected));
+        let response = rpc.handle(&btc_rpc::handler::RpcRequest {
+            jsonrpc: "2.0".into(),
+            method: "getblockhash".into(),
+            params: serde_json::json!([3]),
+            id: serde_json::json!(1),
+        });
+        assert_eq!(response.result.unwrap(), expected.to_string());
+        assert_eq!(
+            state.chain_height.load(std::sync::atomic::Ordering::SeqCst),
+            3
+        );
+        peer.await.unwrap();
+    }
+
     // SyncState tests
     // -----------------------------------------------------------------------
 
@@ -1672,7 +1970,7 @@ mod tests {
         });
         let p = sm.progress();
         // 50% of headers = 5% overall
-        assert!((p - 0.05).abs() < 1e-9, "expected ~0.05, got {}", p);
+        assert!((p - 0.05).abs() < 1e-9, "expected ~0.05, got {p}");
     }
 
     #[test]
@@ -1682,7 +1980,7 @@ mod tests {
             target: 800_000,
         });
         let p = sm.progress();
-        assert!((p - 0.1).abs() < 1e-9, "expected ~0.1, got {}", p);
+        assert!((p - 0.1).abs() < 1e-9, "expected ~0.1, got {p}");
     }
 
     #[test]
@@ -1693,7 +1991,7 @@ mod tests {
         });
         let p = sm.progress();
         // 50% of blocks = 0.1 + 0.45 = 0.55
-        assert!((p - 0.55).abs() < 1e-9, "expected ~0.55, got {}", p);
+        assert!((p - 0.55).abs() < 1e-9, "expected ~0.55, got {p}");
     }
 
     #[test]
@@ -1703,7 +2001,7 @@ mod tests {
             target: 800_000,
         });
         let p = sm.progress();
-        assert!((p - 1.0).abs() < 1e-9, "expected ~1.0, got {}", p);
+        assert!((p - 1.0).abs() < 1e-9, "expected ~1.0, got {p}");
     }
 
     #[test]
@@ -1763,10 +2061,7 @@ mod tests {
             let p = sm.progress();
             assert!(
                 p >= prev,
-                "progress went backwards: {} -> {} at state {:?}",
-                prev,
-                p,
-                state
+                "progress went backwards: {prev} -> {p} at state {state:?}"
             );
             prev = p;
         }
@@ -1819,7 +2114,7 @@ mod tests {
         ];
         // All variants should format without panicking.
         for event in &events {
-            let _ = format!("{:?}", event);
+            let _ = format!("{event:?}");
         }
     }
 
@@ -1914,15 +2209,13 @@ mod tests {
         for h in 1..=5u64 {
             assert!(
                 sm.reorg_manager().get_undo(h).is_none(),
-                "height {} should be pruned",
-                h
+                "height {h} should be pruned"
             );
         }
         for h in 6..=10u64 {
             assert!(
                 sm.reorg_manager().get_undo(h).is_some(),
-                "height {} should remain",
-                h
+                "height {h} should remain"
             );
         }
     }
@@ -1937,8 +2230,7 @@ mod tests {
         let msg = sync_err.to_string();
         assert!(
             msg.contains("reorg") || msg.contains("200") || msg.contains("100"),
-            "reorg error should be wrapped in SyncError: {}",
-            msg
+            "reorg error should be wrapped in SyncError: {msg}"
         );
     }
 
@@ -2005,7 +2297,8 @@ mod tests {
             hash: "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f".to_string(),
         };
         let json = serde_json::to_string(&cp).expect("serialize should succeed");
-        let deserialized: Checkpoint = serde_json::from_str(&json).expect("deserialize should succeed");
+        let deserialized: Checkpoint =
+            serde_json::from_str(&json).expect("deserialize should succeed");
         assert_eq!(cp, deserialized);
     }
 
@@ -2019,10 +2312,17 @@ mod tests {
         let db_path = dir.path().join("utxo.redb");
 
         let persistent = open_persistent_utxo_set(&db_path);
-        assert!(persistent.is_some(), "should be able to open persistent UTXO set");
+        assert!(
+            persistent.is_some(),
+            "should be able to open persistent UTXO set"
+        );
 
         let persistent = persistent.unwrap();
-        assert_eq!(persistent.cache_len(), 0, "fresh set should have empty cache");
+        assert_eq!(
+            persistent.cache_len(),
+            0,
+            "fresh set should have empty cache"
+        );
     }
 
     #[test]
@@ -2044,14 +2344,18 @@ mod tests {
 
         assert_eq!(*sm.state(), SyncState::Idle);
         assert!(sm.datadir().is_some());
-        assert!(sm.has_persistent_utxo(), "should have persistent UTXO set when datadir is configured");
+        assert!(
+            sm.has_persistent_utxo(),
+            "should have persistent UTXO set when datadir is configured"
+        );
     }
 
     #[test]
     fn test_open_persistent_utxo_set_invalid_path() {
         // On some systems this may fail differently, but the function should
         // return None for an invalid path.
-        let result = open_persistent_utxo_set(std::path::Path::new("/dev/null/impossible/path.redb"));
+        let result =
+            open_persistent_utxo_set(std::path::Path::new("/dev/null/impossible/path.redb"));
         assert!(result.is_none());
     }
 
@@ -2116,7 +2420,7 @@ mod tests {
     fn test_inv_type_filtering() {
         // Verify that the inv type filter logic correctly separates
         // block and tx items.
-        let items = vec![
+        let items = [
             InvItem {
                 inv_type: InvType::Tx,
                 hash: btc_primitives::hash::Hash256::from_bytes([0x01; 32]),
@@ -2139,12 +2443,14 @@ mod tests {
             },
         ];
 
-        let tx_items: Vec<_> = items.iter()
+        let tx_items: Vec<_> = items
+            .iter()
             .filter(|i| matches!(i.inv_type, InvType::Tx | InvType::WitnessTx))
             .collect();
         assert_eq!(tx_items.len(), 2, "should find 2 tx inv items");
 
-        let block_items: Vec<_> = items.iter()
+        let block_items: Vec<_> = items
+            .iter()
             .filter(|i| matches!(i.inv_type, InvType::Block | InvType::WitnessBlock))
             .collect();
         assert_eq!(block_items.len(), 2, "should find 2 block inv items");
@@ -2228,7 +2534,7 @@ mod tests {
         let hash = BlockHash::from_bytes([0xab; 32]);
         let cp = Checkpoint::new(42, hash);
         assert_eq!(cp.height, 42);
-        assert!(cp.hash.len() > 0);
+        assert!(!cp.hash.is_empty());
     }
 
     #[test]
@@ -2252,7 +2558,7 @@ mod tests {
     #[test]
     fn test_checkpoint_debug() {
         let cp = Checkpoint::new(1, BlockHash::ZERO);
-        let debug = format!("{:?}", cp);
+        let debug = format!("{cp:?}");
         assert!(debug.contains("Checkpoint"));
     }
 
@@ -2293,7 +2599,7 @@ mod tests {
     fn test_sync_event_clone() {
         let event = SyncEvent::SyncComplete { height: 100 };
         let event2 = event.clone();
-        let _ = format!("{:?}", event2);
+        let _ = format!("{event2:?}");
     }
 
     #[test]
@@ -2339,43 +2645,61 @@ mod tests {
 
     #[test]
     fn test_compute_progress_headers_zero_target() {
-        let state = SyncState::DownloadingHeaders { progress: 0, target: 0 };
+        let state = SyncState::DownloadingHeaders {
+            progress: 0,
+            target: 0,
+        };
         assert_eq!(compute_progress(&state), 0.0);
     }
 
     #[test]
     fn test_compute_progress_headers_midway() {
-        let state = SyncState::DownloadingHeaders { progress: 400_000, target: 800_000 };
+        let state = SyncState::DownloadingHeaders {
+            progress: 400_000,
+            target: 800_000,
+        };
         let p = compute_progress(&state);
-        assert!((p - 0.05).abs() < 1e-9, "expected ~0.05, got {}", p);
+        assert!((p - 0.05).abs() < 1e-9, "expected ~0.05, got {p}");
     }
 
     #[test]
     fn test_compute_progress_headers_complete() {
-        let state = SyncState::DownloadingHeaders { progress: 800_000, target: 800_000 };
+        let state = SyncState::DownloadingHeaders {
+            progress: 800_000,
+            target: 800_000,
+        };
         let p = compute_progress(&state);
-        assert!((p - 0.1).abs() < 1e-9, "expected ~0.1, got {}", p);
+        assert!((p - 0.1).abs() < 1e-9, "expected ~0.1, got {p}");
     }
 
     #[test]
     fn test_compute_progress_blocks_zero_target() {
-        let state = SyncState::DownloadingBlocks { progress: 0, target: 0 };
+        let state = SyncState::DownloadingBlocks {
+            progress: 0,
+            target: 0,
+        };
         let p = compute_progress(&state);
         assert!((p - 0.1).abs() < 1e-9);
     }
 
     #[test]
     fn test_compute_progress_blocks_midway() {
-        let state = SyncState::DownloadingBlocks { progress: 400_000, target: 800_000 };
+        let state = SyncState::DownloadingBlocks {
+            progress: 400_000,
+            target: 800_000,
+        };
         let p = compute_progress(&state);
-        assert!((p - 0.55).abs() < 1e-9, "expected ~0.55, got {}", p);
+        assert!((p - 0.55).abs() < 1e-9, "expected ~0.55, got {p}");
     }
 
     #[test]
     fn test_compute_progress_blocks_complete() {
-        let state = SyncState::DownloadingBlocks { progress: 800_000, target: 800_000 };
+        let state = SyncState::DownloadingBlocks {
+            progress: 800_000,
+            target: 800_000,
+        };
         let p = compute_progress(&state);
-        assert!((p - 1.0).abs() < 1e-9, "expected ~1.0, got {}", p);
+        assert!((p - 1.0).abs() < 1e-9, "expected ~1.0, got {p}");
     }
 
     #[test]
@@ -2383,39 +2707,78 @@ mod tests {
         let states = [
             SyncState::Idle,
             SyncState::ConnectingPeers,
-            SyncState::DownloadingHeaders { progress: 0, target: 1000 },
-            SyncState::DownloadingHeaders { progress: 250, target: 1000 },
-            SyncState::DownloadingHeaders { progress: 500, target: 1000 },
-            SyncState::DownloadingHeaders { progress: 750, target: 1000 },
-            SyncState::DownloadingHeaders { progress: 1000, target: 1000 },
-            SyncState::DownloadingBlocks { progress: 0, target: 1000 },
-            SyncState::DownloadingBlocks { progress: 250, target: 1000 },
-            SyncState::DownloadingBlocks { progress: 500, target: 1000 },
-            SyncState::DownloadingBlocks { progress: 750, target: 1000 },
-            SyncState::DownloadingBlocks { progress: 1000, target: 1000 },
+            SyncState::DownloadingHeaders {
+                progress: 0,
+                target: 1000,
+            },
+            SyncState::DownloadingHeaders {
+                progress: 250,
+                target: 1000,
+            },
+            SyncState::DownloadingHeaders {
+                progress: 500,
+                target: 1000,
+            },
+            SyncState::DownloadingHeaders {
+                progress: 750,
+                target: 1000,
+            },
+            SyncState::DownloadingHeaders {
+                progress: 1000,
+                target: 1000,
+            },
+            SyncState::DownloadingBlocks {
+                progress: 0,
+                target: 1000,
+            },
+            SyncState::DownloadingBlocks {
+                progress: 250,
+                target: 1000,
+            },
+            SyncState::DownloadingBlocks {
+                progress: 500,
+                target: 1000,
+            },
+            SyncState::DownloadingBlocks {
+                progress: 750,
+                target: 1000,
+            },
+            SyncState::DownloadingBlocks {
+                progress: 1000,
+                target: 1000,
+            },
             SyncState::Synced,
         ];
         let mut prev = -1.0f64;
         for state in &states {
             let p = compute_progress(state);
-            assert!(p >= prev, "progress went backwards: {} -> {} at {:?}", prev, p, state);
+            assert!(
+                p >= prev,
+                "progress went backwards: {prev} -> {p} at {state:?}"
+            );
             prev = p;
         }
     }
 
     #[test]
     fn test_compute_progress_headers_quarter() {
-        let state = SyncState::DownloadingHeaders { progress: 250, target: 1000 };
+        let state = SyncState::DownloadingHeaders {
+            progress: 250,
+            target: 1000,
+        };
         let p = compute_progress(&state);
-        assert!((p - 0.025).abs() < 1e-9, "expected 0.025, got {}", p);
+        assert!((p - 0.025).abs() < 1e-9, "expected 0.025, got {p}");
     }
 
     #[test]
     fn test_compute_progress_blocks_quarter() {
-        let state = SyncState::DownloadingBlocks { progress: 250, target: 1000 };
+        let state = SyncState::DownloadingBlocks {
+            progress: 250,
+            target: 1000,
+        };
         let p = compute_progress(&state);
         // 0.1 + 0.25 * 0.9 = 0.1 + 0.225 = 0.325
-        assert!((p - 0.325).abs() < 1e-9, "expected 0.325, got {}", p);
+        assert!((p - 0.325).abs() < 1e-9, "expected 0.325, got {p}");
     }
 
     // -----------------------------------------------------------------------
@@ -2498,8 +2861,14 @@ mod tests {
 
     #[test]
     fn test_compute_batch_end_default_batch_size() {
-        assert_eq!(compute_batch_end(1, BLOCK_DOWNLOAD_BATCH_SIZE, 800_000), 128);
-        assert_eq!(compute_batch_end(129, BLOCK_DOWNLOAD_BATCH_SIZE, 800_000), 256);
+        assert_eq!(
+            compute_batch_end(1, BLOCK_DOWNLOAD_BATCH_SIZE, 800_000),
+            128
+        );
+        assert_eq!(
+            compute_batch_end(129, BLOCK_DOWNLOAD_BATCH_SIZE, 800_000),
+            256
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2519,7 +2888,12 @@ mod tests {
         let mut params = ChainParams::mainnet();
         params.assume_valid = Some(BlockHash::from_bytes([0xcc; 32]));
         let some_hash = BlockHash::from_bytes([0xbb; 32]);
-        assert!(!should_verify_scripts(&params, 100, &some_hash, Some(500_000)));
+        assert!(!should_verify_scripts(
+            &params,
+            100,
+            &some_hash,
+            Some(500_000)
+        ));
     }
 
     #[test]
@@ -2527,7 +2901,12 @@ mod tests {
         let mut params = ChainParams::mainnet();
         params.assume_valid = Some(BlockHash::from_bytes([0xcc; 32]));
         let some_hash = BlockHash::from_bytes([0xbb; 32]);
-        assert!(should_verify_scripts(&params, 500_001, &some_hash, Some(500_000)));
+        assert!(should_verify_scripts(
+            &params,
+            500_001,
+            &some_hash,
+            Some(500_000)
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -2635,11 +3014,26 @@ mod tests {
     #[test]
     fn test_classify_inv_items_mixed_with_error_type() {
         let items = vec![
-            InvItem { inv_type: InvType::Tx, hash: btc_primitives::hash::Hash256::from_bytes([0x01; 32]) },
-            InvItem { inv_type: InvType::WitnessTx, hash: btc_primitives::hash::Hash256::from_bytes([0x02; 32]) },
-            InvItem { inv_type: InvType::Block, hash: btc_primitives::hash::Hash256::from_bytes([0x03; 32]) },
-            InvItem { inv_type: InvType::WitnessBlock, hash: btc_primitives::hash::Hash256::from_bytes([0x04; 32]) },
-            InvItem { inv_type: InvType::Error, hash: btc_primitives::hash::Hash256::from_bytes([0x05; 32]) },
+            InvItem {
+                inv_type: InvType::Tx,
+                hash: btc_primitives::hash::Hash256::from_bytes([0x01; 32]),
+            },
+            InvItem {
+                inv_type: InvType::WitnessTx,
+                hash: btc_primitives::hash::Hash256::from_bytes([0x02; 32]),
+            },
+            InvItem {
+                inv_type: InvType::Block,
+                hash: btc_primitives::hash::Hash256::from_bytes([0x03; 32]),
+            },
+            InvItem {
+                inv_type: InvType::WitnessBlock,
+                hash: btc_primitives::hash::Hash256::from_bytes([0x04; 32]),
+            },
+            InvItem {
+                inv_type: InvType::Error,
+                hash: btc_primitives::hash::Hash256::from_bytes([0x05; 32]),
+            },
         ];
         let (blocks, txs) = classify_inv_items(&items);
         assert_eq!(blocks, 2);
@@ -2649,8 +3043,14 @@ mod tests {
     #[test]
     fn test_classify_inv_items_only_blocks() {
         let items = vec![
-            InvItem { inv_type: InvType::Block, hash: btc_primitives::hash::Hash256::from_bytes([0x01; 32]) },
-            InvItem { inv_type: InvType::WitnessBlock, hash: btc_primitives::hash::Hash256::from_bytes([0x02; 32]) },
+            InvItem {
+                inv_type: InvType::Block,
+                hash: btc_primitives::hash::Hash256::from_bytes([0x01; 32]),
+            },
+            InvItem {
+                inv_type: InvType::WitnessBlock,
+                hash: btc_primitives::hash::Hash256::from_bytes([0x02; 32]),
+            },
         ];
         let (blocks, txs) = classify_inv_items(&items);
         assert_eq!(blocks, 2);
@@ -2660,8 +3060,14 @@ mod tests {
     #[test]
     fn test_classify_inv_items_only_txs() {
         let items = vec![
-            InvItem { inv_type: InvType::Tx, hash: btc_primitives::hash::Hash256::from_bytes([0x01; 32]) },
-            InvItem { inv_type: InvType::WitnessTx, hash: btc_primitives::hash::Hash256::from_bytes([0x02; 32]) },
+            InvItem {
+                inv_type: InvType::Tx,
+                hash: btc_primitives::hash::Hash256::from_bytes([0x01; 32]),
+            },
+            InvItem {
+                inv_type: InvType::WitnessTx,
+                hash: btc_primitives::hash::Hash256::from_bytes([0x02; 32]),
+            },
         ];
         let (blocks, txs) = classify_inv_items(&items);
         assert_eq!(blocks, 0);
@@ -2670,9 +3076,10 @@ mod tests {
 
     #[test]
     fn test_classify_inv_items_only_error() {
-        let items = vec![
-            InvItem { inv_type: InvType::Error, hash: btc_primitives::hash::Hash256::from_bytes([0x01; 32]) },
-        ];
+        let items = vec![InvItem {
+            inv_type: InvType::Error,
+            hash: btc_primitives::hash::Hash256::from_bytes([0x01; 32]),
+        }];
         let (blocks, txs) = classify_inv_items(&items);
         assert_eq!(blocks, 0);
         assert_eq!(txs, 0);
@@ -2753,13 +3160,25 @@ mod tests {
     #[test]
     fn test_next_state_downloading_blocks() {
         let state = next_state_downloading_blocks(100, 1000);
-        assert_eq!(state, SyncState::DownloadingBlocks { progress: 100, target: 1000 });
+        assert_eq!(
+            state,
+            SyncState::DownloadingBlocks {
+                progress: 100,
+                target: 1000
+            }
+        );
     }
 
     #[test]
     fn test_next_state_downloading_blocks_complete() {
         let state = next_state_downloading_blocks(1000, 1000);
-        assert_eq!(state, SyncState::DownloadingBlocks { progress: 1000, target: 1000 });
+        assert_eq!(
+            state,
+            SyncState::DownloadingBlocks {
+                progress: 1000,
+                target: 1000
+            }
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2972,14 +3391,29 @@ mod tests {
     #[test]
     fn test_sync_state_display_all_variants_formatted() {
         assert_eq!(format!("{}", SyncState::Idle), "idle");
-        assert_eq!(format!("{}", SyncState::ConnectingPeers), "connecting_peers");
+        assert_eq!(
+            format!("{}", SyncState::ConnectingPeers),
+            "connecting_peers"
+        );
         assert_eq!(format!("{}", SyncState::Synced), "synced");
         assert_eq!(
-            format!("{}", SyncState::DownloadingHeaders { progress: 5, target: 10 }),
+            format!(
+                "{}",
+                SyncState::DownloadingHeaders {
+                    progress: 5,
+                    target: 10
+                }
+            ),
             "downloading_headers (5/10)"
         );
         assert_eq!(
-            format!("{}", SyncState::DownloadingBlocks { progress: 3, target: 7 }),
+            format!(
+                "{}",
+                SyncState::DownloadingBlocks {
+                    progress: 3,
+                    target: 7
+                }
+            ),
             "downloading_blocks (3/7)"
         );
     }
@@ -2989,7 +3423,15 @@ mod tests {
         assert!(SyncState::Idle.is_idle_or_synced());
         assert!(SyncState::Synced.is_idle_or_synced());
         assert!(!SyncState::ConnectingPeers.is_idle_or_synced());
-        assert!(!SyncState::DownloadingHeaders { progress: 0, target: 0 }.is_idle_or_synced());
-        assert!(!SyncState::DownloadingBlocks { progress: 0, target: 0 }.is_idle_or_synced());
+        assert!(!SyncState::DownloadingHeaders {
+            progress: 0,
+            target: 0
+        }
+        .is_idle_or_synced());
+        assert!(!SyncState::DownloadingBlocks {
+            progress: 0,
+            target: 0
+        }
+        .is_idle_or_synced());
     }
 }

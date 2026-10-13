@@ -28,7 +28,7 @@
 //! [script_pubkey: script_len bytes]
 //! ```
 
-use std::io::{self, Read, BufReader};
+use std::io::{self, BufReader, Read};
 use std::path::Path;
 
 use btc_primitives::amount::Amount;
@@ -132,12 +132,9 @@ pub fn read_snapshot_entry<R: Read>(
     reader: &mut R,
     index: u64,
 ) -> Result<UtxoSnapshotEntry, SnapshotError> {
-    let txid_bytes = read_hash(reader)
-        .map_err(|_| SnapshotError::TruncatedEntry { index })?;
-    let vout = read_u32_le(reader)
-        .map_err(|_| SnapshotError::TruncatedEntry { index })?;
-    let height = read_u64_le(reader)
-        .map_err(|_| SnapshotError::TruncatedEntry { index })?;
+    let txid_bytes = read_hash(reader).map_err(|_| SnapshotError::TruncatedEntry { index })?;
+    let vout = read_u32_le(reader).map_err(|_| SnapshotError::TruncatedEntry { index })?;
+    let height = read_u64_le(reader).map_err(|_| SnapshotError::TruncatedEntry { index })?;
 
     let mut coinbase_byte = [0u8; 1];
     reader
@@ -145,10 +142,8 @@ pub fn read_snapshot_entry<R: Read>(
         .map_err(|_| SnapshotError::TruncatedEntry { index })?;
     let is_coinbase = coinbase_byte[0] != 0;
 
-    let value = read_i64_le(reader)
-        .map_err(|_| SnapshotError::TruncatedEntry { index })?;
-    let script_len = read_u32_le(reader)
-        .map_err(|_| SnapshotError::TruncatedEntry { index })?;
+    let value = read_i64_le(reader).map_err(|_| SnapshotError::TruncatedEntry { index })?;
+    let script_len = read_u32_le(reader).map_err(|_| SnapshotError::TruncatedEntry { index })?;
 
     if script_len > MAX_SNAPSHOT_SCRIPT_SIZE {
         return Err(SnapshotError::ScriptTooLarge {
@@ -214,10 +209,8 @@ pub fn load_utxo_snapshot<DB: Database>(
 
             // Also store metadata (height + is_coinbase) under a companion key,
             // matching PersistentUtxoSet's convention.
-            let meta_outpoint = OutPoint::new(
-                entry.outpoint.txid,
-                entry.outpoint.vout | 0x8000_0000,
-            );
+            let meta_outpoint =
+                OutPoint::new(entry.outpoint.txid, entry.outpoint.vout | 0x8000_0000);
             let meta_txout = TxOut {
                 value: Amount::from_sat(entry.height as i64),
                 script_pubkey: ScriptBuf::from_bytes(vec![entry.is_coinbase as u8]),

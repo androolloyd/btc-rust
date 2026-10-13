@@ -19,10 +19,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use btc_primitives::hash::TxHash;
-use btc_primitives::transaction::{OutPoint, Transaction};
 use btc_primitives::amount::Amount;
 use btc_primitives::encode::Encodable;
+use btc_primitives::hash::TxHash;
+use btc_primitives::transaction::{OutPoint, Transaction};
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
@@ -259,7 +259,10 @@ impl ClusterMempool {
         // Check minimum relay feerate.
         let feerate = FixedFeeRate::from_fee_weight(fee_sat, weight);
         if feerate.as_raw() < self.min_relay_feerate {
-            return Err(ClusterMempoolError::BelowMinRelayFeerate { fee: fee_sat, weight });
+            return Err(ClusterMempoolError::BelowMinRelayFeerate {
+                fee: fee_sat,
+                weight,
+            });
         }
 
         // Find related cluster IDs.
@@ -314,12 +317,15 @@ impl ClusterMempool {
         }
 
         // Store TxInfo.
-        self.txs.insert(txid, TxInfo {
-            tx,
-            fee: fee_sat,
-            weight,
-            cluster_id,
-        });
+        self.txs.insert(
+            txid,
+            TxInfo {
+                tx,
+                fee: fee_sat,
+                weight,
+                cluster_id,
+            },
+        );
 
         // Add txid to the cluster.
         let cluster = self.clusters.entry(cluster_id).or_insert_with(|| Cluster {
@@ -445,20 +451,14 @@ impl ClusterMempool {
     /// mempool is empty.
     pub fn evict_worst(&mut self) -> Vec<TxInfo> {
         // Find the cluster with the lowest feerate.
-        let worst_cluster_id = match self
-            .clusters
-            .values()
-            .min_by_key(|c| c.feerate())
-        {
+        let worst_cluster_id = match self.clusters.values().min_by_key(|c| c.feerate()) {
             Some(c) => c.id,
             None => return Vec::new(),
         };
 
         // Get the last (lowest-feerate) chunk from that cluster.
         let worst_chunk_txids: Vec<TxHash> = match self.clusters.get(&worst_cluster_id) {
-            Some(c) if !c.chunks.is_empty() => {
-                c.chunks.last().unwrap().txids.clone()
-            }
+            Some(c) if !c.chunks.is_empty() => c.chunks.last().unwrap().txids.clone(),
             _ => return Vec::new(),
         };
 
@@ -576,7 +576,9 @@ impl ClusterMempool {
         let child_txid = child.txid();
 
         if self.txs.contains_key(&parent_txid) {
-            return Err(ClusterMempoolError::ParentAlreadyExists(parent_txid.to_hex()));
+            return Err(ClusterMempoolError::ParentAlreadyExists(
+                parent_txid.to_hex(),
+            ));
         }
         if self.txs.contains_key(&child_txid) {
             return Err(ClusterMempoolError::ChildAlreadyExists(child_txid.to_hex()));
@@ -761,14 +763,17 @@ impl ClusterMempool {
                 }
             }
 
-            self.clusters.insert(new_cid, Cluster {
-                id: new_cid,
-                txids: component,
-                linearization: Vec::new(),
-                chunks: Vec::new(),
-                total_fee,
-                total_weight,
-            });
+            self.clusters.insert(
+                new_cid,
+                Cluster {
+                    id: new_cid,
+                    txids: component,
+                    linearization: Vec::new(),
+                    chunks: Vec::new(),
+                    total_fee,
+                    total_weight,
+                },
+            );
 
             self.relinearize_cluster(new_cid);
         }
@@ -924,10 +929,7 @@ fn set_fee_weight(set: &[TxHash], tx_map: &HashMap<TxHash, TxInfo>) -> (u64, usi
 }
 
 /// Topological sort a set of txids using the parent map (Kahn's algorithm).
-fn topo_sort(
-    set: &[TxHash],
-    parents: &HashMap<TxHash, HashSet<TxHash>>,
-) -> Vec<TxHash> {
+fn topo_sort(set: &[TxHash], parents: &HashMap<TxHash, HashSet<TxHash>>) -> Vec<TxHash> {
     let set_members: HashSet<TxHash> = set.iter().copied().collect();
 
     // Compute in-degree within the set.
@@ -1153,11 +1155,7 @@ mod tests {
     }
 
     /// Build a transaction with multiple inputs.
-    fn make_tx_multi_input(
-        id_byte: u8,
-        parent_txids: &[TxHash],
-        output_value: i64,
-    ) -> Transaction {
+    fn make_tx_multi_input(id_byte: u8, parent_txids: &[TxHash], output_value: i64) -> Transaction {
         let inputs: Vec<TxIn> = if parent_txids.is_empty() {
             vec![TxIn {
                 previous_output: OutPoint::new(TxHash::from_bytes([id_byte; 32]), 0),
@@ -1594,7 +1592,8 @@ mod tests {
 
         let old_tx = make_tx(0x01, None, 50_000);
         let old_txid = old_tx.txid();
-        pool.add_tx(old_tx.clone(), Amount::from_sat(2_000)).unwrap();
+        pool.add_tx(old_tx.clone(), Amount::from_sat(2_000))
+            .unwrap();
 
         // New tx spends the same input with higher fee.
         let new_tx = make_tx(0x01, None, 48_000);
@@ -1611,7 +1610,8 @@ mod tests {
 
         let old_tx = make_tx(0x01, None, 50_000);
         let old_txid = old_tx.txid();
-        pool.add_tx(old_tx.clone(), Amount::from_sat(10_000)).unwrap();
+        pool.add_tx(old_tx.clone(), Amount::from_sat(10_000))
+            .unwrap();
 
         // New tx has lower fee — should fail.
         let new_tx = make_tx(0x01, None, 50_000);
@@ -1667,12 +1667,7 @@ mod tests {
 
         let child = make_tx(0x02, Some(parent_txid), 40_000);
 
-        let result = pool.accept_package(
-            parent,
-            Amount::from_sat(1),
-            child,
-            Amount::from_sat(1),
-        );
+        let result = pool.accept_package(parent, Amount::from_sat(1), child, Amount::from_sat(1));
 
         assert!(matches!(
             result,
@@ -1687,7 +1682,8 @@ mod tests {
 
         let parent = make_tx(0x01, None, 50_000);
         let parent_txid = parent.txid();
-        pool.add_tx(parent.clone(), Amount::from_sat(5_000)).unwrap();
+        pool.add_tx(parent.clone(), Amount::from_sat(5_000))
+            .unwrap();
 
         let child = make_tx(0x02, Some(parent_txid), 40_000);
 
@@ -2083,28 +2079,34 @@ mod tests {
     #[test]
     fn test_error_display() {
         let e1 = ClusterMempoolError::AlreadyExists("abc".to_string());
-        assert!(format!("{}", e1).contains("abc"));
+        assert!(format!("{e1}").contains("abc"));
 
-        let e2 = ClusterMempoolError::ClusterTooLarge { size: 102, max: 101 };
-        assert!(format!("{}", e2).contains("102"));
+        let e2 = ClusterMempoolError::ClusterTooLarge {
+            size: 102,
+            max: 101,
+        };
+        assert!(format!("{e2}").contains("102"));
 
-        let e3 = ClusterMempoolError::BelowMinRelayFeerate { fee: 1, weight: 100 };
-        assert!(format!("{}", e3).contains("below minimum"));
+        let e3 = ClusterMempoolError::BelowMinRelayFeerate {
+            fee: 1,
+            weight: 100,
+        };
+        assert!(format!("{e3}").contains("below minimum"));
 
         let e4 = ClusterMempoolError::PackageRbfFailed;
-        assert!(format!("{}", e4).contains("dominate"));
+        assert!(format!("{e4}").contains("dominate"));
 
         let e5 = ClusterMempoolError::PackageBelowMinFeerate {
             package_feerate: 500,
             min_feerate: 1000,
         };
-        assert!(format!("{}", e5).contains("500"));
+        assert!(format!("{e5}").contains("500"));
 
         let e6 = ClusterMempoolError::ParentAlreadyExists("def".to_string());
-        assert!(format!("{}", e6).contains("def"));
+        assert!(format!("{e6}").contains("def"));
 
         let e7 = ClusterMempoolError::ChildAlreadyExists("ghi".to_string());
-        assert!(format!("{}", e7).contains("ghi"));
+        assert!(format!("{e7}").contains("ghi"));
     }
 
     #[test]

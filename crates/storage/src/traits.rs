@@ -1,7 +1,9 @@
-use btc_primitives::block::BlockHeader;
+use btc_primitives::block::{Block, BlockHeader};
 use btc_primitives::hash::{BlockHash, TxHash};
-use btc_primitives::transaction::{Transaction, TxOut, OutPoint};
+use btc_primitives::transaction::{OutPoint, Transaction, TxOut};
 use thiserror::Error;
+
+pub const MAX_FEE_STATE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -38,6 +40,14 @@ pub struct TxBlockLocation {
     pub tx_position: u32,
 }
 
+/// One validated transaction touching a script, ordered by active height/position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptHistoryEntry {
+    pub txid: TxHash,
+    pub height: u64,
+    pub tx_position: u32,
+}
+
 /// An entry in the per-address (per-script) index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddressIndexValue {
@@ -55,6 +65,52 @@ pub struct AddressIndexValue {
 
 /// Read-only database transaction
 pub trait DbTx: Send + Sync {
+    fn exex_journal_tip(&self) -> Result<Option<crate::exex::JournalTip>, StorageError> {
+        Ok(None)
+    }
+    fn exex_journal_entry(
+        &self,
+        _sequence: u64,
+    ) -> Result<Option<crate::exex::JournalEntry>, StorageError> {
+        Err(StorageError::Database(
+            "durable ExEx journal unsupported".into(),
+        ))
+    }
+    fn exex_state(&self, _name: &str) -> Result<Option<crate::exex::ExtensionState>, StorageError> {
+        Err(StorageError::Database(
+            "durable extension state unsupported".into(),
+        ))
+    }
+    fn stage_checkpoint(&self) -> Result<Option<(u64, BlockHash)>, StorageError> {
+        Ok(None)
+    }
+
+    fn fee_observations(&self) -> Result<Option<Vec<u8>>, StorageError> {
+        Ok(None)
+    }
+    /// None means the validated script index has never been enabled.
+    fn script_index_tip(&self) -> Result<Option<(u64, BlockHash)>, StorageError> {
+        Ok(None)
+    }
+    fn script_history(
+        &self,
+        _hash: &[u8; 32],
+        _limit: usize,
+    ) -> Result<Vec<ScriptHistoryEntry>, StorageError> {
+        Err(StorageError::Database(
+            "validated script history unsupported".into(),
+        ))
+    }
+    fn get_block_undo(&self, _hash: &BlockHash) -> Result<Option<Vec<u8>>, StorageError> {
+        Err(StorageError::Database(
+            "undo records unsupported by this backend".into(),
+        ))
+    }
+    fn get_block(&self, _hash: &BlockHash) -> Result<Option<Block>, StorageError> {
+        Err(StorageError::Database(
+            "block bodies unsupported by this backend".into(),
+        ))
+    }
     fn get_block_header(&self, hash: &BlockHash) -> Result<Option<BlockHeader>, StorageError>;
     fn get_block_hash_by_height(&self, height: u64) -> Result<Option<BlockHash>, StorageError>;
     fn get_transaction(&self, txid: &TxHash) -> Result<Option<Transaction>, StorageError>;
@@ -66,11 +122,99 @@ pub trait DbTx: Send + Sync {
     fn get_tx_block_index(&self, txid: &TxHash) -> Result<Option<TxBlockLocation>, StorageError>;
 
     /// Get all transaction entries for a given script hash (address index).
-    fn get_address_txs(&self, script_hash: &[u8; 32]) -> Result<Vec<AddressIndexValue>, StorageError>;
+    fn get_address_txs(
+        &self,
+        script_hash: &[u8; 32],
+    ) -> Result<Vec<AddressIndexValue>, StorageError>;
 }
 
 /// Read-write database transaction
 pub trait DbTxMut: DbTx {
+    fn initialize_exex_journal(&self, _genesis: BlockHash) -> Result<(), StorageError> {
+        Err(StorageError::Database(
+            "durable ExEx initialization unsupported".into(),
+        ))
+    }
+    fn append_exex_event(
+        &self,
+        _connected: bool,
+        _height: u64,
+        _block: &Block,
+    ) -> Result<(), StorageError> {
+        Err(StorageError::Database(
+            "durable ExEx publication unsupported".into(),
+        ))
+    }
+    fn set_exex_state(
+        &self,
+        _name: &str,
+        _state: &crate::exex::ExtensionState,
+    ) -> Result<(), StorageError> {
+        Err(StorageError::Database(
+            "durable extension state unsupported".into(),
+        ))
+    }
+    fn set_stage_checkpoint(&self, _height: u64, _hash: &BlockHash) -> Result<(), StorageError> {
+        Err(StorageError::Database(
+            "stage checkpoints unsupported".into(),
+        ))
+    }
+    fn index_script_plan(
+        &self,
+        _plan: &crate::index_plan::BlockIndexPlan,
+        _remove: bool,
+    ) -> Result<(), StorageError> {
+        Err(StorageError::Database(
+            "prepared script indices unsupported".into(),
+        ))
+    }
+
+    fn set_fee_observations(&self, _bytes: &[u8]) -> Result<(), StorageError> {
+        Err(StorageError::Database(
+            "fee observation persistence unsupported".into(),
+        ))
+    }
+    fn index_script_block(
+        &self,
+        _height: u64,
+        _block: &Block,
+        _undo: &btc_consensus::utxo::UtxoSetUpdate,
+        _remove: bool,
+    ) -> Result<(), StorageError> {
+        Err(StorageError::Database(
+            "validated script indexing unsupported".into(),
+        ))
+    }
+    fn set_script_index_tip(&self, _height: u64, _hash: &BlockHash) -> Result<(), StorageError> {
+        Err(StorageError::Database(
+            "validated script indexing unsupported".into(),
+        ))
+    }
+    fn put_block_undo(&self, _hash: &BlockHash, _bytes: &[u8]) -> Result<(), StorageError> {
+        Err(StorageError::Database(
+            "undo records unsupported by this backend".into(),
+        ))
+    }
+    fn delete_block_hash_by_height(&self, _height: u64) -> Result<(), StorageError> {
+        Err(StorageError::Database(
+            "height deletion unsupported by this backend".into(),
+        ))
+    }
+    fn delete_tx_block_index(&self, _txid: &TxHash) -> Result<(), StorageError> {
+        Err(StorageError::Database(
+            "transaction index deletion unsupported by this backend".into(),
+        ))
+    }
+    fn replace_mempool(&self, _transactions: &[Transaction]) -> Result<(), StorageError> {
+        Err(StorageError::Database(
+            "mempool persistence unsupported by this backend".into(),
+        ))
+    }
+    fn put_block(&self, _hash: &BlockHash, _block: &Block) -> Result<(), StorageError> {
+        Err(StorageError::Database(
+            "block bodies unsupported by this backend".into(),
+        ))
+    }
     fn put_block_header(&self, hash: &BlockHash, header: &BlockHeader) -> Result<(), StorageError>;
     fn put_block_hash_by_height(&self, height: u64, hash: &BlockHash) -> Result<(), StorageError>;
     fn put_transaction(&self, txid: &TxHash, tx: &Transaction) -> Result<(), StorageError>;
@@ -129,7 +273,7 @@ mod tests {
     #[test]
     fn test_storage_error_debug() {
         let err = StorageError::Database("debug test".into());
-        let debug_str = format!("{:?}", err);
+        let debug_str = format!("{err:?}");
         assert!(debug_str.contains("Database"));
         assert!(debug_str.contains("debug test"));
     }

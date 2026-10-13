@@ -84,10 +84,7 @@ pub fn analyze_script(script: &Script) -> ScriptAnalysis {
                         // Save current branch and start a new one.
                         if !current_branch_ops.is_empty() {
                             branches.push(ScriptBranch {
-                                condition: format!(
-                                    "{:?} (depth {})",
-                                    op, branch_depth
-                                ),
+                                condition: format!("{op:?} (depth {branch_depth})"),
                                 ops: std::mem::take(&mut current_branch_ops),
                             });
                         }
@@ -95,10 +92,7 @@ pub fn analyze_script(script: &Script) -> ScriptAnalysis {
                     Opcode::OP_ELSE => {
                         if in_branch && !current_branch_ops.is_empty() {
                             branches.push(ScriptBranch {
-                                condition: format!(
-                                    "ELSE (depth {})",
-                                    branch_depth
-                                ),
+                                condition: format!("ELSE (depth {branch_depth})"),
                                 ops: std::mem::take(&mut current_branch_ops),
                             });
                         }
@@ -112,10 +106,7 @@ pub fn analyze_script(script: &Script) -> ScriptAnalysis {
                         }
                         if !current_branch_ops.is_empty() {
                             branches.push(ScriptBranch {
-                                condition: format!(
-                                    "ENDIF (depth {})",
-                                    branch_depth + 1
-                                ),
+                                condition: format!("ENDIF (depth {})", branch_depth + 1),
                                 ops: std::mem::take(&mut current_branch_ops),
                             });
                         }
@@ -139,10 +130,22 @@ pub fn analyze_script(script: &Script) -> ScriptAnalysis {
                     }
 
                     // Number opcodes -- track N for multisig counting.
-                    Opcode::OP_1 | Opcode::OP_2 | Opcode::OP_3 | Opcode::OP_4
-                    | Opcode::OP_5 | Opcode::OP_6 | Opcode::OP_7 | Opcode::OP_8
-                    | Opcode::OP_9 | Opcode::OP_10 | Opcode::OP_11 | Opcode::OP_12
-                    | Opcode::OP_13 | Opcode::OP_14 | Opcode::OP_15 | Opcode::OP_16 => {
+                    Opcode::OP_1
+                    | Opcode::OP_2
+                    | Opcode::OP_3
+                    | Opcode::OP_4
+                    | Opcode::OP_5
+                    | Opcode::OP_6
+                    | Opcode::OP_7
+                    | Opcode::OP_8
+                    | Opcode::OP_9
+                    | Opcode::OP_10
+                    | Opcode::OP_11
+                    | Opcode::OP_12
+                    | Opcode::OP_13
+                    | Opcode::OP_14
+                    | Opcode::OP_15
+                    | Opcode::OP_16 => {
                         last_n_keys = (op as u8 - Opcode::OP_1 as u8 + 1) as usize;
                         stack_depth += 1;
                     }
@@ -152,10 +155,16 @@ pub fn analyze_script(script: &Script) -> ScriptAnalysis {
                     }
 
                     // Arithmetic / comparison ops consume 2, push 1 => net -1
-                    Opcode::OP_ADD | Opcode::OP_SUB | Opcode::OP_EQUAL
-                    | Opcode::OP_NUMEQUAL | Opcode::OP_BOOLAND | Opcode::OP_BOOLOR
-                    | Opcode::OP_LESSTHAN | Opcode::OP_GREATERTHAN
-                    | Opcode::OP_MIN | Opcode::OP_MAX => {
+                    Opcode::OP_ADD
+                    | Opcode::OP_SUB
+                    | Opcode::OP_EQUAL
+                    | Opcode::OP_NUMEQUAL
+                    | Opcode::OP_BOOLAND
+                    | Opcode::OP_BOOLOR
+                    | Opcode::OP_LESSTHAN
+                    | Opcode::OP_GREATERTHAN
+                    | Opcode::OP_MIN
+                    | Opcode::OP_MAX => {
                         stack_depth = stack_depth.saturating_sub(1);
                     }
 

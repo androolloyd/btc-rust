@@ -7,15 +7,15 @@
 //! 4. Hash puzzles and commitment schemes
 //! 5. Full P2PKH and multisig sign+verify roundtrips with real signatures
 
-use btc_test::TestKeyPair;
-use btc_consensus::script_engine::{ScriptEngine, ScriptFlags, encode_num, decode_num};
+use btc_consensus::script_engine::{decode_num, encode_num, ScriptEngine, ScriptFlags};
 use btc_consensus::sig_verify::Secp256k1Verifier;
 use btc_consensus::sighash::{sighash_legacy, SighashType};
-use btc_primitives::hash::{sha256, hash160, sha256d};
-use btc_primitives::script::{Opcode, ScriptBuf};
-use btc_primitives::transaction::{Transaction, TxIn, TxOut, OutPoint};
 use btc_primitives::amount::Amount;
 use btc_primitives::hash::TxHash;
+use btc_primitives::hash::{hash160, sha256, sha256d};
+use btc_primitives::script::{Opcode, ScriptBuf};
+use btc_primitives::transaction::{OutPoint, Transaction, TxIn, TxOut};
+use btc_test::TestKeyPair;
 
 static VERIFIER: Secp256k1Verifier = Secp256k1Verifier;
 
@@ -41,7 +41,12 @@ fn make_spend_tx(_prev_script_pubkey: &ScriptBuf, value: i64) -> Transaction {
 }
 
 /// Sign a transaction input against a given script_pubkey using legacy sighash.
-fn sign_legacy(key: &TestKeyPair, tx: &Transaction, input_index: usize, script_pubkey: &[u8]) -> Vec<u8> {
+fn sign_legacy(
+    key: &TestKeyPair,
+    tx: &Transaction,
+    input_index: usize,
+    script_pubkey: &[u8],
+) -> Vec<u8> {
     let hash = sighash_legacy(tx, input_index, script_pubkey, SighashType::ALL)
         .expect("sighash should succeed");
     let secp = secp256k1::Secp256k1::new();
@@ -75,9 +80,10 @@ fn test_20_of_20_checkmultisig() {
     let tx = make_spend_tx(&script_pubkey, 50_000);
 
     // Sign with all 20 keys in order
-    let sigs: Vec<Vec<u8>> = keys.iter().map(|k| {
-        sign_legacy(k, &tx, 0, script_pubkey.as_bytes())
-    }).collect();
+    let sigs: Vec<Vec<u8>> = keys
+        .iter()
+        .map(|k| sign_legacy(k, &tx, 0, script_pubkey.as_bytes()))
+        .collect();
 
     // Build script_sig: OP_0 <sig1> ... <sig20>
     let mut script_sig = ScriptBuf::new();
@@ -136,7 +142,10 @@ fn test_max_stack_1000_elements() {
 
     let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
     engine.execute(script.as_script()).unwrap();
-    assert!(engine.success(), "1000 stack elements with OP_PICK should succeed");
+    assert!(
+        engine.success(),
+        "1000 stack elements with OP_PICK should succeed"
+    );
     assert_eq!(engine.stack().len(), 1000);
 }
 
@@ -171,7 +180,10 @@ fn test_over_max_script_ops_202_fails() {
 
     let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
     let result = engine.execute(script.as_script());
-    assert!(result.is_err(), "202 counted opcodes should fail with OpCountLimit");
+    assert!(
+        result.is_err(),
+        "202 counted opcodes should fail with OpCountLimit"
+    );
 }
 
 #[test]
@@ -188,7 +200,10 @@ fn test_max_push_size_520_bytes() {
 
     let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
     engine.execute(script.as_script()).unwrap();
-    assert!(engine.success(), "520-byte push + SHA256 verify should succeed");
+    assert!(
+        engine.success(),
+        "520-byte push + SHA256 verify should succeed"
+    );
 }
 
 #[test]
@@ -247,7 +262,10 @@ fn test_p2pkh_wrong_key_fails() {
     // P2PKH script uses OP_EQUALVERIFY which returns an error (not just falsy stack)
     // when the pubkey hash doesn't match.
     let result = engine.execute(script_pubkey.as_script());
-    assert!(result.is_err(), "P2PKH with wrong key should fail at EQUALVERIFY (hash mismatch)");
+    assert!(
+        result.is_err(),
+        "P2PKH with wrong key should fail at EQUALVERIFY (hash mismatch)"
+    );
 }
 
 #[test]
@@ -280,7 +298,10 @@ fn test_2_of_3_multisig_full_roundtrip() {
     let mut engine = ScriptEngine::new(&VERIFIER, ScriptFlags::none(), Some(&tx), 0, 50_000);
     engine.execute(script_sig.as_script()).unwrap();
     engine.execute(script_pubkey.as_script()).unwrap();
-    assert!(engine.success(), "2-of-3 CHECKMULTISIG should succeed with keys 1 and 3");
+    assert!(
+        engine.success(),
+        "2-of-3 CHECKMULTISIG should succeed with keys 1 and 3"
+    );
 }
 
 #[test]
@@ -312,7 +333,10 @@ fn test_2_of_3_multisig_wrong_order_fails() {
     let mut engine = ScriptEngine::new(&VERIFIER, ScriptFlags::none(), Some(&tx), 0, 50_000);
     engine.execute(script_sig.as_script()).unwrap();
     engine.execute(script_pubkey.as_script()).unwrap();
-    assert!(!engine.success(), "CHECKMULTISIG with sigs in wrong order should fail");
+    assert!(
+        !engine.success(),
+        "CHECKMULTISIG with sigs in wrong order should fail"
+    );
 }
 
 #[test]
@@ -341,7 +365,10 @@ fn test_lightning_funding_output_2_of_2() {
     let mut engine = ScriptEngine::new(&VERIFIER, ScriptFlags::none(), Some(&tx), 0, 100_000);
     engine.execute(script_sig.as_script()).unwrap();
     engine.execute(script_pubkey.as_script()).unwrap();
-    assert!(engine.success(), "Lightning 2-of-2 funding output should succeed");
+    assert!(
+        engine.success(),
+        "Lightning 2-of-2 funding output should succeed"
+    );
 }
 
 #[test]
@@ -381,7 +408,10 @@ fn test_lightning_commitment_to_self_revocation_path() {
     let mut engine = ScriptEngine::new(&VERIFIER, ScriptFlags::none(), Some(&tx), 0, 50_000);
     engine.execute(script_sig.as_script()).unwrap();
     engine.execute(script_pubkey.as_script()).unwrap();
-    assert!(engine.success(), "Lightning commitment revocation path should succeed");
+    assert!(
+        engine.success(),
+        "Lightning commitment revocation path should succeed"
+    );
 }
 
 #[test]
@@ -434,7 +464,10 @@ fn test_lightning_commitment_to_self_delayed_path() {
     let mut engine = ScriptEngine::new(&VERIFIER, flags, Some(&tx), 0, 50_000);
     engine.execute(script_sig.as_script()).unwrap();
     engine.execute(script_pubkey.as_script()).unwrap();
-    assert!(engine.success(), "Lightning commitment delayed path (CSV) should succeed");
+    assert!(
+        engine.success(),
+        "Lightning commitment delayed path (CSV) should succeed"
+    );
 }
 
 #[test]
@@ -478,7 +511,10 @@ fn test_atomic_swap_claim_path() {
     let mut engine = ScriptEngine::new(&VERIFIER, ScriptFlags::none(), Some(&tx), 0, 50_000);
     engine.execute(script_sig.as_script()).unwrap();
     engine.execute(script_pubkey.as_script()).unwrap();
-    assert!(engine.success(), "Atomic swap claim path should succeed with correct preimage");
+    assert!(
+        engine.success(),
+        "Atomic swap claim path should succeed with correct preimage"
+    );
 }
 
 #[test]
@@ -536,7 +572,10 @@ fn test_atomic_swap_timeout_path() {
     let mut engine = ScriptEngine::new(&VERIFIER, flags, Some(&tx), 0, 50_000);
     engine.execute(script_sig.as_script()).unwrap();
     engine.execute(script_pubkey.as_script()).unwrap();
-    assert!(engine.success(), "Atomic swap timeout path should succeed after locktime");
+    assert!(
+        engine.success(),
+        "Atomic swap timeout path should succeed after locktime"
+    );
 }
 
 #[test]
@@ -576,7 +615,10 @@ fn test_atomic_swap_wrong_preimage_fails() {
     engine.execute(script_sig.as_script()).unwrap();
     let result = engine.execute(script_pubkey.as_script());
     // OP_EQUALVERIFY will fail
-    assert!(result.is_err(), "Atomic swap with wrong preimage should fail at EQUALVERIFY");
+    assert!(
+        result.is_err(),
+        "Atomic swap with wrong preimage should fail at EQUALVERIFY"
+    );
 }
 
 // ============================================================================
@@ -682,7 +724,10 @@ fn test_simple_vault_recovery_path() {
     let mut engine = ScriptEngine::new(&VERIFIER, flags, Some(&tx), 0, 100_000);
     engine.execute(script_sig.as_script()).unwrap();
     engine.execute(script_pubkey.as_script()).unwrap();
-    assert!(engine.success(), "Vault recovery path should succeed after CSV delay");
+    assert!(
+        engine.success(),
+        "Vault recovery path should succeed after CSV delay"
+    );
 }
 
 #[test]
@@ -724,7 +769,10 @@ fn test_dead_mans_switch() {
     let mut engine = ScriptEngine::new(&VERIFIER, ScriptFlags::none(), Some(&tx), 0, 50_000);
     engine.execute(script_sig.as_script()).unwrap();
     engine.execute(script_pubkey.as_script()).unwrap();
-    assert!(engine.success(), "Dead man's switch: owner path should succeed");
+    assert!(
+        engine.success(),
+        "Dead man's switch: owner path should succeed"
+    );
 
     // Heir spending (ELSE path) after delay
     let tx_heir = Transaction {
@@ -756,7 +804,10 @@ fn test_dead_mans_switch() {
     let mut engine2 = ScriptEngine::new(&VERIFIER, flags, Some(&tx_heir), 0, 50_000);
     engine2.execute(script_sig_heir.as_script()).unwrap();
     engine2.execute(script_pubkey.as_script()).unwrap();
-    assert!(engine2.success(), "Dead man's switch: heir path should succeed after delay");
+    assert!(
+        engine2.success(),
+        "Dead man's switch: heir path should succeed after delay"
+    );
 }
 
 // ============================================================================
@@ -838,7 +889,10 @@ fn test_op_return_in_unexecuted_branch() {
 
     let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
     engine.execute(script.as_script()).unwrap();
-    assert!(engine.success(), "OP_RETURN in dead branch should be skipped");
+    assert!(
+        engine.success(),
+        "OP_RETURN in dead branch should be skipped"
+    );
 }
 
 #[test]
@@ -855,7 +909,10 @@ fn test_disabled_opcode_in_dead_branch_fails() {
     // Without OP_CAT plugin registered, it's a disabled opcode
     let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
     let result = engine.execute(script.as_script());
-    assert!(result.is_err(), "Disabled opcode in dead branch should still fail");
+    assert!(
+        result.is_err(),
+        "Disabled opcode in dead branch should still fail"
+    );
 }
 
 #[test]
@@ -929,12 +986,15 @@ fn test_number_overflow_5_byte_result() {
     let mut script = ScriptBuf::new();
     script.push_slice(&encode_num(i32::MAX as i64));
     script.push_opcode(Opcode::OP_1ADD); // 2147483648 -- 5 bytes
-    // Try to do another arithmetic op on the 5-byte result
+                                         // Try to do another arithmetic op on the 5-byte result
     script.push_opcode(Opcode::OP_1ADD); // should fail: input is 5 bytes
 
     let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
     let result = engine.execute(script.as_script());
-    assert!(result.is_err(), "Arithmetic on 5-byte number should fail with overflow");
+    assert!(
+        result.is_err(),
+        "Arithmetic on 5-byte number should fail with overflow"
+    );
 }
 
 #[test]
@@ -1013,7 +1073,7 @@ fn test_op_count_includes_multisig_keys() {
     script.push_slice(&k1.pubkey_bytes());
     script.push_slice(&k2.pubkey_bytes());
     script.push_opcode(Opcode::OP_2); // 2 keys
-    // 199 NOPs (each counted)
+                                      // 199 NOPs (each counted)
     for _ in 0..199 {
         script.push_opcode(Opcode::OP_NOP);
     }
@@ -1022,7 +1082,10 @@ fn test_op_count_includes_multisig_keys() {
 
     let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
     let result = engine.execute(script.as_script());
-    assert!(result.is_err(), "CHECKMULTISIG keys should count toward 201 op limit");
+    assert!(
+        result.is_err(),
+        "CHECKMULTISIG keys should count toward 201 op limit"
+    );
 }
 
 #[test]
@@ -1083,7 +1146,10 @@ fn test_hash_preimage_puzzle_wrong_preimage() {
     let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
     engine.execute(script_sig.as_script()).unwrap();
     engine.execute(script_pubkey.as_script()).unwrap();
-    assert!(!engine.success(), "Wrong preimage should not solve the puzzle");
+    assert!(
+        !engine.success(),
+        "Wrong preimage should not solve the puzzle"
+    );
 }
 
 #[test]
@@ -1177,7 +1243,10 @@ fn test_hash_chain_ripemd_sha256_hash160() {
 
     let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
     engine.execute(script.as_script()).unwrap();
-    assert!(engine.success(), "Chained RIPEMD160 -> SHA256 -> HASH160 should match");
+    assert!(
+        engine.success(),
+        "Chained RIPEMD160 -> SHA256 -> HASH160 should match"
+    );
 }
 
 // ============================================================================
@@ -1203,7 +1272,10 @@ fn test_pick_from_deep_stack() {
 
     let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
     engine.execute(script.as_script()).unwrap();
-    assert!(engine.success(), "OP_PICK from depth 99 should find the correct value");
+    assert!(
+        engine.success(),
+        "OP_PICK from depth 99 should find the correct value"
+    );
 }
 
 #[test]
@@ -1245,7 +1317,10 @@ fn test_altstack_roundtrip() {
 
     let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
     engine.execute(script.as_script()).unwrap();
-    assert!(engine.success(), "Altstack roundtrip should preserve values");
+    assert!(
+        engine.success(),
+        "Altstack roundtrip should preserve values"
+    );
 }
 
 #[test]
@@ -1264,7 +1339,10 @@ fn test_depth_opcode() {
 
     let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
     engine.execute(script.as_script()).unwrap();
-    assert!(engine.success(), "OP_DEPTH should report correct stack depth");
+    assert!(
+        engine.success(),
+        "OP_DEPTH should report correct stack depth"
+    );
 }
 
 #[test]
@@ -1464,7 +1542,10 @@ fn test_within_boundary_exclusive() {
 
     let mut engine = ScriptEngine::new_without_tx(&VERIFIER, ScriptFlags::none());
     engine.execute(script.as_script()).unwrap();
-    assert!(!engine.success(), "8 should NOT be within [3, 8) -- exclusive upper bound");
+    assert!(
+        !engine.success(),
+        "8 should NOT be within [3, 8) -- exclusive upper bound"
+    );
 }
 
 #[test]
@@ -1563,7 +1644,10 @@ fn test_cltv_type_mismatch_block_vs_time_fails() {
 
     let mut engine = ScriptEngine::new(&VERIFIER, flags, Some(&tx), 0, 0);
     let result = engine.execute(script.as_script());
-    assert!(result.is_err(), "CLTV type mismatch (block vs time) should fail");
+    assert!(
+        result.is_err(),
+        "CLTV type mismatch (block vs time) should fail"
+    );
 }
 
 #[test]
@@ -1631,7 +1715,10 @@ fn test_csv_disabled_flag_acts_as_nop() {
 
     let mut engine = ScriptEngine::new(&VERIFIER, flags, Some(&tx), 0, 0);
     engine.execute(script.as_script()).unwrap();
-    assert!(engine.success(), "CSV with disable flag should behave as NOP");
+    assert!(
+        engine.success(),
+        "CSV with disable flag should behave as NOP"
+    );
 }
 
 // ============================================================================
@@ -1667,7 +1754,9 @@ fn test_merkle_proof_with_op_cat() {
     let mut engine = ScriptEngine::new_with_registry(
         &VERIFIER,
         ScriptFlags::none(),
-        None, 0, 0,
+        None,
+        0,
+        0,
         Some(&registry),
     );
     engine.execute(script.as_script()).unwrap();
@@ -1728,11 +1817,16 @@ fn test_merkle_proof_3_level_with_op_cat() {
     let mut engine = ScriptEngine::new_with_registry(
         &VERIFIER,
         ScriptFlags::none(),
-        None, 0, 0,
+        None,
+        0,
+        0,
         Some(&registry),
     );
     engine.execute(script.as_script()).unwrap();
-    assert!(engine.success(), "3-level Merkle proof with OP_CAT should verify");
+    assert!(
+        engine.success(),
+        "3-level Merkle proof with OP_CAT should verify"
+    );
 }
 
 // ============================================================================
@@ -1768,7 +1862,10 @@ fn test_checksig_with_codeseparator() {
     let mut engine = ScriptEngine::new(&VERIFIER, ScriptFlags::none(), Some(&tx), 0, 50_000);
     engine.execute(script_sig.as_script()).unwrap();
     engine.execute(script_pubkey.as_script()).unwrap();
-    assert!(engine.success(), "CHECKSIG with OP_CODESEPARATOR should use the subscript after separator");
+    assert!(
+        engine.success(),
+        "CHECKSIG with OP_CODESEPARATOR should use the subscript after separator"
+    );
 }
 
 // ============================================================================
@@ -1811,7 +1908,10 @@ fn test_escrow_3_of_3_with_hash_commitment() {
     let mut engine = ScriptEngine::new(&VERIFIER, ScriptFlags::none(), Some(&tx), 0, 50_000);
     engine.execute(script_sig.as_script()).unwrap();
     engine.execute(script_pubkey.as_script()).unwrap();
-    assert!(engine.success(), "Escrow with hash commitment + 2-of-3 multisig should succeed");
+    assert!(
+        engine.success(),
+        "Escrow with hash commitment + 2-of-3 multisig should succeed"
+    );
 }
 
 #[test]
@@ -1847,7 +1947,10 @@ fn test_escrow_wrong_secret_fails() {
     let mut engine = ScriptEngine::new(&VERIFIER, ScriptFlags::none(), Some(&tx), 0, 50_000);
     engine.execute(script_sig.as_script()).unwrap();
     let result = engine.execute(script_pubkey.as_script());
-    assert!(result.is_err(), "Escrow with wrong secret should fail at EQUALVERIFY");
+    assert!(
+        result.is_err(),
+        "Escrow with wrong secret should fail at EQUALVERIFY"
+    );
 }
 
 #[test]
@@ -1989,7 +2092,10 @@ fn test_dual_checksig_both_must_pass() {
     let mut engine = ScriptEngine::new(&VERIFIER, ScriptFlags::none(), Some(&tx), 0, 50_000);
     engine.execute(script_sig.as_script()).unwrap();
     engine.execute(script_pubkey.as_script()).unwrap();
-    assert!(engine.success(), "Dual CHECKSIG should succeed with both valid signatures");
+    assert!(
+        engine.success(),
+        "Dual CHECKSIG should succeed with both valid signatures"
+    );
 }
 
 // ============================================================================
@@ -2142,7 +2248,10 @@ fn test_checksigverify_invalid_sig_fails() {
     let mut engine = ScriptEngine::new(&VERIFIER, ScriptFlags::none(), Some(&tx), 0, 50_000);
     engine.execute(script_sig.as_script()).unwrap();
     let result = engine.execute(script_pubkey.as_script());
-    assert!(result.is_err(), "CHECKSIGVERIFY with invalid signature should fail");
+    assert!(
+        result.is_err(),
+        "CHECKSIGVERIFY with invalid signature should fail"
+    );
 }
 
 // ============================================================================
@@ -2155,13 +2264,21 @@ fn test_nops_interspersed_with_operations() {
     // Total counted ops must stay <= 201
     let mut script = ScriptBuf::new();
     script.push_opcode(Opcode::OP_3);
-    for _ in 0..10 { script.push_opcode(Opcode::OP_NOP); }
+    for _ in 0..10 {
+        script.push_opcode(Opcode::OP_NOP);
+    }
     script.push_opcode(Opcode::OP_4);
-    for _ in 0..10 { script.push_opcode(Opcode::OP_NOP); }
+    for _ in 0..10 {
+        script.push_opcode(Opcode::OP_NOP);
+    }
     script.push_opcode(Opcode::OP_ADD);
-    for _ in 0..10 { script.push_opcode(Opcode::OP_NOP); }
+    for _ in 0..10 {
+        script.push_opcode(Opcode::OP_NOP);
+    }
     script.push_opcode(Opcode::OP_7);
-    for _ in 0..10 { script.push_opcode(Opcode::OP_NOP); }
+    for _ in 0..10 {
+        script.push_opcode(Opcode::OP_NOP);
+    }
     script.push_opcode(Opcode::OP_NUMEQUAL);
     // Total counted ops: 40 NOPs + 2 (ADD, NUMEQUAL) = 42
 
@@ -2230,8 +2347,7 @@ fn test_multiple_disabled_opcodes_all_fail() {
         let result = engine.execute(script.as_script());
         assert!(
             result.is_err(),
-            "Disabled opcode {:?} in dead branch should still fail",
-            op
+            "Disabled opcode {op:?} in dead branch should still fail"
         );
     }
 }
@@ -2252,7 +2368,10 @@ fn test_cltv_as_nop_when_flag_not_set() {
     let flags = ScriptFlags::none(); // CLTV not enabled
     let mut engine = ScriptEngine::new_without_tx(&VERIFIER, flags);
     engine.execute(script.as_script()).unwrap();
-    assert!(engine.success(), "CLTV should act as NOP when flag is not set");
+    assert!(
+        engine.success(),
+        "CLTV should act as NOP when flag is not set"
+    );
 }
 
 #[test]
@@ -2266,7 +2385,10 @@ fn test_csv_as_nop_when_flag_not_set() {
     let flags = ScriptFlags::none(); // CSV not enabled
     let mut engine = ScriptEngine::new_without_tx(&VERIFIER, flags);
     engine.execute(script.as_script()).unwrap();
-    assert!(engine.success(), "CSV should act as NOP when flag is not set");
+    assert!(
+        engine.success(),
+        "CSV should act as NOP when flag is not set"
+    );
 }
 
 // ============================================================================
