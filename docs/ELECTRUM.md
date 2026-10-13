@@ -11,8 +11,9 @@ This is an implemented subset, not a complete wallet server. `server.version`
 and `server.features` return explicit unsupported errors; failed version
 negotiation closes that connection. The service advertises no completed Electrum
 protocol version. The protocol requires every nonoptional method of an advertised
-version to work. Header checkpoint proofs, fee estimation and other required
-methods remain unfinished and return explicit errors.
+version to work. Fee estimation and other required methods remain unfinished and
+return explicit errors. Header checkpoint proofs now use the actual validated
+active-chain prefix.
 Script history, balances, mempool and unspent queries now use an independently
 maintained validated index and the actual pool. Unknown scripts return real
 empty state only when that index is complete for the active tip.
@@ -20,8 +21,8 @@ empty state only when that index is complete for the active tip.
 | Implemented method | Actual data/operation |
 | --- | --- |
 | `blockchain.headers.subscribe()` | Validated tip height and serialized header, with committed-tip notifications |
-| `blockchain.block.header(height, cp_height=0)` | Actual active-chain header, including network genesis |
-| `blockchain.block.headers(start_height, count, cp_height=0)` | Up to 2016 actual headers; short/empty ranges report their actual count |
+| `blockchain.block.header(height, cp_height=0)` | Actual active-chain header, including network genesis; positive checkpoint returns header, branch and root |
+| `blockchain.block.headers(start_height, count, cp_height=0)` | Up to 2016 actual headers; positive checkpoint proves the last returned header in a nonempty range |
 | `blockchain.transaction.get(tx_hash, verbose=false)` | Actual pool/active-chain transaction, raw or the shared Core-style verbose view |
 | `blockchain.transaction.broadcast(raw_tx)` | Ordinary validated admission, durable pool update and the existing transaction relay event |
 | `blockchain.transaction.get_merkle(tx_hash, height)` | Actual active-block position and txid merkle branch |
@@ -50,6 +51,31 @@ allows. Lagged subscribers reread the real tip. Subscriptions belong to each
 connection and disappear when it closes; there is no global fake status map.
 If a provider's event source closes, subscribed clients disconnect rather than
 remaining attached to an apparently active subscription without updates.
+
+Header checkpoint leaves are the actual header SHA256d hashes from genesis
+through `cp_height`, inclusive. Trees use ElectrumX's natural height, double-SHA256
+pair hashing, odd-width sibling duplication and reversed display byte order.
+With a positive checkpoint, a single-header response contains `header`, `branch`
+and `root`; a chunk adds `branch` and `root` to `hex`, actual `count` and `max`.
+Its proof covers the last header actually returned after the 2016-header cap and
+tip truncation. Empty output has no proof and does not require an available
+checkpoint. Omitted/zero checkpoints retain the existing unproved response.
+Wrong checkpoint types fail; nonempty proofs require
+`header_height <= cp_height <= validated_tip`.
+
+One backend-wide cached tree is keyed by prefix length and the actual checkpoint
+block hash while holding the chain lock. A winning reorg changes that identity;
+equal-work side branches do not. Extensions above the checkpoint can reuse it.
+Only a complete successful tree receives a cache identity, and an old tree is
+released before replacement. Proof prefixes are bounded to 1,048,576 headers
+(`cp_height <= 1,048,575`), roughly 64 MiB of hash payload. Larger proofs error
+explicitly; this does not limit block acceptance or chain height. Cold requests
+build the entire prefix under the chain lock; cached paths take logarithmic work.
+Repeated cold prefixes and broad-load/public hosting remain unqualified.
+
+A root supplied by this server is not an independent trust anchor. Clients must
+pin an independently trusted checkpoint commitment to authenticate a branch.
+These query proofs do not install or alter consensus checkpoints.
 
 The validated index has one row per script/transaction, so multiple receipts,
 self payments and input/output overlap cannot duplicate history. Input scripts
@@ -131,6 +157,8 @@ this port, and TLS/public hosting are not provided.
 
 Primary references are [ElectrumX protocol basics](https://electrumx.readthedocs.io/en/latest/protocol-basics.html),
 [ElectrumX 1.4 method semantics](https://electrumx.readthedocs.io/en/latest/protocol-methods.html),
+released ElectrumX 1.16.0's [header query implementation](https://github.com/spesmilo/electrumx/blob/1.16.0/electrumx/server/session.py)
+and [Merkle implementation](https://github.com/spesmilo/electrumx/blob/1.16.0/electrumx/lib/merkle.py),
 Core v29's [transaction RPC](https://github.com/bitcoin/bitcoin/blob/v29.0/src/rpc/rawtransaction.cpp)
 and [block/merkle primitives](https://github.com/bitcoin/bitcoin/blob/v29.0/src/consensus/merkle.cpp),
 plus Core's [coin handling](https://github.com/bitcoin/bitcoin/blob/v29.0/src/coins.cpp).
@@ -187,3 +215,29 @@ connections inherit no subscriptions. Unknown-script null status is deduplicated
 The gate passes 3,339 tests across 43 suites (two existing ignores), formatting,
 Clippy, feature checks and release build. Closed-stream and successful-versus-
 rejected-publication regressions pass. No package or consensus rules changed.
+
+The header-checkpoint milestone passes 628 exact proof comparisons against
+actual Core v29 headers and the unchanged Merkle class from released ElectrumX
+1.16.0. Its source is checksum-pinned by `scripts/electrumx_reference.py`, retains
+the upstream license in the temporary download, and introduces no node dependency.
+Every position in selected even/odd prefixes through height 101 is covered,
+alongside cached paths, named/positional arguments, malformed types, unavailable
+windows, overflow and empty output. A warmed height-103 checkpoint stays unchanged
+on equal-work side branches and is queried immediately after the winning reorg,
+before another prefix can evict the cache. Its branch/root change while a header
+below the fork remains identical; a checkpoint below the fork remains unchanged.
+Proofs survive real pool and confirmed-chain restarts. Actual validation through
+height 2018 tests the precise 2016-header chunk endpoint, short tip ranges and
+2,019-header trees again after reopening the same database. Existing 260 wallet
+query comparisons, status notifications and admission/reorg assertions still pass.
+
+The final gate passes 3,342 tests across 43 suites (two existing ignores),
+formatting, Clippy, feature checks and release build. Three new regressions cover
+the unchanged published height-5/checkpoint-8 header proof, allocation bounds
+before source reads, and failed-prefix cache publication. The first native run
+found an obsolete fixture expecting checkpoint support to be absent; that
+expectation was corrected to the actual window error. The complete rerun and
+strengthened warm-cache reorg follow-up both pass. No dependency versions,
+lockfiles or ordinary consensus rules changed. Fee providers and remaining
+mandatory protocol methods, full negotiation, TLS and broad public-chain/load
+qualification remain unfinished.

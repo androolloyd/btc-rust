@@ -18,3 +18,5 @@ pub mod zmq;
 mod mempool;
 
 mod electrum_wallet;
+
+mod header_proofs;

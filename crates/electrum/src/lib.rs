@@ -1,7 +1,7 @@
 //! Embedded Electrum protocol server for btc-rust.
 //!
 //! Experimental newline RPC chain/transaction subset with an actual provider.
-//! Complete protocol negotiation awaits checkpoint proofs and remaining methods.
+//! Complete protocol negotiation awaits fee providers and remaining methods.
 
 pub mod error;
 pub mod handler;

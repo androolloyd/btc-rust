@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Accept the actual experimental Electrum chain/transaction listener with Core.
 
-No protocol-completeness claim: negotiation and missing subscription methods
+No protocol-completeness claim: negotiation and missing fee/protocol methods
 must fail explicitly. Real Core-funded signatures, actual header bytes and
 independently calculated merkle paths cover admission, mining, fork and restart.
 """
@@ -13,6 +13,7 @@ import socket
 import subprocess
 import tempfile
 from check_core_p2p import core_rpc, reserve_ports, rust_rpc, wait_until
+from electrumx_reference import merkle_reference
 
 
 class Client:
@@ -70,6 +71,70 @@ def proof(txids, position):
         hashes = [hashlib.sha256(hashlib.sha256(hashes[i] + hashes[min(i+1,len(hashes)-1)]).digest()).digest() for i in range(0,len(hashes),2)]
         index >>= 1
     return branch, hashes[0][::-1].hex()
+
+
+def checkpoint_proofs(client, core_port, full=False):
+    """Actual Core headers + unchanged upstream ElectrumX, never Rust expected data."""
+    tip = core_rpc(core_port,"getblockcount",[])
+    hashes = [core_rpc(core_port,"getblockhash",[height]) for height in range(tip+1)]
+    headers = [core_rpc(core_port,"getblockheader",[value,False]) for value in hashes]
+    leaves = [hashlib.sha256(hashlib.sha256(bytes.fromhex(header)).digest()).digest() for header in headers]
+    assert [leaf[::-1].hex() for leaf in leaves] == hashes
+    reference = merkle_reference(); cases = 0
+    checkpoints = sorted({n for n in [1,2,3,4,7,8,15,16,31,32,63,64,100,101,102,103,104,105,tip] if 0 < n <= tip})
+    if not full: checkpoints = sorted({min(100,tip), min(103,tip),tip} - {0})
+    snapshots = {}
+    for cp in checkpoints:
+        positions = range(cp+1) if full else sorted({0,cp//2,cp})
+        for height in positions:
+            branch,root = reference.branch_and_root(leaves[:cp+1],height)
+            expected = {"header":headers[height],"branch":[value[::-1].hex() for value in branch],"root":root[::-1].hex()}
+            manual_branch,manual_root = proof(hashes[:cp+1],height)
+            assert (expected["branch"],expected["root"]) == (manual_branch,manual_root)
+            assert reference.root_from_proof(leaves[height],branch,height) == root
+            result = client.call("blockchain.block.header",{"height":height,"cp_height":cp})
+            assert result == expected, (cp,height,result,expected)
+            snapshots[(height,cp)] = result; cases += 1
+        for start,count in [(0,1),(cp//2,2),(cp,1)]:
+            end = min(start+count-1,tip)
+            if end > cp: continue
+            branch,root = reference.branch_and_root(leaves[:cp+1],end)
+            expected = {"count":end-start+1,"hex":"".join(headers[start:end+1]),"max":2016,"branch":[value[::-1].hex() for value in branch],"root":root[::-1].hex()}
+            assert client.call("blockchain.block.headers",[start,count,cp]) == expected
+            cases += 1
+    # Actual returned count determines the proof endpoint after tip truncation.
+    if tip:
+        branch,root = reference.branch_and_root(leaves,tip)
+        expected = {"count":2,"hex":"".join(headers[tip-1:]),"max":2016,"branch":[value[::-1].hex() for value in branch],"root":root[::-1].hex()}
+        assert client.call("blockchain.block.headers",{"start_height":tip-1,"count":5000,"cp_height":tip}) == expected; cases += 1
+        for method,params in [("blockchain.block.header",[0,tip+1]),("blockchain.block.header",[tip+1,tip]),("blockchain.block.headers",[tip-1,2,tip-1]),("blockchain.block.header",[0,2**64-1])]:
+            assert client.call(method,params,True)["code"] == 1
+    assert client.call("blockchain.block.headers",[2**64-1,5000,2**64-1]) == {"count":0,"hex":"","max":2016}
+    assert client.call("blockchain.block.headers",[0,0,2**64-1]) == {"count":0,"hex":"","max":2016}
+    for value in [-1,1.5,True,"1"]:
+        assert client.call("blockchain.block.header",[0,value],True)["code"] == -32602
+        assert client.call("blockchain.block.headers",[0,0,value],True)["code"] == -32602
+    print(f"checkpoint oracle passed: Core height {tip}, {cases} actual upstream-reference proof comparisons",flush=True)
+    return snapshots
+
+
+def chunk_boundary(client, core_port, expected_tip=2018):
+    tip = core_rpc(core_port,"getblockcount",[]); assert tip == expected_tip
+    hashes = [core_rpc(core_port,"getblockhash",[height]) for height in range(tip+1)]
+    headers = [core_rpc(core_port,"getblockheader",[value,False]) for value in hashes]
+    leaves = [bytes.fromhex(value)[::-1] for value in hashes]; reference = merkle_reference()
+    for position in [0,1,2015,2016,tip]:
+        branch,root = reference.branch_and_root(leaves,position)
+        assert client.call("blockchain.block.header",[position,tip]) == {"header":headers[position],"branch":[value[::-1].hex() for value in branch],"root":root[::-1].hex()}
+    results = []
+    for start,requested in [(0,2**64-1),(1,2016),(tip-1,5000)]:
+        count = min(requested,2016,tip-start+1); last = start+count-1
+        branch,root = reference.branch_and_root(leaves,last)
+        expected = {"count":count,"hex":"".join(headers[start:start+count]),"max":2016,"branch":[value[::-1].hex() for value in branch],"root":root[::-1].hex()}
+        result = client.call("blockchain.block.headers",{"start_height":start,"count":requested,"cp_height":tip})
+        assert result == expected; results.append(result)
+    print("checkpoint chunk cap passed: 2019 actual Core headers, exact 2016-header cap endpoint, short ranges and cached paths",flush=True)
+    return results
 
 
 def wallet_snapshot(client, core_port, watch_scripts, observers=()):
@@ -173,8 +238,10 @@ def main():
                 assert client.call("blockchain.block.header",[0]) == genesis_header
                 assert client.call("blockchain.headers.subscribe") == {"height":0,"hex":genesis_header}
                 assert client.call("blockchain.block.headers",{"start_height":0,"count":5000}) == {"count":1,"hex":genesis_header,"max":2016}
-                for method, params in [("server.features",[]),("blockchain.estimatefee",[6]),("blockchain.block.header",[0,1])]:
+                for method, params in [("server.features",[]),("blockchain.estimatefee",[6])]:
                     assert client.call(method,params,True)["code"] == -32601
+                assert client.call("blockchain.block.header",[0,1],True)["code"] == 1
+                assert client.call("blockchain.block.headers",[0,0,1]) == {"count":0,"hex":"","max":2016}
                 unsupported = Client(electrum_port); clients.append(unsupported)
                 assert unsupported.call("server.version",["acceptance",["1.4","1.4.5"]],True)["code"] == -32601
                 assert unsupported.stream.readline() == b""; unsupported.close(); clients.remove(unsupported)
@@ -201,6 +268,7 @@ def main():
                     raw_headers.append(core_rpc(core_port,"getblockheader",[block_hash,False]))
                 assert client.header(101) == {"height":101,"hex":raw_headers[-1]}
                 assert client.call("blockchain.block.headers",[100,100]) == {"count":2,"hex":"".join(raw_headers[99:]),"max":2016}
+                checkpoint_proofs(client,core_port,full=True)
                 wallet_snapshot(client,core_port,scripts,observers=(second,))
                 parent = core_rpc(core_port,"getblock",[hashes[0],2])["tx"][0]; parent_id = parent["txid"]
                 raw = core_rpc(core_port,"createrawtransaction",[[{"txid":parent_id,"vout":0}],{address:49.9999}])
@@ -252,11 +320,24 @@ def main():
                     branch, root_hash = proof(odd_block["tx"],position); assert root_hash == odd_block["merkleroot"]
                     assert client.call("blockchain.transaction.get_merkle",[tx,103]) == {"block_height":103,"pos":position,"merkle":branch}
                 wallet_snapshot(client,core_port,scripts,observers=(second,))
+                old_checkpoints = checkpoint_proofs(client,core_port)
+                # Leave the exact later checkpoint cached before side branches
+                # arrive; it must change only once the new branch is active.
+                old_cached = client.call("blockchain.block.header",[100,103])
                 client.unsubscribe(main_script); unsubscribed_count = client.status_counts[main_script]
                 core_rpc(core_port,"invalidateblock",[mined]); fork_address = core_rpc(core_port,"getnewaddress",[])
                 for _ in range(3):
                     fork = core_rpc(core_port,"generateblock",[fork_address,[]])["hash"]
                     assert rust_rpc(rust_port,"submitblock",[core_rpc(core_port,"getblock",[fork,0])]) is None
+                    if core_rpc(core_port,"getblockcount",[]) <= 103:
+                        assert client.call("blockchain.block.header",[100,103]) == old_cached
+                # Query the warmed prefix before another checkpoint can evict
+                # it, so a cache keyed only by height would fail this regression.
+                changed = client.call("blockchain.block.header",[100,103])
+                assert changed["header"] == old_cached["header"] and changed["root"] != old_cached["root"] and changed["branch"] != old_cached["branch"]
+                new_checkpoints = checkpoint_proofs(client,core_port)
+                assert changed["root"] == new_checkpoints[(0,103)]["root"]
+                assert new_checkpoints[(0,100)] == old_checkpoints[(0,100)]
                 assert client.header(104) == {"height":104,"hex":core_rpc(core_port,"getblockheader",[fork,False])}
                 assert client.call("blockchain.transaction.get_merkle",[txid,102],True)["code"] == 1
                 assert client.call("blockchain.transaction.get",[txid,True]) == core_rpc(core_port,"getrawtransaction",[txid,True])
@@ -297,6 +378,7 @@ def main():
                 wallet_snapshot(client,core_port,scripts,observers=(second,))
                 # Reopen with a real multi-root/dependent mempool, then prove
                 # status order remains stable and sessions require resubscribe.
+                pool_checkpoint = checkpoint_proofs(client,core_port)
                 stable_pool = wallet_snapshot(None,core_port,scripts)
                 pool_tip = rust_rpc(rust_port,"getbestblockhash",[])
                 rust_rpc(rust_port,"stop",[]); assert rust.wait(timeout=10) == 0
@@ -306,6 +388,7 @@ def main():
                 wait_until(lambda: rust_rpc(rust_port,"getbestblockhash",[]) == pool_tip)
                 client = Client(electrum_port); clients.append(client)
                 assert client.call("blockchain.scripthash.unsubscribe",[main_script]) is False
+                assert checkpoint_proofs(client,core_port) == pool_checkpoint
                 assert wallet_snapshot(client,core_port,scripts) == stable_pool
                 for script,status in stable_pool.items(): client.subscribe(script,status)
                 second = Client(electrum_port); clients.append(second); second.subscribe(main_script,stable_pool[main_script])
@@ -314,6 +397,7 @@ def main():
                 assert client.header(105) == {"height":105,"hex":core_rpc(core_port,"getblockheader",[fork,False])}
                 block = core_rpc(core_port,"getblock",[fork]); assert block["tx"].index(replacement_id) < block["tx"].index(child_id)
                 wallet_snapshot(client,core_port,scripts,observers=(second,))
+                final_checkpoints = checkpoint_proofs(client,core_port)
                 stable_status = wallet_snapshot(None,core_port,scripts)
                 counts = dict(client.status_counts)
                 before = rust_rpc(rust_port,"getbestblockhash",[])
@@ -344,6 +428,7 @@ def main():
                 client = Client(electrum_port); clients.append(client)
                 assert client.call("blockchain.headers.subscribe") == {"height":105,"hex":core_rpc(core_port,"getblockheader",[fork,False])}
                 assert client.call("blockchain.scripthash.unsubscribe",[main_script]) is False
+                assert checkpoint_proofs(client,core_port) == final_checkpoints
                 after_restart = wallet_snapshot(client,core_port,scripts)
                 assert after_restart == stable_status
                 for script,status in after_restart.items(): client.subscribe(script,status)
@@ -351,6 +436,25 @@ def main():
                 # Batch IDs, notifications and malformed members use actual provider data.
                 client.send([{"id":"a","method":"blockchain.block.header","params":[105],"jsonrpc":"2.0"},{"method":"server.ping","jsonrpc":"2.0"},7])
                 reply = client.read(); assert len(reply) == 2 and reply[0]["id"] == "a" and reply[0]["result"] == core_rpc(core_port,"getblockheader",[fork,False]) and reply[1]["error"]["code"] == -32600
+                # Extend real validated state beyond the chunk cap, without
+                # running broad wallet subscriptions during the bulk fixture.
+                client.close(); clients.remove(client)
+                long_address = core_rpc(core_port,"getnewaddress",[])
+                remaining = 2018-core_rpc(core_port,"getblockcount",[])
+                while remaining:
+                    count = min(100,remaining)
+                    for block_hash in core_rpc(core_port,"generatetoaddress",[count,long_address]):
+                        assert rust_rpc(rust_port,"submitblock",[core_rpc(core_port,"getblock",[block_hash,0])]) is None
+                    remaining -= count
+                client = Client(electrum_port); clients.append(client)
+                long_results = chunk_boundary(client,core_port)
+                long_tip = rust_rpc(rust_port,"getbestblockhash",[])
+                rust_rpc(rust_port,"stop",[]); assert rust.wait(timeout=10) == 0
+                client.close(); clients.remove(client)
+                rust = subprocess.Popen(command,stdout=rust_log,stderr=rust_log); processes.append(rust)
+                wait_until(lambda: rust_rpc(rust_port,"getbestblockhash",[]) == long_tip)
+                client = Client(electrum_port); clients.append(client)
+                assert chunk_boundary(client,core_port) == long_results
                 # Hold the configured port: node startup must fail, not disable silently.
                 rust_rpc(rust_port,"stop",[]); assert rust.wait(timeout=10) == 0
                 client.close(); clients.remove(client)
@@ -362,7 +466,7 @@ def main():
                     assert not (root/"rust"/".cookie").exists()
                 finally: occupied.close()
                 core_rpc(core_port,"stop",[]); assert core.wait(timeout=10) == 0
-                print("PASSED: actual Core genesis/headers and ranges, real signed Electrum admission/mining, witness txid/verbose parity, independent even/odd merkle paths, fragmented-request notification, reorg/pool restore, 105-block restart, four real script-query oracles including RBF/descendant eviction/dependent/same-block spends, actual status SHA256 and notifications, fragmented subscription updates, connection isolation/unsubscribe/limits, stable restart, explicit unsupported/malformed errors, shutdown and startup bind failure",flush=True)
+                print("PASSED: actual Core genesis/headers and ranges, real signed Electrum admission/mining, witness txid/verbose parity, independent even/odd merkle paths, fragmented-request notification, reorg/pool restore, 105-block restart, four real script-query oracles including RBF/descendant eviction/dependent/same-block spends, actual status SHA256 and notifications, fragmented subscription updates, connection isolation/unsubscribe/limits, stable restart, actual header checkpoint proofs against ElectrumX/Core, cached reorg and 2018-block restart, exact 2016 chunk cap, explicit unsupported/malformed errors, shutdown and startup bind failure",flush=True)
             except Exception:
                 print((root/"rust.log").read_text()[-6000:]); raise
             finally:

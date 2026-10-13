@@ -45,6 +45,7 @@ pub struct NodeChainBackend {
     block_events: tokio::sync::broadcast::Sender<BlockHash>,
     tx_events: tokio::sync::broadcast::Sender<TxHash>,
     wallet_events: tokio::sync::watch::Sender<u64>,
+    pub(super) header_proofs: Mutex<crate::header_proofs::HeaderProofCache>,
     legacy_checkpoint: Option<btc_storage::redb_backend::LegacyCheckpointArchive>,
 }
 
@@ -235,6 +236,7 @@ impl NodeChainBackend {
             block_events: tokio::sync::broadcast::channel(256).0,
             tx_events: tokio::sync::broadcast::channel(1024).0,
             wallet_events: tokio::sync::watch::channel(0).0,
+            header_proofs: Mutex::new(crate::header_proofs::HeaderProofCache::default()),
             legacy_checkpoint,
         })
     }
@@ -1210,15 +1212,17 @@ impl btc_electrum::ElectrumBackend for NodeChainBackend {
                     None | Some(Value::Null) => 0,
                     Some(_) => number(cp_index)?,
                 };
-                if checkpoint != 0 {
-                    return Err(fail(
-                        btc_electrum::protocol::METHOD_NOT_FOUND,
-                        "header checkpoint proofs are not implemented",
-                    ));
-                }
                 let start = number(0)?;
                 if method == METHOD_BLOCK_HEADER {
-                    return Ok(json!(hex::encode(encode(&header(start)?.header))));
+                    let bytes = hex::encode(encode(&header(start)?.header));
+                    if checkpoint == 0 {
+                        return Ok(json!(bytes));
+                    }
+                    let mut proof = self
+                        .header_checkpoint_proof(&data, start, checkpoint)
+                        .map_err(map_error)?;
+                    proof["header"] = json!(bytes);
+                    return Ok(proof);
                 }
                 let count = number(1)?.min(2016);
                 let available = if start > data.headers.best_height() {
@@ -1231,7 +1235,20 @@ impl btc_electrum::ElectrumBackend for NodeChainBackend {
                 for offset in 0..count {
                     bytes.extend(encode(&header(start + offset)?.header));
                 }
-                Ok(json!({"count":count, "hex":hex::encode(bytes), "max":2016}))
+                let mut result = json!({"count":count, "hex":hex::encode(bytes), "max":2016});
+                // ElectrumX attaches a proof only for nonempty actual output,
+                // using the last returned header after chunk/tip truncation.
+                if count != 0 && checkpoint != 0 {
+                    let last = start
+                        .checked_add(count - 1)
+                        .ok_or_else(|| fail(INVALID_PARAMS, "header range overflow"))?;
+                    let proof = self
+                        .header_checkpoint_proof(&data, last, checkpoint)
+                        .map_err(map_error)?;
+                    result["branch"] = proof["branch"].clone();
+                    result["root"] = proof["root"].clone();
+                }
+                Ok(result)
             }
             METHOD_TRANSACTION_GET_MERKLE => {
                 let txid = TxHash::from_hex(string(0)?)
