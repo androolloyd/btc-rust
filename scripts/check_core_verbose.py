@@ -81,10 +81,8 @@ def main():
                 def compare(method, params):
                     nonlocal comparisons
                     actual = rpc(method, params); expected = core_rpc(core_port, method, params)
-                    # The preexisting header response does not yet include Core's
-                    # target. All transaction fields and other block fields agree.
+                    # Header/block target is now checked exactly as well.
                     if method == "getblock" and isinstance(expected, dict):
-                        expected.pop("target", None)
                         # Core writes floating difficulty with fewer significant
                         # digits. No amount, size, byte, flag or tx field is relaxed.
                         assert math.isclose(actual["difficulty"], expected["difficulty"], rel_tol=1e-14)

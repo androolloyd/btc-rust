@@ -22,6 +22,7 @@ pub const METHOD_SCRIPTHASH_UNSUBSCRIBE: &str = "blockchain.scripthash.unsubscri
 pub const METHOD_TRANSACTION_GET: &str = "blockchain.transaction.get";
 pub const METHOD_TRANSACTION_BROADCAST: &str = "blockchain.transaction.broadcast";
 pub const METHOD_TRANSACTION_GET_MERKLE: &str = "blockchain.transaction.get_merkle";
+pub const METHOD_TRANSACTION_ID_FROM_POS: &str = "blockchain.transaction.id_from_pos";
 
 // Fee estimation
 pub const METHOD_ESTIMATEFEE: &str = "blockchain.estimatefee";

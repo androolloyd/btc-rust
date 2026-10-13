@@ -114,8 +114,17 @@ impl NodeChainBackend {
         // RPC submissions always run scripts; an assume-valid shortcut cannot
         // be inferred merely from a matching incoming block hash.
         params.assume_valid = None;
+        let canonical_genesis = btc_consensus::chain::genesis_block(&params);
+        if canonical_genesis.block_hash() != params.genesis_hash
+            || !canonical_genesis.check_merkle_root()
+            || !canonical_genesis.header.check_proof_of_work()
+        {
+            return Err(eyre::eyre!(
+                "canonical genesis construction disagrees with network parameters"
+            ));
+        }
         let mut headers = ChainState::new(params);
-        let genesis = headers.best_header().header;
+        let genesis = canonical_genesis.header;
         if resync {
             if let Some(archive) = db.resync_legacy_checkpoint(&genesis)? {
                 tracing::warn!(height = archive.height, hash = %archive.hash,
@@ -130,6 +139,30 @@ impl NodeChainBackend {
             return Err(eyre::eyre!(
                 "legacy checkpoint archive belongs to another network"
             ));
+        }
+        // Reject an incompatible network anchor before replay/backfills or any
+        // normal startup writes. In particular, old Testnet4 headers used the
+        // Bitcoin genesis merkle root and do not identify published Testnet4.
+        {
+            let reader = db.tx()?;
+            if reader
+                .get_block_hash_by_height(0)?
+                .is_some_and(|hash| hash != genesis.block_hash())
+                || reader
+                    .get_block_header(&genesis.block_hash())?
+                    .is_some_and(|header| header != genesis)
+            {
+                return Err(eyre::eyre!("stored genesis disagrees with network identity; preserve this database and resync in a separate data directory"));
+            }
+            if reader
+                .get_block(&genesis.block_hash())?
+                .as_ref()
+                .is_some_and(|body| encode(body) != encode(&canonical_genesis))
+            {
+                return Err(eyre::eyre!(
+                    "stored genesis body disagrees with canonical network genesis"
+                ));
+            }
         }
         let utxos = PersistentUtxoSet::new(Arc::clone(&db));
         if let Some((height, expected)) = utxos.validated_tip()? {
@@ -167,6 +200,7 @@ impl NodeChainBackend {
             let hash = genesis.block_hash();
             let tx = db.tx_mut()?;
             tx.put_block_header(&hash, &genesis)?;
+            tx.put_block(&hash, &canonical_genesis)?;
             tx.put_block_hash_by_height(0, &hash)?;
             tx.set_best_block(0, &hash)?;
             tx.commit()?;
@@ -229,6 +263,30 @@ impl NodeChainBackend {
         };
         // Reopening does not invent historical admission times for restored txs.
         fees.update(height, hash, &mempool, &HashSet::new(), false);
+        // Older valid stores contained only the genesis header. Backfill the
+        // authenticated exact body without creating coins or transaction indices.
+        let hash = genesis.block_hash();
+        let reader = db.tx()?;
+        let existing = reader.get_block(&hash)?;
+        if existing
+            .as_ref()
+            .is_some_and(|body| encode(body) != encode(&canonical_genesis))
+        {
+            return Err(eyre::eyre!(
+                "stored genesis body disagrees with canonical network genesis"
+            ));
+        }
+        let incomplete = existing.is_none()
+            || reader.get_block_hash_by_height(0)?.is_none()
+            || reader.get_block_header(&hash)?.is_none();
+        drop(reader);
+        if incomplete {
+            let write = db.tx_mut()?;
+            write.put_block_header(&hash, &genesis)?;
+            write.put_block_hash_by_height(0, &hash)?;
+            write.put_block(&hash, &canonical_genesis)?;
+            write.commit()?;
+        }
         state.update_mempool(mempool.entries.len() as u64, mempool.bytes as u64);
         state.update_chain_tip(
             headers.best_height(),
@@ -1016,7 +1074,7 @@ impl NodeChainBackend {
             "height": entry.height, "version": header.version, "versionHex": format!("{:08x}", header.version),
             "merkleroot": header.merkle_root.to_string(), "time": header.time,
             "mediantime": headers.median_time_past(entry), "nonce": header.nonce,
-            "bits": format!("{:08x}", header.bits.to_u32()), "difficulty": compact_bits_to_difficulty(header.bits.to_u32()),
+            "bits": format!("{:08x}", header.bits.to_u32()), "target": compact_bits_to_target_hex(headers.best_header().header.bits.to_u32()), "difficulty": compact_bits_to_difficulty(header.bits.to_u32()),
             "chainwork": hex::encode(entry.cumulative_work),
             "nTx": if entry.height == 0 { 1 } else { block.as_ref().ok_or_else(|| internal("committed block body missing"))?.transactions.len() },
         });
@@ -1320,10 +1378,28 @@ impl btc_electrum::ElectrumBackend for NodeChainBackend {
                 }
                 Ok(result)
             }
-            METHOD_TRANSACTION_GET_MERKLE => {
-                let txid = TxHash::from_hex(string(0)?)
-                    .map_err(|_| fail(INVALID_PARAMS, "invalid transaction hash"))?;
-                let height = number(1)?;
+            METHOD_TRANSACTION_GET_MERKLE | METHOD_TRANSACTION_ID_FROM_POS => {
+                let by_position = method == METHOD_TRANSACTION_ID_FROM_POS;
+                let height = number(if by_position { 0 } else { 1 })?;
+                let requested_position = if by_position { Some(number(1)?) } else { None };
+                let txid = if by_position {
+                    None
+                } else {
+                    Some(
+                        TxHash::from_hex(string(0)?)
+                            .map_err(|_| fail(INVALID_PARAMS, "invalid transaction hash"))?,
+                    )
+                };
+                let want_proof = if by_position {
+                    match params.get(2) {
+                        None => false,
+                        Some(value) => value
+                            .as_bool()
+                            .ok_or_else(|| fail(INVALID_PARAMS, "merkle must be boolean"))?,
+                    }
+                } else {
+                    true
+                };
                 let hash = header(height)?.header.block_hash();
                 let block = self
                     .db
@@ -1338,13 +1414,26 @@ impl btc_electrum::ElectrumBackend for NodeChainBackend {
                         "stored block body disagrees with header",
                     ));
                 }
-                let position = block
-                    .transactions
-                    .iter()
-                    .position(|tx| tx.txid() == txid)
-                    .ok_or_else(|| {
-                        fail(1, "transaction is not in the active block at that height")
-                    })?;
+                let position = if let Some(position) = requested_position {
+                    usize::try_from(position)
+                        .ok()
+                        .filter(|p| *p < block.transactions.len())
+                        .ok_or_else(|| {
+                            fail(1, "transaction position unavailable at active height")
+                        })?
+                } else {
+                    block
+                        .transactions
+                        .iter()
+                        .position(|tx| Some(tx.txid()) == txid)
+                        .ok_or_else(|| {
+                            fail(1, "transaction is not in the active block at that height")
+                        })?
+                };
+                let txid = block.transactions[position].txid();
+                if !want_proof {
+                    return Ok(json!(txid.to_string()));
+                }
                 let mut index = position;
                 let mut hashes: Vec<_> = block
                     .transactions
@@ -1367,7 +1456,11 @@ impl btc_electrum::ElectrumBackend for NodeChainBackend {
                         .collect();
                     index >>= 1;
                 }
-                Ok(json!({"block_height":height, "pos":position, "merkle":branch}))
+                if by_position {
+                    Ok(json!({"tx_hash":txid.to_string(),"merkle":branch}))
+                } else {
+                    Ok(json!({"block_height":height, "pos":position, "merkle":branch}))
+                }
             }
             _ => Err(fail(
                 btc_electrum::protocol::METHOD_NOT_FOUND,
@@ -1632,7 +1725,14 @@ impl ChainBackend for NodeChainBackend {
                                 .map(|t| t.txid().to_string())
                                 .collect::<Vec<_>>())
                         } else {
-                            let undo = self.rpc_undo(hash)?;
+                            let undo = if headers
+                                .get_header(&hash)
+                                .is_some_and(|entry| entry.height == 0)
+                            {
+                                HashMap::new()
+                            } else {
+                                self.rpc_undo(hash)?
+                            };
                             json!(block
                                 .transactions
                                 .iter()
@@ -1836,6 +1936,156 @@ mod tests {
     use btc_primitives::amount::Amount;
     use btc_rpc::handler::{RpcHandler, RpcRequest};
     use btc_test::TestKeyPair;
+
+    #[test]
+    fn genesis_body_upgrade_cannot_create_spendable_coins_or_replace_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.redb");
+        let params = ChainParams::regtest();
+        let genesis = btc_consensus::chain::genesis_block(&params);
+        // Actual old layout: the canonical header and tip exist without a body.
+        {
+            let db = RedbDatabase::new(&path).unwrap();
+            db.init_tables().unwrap();
+            let write = db.tx_mut().unwrap();
+            write
+                .put_block_header(&genesis.block_hash(), &genesis.header)
+                .unwrap();
+            write
+                .put_block_hash_by_height(0, &genesis.block_hash())
+                .unwrap();
+            write.set_best_block(0, &genesis.block_hash()).unwrap();
+            write.commit().unwrap();
+        }
+        let backend = NodeChainBackend::open(&path, NodeState::new(Network::Regtest)).unwrap();
+        assert_eq!(
+            encode(&backend.block(&genesis.block_hash()).unwrap().unwrap()),
+            encode(&genesis)
+        );
+        assert_eq!(backend.db.coin_count().unwrap(), 0);
+        assert!(backend
+            .db
+            .tx()
+            .unwrap()
+            .get_tx_block_index(&genesis.transactions[0].txid())
+            .unwrap()
+            .is_none());
+        assert!(backend
+            .db
+            .tx()
+            .unwrap()
+            .get_transaction(&genesis.transactions[0].txid())
+            .unwrap()
+            .is_none());
+        let proof = btc_electrum::ElectrumBackend::call(
+            &backend,
+            "blockchain.transaction.id_from_pos",
+            json!([0, 0, true]),
+        )
+        .unwrap();
+        assert_eq!(
+            proof,
+            json!({"tx_hash":genesis.header.merkle_root.to_string(),"merkle":[]})
+        );
+        drop(backend);
+        let mut damaged = genesis.clone();
+        damaged.transactions[0].outputs[0].value = Amount::from_sat(1);
+        let db = RedbDatabase::new(&path).unwrap();
+        let write = db.tx_mut().unwrap();
+        write.put_block(&genesis.block_hash(), &damaged).unwrap();
+        write.commit().unwrap();
+        drop(db);
+        let error = NodeChainBackend::open(&path, NodeState::new(Network::Regtest))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("stored genesis body"));
+        let db = RedbDatabase::new(&path).unwrap();
+        assert_eq!(
+            encode(
+                &db.tx()
+                    .unwrap()
+                    .get_block(&genesis.block_hash())
+                    .unwrap()
+                    .unwrap()
+            ),
+            encode(&damaged)
+        );
+    }
+
+    #[test]
+    fn old_testnet4_wrong_anchor_is_rejected_without_overwriting_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wrong.redb");
+        let mut wrong = btc_consensus::chain::genesis_header(&ChainParams::testnet4());
+        wrong.merkle_root =
+            btc_consensus::chain::genesis_header(&ChainParams::mainnet()).merkle_root;
+        {
+            let db = RedbDatabase::new(&path).unwrap();
+            db.init_tables().unwrap();
+            let write = db.tx_mut().unwrap();
+            write.put_block_header(&wrong.block_hash(), &wrong).unwrap();
+            write
+                .put_block_hash_by_height(0, &wrong.block_hash())
+                .unwrap();
+            write.set_best_block(0, &wrong.block_hash()).unwrap();
+            write.commit().unwrap();
+        }
+        let error = NodeChainBackend::open(&path, NodeState::new(Network::Testnet4))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("stored genesis disagrees with network identity"));
+        let db = RedbDatabase::new(&path).unwrap();
+        let reader = db.tx().unwrap();
+        assert_eq!(reader.get_best_block_hash().unwrap(), wrong.block_hash());
+        assert_eq!(
+            reader
+                .get_block_header(&wrong.block_hash())
+                .unwrap()
+                .unwrap(),
+            wrong
+        );
+        assert!(reader.get_block(&wrong.block_hash()).unwrap().is_none());
+        assert!(reader
+            .get_block_header(&ChainParams::testnet4().genesis_hash)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn transaction_position_queries_cannot_publish_from_corrupt_actual_bodies() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = NodeChainBackend::open(
+            &dir.path().join("position.redb"),
+            NodeState::new(Network::Regtest),
+        )
+        .unwrap();
+        let key = TestKeyPair::from_secret(secp256k1::SecretKey::from_slice(&[17; 32]).unwrap());
+        let address = Address::p2pkh_from_pubkey(&key.pubkey_bytes(), Network::Regtest).to_string();
+        let hashes =
+            ChainBackend::call(&backend, "generatetoaddress", json!([1, address])).unwrap();
+        let hash = BlockHash::from_hex(hashes[0].as_str().unwrap()).unwrap();
+        let mut damaged = backend.block(&hash).unwrap().unwrap();
+        let identifier = damaged.transactions[0].txid().to_string();
+        damaged.transactions[0].outputs[0].value = Amount::from_sat(1);
+        let write = backend.db.tx_mut().unwrap();
+        write.put_block(&hash, &damaged).unwrap();
+        write.commit().unwrap();
+        for (method, params) in [
+            ("blockchain.transaction.id_from_pos", json!([1, 0])),
+            ("blockchain.transaction.id_from_pos", json!([1, 0, true])),
+            ("blockchain.transaction.get_merkle", json!([identifier, 1])),
+        ] {
+            assert_eq!(
+                btc_electrum::ElectrumBackend::call(&backend, method, params)
+                    .unwrap_err()
+                    .code,
+                INTERNAL_ERROR
+            );
+        }
+        assert_eq!(backend.tip().unwrap().0, 1);
+    }
 
     fn handler(backend: &Arc<NodeChainBackend>) -> RpcHandler {
         let state = &backend.state;

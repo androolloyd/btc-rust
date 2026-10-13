@@ -575,13 +575,55 @@ pub fn genesis_header(params: &ChainParams) -> BlockHeader {
             version: 1,
             prev_blockhash: BlockHash::ZERO,
             merkle_root: TxHash::from_hex(
-                "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b",
+                "7aa0a7ae1e223414cb807e40cd57e667b718e42aaf9306db9102fe28912b7b4e",
             )
             .unwrap(),
             time: 1714777860,
             bits: CompactTarget::from_u32(0x1d00ffff),
             nonce: 393743547,
         },
+    }
+}
+
+/// Canonical complete genesis body from Core v29 kernel/chainparams.cpp.
+/// Reading this body does not connect its outputs to the spendable coin set.
+pub fn genesis_block(params: &ChainParams) -> btc_primitives::Block {
+    use btc_primitives::{Amount, OutPoint, ScriptBuf, Transaction, TxHash, TxIn, TxOut};
+    let testnet4 = params.network == btc_primitives::Network::Testnet4;
+    let message: &[u8] = if testnet4 {
+        b"03/May/2024 000000000000000000001ebd58c244970b3aa9d783bb001011fbe8ea8e98e00e"
+    } else {
+        b"The Times 03/Jan/2009 Chancellor on brink of second bailout for banks"
+    };
+    // Core intentionally pushes the serialized CScriptNum(4), not OP_4.
+    let mut script_sig = ScriptBuf::from_bytes(vec![4, 0xff, 0xff, 0, 0x1d, 1, 4]);
+    script_sig.push_slice(message);
+    let key = if testnet4 {
+        // The published Testnet4 genesis contains 33 zero bytes here. This is
+        // its actual unspendable historical script, not a synthesized curve key.
+        vec![0; 33]
+    } else {
+        hex::decode("04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f").expect("constant genesis key")
+    };
+    let mut script_pubkey = ScriptBuf::new();
+    script_pubkey.push_slice(&key);
+    script_pubkey.push_opcode(btc_primitives::Opcode::OP_CHECKSIG);
+    btc_primitives::Block {
+        header: genesis_header(params),
+        transactions: vec![Transaction {
+            version: 1,
+            inputs: vec![TxIn {
+                previous_output: OutPoint::new(TxHash::ZERO, u32::MAX),
+                script_sig,
+                sequence: u32::MAX,
+            }],
+            outputs: vec![TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                script_pubkey,
+            }],
+            witness: vec![],
+            lock_time: 0,
+        }],
     }
 }
 
@@ -798,6 +840,40 @@ fn compact_from_u256(v: &U256) -> CompactTarget {
 mod tests {
     use super::*;
     use btc_primitives::hash::TxHash;
+
+    #[test]
+    fn all_published_network_genesis_bodies_bind_exact_header_identity() {
+        for network in [
+            btc_primitives::Network::Mainnet,
+            btc_primitives::Network::Testnet,
+            btc_primitives::Network::Testnet4,
+            btc_primitives::Network::Signet,
+            btc_primitives::Network::Regtest,
+        ] {
+            let params = ChainParams::from_network(network);
+            let block = genesis_block(&params);
+            assert!(block.header.check_proof_of_work());
+            assert!(
+                block.check_merkle_root(),
+                "{network:?}: {}",
+                block.transactions[0].txid()
+            );
+            assert_eq!(block.block_hash(), params.genesis_hash);
+            assert_eq!(ChainState::new(params).best_header().header, block.header);
+            // Core's published Testnet4 transaction commits to its distinct
+            // timestamp and 33-zero-byte output, rather than the 2009 coinbase.
+            if network == btc_primitives::Network::Testnet4 {
+                assert_eq!(
+                    block.transactions[0].txid().to_string(),
+                    "7aa0a7ae1e223414cb807e40cd57e667b718e42aaf9306db9102fe28912b7b4e"
+                );
+                assert_eq!(
+                    block.block_hash().to_string(),
+                    "00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043"
+                );
+            }
+        }
+    }
 
     /// Helper: build a regtest ChainState (easiest PoW target).
     fn regtest_chain() -> ChainState {

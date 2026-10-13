@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Accept the actual experimental Electrum chain/transaction listener with Core.
 
-No protocol-completeness claim: negotiation and missing fee/protocol methods
+No protocol-completeness claim: negotiation and remaining protocol methods
 must fail explicitly. Real Core-funded signatures, actual header bytes and
 independently calculated merkle paths cover admission, mining, fork and restart.
 """
@@ -71,6 +71,26 @@ def proof(txids, position):
         hashes = [hashlib.sha256(hashlib.sha256(hashes[i] + hashes[min(i+1,len(hashes)-1)]).digest()).digest() for i in range(0,len(hashes),2)]
         index >>= 1
     return branch, hashes[0][::-1].hex()
+
+
+def position_proofs(client, core_port, heights):
+    cases=0
+    reference=merkle_reference()
+    for height in heights:
+        block=core_rpc(core_port,"getblock",[core_rpc(core_port,"getblockhash",[height])])
+        leaves=[bytes.fromhex(identifier)[::-1] for identifier in block["tx"]]
+        for position,identifier in enumerate(block["tx"]):
+            branch,root=reference.branch_and_root(leaves,position)
+            assert root[::-1].hex()==block["merkleroot"]
+            branch=[value[::-1].hex() for value in branch]
+            assert client.call("blockchain.transaction.id_from_pos",[height,position])==identifier
+            assert client.call("blockchain.transaction.id_from_pos",{"height":height,"tx_pos":position,"merkle":False})==identifier
+            assert client.call("blockchain.transaction.id_from_pos",[height,position,True])=={"tx_hash":identifier,"merkle":branch}
+            assert client.call("blockchain.transaction.get_merkle",[identifier,height])=={"block_height":height,"pos":position,"merkle":branch}
+            cases+=4
+        assert client.call("blockchain.transaction.id_from_pos",[height,len(leaves),True],True)["code"]==1
+        assert client.call("blockchain.transaction.id_from_pos",[height,2**64-1],True)["code"]==1
+    print(f"position oracle passed: {cases} actual Core/ElectrumX transaction-position comparisons at heights {heights}",flush=True)
 
 
 def checkpoint_proofs(client, core_port, full=False):
@@ -236,6 +256,7 @@ def main():
                 client = Client(electrum_port); clients.append(client)
                 genesis = core_rpc(core_port,"getblockhash",[0]); genesis_header = core_rpc(core_port,"getblockheader",[genesis,False])
                 assert client.call("blockchain.block.header",[0]) == genesis_header
+                position_proofs(client,core_port,[0])
                 assert client.call("blockchain.headers.subscribe") == {"height":0,"hex":genesis_header}
                 assert client.call("blockchain.block.headers",{"start_height":0,"count":5000}) == {"count":1,"hex":genesis_header,"max":2016}
                 for method, params in [("server.features",[])]:
@@ -272,6 +293,7 @@ def main():
                 assert client.header(101) == {"height":101,"hex":raw_headers[-1]}
                 assert client.call("blockchain.block.headers",[100,100]) == {"count":2,"hex":"".join(raw_headers[99:]),"max":2016}
                 checkpoint_proofs(client,core_port,full=True)
+                position_proofs(client,core_port,[0,1,50,100,101])
                 wallet_snapshot(client,core_port,scripts,observers=(second,))
                 parent = core_rpc(core_port,"getblock",[hashes[0],2])["tx"][0]; parent_id = parent["txid"]
                 raw = core_rpc(core_port,"createrawtransaction",[[{"txid":parent_id,"vout":0}],{address:49.9999}])
@@ -323,6 +345,9 @@ def main():
                     branch, root_hash = proof(odd_block["tx"],position); assert root_hash == odd_block["merkleroot"]
                     assert client.call("blockchain.transaction.get_merkle",[tx,103]) == {"block_height":103,"pos":position,"merkle":branch}
                 wallet_snapshot(client,core_port,scripts,observers=(second,))
+                position_proofs(client,core_port,[102,103])
+                old_position = client.call("blockchain.transaction.id_from_pos",[102,1,True])
+                old_coinbase = client.call("blockchain.transaction.id_from_pos",[102,0])
                 old_checkpoints = checkpoint_proofs(client,core_port)
                 # Leave the exact later checkpoint cached before side branches
                 # arrive; it must change only once the new branch is active.
@@ -334,10 +359,14 @@ def main():
                     assert rust_rpc(rust_port,"submitblock",[core_rpc(core_port,"getblock",[fork,0])]) is None
                     if core_rpc(core_port,"getblockcount",[]) <= 103:
                         assert client.call("blockchain.block.header",[100,103]) == old_cached
+                        assert client.call("blockchain.transaction.id_from_pos",[102,1,True]) == old_position
                 # Query the warmed prefix before another checkpoint can evict
                 # it, so a cache keyed only by height would fail this regression.
                 changed = client.call("blockchain.block.header",[100,103])
                 assert changed["header"] == old_cached["header"] and changed["root"] != old_cached["root"] and changed["branch"] != old_cached["branch"]
+                assert client.call("blockchain.transaction.id_from_pos",[102,0]) != old_coinbase
+                assert client.call("blockchain.transaction.id_from_pos",[102,1],True)["code"] == 1
+                position_proofs(client,core_port,[102,103,104])
                 new_checkpoints = checkpoint_proofs(client,core_port)
                 assert changed["root"] == new_checkpoints[(0,103)]["root"]
                 assert new_checkpoints[(0,100)] == old_checkpoints[(0,100)]
@@ -432,6 +461,7 @@ def main():
                 assert client.call("blockchain.headers.subscribe") == {"height":105,"hex":core_rpc(core_port,"getblockheader",[fork,False])}
                 assert client.call("blockchain.scripthash.unsubscribe",[main_script]) is False
                 assert checkpoint_proofs(client,core_port) == final_checkpoints
+                position_proofs(client,core_port,[0,102,103,104,105])
                 after_restart = wallet_snapshot(client,core_port,scripts)
                 assert after_restart == stable_status
                 for script,status in after_restart.items(): client.subscribe(script,status)
@@ -450,6 +480,7 @@ def main():
                         assert rust_rpc(rust_port,"submitblock",[core_rpc(core_port,"getblock",[block_hash,0])]) is None
                     remaining -= count
                 client = Client(electrum_port); clients.append(client)
+                position_proofs(client,core_port,[2015,2016,2017,2018])
                 long_results = chunk_boundary(client,core_port)
                 long_tip = rust_rpc(rust_port,"getbestblockhash",[])
                 rust_rpc(rust_port,"stop",[]); assert rust.wait(timeout=10) == 0
@@ -458,6 +489,7 @@ def main():
                 wait_until(lambda: rust_rpc(rust_port,"getbestblockhash",[]) == long_tip)
                 client = Client(electrum_port); clients.append(client)
                 assert chunk_boundary(client,core_port) == long_results
+                position_proofs(client,core_port,[0,2016,2018])
                 # Hold the configured port: node startup must fail, not disable silently.
                 rust_rpc(rust_port,"stop",[]); assert rust.wait(timeout=10) == 0
                 client.close(); clients.remove(client)
@@ -469,7 +501,7 @@ def main():
                     assert not (root/"rust"/".cookie").exists()
                 finally: occupied.close()
                 core_rpc(core_port,"stop",[]); assert core.wait(timeout=10) == 0
-                print("PASSED: actual Core genesis/headers and ranges, real signed Electrum admission/mining, witness txid/verbose parity, independent even/odd merkle paths, fragmented-request notification, reorg/pool restore, 105-block restart, four real script-query oracles including RBF/descendant eviction/dependent/same-block spends, actual status SHA256 and notifications, fragmented subscription updates, connection isolation/unsubscribe/limits, stable restart, actual header checkpoint proofs against ElectrumX/Core, cached reorg and 2018-block restart, exact 2016 chunk cap, explicit unsupported/malformed errors, shutdown and startup bind failure",flush=True)
+                print("PASSED: actual Core genesis/headers and ranges, exact transaction-position views and upstream branches, real signed Electrum admission/mining, witness txid/verbose parity, independent even/odd merkle paths, fragmented-request notification, reorg/pool restore, 105-block restart, four real script-query oracles including RBF/descendant eviction/dependent/same-block spends, actual status SHA256 and notifications, fragmented subscription updates, connection isolation/unsubscribe/limits, stable restart, actual header checkpoint proofs against ElectrumX/Core, cached reorg and 2018-block restart, exact 2016 chunk cap, explicit unsupported/malformed errors, shutdown and startup bind failure",flush=True)
             except Exception:
                 print((root/"rust.log").read_text()[-6000:]); raise
             finally:

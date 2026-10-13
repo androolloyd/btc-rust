@@ -111,3 +111,12 @@ The existing Electrum native acceptance also passes all 260 wallet-query
 comparisons, actual script-status races/notifications, 628 upstream checkpoint
 comparisons, RBF/reorg/pool restoration and the 2016-header cap before/after the
 height-2018 restart with fee receipts enabled.
+
+Exact-head CI for `a49afdc` passed both fuzz workflows and the workspace, macOS,
+advisory and container checks, but both Core jobs failed when the fork fixture
+regenerated an already invalidated block with the same recipient and timestamp.
+The fixture now freezes Core's regtest clock and mines the replacement branch
+to a different actual wallet address, checking each old/new block identity.
+The focused fixed-clock acceptance and the full new-release rerun pass every
+existing fee assertion, including durable learning, reorg reset/relearning and
+expiration. This repairs the acceptance fixture without changing estimation or consensus rules.

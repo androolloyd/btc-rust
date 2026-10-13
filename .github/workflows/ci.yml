@@ -74,6 +74,7 @@ jobs:
       - run: python3 scripts/check_core_checkpoint.py --bitcoind "$RUNNER_TEMP/btc-core29/bitcoin-29.0/bin/bitcoind"
       - run: python3 scripts/check_core_http.py --bitcoind "$RUNNER_TEMP/btc-core29/bitcoin-29.0/bin/bitcoind"
       - run: python3 scripts/check_core_verbose.py --bitcoind "$RUNNER_TEMP/btc-core29/bitcoin-29.0/bin/bitcoind"
+      - run: python3 scripts/check_core_genesis.py --bitcoind "$RUNNER_TEMP/btc-core29/bitcoin-29.0/bin/bitcoind"
       - run: python3 scripts/check_core_electrum.py --bitcoind "$RUNNER_TEMP/btc-core29/bitcoin-29.0/bin/bitcoind"
       - run: python3 scripts/check_core_fees.py --bitcoind "$RUNNER_TEMP/btc-core29/bitcoin-29.0/bin/bitcoind"
       - run: python3 scripts/check_core_psbt.py --bitcoind "$RUNNER_TEMP/btc-core29/bitcoin-29.0/bin/bitcoind"

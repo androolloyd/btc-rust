@@ -27,6 +27,7 @@ empty state only when that index is complete for the active tip.
 | `blockchain.transaction.get(tx_hash, verbose=false)` | Actual pool/active-chain transaction, raw or the shared Core-style verbose view |
 | `blockchain.transaction.broadcast(raw_tx)` | Ordinary validated admission, durable pool update and the existing transaction relay event |
 | `blockchain.transaction.get_merkle(tx_hash, height)` | Actual active-block position and txid merkle branch |
+| `blockchain.transaction.id_from_pos(height, tx_pos, merkle=false)` | Actual active-block transaction ID, optionally with its txid branch |
 | `blockchain.scripthash.get_history(scripthash)` | Confirmed transactions in block order, then actual pool touches/fees with height 0 or -1 |
 | `blockchain.scripthash.get_mempool(scripthash)` | Actual transactions receiving or spending the script, including unconfirmed parents |
 | `blockchain.scripthash.get_balance(scripthash)` | Durable coin balance including immature coinbases; signed net mempool delta |
@@ -48,6 +49,15 @@ peer propagation uses the existing relay queue; it depends on connected peers.
 
 Merkle branches use actual txids rather than witness hashes, Bitcoin's byte
 order and odd-width sibling duplication, and agree with the stored header root.
+Position queries accept nonnegative integer heights/positions and an optional
+boolean proof flag. They read and check the actual active block body even when
+a proof is not requested. An unavailable position/height errors rather than
+returning an ID from a stale index. The proof response is `{tx_hash, merkle}`;
+without proof it is the ID string. Named arguments use `height`, `tx_pos` and
+`merkle`. Explicit named nulls remain visible to type validation instead of
+being silently discarded as omitted defaults. Canonical genesis has one actual transaction and an empty proof branch
+on every supported network, but contributes no spendable coins or script history.
+
 After a reorg, the same height resolves the new active block; a detached
 transaction cannot retain an active proof. Header notifications report the
 latest committed tip, so intermediate tips can be coalesced as the protocol
@@ -165,7 +175,8 @@ released ElectrumX 1.16.0's [header query implementation](https://github.com/spe
 and [Merkle implementation](https://github.com/spesmilo/electrumx/blob/1.16.0/electrumx/lib/merkle.py),
 Core v29's [transaction RPC](https://github.com/bitcoin/bitcoin/blob/v29.0/src/rpc/rawtransaction.cpp)
 and [block/merkle primitives](https://github.com/bitcoin/bitcoin/blob/v29.0/src/consensus/merkle.cpp),
-plus Core's [coin handling](https://github.com/bitcoin/bitcoin/blob/v29.0/src/coins.cpp).
+plus Core's [coin handling](https://github.com/bitcoin/bitcoin/blob/v29.0/src/coins.cpp)
+and [canonical network genesis construction](https://github.com/bitcoin/bitcoin/blob/v29.0/src/kernel/chainparams.cpp).
 
 Independent acceptance runs the compiled listener against released Core v29
 using real wallet signatures, identical validated blocks, independently computed
@@ -245,3 +256,23 @@ strengthened warm-cache reorg follow-up both pass. No dependency versions,
 lockfiles or ordinary consensus rules changed. Fee providers are accepted in
 [FEES.md](FEES.md); remaining mandatory protocol methods, full negotiation, TLS and broad public-chain/load
 qualification remain unfinished.
+
+The transaction-position/genesis milestone passes 120 exact comparisons against
+actual Core active-block transactions and the unchanged released ElectrumX Merkle
+class. Positional/named ID queries, optional proofs and existing get_merkle agree
+on singleton, even- and odd-width blocks. Equal-work branches retain the old
+position; the winning fork immediately changes coinbase identity and removes a
+detached position. Proofs and IDs agree again after restarts at 105 and 2018.
+All existing 260 wallet-query comparisons, status notifications/races, signed
+admissions, RBF/restoration and 628 header checkpoint comparisons remain passing.
+
+The separate `scripts/check_core_genesis.py` compares complete actual Core genesis
+headers/bodies and verbose views on all five networks, before and after restart,
+including typed/range errors and absence of genesis coins/script history.
+Testnet4's corrected published identity does not establish full BIP94 consensus
+parity. Existing wrong-anchor stores fail without overwriting their records.
+The gate passes 3,347 tests in 43 suites with two existing ignores, formatting,
+Clippy, features and release build. Header-only upgrade and corrupt-body/no-success
+regressions pass. Remaining required server metadata, version negotiation and peer
+methods must be completed before a protocol version can be advertised; stage
+backends and public/TLS/load qualification remain open.

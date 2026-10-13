@@ -15,6 +15,7 @@ from pathlib import Path
 import struct
 import subprocess
 import tempfile
+import time
 from check_core_p2p import core_rpc, rust_rpc, reserve_ports, wait_until
 from check_core_electrum import Client
 from electrumx_reference import fee_histogram_reference
@@ -78,6 +79,7 @@ def main():
                 ports[0].close();ports[1].close()
                 core=subprocess.Popen([str(args.bitcoind),"-regtest",f"-datadir={root/'core'}","-server","-listen=0","-dnsseed=0","-discover=0","-connect=0","-listenonion=0","-par=1","-keypool=2","-txindex=1",f"-rpcport={cp}","-rpcbind=127.0.0.1","-rpcallowip=127.0.0.1","-rpcuser=interop","-rpcpassword=regtest-only","-fallbackfee=0.00002",f"-port={cpp}"],stdout=cl,stderr=cl);processes.append(core)
                 wait_until(lambda: core_rpc(cp,"getblockcount",[]) == 0)
+                core_rpc(cp,"setmocktime",[int(time.time())])
                 core_rpc(cp,"createwallet",["fees"]); address=core_rpc(cp,"getnewaddress",[])
                 destination=bytes.fromhex(core_rpc(cp,"getaddressinfo",[address])["scriptPubKey"])
                 command=[str(args.node),"--network","regtest","--datadir",str(root/"rust"),"--rpc-port",str(rp),"--port",str(rpp),"--electrum-port",str(ep),"run"]
@@ -141,9 +143,16 @@ def main():
                 rust=subprocess.Popen(command,stdout=rl,stderr=rl);processes.append(rust)
                 wait_until(lambda: rust_rpc(rp,"getbestblockhash",[]) == mined);client=Client(ep)
                 quotes(client,rp,{1:-1,2:{"CONSERVATIVE":-1,"ECONOMICAL":0.00002},3:0.00002,6:0.00002});assert pool_oracle(client,cp,rp) == []
+                # A fixed Core clock makes timing collisions deterministic. A
+                # different real coinbase recipient must distinguish the fork
+                # even when old/new templates share exactly the same timestamp.
+                old_branch={h:core_rpc(cp,"getblockhash",[h]) for h in [103,104,105]}
+                fork_address=core_rpc(cp,"getnewaddress",[])
                 core_rpc(cp,"invalidateblock",[empty],timeout=60)
                 for _ in range(4):
-                    fork=core_rpc(cp,"generateblock",[address,[]])["hash"]
+                    fork=core_rpc(cp,"generateblock",[fork_address,[]])["hash"]
+                    height=core_rpc(cp,"getblockcount",[])
+                    assert fork != old_branch.get(height)
                     assert rust_rpc(rp,"submitblock",[core_rpc(cp,"getblock",[fork,0])]) is None
                     quotes(client,rp,{1:-1,3:0.00002 if core_rpc(cp,"getblockcount",[]) <= 105 else -1})
                 assert rust_rpc(rp,"getbestblockhash",[]) == fork

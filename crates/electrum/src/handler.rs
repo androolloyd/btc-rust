@@ -138,6 +138,7 @@ impl ElectrumHandler {
             METHOD_TRANSACTION_GET => (&["tx_hash", "verbose"], 1),
             METHOD_TRANSACTION_BROADCAST => (&["raw_tx"], 1),
             METHOD_TRANSACTION_GET_MERKLE => (&["tx_hash", "height"], 2),
+            METHOD_TRANSACTION_ID_FROM_POS => (&["height", "tx_pos", "merkle"], 2),
             METHOD_SCRIPTHASH_GET_HISTORY | METHOD_SCRIPTHASH_GET_MEMPOOL | METHOD_SCRIPTHASH_GET_BALANCE | METHOD_SCRIPTHASH_LISTUNSPENT | METHOD_SCRIPTHASH_SUBSCRIBE | METHOD_SCRIPTHASH_UNSUBSCRIBE => (&["scripthash"],1),
             // An advertised Electrum version requires *all* its nonoptional
             // methods. Do not claim compatibility before every required method works.
@@ -157,7 +158,9 @@ impl ElectrumHandler {
                     .iter()
                     .map(|name| values.get(*name).cloned().unwrap_or(Value::Null))
                     .collect();
-                while ordered.len() > required && ordered.last() == Some(&Value::Null) {
+                // Omission can use the backend's default; an explicit null
+                // must remain visible to that method's type validation.
+                while ordered.len() > required && !values.contains_key(names[ordered.len() - 1]) {
                     ordered.pop();
                 }
                 Value::Array(ordered)
@@ -386,6 +389,7 @@ mod tests {
             (METHOD_BLOCK_HEADERS, json!([0, 2])),
             (METHOD_TRANSACTION_GET, json!(["00".repeat(32)])),
             (METHOD_TRANSACTION_BROADCAST, json!(["ff"])),
+            (METHOD_TRANSACTION_ID_FROM_POS, json!([0, 0, true])),
             (METHOD_SCRIPTHASH_GET_BALANCE, json!(["00".repeat(32)])),
             (METHOD_SCRIPTHASH_GET_HISTORY, json!(["00".repeat(32)])),
             (METHOD_SCRIPTHASH_GET_MEMPOOL, json!(["00".repeat(32)])),

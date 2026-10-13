@@ -385,7 +385,7 @@ Built-in example plugins:
 
 ### APIs
 - **JSON-RPC** — validated chain, transaction, mining and pool queries over authenticated HTTP and local newline RPC
-- **Experimental Electrum subset** — opt-in loopback chain/transaction queries, verified admission, transaction and header checkpoint proofs, and header notifications; validated history/balance/unspent/pool queries and connection-owned script-status notifications are available; full protocol negotiation remains unfinished. See [supported methods and setup](docs/ELECTRUM.md).
+- **Experimental Electrum subset** — opt-in loopback chain/transaction queries, verified admission, transaction IDs by active-block position, transaction and header checkpoint proofs, and header notifications; validated history/balance/unspent/pool queries and connection-owned script-status notifications are available; full protocol negotiation remains unfinished. See [supported methods and setup](docs/ELECTRUM.md).
 - **Fee providers** — actual relay policy and pool histograms, plus bounded empirical confirmation estimates with explicit insufficient-data results. See [fee scope](docs/FEES.md).
 - **Esplora REST** — experimental endpoint scaffolding; validated fee/pool providers are not installed on that separate service
 - **Prometheus** — `/metrics` endpoint with 7 gauges (chain height, peers, mempool, sync progress, etc.)

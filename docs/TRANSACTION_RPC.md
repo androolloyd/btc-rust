@@ -56,17 +56,28 @@ point; otherwise the actual witness address describes that output. Unknown and
 malformed scripts retain their actual hex and Core-style disassembly errors.
 No script classification activates experimental consensus behavior.
 
-Known limits remain explicit: the genesis body is not stored by this backend,
-so `getblock` for genesis remains unavailable; Core-style genesis-coinbase
-`getrawtransaction` queries are rejected. Block headers do not yet include
-Core's `target` field. Named arguments, general parameter/error-message parity,
-fee estimation/priority policy and Electrum providers remain separate work.
+All five supported networks now store their exact canonical genesis body, so
+raw and verbose `getblock` work at height zero. Old valid header-only stores gain
+the exact body in a transaction after normal history verification. No genesis
+coins, transaction-index rows, script history or fee observations are created;
+Core-style genesis-coinbase `getrawtransaction` queries are still rejected.
+Testnet4 now uses its published distinct merkle root. A database anchored to the
+previous incorrect Testnet4 header fails without overwriting its records; preserve
+that directory and resync in a separate data directory. This establishes genesis
+identity, not complete Testnet4/BIP94 consensus parity.
+
+Header and block JSON now include Core v29's `target`: its rendering uses the
+current active tip's difficulty target, while `bits`/`difficulty` describe the
+queried block. Named arguments, general parameter/error-message parity, Core
+multi-horizon fee estimation, prioritization and remaining Electrum protocol
+methods remain separate work. Actual bounded fee providers are in [FEES.md](FEES.md).
 Large HTTP results are subject to the existing 16 MiB response budget and may
 return 503; use transaction queries or lower block verbosity where appropriate.
 
 Primary references are Core v29's [transaction RPC and block context](https://github.com/bitcoin/bitcoin/blob/v29.0/src/rpc/rawtransaction.cpp),
 [transaction/script rendering](https://github.com/bitcoin/bitcoin/blob/v29.0/src/core_write.cpp),
-[block verbosity and undo](https://github.com/bitcoin/bitcoin/blob/v29.0/src/rpc/blockchain.cpp),
+[block verbosity, header target and undo](https://github.com/bitcoin/bitcoin/blob/v29.0/src/rpc/blockchain.cpp),
+[canonical genesis bodies](https://github.com/bitcoin/bitcoin/blob/v29.0/src/kernel/chainparams.cpp),
 [script template solver](https://github.com/bitcoin/bitcoin/blob/v29.0/src/script/solver.cpp),
 [descriptor inference](https://github.com/bitcoin/bitcoin/blob/v29.0/src/script/descriptor.cpp)
 and [Core's unspendable-coin exclusion](https://github.com/bitcoin/bitcoin/blob/v29.0/src/coins.cpp),
@@ -75,8 +86,8 @@ plus [BIP141 weight](https://github.com/bitcoin/bips/blob/master/bip-0141.mediaw
 Independent native acceptance uses released Core wallet signatures and ordinary
 block validation, with all transaction bytes, amounts, scripts, descriptors,
 prevout metadata and confirmations compared exactly. Core's rounded floating
-difficulty field is compared at 1e-14 relative precision; the missing header
-target is recorded above. No transaction assertion is relaxed.
+difficulty field is compared at 1e-14 relative precision; the header target and
+every transaction field are exact. No transaction assertion is relaxed.
 
 ```sh
 python3 scripts/check_core_verbose.py --bitcoind /path/to/bitcoin-29.0/bin/bitcoind
@@ -91,3 +102,20 @@ in 43 suites, formatting, Clippy, minimal feature checks and the release build
 (two preexisting ignored tests). No dependency or ordinary consensus changes.
 The existing eighteen-case HTTP/released `bitcoin-cli` acceptance and all four
 inbound/outbound v1/v2 P2P relay/reorg/mempool/IBD/restart scenarios also pass.
+
+The genesis/transaction-position follow-up passes exact released Core v29 genesis
+hashes, complete serialized headers/bodies, header JSON and block verbosity 1/2/3
+on Mainnet, Testnet3, Testnet4, Signet and Regtest, before and after durable
+restart. Genesis output exclusion, ordinary transaction-lookup rejection,
+empty script history and actual singleton Electrum proofs remain checked.
+The final gate passes 3,347 tests in 43 suites (two existing ignores). Regressions
+preserve old incompatible Testnet4 rows, reject damaged genesis bodies without
+replacement and prevent transaction-position success from corrupt actual bodies.
+The first gate exposed a 32-versus-33-byte Testnet4 construction mistake; the
+published 33-byte script was restored before the complete passing rerun. All
+350 existing verbose comparisons, 283 real coinbase scripts and ten error
+classifications also pass with the formerly excluded target checked exactly.
+
+```sh
+python3 scripts/check_core_genesis.py --bitcoind /path/to/bitcoin-29.0/bin/bitcoind
+```
