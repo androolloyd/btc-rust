@@ -5,6 +5,9 @@ pub const METHOD_SERVER_VERSION: &str = "server.version";
 pub const METHOD_SERVER_BANNER: &str = "server.banner";
 pub const METHOD_SERVER_FEATURES: &str = "server.features";
 pub const METHOD_SERVER_PING: &str = "server.ping";
+pub const METHOD_SERVER_DONATION_ADDRESS: &str = "server.donation_address";
+pub const METHOD_SERVER_PEERS_SUBSCRIBE: &str = "server.peers.subscribe";
+pub const METHOD_SERVER_ADD_PEER: &str = "server.add_peer";
 
 // Blockchain header methods
 pub const METHOD_HEADERS_SUBSCRIBE: &str = "blockchain.headers.subscribe";

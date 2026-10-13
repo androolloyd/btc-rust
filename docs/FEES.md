@@ -120,3 +120,9 @@ to a different actual wallet address, checking each old/new block identity.
 The focused fixed-clock acceptance and the full new-release rerun pass every
 existing fee assertion, including durable learning, reorg reset/relearning and
 expiration. This repairs the acceptance fixture without changing estimation or consensus rules.
+
+The local Electrum 1.4 milestone repeats this complete native fixture with an
+actual successful version handshake before learning and after reopening. All
+180 Core-validated spends, observed quotes and upstream compact histograms,
+RBF/rejection, partial/delayed confirmation, durable restart, equal-work retention,
+winning-fork reset/relearning and expiration pass on negotiated connections.

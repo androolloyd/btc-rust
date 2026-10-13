@@ -1223,6 +1223,22 @@ impl NodeChainBackend {
 }
 
 impl btc_electrum::ElectrumBackend for NodeChainBackend {
+    fn protocol_1_4_genesis(&self) -> Result<Option<BlockHash>, btc_electrum::ElectrumRpcError> {
+        let data = self
+            .lock()
+            .map_err(|error| btc_electrum::ElectrumRpcError {
+                code: error.code,
+                message: error.message,
+            })?;
+        let genesis =
+            data.headers
+                .get_header_by_height(0)
+                .ok_or_else(|| btc_electrum::ElectrumRpcError {
+                    code: INTERNAL_ERROR,
+                    message: "validated genesis missing".into(),
+                })?;
+        Ok(Some(genesis.header.block_hash()))
+    }
     fn subscribe_scripts(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
         Some(self.wallet_events.subscribe())
     }

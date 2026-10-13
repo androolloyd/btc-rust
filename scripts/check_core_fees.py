@@ -86,6 +86,7 @@ def main():
                 for item in ports[2:]:item.close()
                 rust=subprocess.Popen(command,stdout=rl,stderr=rl);processes.append(rust)
                 wait_until(lambda: rust_rpc(rp,"getblockcount",[]) == 0);client=Client(ep)
+                assert client.call("server.version",["fee-acceptance","1.4"]) == ["btc-rust 0.1.0","1.4"]
                 quotes(client,rp,{1:-1,2:-1,144:-1,145:-1,1008:-1}); assert pool_oracle(client,cp,rp) == []
                 for target in [0,-1,1.5,True,"2"]:
                     assert client.call("blockchain.estimatefee",[target],True)["code"] == -32602
@@ -142,6 +143,7 @@ def main():
                 rust_rpc(rp,"stop",[]);assert rust.wait(timeout=10) == 0;client.close();client=None
                 rust=subprocess.Popen(command,stdout=rl,stderr=rl);processes.append(rust)
                 wait_until(lambda: rust_rpc(rp,"getbestblockhash",[]) == mined);client=Client(ep)
+                assert client.call("server.version",["fee-restart","1.4"]) == ["btc-rust 0.1.0","1.4"]
                 quotes(client,rp,{1:-1,2:{"CONSERVATIVE":-1,"ECONOMICAL":0.00002},3:0.00002,6:0.00002});assert pool_oracle(client,cp,rp) == []
                 # A fixed Core clock makes timing collisions deterministic. A
                 # different real coinbase recipient must distinguish the fork

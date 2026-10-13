@@ -1,4 +1,4 @@
-# Experimental Electrum chain and script service
+# Experimental local Electrum 1.4 service
 
 The compiled node can serve actual chain/transaction queries on an explicitly
 enabled **loopback** TCP port. It is disabled by default:
@@ -7,11 +7,13 @@ enabled **loopback** TCP port. It is disabled by default:
 btc-node --network regtest --datadir /path/to/regtest-data --electrum-port 50001 run
 ```
 
-This is an implemented subset, not a complete wallet server. `server.version`
-and `server.features` return explicit unsupported errors; failed version
-negotiation closes that connection. The service advertises no completed Electrum
-protocol version. The protocol requires every nonoptional method of an advertised
-version to work. Remaining mandatory protocol methods are still unfinished.
+The compiled validated node now negotiates Bitcoin Electrum protocol **1.4**.
+Every method in the released 1.4 Bitcoin catalog has an installed operation;
+public-chain, TLS and broad-load qualification remain incomplete. This does not
+advertise later protocol versions or establish compatibility with every wallet.
+The library's default/partial providers still refuse negotiation and features.
+An adapter must explicitly supply the complete protocol and actual validated
+genesis anchor; metadata is installed only after binding a real loopback listener.
 Header checkpoint proofs use the actual validated active-chain prefix. Relay
 fees, pool histograms and bounded empirical confirmation estimates now use real
 providers; their scope and insufficient-data behavior are in [FEES.md](FEES.md).
@@ -37,7 +39,37 @@ empty state only when that index is complete for the active tip.
 | `blockchain.relayfee()` | Actual configured pool admission floor |
 | `mempool.get_fee_histogram()` | Actual current pool fee/virtual-size bins using released ElectrumX compression |
 | `blockchain.estimatefee(number, mode)` | Actual observed confirmation quote, or `-1` for insufficient data |
-| `server.ping()` / `server.banner()` | Connection keepalive / explicit subset description |
+| `server.ping()` / `server.banner()` | Connection keepalive / actual local-service scope |
+| `server.version(client_name="", protocol_version="1.4")` | One highest-common-version negotiation per real connection |
+| `server.features()` | Actual bound TCP endpoint, validated genesis, software version and protocol bounds |
+| `server.donation_address()` | Empty string: this service requests no donations |
+| `server.peers.subscribe()` | Empty peer-server list: discovery/registration are disabled; no notifications |
+| `server.add_peer(features)` | False under the isolated policy, without resolution or registration |
+
+The server's minimum and maximum protocol versions are both 1.4. An omitted
+version uses that minimum; a string requests exactly that version, and a two-string
+range selects the highest shared version. A first request with no common version
+returns an error and closes. Only the first version call is accepted per connection;
+a repeated call errors while preserving the connection and existing subscriptions.
+A successful version notification owns that same state without emitting a response.
+Legacy/v2 envelopes, named arguments and ordered batches retain their wire behavior.
+A rejected first negotiation stops the batch before any following member can admit
+transactions or mutate state, including when the rejected call was a notification.
+
+Client names are strings up to 128 UTF-8 bytes, without controls. Version strings
+have a dot, at most 64 bytes/eight unsigned 32-bit components; malformed or
+unsupported strings have no common version. Wrong JSON types/range shapes and
+explicit null defaults error. Named `protocol_version` can omit `client_name`.
+No client identity is authenticated or retained by this handshake.
+
+`server.features` uses the actual bound address/port and validated genesis hash,
+reports SHA256 script hashing, no pruning, software version and the same protocol
+bounds as negotiation. It advertises no SSL route. The listener operates in an
+explicitly isolated mode: no peer discovery/announcements/registered peer servers
+and no donation address. Peer queries therefore return an empty list without
+subscribing; announcements return false without DNS resolution, outbound connections
+or registry mutation. Bitcoin P2P connections are not Electrum server peers. These
+policy results do not stand in for a public peer-discovery backend.
 
 Queries use the same mutex-protected validated backend as HTTP RPC, mining and
 P2P. Transaction lookup follows the active-index/mempool boundaries described in
@@ -173,6 +205,9 @@ Primary references are [ElectrumX protocol basics](https://electrumx.readthedocs
 [ElectrumX 1.4 method semantics](https://electrumx.readthedocs.io/en/latest/protocol-methods.html),
 released ElectrumX 1.16.0's [header query implementation](https://github.com/spesmilo/electrumx/blob/1.16.0/electrumx/server/session.py)
 and [Merkle implementation](https://github.com/spesmilo/electrumx/blob/1.16.0/electrumx/lib/merkle.py),
+[version selection](https://github.com/spesmilo/electrumx/blob/1.16.0/electrumx/lib/util.py),
+[disabled announcement handling](https://github.com/spesmilo/electrumx/blob/1.16.0/electrumx/server/peers.py)
+and [empty donation configuration](https://github.com/spesmilo/electrumx/blob/1.16.0/electrumx/server/env.py),
 Core v29's [transaction RPC](https://github.com/bitcoin/bitcoin/blob/v29.0/src/rpc/rawtransaction.cpp)
 and [block/merkle primitives](https://github.com/bitcoin/bitcoin/blob/v29.0/src/consensus/merkle.cpp),
 plus Core's [coin handling](https://github.com/bitcoin/bitcoin/blob/v29.0/src/coins.cpp)
@@ -273,6 +308,37 @@ Testnet4's corrected published identity does not establish full BIP94 consensus
 parity. Existing wrong-anchor stores fail without overwriting their records.
 The gate passes 3,347 tests in 43 suites with two existing ignores, formatting,
 Clippy, features and release build. Header-only upgrade and corrupt-body/no-success
-regressions pass. Remaining required server metadata, version negotiation and peer
-methods must be completed before a protocol version can be advertised; stage
-backends and public/TLS/load qualification remain open.
+regressions pass. Local server metadata, version negotiation and isolated peer-policy methods are
+implemented in the follow-up below; stage backends and public/TLS/load
+qualification remain open.
+
+The local server-method/negotiation milestone passes all 22 method names from the
+unchanged released Bitcoin ElectrumX 1.4 catalog through the actual compiled
+listener. Sixteen standard version selections match unchanged checksum-pinned
+upstream functions; five omitted/named cases, eleven typed/bounded failures,
+legacy responses, notification ownership, successful/duplicate batch ordering
+and persistent duplicate errors pass. Metadata reports the actual bound port
+and Core-derived genesis on all five networks before and after restart. Peer
+announcements are declined without registering their supplied names, peer queries
+remain empty and emit no notifications, and no donation address is invented.
+
+Two failed first-negotiation batches, one request and one notification, cannot
+admit the actual funded Core-signed spend in their next member. That exact spend
+is then admitted/mined by both implementations through the normal successful
+path, so the negative check does not depend on invalid transaction bytes.
+Existing 260 wallet-query, 120 position and 628 checkpoint comparisons, genuine
+RBF/reorg/restoration, status races and all restart/cap assertions pass through
+height 2018 with live version ownership and stable service identity. The local
+gate passes 3,349 tests in 43 suites (two existing ignores), formatting, Clippy,
+feature checks and release build. Bounded hostile-version and failed capability-
+anchor listener-closure regressions pass. The separate real-fee fixture also negotiates 1.4 before learning and after
+restart: all 180 Core-validated witness spends, exact released histogram bins,
+partial confirmations, RBF, winning-reorg reset/relearning and expiration pass.
+No dependencies or consensus changes.
+
+The acceptance helper retains complete released source/licenses in its temporary
+downloads, checks exact SHA256 before using AST-selected unchanged negotiation
+functions, and reads the exact upstream 1.4 catalog before asserting coverage.
+No additional production dependency or public peer connection is introduced.
+Stage providers, other advertised protocol versions, public discovery, TLS and
+broad-load/full-chain qualification remain open.

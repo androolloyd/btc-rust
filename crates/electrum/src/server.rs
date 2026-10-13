@@ -39,6 +39,11 @@ impl ElectrumServer {
         handler: Arc<ElectrumHandler>,
         mut shutdown: watch::Receiver<bool>,
     ) -> std::io::Result<()> {
+        let handler = Arc::new(
+            handler
+                .for_listener(listener.local_addr()?)
+                .map_err(|error| std::io::Error::other(error.message))?,
+        );
         tracing::info!(addr = %listener.local_addr()?, "experimental Electrum chain service listening");
         let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
         let mut clients = JoinSet::new();
@@ -211,6 +216,49 @@ async fn connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn failed_capability_anchor_closes_bound_listener_without_advertising() {
+        struct FailedAnchor;
+        impl crate::handler::ElectrumBackend for FailedAnchor {
+            fn call(
+                &self,
+                _: &str,
+                _: serde_json::Value,
+            ) -> Result<serde_json::Value, crate::protocol::ElectrumError> {
+                Err(crate::protocol::ElectrumError {
+                    code: -32603,
+                    message: "unavailable".into(),
+                })
+            }
+            fn subscribe_headers(
+                &self,
+            ) -> tokio::sync::broadcast::Receiver<btc_primitives::BlockHash> {
+                tokio::sync::broadcast::channel(1).1
+            }
+            fn protocol_1_4_genesis(
+                &self,
+            ) -> Result<Option<btc_primitives::BlockHash>, crate::protocol::ElectrumError>
+            {
+                Err(crate::protocol::ElectrumError {
+                    code: -32603,
+                    message: "damaged anchor".into(),
+                })
+            }
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let (_sender, shutdown) = watch::channel(false);
+        let error = ElectrumServer::new(endpoint.port())
+            .run_listener(
+                listener,
+                Arc::new(ElectrumHandler::new().with_backend(Arc::new(FailedAnchor))),
+                shutdown,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("damaged anchor"));
+        assert!(TcpStream::connect(endpoint).await.is_err());
+    }
     #[tokio::test]
     async fn real_listener_returns_errors_and_stops_with_idle_partial_clients() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

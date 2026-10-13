@@ -11,7 +11,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 from check_core_p2p import core_rpc, reserve_ports, rust_rpc, wait_until
-from check_core_electrum import Client
+from check_core_electrum import Client, server_identity
 
 
 def same(actual, expected):
@@ -52,6 +52,7 @@ def main():
                         same(rust_rpc(rp,"getblockheader",[expected_hash]),core_rpc(cp,"getblockheader",[expected_hash]))
                         for level in [1,2,3]:same(rust_rpc(rp,"getblock",[expected_hash,level]),core_rpc(cp,"getblock",[expected_hash,level]))
                         client=Client(ep)
+                        server_identity(client,ep,expected_hash)
                         assert client.call("blockchain.transaction.id_from_pos",[0,0]) == identifier
                         assert client.call("blockchain.transaction.id_from_pos",{"height":0,"tx_pos":0,"merkle":True}) == {"tx_hash":identifier,"merkle":[]}
                         assert client.call("blockchain.transaction.get_merkle",[identifier,0]) == {"block_height":0,"pos":0,"merkle":[]}

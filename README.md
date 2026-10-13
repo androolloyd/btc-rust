@@ -319,7 +319,7 @@ btc-mempool      → Fee-sorted pool, RBF (BIP125), cluster mempool, fee estimat
 btc-stages       → Pipeline: Headers → Bodies → Execution → Indexing → AddressIndex
 btc-rpc          → JSON-RPC 2.0 server with Bitcoin Core-compatible methods
 btc-exex         → Execution Extensions plugin system (ordinals indexer included)
-btc-electrum     → Opt-in validated Electrum chain/transaction subset
+btc-electrum     → Opt-in local validated Bitcoin Electrum 1.4 service
 btc-test         → In-process regtest harness for BIP development
 btc-node         → CLI, NodeBuilder, sync manager, Esplora REST, Prometheus, ZMQ
 btc-forge        → Script builders, debugger, transaction tooling, Miniscript
@@ -385,7 +385,7 @@ Built-in example plugins:
 
 ### APIs
 - **JSON-RPC** — validated chain, transaction, mining and pool queries over authenticated HTTP and local newline RPC
-- **Experimental Electrum subset** — opt-in loopback chain/transaction queries, verified admission, transaction IDs by active-block position, transaction and header checkpoint proofs, and header notifications; validated history/balance/unspent/pool queries and connection-owned script-status notifications are available; full protocol negotiation remains unfinished. See [supported methods and setup](docs/ELECTRUM.md).
+- **Experimental local Electrum 1.4** — opt-in loopback chain/transaction queries, verified admission, transaction IDs by active-block position, transaction and header checkpoint proofs, and header notifications; validated history/balance/unspent/pool queries and connection-owned script-status notifications are available; the released Bitcoin 1.4 method catalog and connection-owned negotiation are implemented; public/TLS/load qualification remains open. See [supported methods and setup](docs/ELECTRUM.md).
 - **Fee providers** — actual relay policy and pool histograms, plus bounded empirical confirmation estimates with explicit insufficient-data results. See [fee scope](docs/FEES.md).
 - **Esplora REST** — experimental endpoint scaffolding; validated fee/pool providers are not installed on that separate service
 - **Prometheus** — `/metrics` endpoint with 7 gauges (chain height, peers, mempool, sync progress, etc.)

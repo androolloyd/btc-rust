@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Accept the actual experimental Electrum chain/transaction listener with Core.
 
-No protocol-completeness claim: negotiation and remaining protocol methods
-must fail explicitly. Real Core-funded signatures, actual header bytes and
+Local protocol 1.4 negotiation is checked against released ElectrumX; public/TLS
+qualification is separate. Real Core-funded signatures, actual header bytes and
 independently calculated merkle paths cover admission, mining, fork and restart.
 """
 import argparse
@@ -13,18 +13,24 @@ import socket
 import subprocess
 import tempfile
 from check_core_p2p import core_rpc, reserve_ports, rust_rpc, wait_until
-from electrumx_reference import merkle_reference
+from electrumx_reference import merkle_reference, protocol_reference, methods_1_4_reference
 
 
 class Client:
+    methods=set()
+    notification_methods=set()
     def __init__(self, port):
         self.socket = socket.create_connection(("127.0.0.1", port), timeout=30)
         self.stream = self.socket.makefile("rb"); self.id = 0; self.notifications = []; self.subscriptions = {}; self.status_counts = {}
-    def send(self, body): self.socket.sendall(json.dumps(body).encode() + b"\n")
+    def send(self, body):
+        for member in body if isinstance(body,list) else [body]:
+            if isinstance(member,dict) and isinstance(member.get("method"),str):self.methods.add(member["method"])
+        self.socket.sendall(json.dumps(body).encode() + b"\n")
     def read(self):
         line = self.stream.readline(16 * 1024 * 1024 + 1)
         assert line.endswith(b"\n") and len(line) <= 16 * 1024 * 1024
         value = json.loads(line)
+        if isinstance(value,dict) and isinstance(value.get("method"),str):self.notification_methods.add(value["method"])
         if isinstance(value,dict) and value.get("method") == "blockchain.scripthash.subscribe":
             assert "id" not in value and value["jsonrpc"] == "2.0" and len(value["params"]) == 2
             script,status = value["params"]; assert script in self.subscriptions
@@ -62,6 +68,90 @@ class Client:
         self.subscriptions.pop(script)
         assert self.call("blockchain.scripthash.unsubscribe",[script]) is False
     def close(self): self.stream.close(); self.socket.close()
+
+
+def server_identity(client, port, genesis):
+    features=client.call("server.features")
+    assert features=={"hosts":{"127.0.0.1":{"tcp_port":port}},"genesis_hash":genesis,"hash_function":"sha256","server_version":"btc-rust 0.1.0","protocol_min":"1.4","protocol_max":"1.4","pruning":None,"peer_discovery":"off","donations":False}
+    assert client.call("server.version",{"protocol_version":["1.4","1.4.5"]})==[features["server_version"],"1.4"]
+    assert client.call("server.version",["repeat","9.9"],True)["code"]==1
+    assert client.call("server.ping") is None
+    assert isinstance(client.call("server.banner"),str)
+    assert client.call("server.donation_address")==""
+    assert client.call("server.peers.subscribe")==[]
+    assert client.call("server.add_peer",{"features":{"hosts":{"must-not-resolve.invalid":{"tcp_port":1}},"genesis_hash":"00"*32}}) is False
+    assert client.call("server.peers.subscribe")==[]
+    for value in [None,[],"host",42]:assert client.call("server.add_peer",[value],True)["code"]==-32602
+    return features
+
+
+def version_oracle(port):
+    reference=protocol_reference()
+    cases=["1.4",["1.0","1.4"],["1.4","1.4.5"],["1.0","2.0"],["1.4","1.4"],"1.3","1.5","2.0","1.4.0",["1.4.1","2.0"],["1.5","1.3"],"01.004","", "bad",["1.3","1.3.9"],["0.0","1.3.99"]]
+    for version in cases:
+        negotiated,_=reference(version,(1,4),(1,4));client=Client(port)
+        try:
+            if negotiated is None:
+                assert client.call("server.version",["oracle",version],True)["code"]==1
+                assert client.stream.readline()==b""
+            else:
+                assert client.call("server.version",["oracle",version])==["btc-rust 0.1.0",".".join(map(str,negotiated))]
+                assert client.call("server.ping") is None
+                assert client.call("server.version",[],True)["code"]==1
+                assert client.call("server.ping") is None
+        finally:client.close()
+    # Each connection owns negotiation; omissions and legacy/v2 frames work.
+    for params in [[],["name"],{}, {"client_name":"named"},{"protocol_version":"1.4"}]:
+        client=Client(port)
+        try:assert client.call("server.version",params)==["btc-rust 0.1.0","1.4"]
+        finally:client.close()
+    invalid=[[None,"1.4"],[False,"1.4"],["n",None],["n",[]],["n",["1.4",2]], ["n","1.4","extra"],["n"*129,"1.4"],["line\nname","1.4"],{"client_name":None},{"protocol_version":None},{"client":"unknown"}]
+    for params in invalid:
+        client=Client(port)
+        try:
+            assert client.call("server.version",params,True)["code"]==-32602
+            assert client.stream.readline()==b""
+        finally:client.close()
+    client=Client(port)
+    try:
+        client.send({"id":"legacy","method":"server.version","params":["legacy","1.4"]})
+        assert client.read()=={"id":"legacy","result":["btc-rust 0.1.0","1.4"],"error":None}
+        assert client.call("server.ping") is None
+    finally:client.close()
+    client=Client(port)
+    try:
+        client.send([{"id":"first","jsonrpc":"2.0","method":"server.version","params":["batch","1.4"]},{"id":"duplicate","jsonrpc":"2.0","method":"server.version","params":["batch","9.9"]},{"id":"ping","jsonrpc":"2.0","method":"server.ping"}])
+        response=client.read()
+        assert len(response)==3 and response[0]=={"id":"first","jsonrpc":"2.0","result":["btc-rust 0.1.0","1.4"]}
+        assert response[1]["id"]=="duplicate" and response[1]["error"]["code"]==1
+        assert response[2]=={"id":"ping","jsonrpc":"2.0","result":None}
+        assert client.call("server.ping") is None
+    finally:client.close()
+    client=Client(port)
+    try:
+        client.send({"method":"server.version","params":["notification","1.4"],"jsonrpc":"2.0"})
+        assert client.call("server.ping") is None
+        assert client.call("server.version",[],True)["code"]==1
+        assert client.call("server.ping") is None
+    finally:client.close()
+    print(f"version oracle passed: {len(cases)} released ElectrumX selections, five default/named cases, eleven typed/bounded failures, legacy/notification ownership and persistent duplicate errors",flush=True)
+
+
+def rejected_version_cannot_admit(port, rpc_port, signed):
+    before=rust_rpc(rpc_port,"getrawmempool",[]);tip=rust_rpc(rpc_port,"getbestblockhash",[])
+    for notification in [False,True]:
+        client=Client(port)
+        try:
+            version={"jsonrpc":"2.0","method":"server.version","params":["rejected","9.9"]}
+            if not notification:version["id"]="version"
+            client.send([version,{"jsonrpc":"2.0","id":"must-not-admit","method":"blockchain.transaction.broadcast","params":[signed]}])
+            if not notification:
+                response=client.read();assert len(response)==1 and response[0]["id"]=="version" and response[0]["error"]["code"]==1
+            assert client.stream.readline()==b""
+            assert rust_rpc(rpc_port,"getrawmempool",[])==before
+            assert rust_rpc(rpc_port,"getbestblockhash",[])==tip
+        finally:client.close()
+    print("rejected-version batch passed: a real valid Core-signed spend cannot execute after request/notification negotiation failure",flush=True)
 
 
 def proof(txids, position):
@@ -255,20 +345,17 @@ def main():
                 wait_until(lambda: rust_rpc(rust_port,"getblockcount",[]) == 0)
                 client = Client(electrum_port); clients.append(client)
                 genesis = core_rpc(core_port,"getblockhash",[0]); genesis_header = core_rpc(core_port,"getblockheader",[genesis,False])
+                identity=server_identity(client,electrum_port,genesis)
+                version_oracle(electrum_port)
                 assert client.call("blockchain.block.header",[0]) == genesis_header
                 position_proofs(client,core_port,[0])
                 assert client.call("blockchain.headers.subscribe") == {"height":0,"hex":genesis_header}
                 assert client.call("blockchain.block.headers",{"start_height":0,"count":5000}) == {"count":1,"hex":genesis_header,"max":2016}
-                for method, params in [("server.features",[])]:
-                    assert client.call(method,params,True)["code"] == -32601
                 assert client.call("blockchain.estimatefee",[6]) == -1
                 assert client.call("blockchain.relayfee") == 0.00001
                 assert client.call("mempool.get_fee_histogram") == []
                 assert client.call("blockchain.block.header",[0,1],True)["code"] == 1
                 assert client.call("blockchain.block.headers",[0,0,1]) == {"count":0,"hex":"","max":2016}
-                unsupported = Client(electrum_port); clients.append(unsupported)
-                assert unsupported.call("server.version",["acceptance",["1.4","1.4.5"]],True)["code"] == -32601
-                assert unsupported.stream.readline() == b""; unsupported.close(); clients.remove(unsupported)
                 for method, params in [("blockchain.block.header",[-1]),("blockchain.block.headers",[0,-1]),("blockchain.block.headers",[0,"2"]),("blockchain.transaction.get",["00"*32,1])]:
                     assert client.call(method,params,True)["code"] == -32602
                 assert client.call("blockchain.block.headers",[2**64-1,5000]) == {"count":0,"hex":"","max":2016}
@@ -298,6 +385,7 @@ def main():
                 parent = core_rpc(core_port,"getblock",[hashes[0],2])["tx"][0]; parent_id = parent["txid"]
                 raw = core_rpc(core_port,"createrawtransaction",[[{"txid":parent_id,"vout":0}],{address:49.9999}])
                 signed = core_rpc(core_port,"signrawtransactionwithwallet",[raw]); assert signed["complete"]
+                rejected_version_cannot_admit(electrum_port,rust_port,signed["hex"])
                 # A real subscribe+broadcast batch changes state after the
                 # initial query but before its response leaves the connection.
                 # The captured revision must still produce the new status.
@@ -459,6 +547,7 @@ def main():
                 wait_until(lambda: rust_rpc(rust_port,"getbestblockhash",[]) == before)
                 client = Client(electrum_port); clients.append(client)
                 assert client.call("blockchain.headers.subscribe") == {"height":105,"hex":core_rpc(core_port,"getblockheader",[fork,False])}
+                assert server_identity(client,electrum_port,genesis)==identity
                 assert client.call("blockchain.scripthash.unsubscribe",[main_script]) is False
                 assert checkpoint_proofs(client,core_port) == final_checkpoints
                 position_proofs(client,core_port,[0,102,103,104,105])
@@ -489,6 +578,7 @@ def main():
                 wait_until(lambda: rust_rpc(rust_port,"getbestblockhash",[]) == long_tip)
                 client = Client(electrum_port); clients.append(client)
                 assert chunk_boundary(client,core_port) == long_results
+                assert server_identity(client,electrum_port,genesis)==identity
                 position_proofs(client,core_port,[0,2016,2018])
                 # Hold the configured port: node startup must fail, not disable silently.
                 rust_rpc(rust_port,"stop",[]); assert rust.wait(timeout=10) == 0
@@ -501,6 +591,9 @@ def main():
                     assert not (root/"rust"/".cookie").exists()
                 finally: occupied.close()
                 core_rpc(core_port,"stop",[]); assert core.wait(timeout=10) == 0
+                assert not (methods_1_4_reference()-Client.methods), ("unexercised released protocol methods",methods_1_4_reference()-Client.methods)
+                assert "server.peers.subscribe" not in Client.notification_methods
+                print("catalog passed: all 22 released Bitcoin Electrum 1.4 methods exercised by the real listener; peer queries produce no notifications",flush=True)
                 print("PASSED: actual Core genesis/headers and ranges, exact transaction-position views and upstream branches, real signed Electrum admission/mining, witness txid/verbose parity, independent even/odd merkle paths, fragmented-request notification, reorg/pool restore, 105-block restart, four real script-query oracles including RBF/descendant eviction/dependent/same-block spends, actual status SHA256 and notifications, fragmented subscription updates, connection isolation/unsubscribe/limits, stable restart, actual header checkpoint proofs against ElectrumX/Core, cached reorg and 2018-block restart, exact 2016 chunk cap, explicit unsupported/malformed errors, shutdown and startup bind failure",flush=True)
             except Exception:
                 print((root/"rust.log").read_text()[-6000:]); raise

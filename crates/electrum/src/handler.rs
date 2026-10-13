@@ -7,6 +7,7 @@ use crate::protocol::{
 use btc_primitives::BlockHash;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{broadcast, watch};
 
@@ -19,6 +20,12 @@ pub const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 pub trait ElectrumBackend: Send + Sync {
     fn call(&self, method: &str, params: Value) -> Result<Value, ElectrumError>;
     fn subscribe_headers(&self) -> broadcast::Receiver<BlockHash>;
+    /// Opt in only after supplying every Bitcoin Electrum 1.4 data operation.
+    /// Return the actual validated genesis anchor, not an assumed network label.
+    /// Partial/standalone providers must retain the default refusal.
+    fn protocol_1_4_genesis(&self) -> Result<Option<BlockHash>, ElectrumError> {
+        Ok(None)
+    }
     /// Coalesced invalidation, published only after durable chain/pool changes.
     fn subscribe_scripts(&self) -> Option<watch::Receiver<u64>> {
         None
@@ -35,12 +42,23 @@ pub trait ElectrumBackend: Send + Sync {
 #[derive(Default)]
 pub struct ElectrumHandler {
     backend: Option<Arc<dyn ElectrumBackend>>,
+    service: Option<LocalService>,
+}
+
+/// This listener is deliberately isolated: discovery/announcements are disabled,
+/// no peer servers are registered, and the operator requests no donations.
+/// P2P Bitcoin peers are not Electrum peer servers.
+#[derive(Clone)]
+struct LocalService {
+    endpoint: SocketAddr,
+    genesis: BlockHash,
 }
 
 /// Subscription ownership belongs to one connection, never to the shared handler.
 #[derive(Default)]
 pub(crate) struct ScriptSession {
     pub scripts: BTreeMap<String, Value>,
+    version_seen: bool,
 }
 
 pub(crate) struct Dispatch {
@@ -63,6 +81,24 @@ impl ElectrumHandler {
     pub fn with_backend(mut self, backend: Arc<dyn ElectrumBackend>) -> Self {
         self.backend = Some(backend);
         self
+    }
+    pub(crate) fn for_listener(&self, endpoint: SocketAddr) -> Result<Self, ElectrumError> {
+        let genesis = self
+            .backend
+            .as_ref()
+            .map(|b| b.protocol_1_4_genesis())
+            .transpose()?
+            .flatten();
+        if !endpoint.ip().is_loopback() || endpoint.port() == 0 {
+            return Err(error(
+                INTERNAL_ERROR,
+                "Electrum listener must have a bound loopback endpoint",
+            ));
+        }
+        Ok(Self {
+            backend: self.backend.clone(),
+            service: genesis.map(|genesis| LocalService { endpoint, genesis }),
+        })
     }
     pub(crate) fn subscribe_headers(&self) -> Option<broadcast::Receiver<BlockHash>> {
         self.backend
@@ -132,19 +168,35 @@ impl ElectrumHandler {
         session: Option<&mut ScriptSession>,
     ) -> Result<Value, ElectrumError> {
         let (names, required): (&[&str], usize) = match method {
-            METHOD_SERVER_PING | METHOD_SERVER_BANNER | METHOD_HEADERS_SUBSCRIBE | METHOD_RELAYFEE | METHOD_FEE_HISTOGRAM => (&[], 0),
+            METHOD_SERVER_PING
+            | METHOD_SERVER_BANNER
+            | METHOD_SERVER_FEATURES
+            | METHOD_SERVER_DONATION_ADDRESS
+            | METHOD_SERVER_PEERS_SUBSCRIBE
+            | METHOD_HEADERS_SUBSCRIBE
+            | METHOD_RELAYFEE
+            | METHOD_FEE_HISTOGRAM => (&[], 0),
+            METHOD_SERVER_VERSION => (&["client_name", "protocol_version"], 0),
+            METHOD_SERVER_ADD_PEER => (&["features"], 1),
             METHOD_BLOCK_HEADER => (&["height", "cp_height"], 1),
             METHOD_BLOCK_HEADERS => (&["start_height", "count", "cp_height"], 2),
             METHOD_TRANSACTION_GET => (&["tx_hash", "verbose"], 1),
             METHOD_TRANSACTION_BROADCAST => (&["raw_tx"], 1),
             METHOD_TRANSACTION_GET_MERKLE => (&["tx_hash", "height"], 2),
             METHOD_TRANSACTION_ID_FROM_POS => (&["height", "tx_pos", "merkle"], 2),
-            METHOD_SCRIPTHASH_GET_HISTORY | METHOD_SCRIPTHASH_GET_MEMPOOL | METHOD_SCRIPTHASH_GET_BALANCE | METHOD_SCRIPTHASH_LISTUNSPENT | METHOD_SCRIPTHASH_SUBSCRIBE | METHOD_SCRIPTHASH_UNSUBSCRIBE => (&["scripthash"],1),
-            // An advertised Electrum version requires *all* its nonoptional
-            // methods. Do not claim compatibility before every required method works.
-            METHOD_SERVER_VERSION | METHOD_SERVER_FEATURES => return Err(error(METHOD_NOT_FOUND, "complete Electrum protocol negotiation is unavailable; this is an experimental chain/transaction subset")),
-            METHOD_ESTIMATEFEE => (&["number","mode"],1),
-            _ => return Err(error(METHOD_NOT_FOUND, "unknown or unsupported Electrum method")),
+            METHOD_SCRIPTHASH_GET_HISTORY
+            | METHOD_SCRIPTHASH_GET_MEMPOOL
+            | METHOD_SCRIPTHASH_GET_BALANCE
+            | METHOD_SCRIPTHASH_LISTUNSPENT
+            | METHOD_SCRIPTHASH_SUBSCRIBE
+            | METHOD_SCRIPTHASH_UNSUBSCRIBE => (&["scripthash"], 1),
+            METHOD_ESTIMATEFEE => (&["number", "mode"], 1),
+            _ => {
+                return Err(error(
+                    METHOD_NOT_FOUND,
+                    "unknown or unsupported Electrum method",
+                ))
+            }
         };
         let params = match params {
             Value::Array(values) if values.len() >= required && values.len() <= names.len() => {
@@ -156,7 +208,15 @@ impl ElectrumHandler {
                 }
                 let mut ordered: Vec<_> = names
                     .iter()
-                    .map(|name| values.get(*name).cloned().unwrap_or(Value::Null))
+                    .map(|name| {
+                        values.get(*name).cloned().unwrap_or_else(|| {
+                            if method == METHOD_SERVER_VERSION && *name == "client_name" {
+                                json!("")
+                            } else {
+                                Value::Null
+                            }
+                        })
+                    })
                     .collect();
                 // Omission can use the backend's default; an explicit null
                 // must remain visible to that method's type validation.
@@ -213,7 +273,43 @@ impl ElectrumHandler {
         }
         match method {
             METHOD_SERVER_PING => Ok(Value::Null),
-            METHOD_SERVER_BANNER => Ok(json!("btc-rust experimental validated chain/transaction service; full protocol negotiation is unavailable")),
+            METHOD_SERVER_BANNER => Ok(json!("btc-rust experimental local validated Electrum service; isolated peer discovery, no donations; public-chain/TLS/load qualification is incomplete")),
+            METHOD_SERVER_VERSION | METHOD_SERVER_FEATURES | METHOD_SERVER_DONATION_ADDRESS | METHOD_SERVER_PEERS_SUBSCRIBE | METHOD_SERVER_ADD_PEER => {
+                use crate::negotiation::{select, MAX_CLIENT_BYTES, PROTOCOL, SERVER_VERSION};
+                let service = self.service.as_ref().ok_or_else(|| error(METHOD_NOT_FOUND, "complete Electrum service is unavailable on this provider/listener"))?;
+                match method {
+                    METHOD_SERVER_VERSION => {
+                        let session = session.ok_or_else(|| error(INTERNAL_ERROR, "version negotiation requires a live connection"))?;
+                        if session.version_seen { return Err(error(1, "server.version already sent")); }
+                        session.version_seen = true;
+                        let client = match params.get(0) {
+                            None => "",
+                            Some(value) => value.as_str().ok_or_else(|| error(INVALID_PARAMS, "client_name must be a string"))?,
+                        };
+                        if client.len() > MAX_CLIENT_BYTES || client.chars().any(char::is_control) {
+                            return Err(error(INVALID_PARAMS, "client_name exceeds bounds or contains controls"));
+                        }
+                        let version = select(params.get(1)).map_err(|message| error(INVALID_PARAMS, message))?
+                            .ok_or_else(|| error(1, "unsupported protocol version"))?;
+                        Ok(json!([SERVER_VERSION, version]))
+                    }
+                    METHOD_SERVER_FEATURES => Ok(json!({
+                        "hosts": {service.endpoint.ip().to_string(): {"tcp_port": service.endpoint.port()}},
+                        "genesis_hash": service.genesis.to_string(), "hash_function": "sha256",
+                        "server_version": SERVER_VERSION, "protocol_min": PROTOCOL, "protocol_max": PROTOCOL,
+                        "pruning": null, "peer_discovery": "off", "donations": false,
+                    })),
+                    METHOD_SERVER_DONATION_ADDRESS => Ok(json!("")),
+                    METHOD_SERVER_PEERS_SUBSCRIBE => Ok(json!([])),
+                    METHOD_SERVER_ADD_PEER => {
+                        if !params[0].is_object() { return Err(error(INVALID_PARAMS, "features must be an object")); }
+                        // The actual isolated policy rejects every announcement;
+                        // no resolution, outbound connection or registry mutation.
+                        Ok(json!(false))
+                    }
+                    _ => unreachable!(),
+                }
+            }
             _ => self.backend.as_ref().ok_or_else(|| error(INTERNAL_ERROR, "validated chain provider unavailable"))?.call(method, params),
         }
     }
@@ -260,11 +356,15 @@ impl ElectrumHandler {
         let request: Result<ElectrumRequest, _> = serde_json::from_value(value);
         let response = match request {
             Ok(request) if valid_id => {
+                let version_seen = session.as_ref().is_some_and(|session| session.version_seen);
                 let response = self.handle_session(&request, session);
                 if request.method == METHOD_HEADERS_SUBSCRIBE && response.error.is_none() {
                     dispatch.header = response.result.clone();
                 }
-                if request.method == METHOD_SERVER_VERSION {
+                if request.method == METHOD_SERVER_VERSION
+                    && response.error.is_some()
+                    && !version_seen
+                {
                     dispatch.close = true;
                 }
                 // Valid notifications execute but never carry response bytes.
@@ -345,6 +445,9 @@ impl ElectrumHandler {
         let mut count = 0;
         for member in members {
             let Some(out) = self.member(member, &mut dispatch, session.as_deref_mut()) else {
+                if dispatch.close {
+                    break;
+                }
                 continue;
             };
             let encoded = serde_json::to_string(&out).expect("RPC response serializes");
@@ -363,6 +466,11 @@ impl ElectrumHandler {
             }
             dispatch.output.push_str(&encoded);
             count += 1;
+            // A rejected first negotiation closes before later batch operations
+            // can mutate chain/pool state, including notification members.
+            if dispatch.close {
+                break;
+            }
         }
         if count == 0 {
             dispatch.output.clear();
@@ -409,9 +517,15 @@ mod tests {
             assert_eq!(response.error.unwrap().code, INTERNAL_ERROR);
             assert!(response.result.is_none());
         }
-        for method in [METHOD_SERVER_VERSION, METHOD_SERVER_FEATURES] {
+        for (method, params) in [
+            (METHOD_SERVER_VERSION, json!([])),
+            (METHOD_SERVER_FEATURES, json!([])),
+            (METHOD_SERVER_PEERS_SUBSCRIBE, json!([])),
+            (METHOD_SERVER_DONATION_ADDRESS, json!([])),
+            (METHOD_SERVER_ADD_PEER, json!([{}])),
+        ] {
             let response: Value = serde_json::from_str(
-                &handler.handle_raw(&json!({"id":4,"method":method,"params":[]}).to_string()),
+                &handler.handle_raw(&json!({"id":4,"method":method,"params":params}).to_string()),
             )
             .unwrap();
             assert_eq!(response["error"]["code"], METHOD_NOT_FOUND);
